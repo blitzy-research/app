@@ -512,7 +512,7 @@ This verifies that the candidate reply email is not already used as:
 
 - Character set: 26 lowercase ASCII letters (`a-z`)
 - Length range: 20–50 characters
-- Minimum keyspace: 26^20 ≈ 1.98 × 10^28
+- Minimum keyspace: 26^20 ≈ 1.99 × 10^28
 - Maximum keyspace: 26^50 ≈ 5.64 × 10^70
 
 For a database with `N` existing reply emails, the probability of a single random generation colliding with an existing value is approximately `N / 26^20`. Even with 1 billion existing contacts (N = 10^9), the probability per generation is approximately 5 × 10^-20 — astronomically low.
@@ -652,9 +652,11 @@ def main(port: int):
     controller.start()
 ```
 
-`aiosmtpd.Controller` (version `^1.2` per `pyproject.toml:87`) runs an asyncio event loop in a **separate daemon thread**. Multiple simultaneous SMTP connections are handled concurrently within this event loop. Each connection's `handle_DATA()` is awaited, but multiple connections can be at different stages of processing simultaneously.
+`aiosmtpd.Controller` (version `^1.2` per `pyproject.toml:87`) runs an asyncio event loop in a **separate daemon thread**. Multiple simultaneous SMTP connections are accepted concurrently within this event loop; however, `_handle()` at line 2335 is a **synchronous** method (not `async def`) and is called directly from the `async handle_DATA()` without `await` (line 2292). This means `_handle()` **blocks the asyncio event loop** for the entire duration of its execution. Within the single email handler process, DATA-phase processing is therefore **serial** — only one `handle_DATA()` callback makes progress at a time.
 
-The web server runs as a separate process:
+Source: `email_handler.py:2335` (`def _handle(self, envelope, msg)` — synchronous), `email_handler.py:2292` (`ret = self._handle(envelope, msg)` — no `await`)
+
+The concurrent contact-creation risk comes from **cross-process** interaction. The web server runs as a separate process:
 
 Source: `Dockerfile:47`
 
@@ -774,7 +776,7 @@ from flask_login import current_user
 
 The SMTP handler at `email_handler.py:2288-2378` does **not** import or use `parallel_limiter`. The `_handle()` method creates a `create_light_app().app_context()` (line 2352) but does **not** establish `current_user` or a Flask `request` object.
 
-**Conclusion:** The SMTP processing path has **no distributed locking mechanism**. Multiple concurrent SMTP connections can execute `handle_reply()` or forward-phase contact creation (`get_or_create_contact()`) simultaneously without any serialization.
+**Conclusion:** The SMTP processing path has **no distributed locking mechanism**. While the email handler's own SMTP connections are serialized at the DATA-processing level (because `_handle()` is synchronous and blocks the event loop — see Section 5.1), the email handler process and the 2 Gunicorn web worker processes can execute contact creation concurrently without any cross-process serialization. A web API request calling `create_contact()` can race with the email handler's forward-phase `get_or_create_contact()`, and neither path holds a distributed lock.
 
 ### 5.5 Multiple Forward Events Creating Contacts Simultaneously
 
