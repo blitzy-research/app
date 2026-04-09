@@ -312,7 +312,7 @@ python server.py
 When running the Flask development server via `python server.py`, the function `local_main()` is invoked:
 
 ```python
-# Source: server.py:572-588
+# Source: server.py:572-589
 def local_main():
     config.COLOR_LOG = True
     app = create_app()
@@ -371,7 +371,7 @@ The timestamps for all four Gunicorn startup messages (`Starting gunicorn`, `Lis
 - **Source:** `wsgi.py:1-3` — The WSGI entry point simply calls `create_app()`.
 - **Source:** `Dockerfile:44-47` — Production container runs Gunicorn with 2 workers and 15-second timeout.
 - **Source:** `app/log.py:69-71` — The werkzeug logger is disabled at import time, suppressing Flask dev server's startup message.
-- **Source:** `server.py:572-588` — `local_main()` calls `create_app()` then `app.run(debug=True, port=7777)`.
+- **Source:** `server.py:572-589` — `local_main()` calls `create_app()` then `app.run(debug=True, port=7777)`.
 
 ---
 
@@ -497,28 +497,32 @@ curl -v -X POST http://localhost:7777/api/auth/login \
 Full verbose output:
 
 ```text
+*   Trying [::1]:7777...
+* Immediate connect fail for ::1: Cannot assign requested address
 *   Trying 127.0.0.1:7777...
-* Connected to localhost (127.0.0.1) port 7777 (#0)
+* Connected to localhost (127.0.0.1) port 7777
 > POST /api/auth/login HTTP/1.1
 > Host: localhost:7777
-> User-Agent: curl/7.81.0
+> User-Agent: curl/8.5.0
 > Accept: */*
 > Content-Type: application/json
-> Content-Length: 58
+> Content-Length: 60
 >
-* Mark bundle as not supporting multiuse
 < HTTP/1.1 422 UNPROCESSABLE ENTITY
 < Server: gunicorn
-< Date: Mon, 15 Jan 2024 10:40:00 GMT
+< Date: Thu, 09 Apr 2026 23:41:53 GMT
 < Connection: close
 < Content-Type: application/json
-< Content-Length: 36
+< Content-Length: 34
+< Access-Control-Allow-Origin: *
+< Vary: Cookie
+< Set-Cookie: slapp=<session_cookie>; Expires=<date>; HttpOnly; Path=/; SameSite=Lax
 <
 {"error":"Account not activated"}
-* Closing connection 0
+* Closing connection
 ```
 
-*(Exact headers such as `Date`, `Server`, and `User-Agent` will vary per environment.)*
+*(Exact values such as `Date`, `User-Agent`, `Set-Cookie` content, and IPv6 connection attempts will vary per environment. The `Content-Length: 34` is the exact byte count of `{"error":"Account not activated"}\n`. The `Access-Control-Allow-Origin: *` header is set by Flask-CORS.)*
 
 **Key findings:**
 - **HTTP Status Code: 422** (Unprocessable Entity)
@@ -633,7 +637,7 @@ What `max_alias_free_plan` value does `/api/user_info` return by default? After 
 When `MAX_NB_EMAIL_FREE_PLAN` is **not set** in `.env`, the default value is **5**.
 
 ```python
-# Source: app/config.py:120-124
+# Source: app/config.py:119-124
 try:
     MAX_NB_EMAIL_FREE_PLAN = int(os.environ["MAX_NB_EMAIL_FREE_PLAN"])
 except Exception:
@@ -742,7 +746,7 @@ def max_alias_for_free_account(self) -> int:
 3. **`config.MAX_NB_EMAIL_FREE_PLAN`** is loaded once at import time from the environment:
 
 ```python
-# Source: app/config.py:120-124
+# Source: app/config.py:119-124
 try:
     MAX_NB_EMAIL_FREE_PLAN = int(os.environ["MAX_NB_EMAIL_FREE_PLAN"])
 except Exception:
@@ -765,7 +769,7 @@ FLAG_FREE_OLD_ALIAS_LIMIT = 1 << 2
 The `MAX_NB_EMAIL_OLD_FREE_PLAN` default is 15:
 
 ```python
-# Source: app/config.py:126
+# Source: app/config.py:125
 MAX_NB_EMAIL_OLD_FREE_PLAN = int(os.environ.get("MAX_NB_EMAIL_OLD_FREE_PLAN", 15))
 ```
 
@@ -773,8 +777,8 @@ MAX_NB_EMAIL_OLD_FREE_PLAN = int(os.environ.get("MAX_NB_EMAIL_OLD_FREE_PLAN", 15
 
 | Component | Source | Purpose |
 |-----------|--------|---------|
-| Config loading | `app/config.py:120-124` | Loads `MAX_NB_EMAIL_FREE_PLAN` from env, defaults to 5 |
-| Old plan config | `app/config.py:126` | Loads `MAX_NB_EMAIL_OLD_FREE_PLAN` from env, defaults to 15 |
+| Config loading | `app/config.py:119-124` | Loads `MAX_NB_EMAIL_FREE_PLAN` from env, defaults to 5 |
+| Old plan config | `app/config.py:125` | Loads `MAX_NB_EMAIL_OLD_FREE_PLAN` from env, defaults to 15 |
 | User model method | `app/models.py:858-865` | `max_alias_for_free_account()` returns global config value |
 | Flag definition | `app/models.py:341` | `FLAG_FREE_OLD_ALIAS_LIMIT = 1 << 2` for old plan users |
 | API serialization | `app/api/views/user_info.py:28-34` | `user_to_dict()` calls `user.max_alias_for_free_account()` |
