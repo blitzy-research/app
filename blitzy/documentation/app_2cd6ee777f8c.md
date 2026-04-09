@@ -51,9 +51,7 @@ It then calls `self._handle(envelope, msg)` at line 2292 and returns the SMTP st
 Source: `email_handler.py:2334-2353`
 
 ```python
-@newrelic.agent.background_task()
 def _handle(self, envelope: Envelope, msg: Message):
-    ...
     with create_light_app().app_context():
         return_status = handle(envelope, msg)
 ```
@@ -90,9 +88,6 @@ Source: `app/email_utils.py:1156-1163`
 def is_reverse_alias(address: str) -> bool:
     if Contact.get_by(reply_email=address):
         return True
-    return address.endswith(f"@{config.EMAIL_DOMAIN}") and (
-        address.startswith("reply+") or address.startswith("ra+")
-    )
 ```
 
 ```mermaid
@@ -150,9 +145,7 @@ Source: `email_handler.py:974-981`
 ```python
 reply_domain = get_email_domain_part(reply_email)
 if not reply_email.endswith(EMAIL_DOMAIN):
-    sl_domain: SLDomain = SLDomain.get_by(domain=reply_domain)
-    if sl_domain is None:
-        return False, status.E501
+    ...  # validates against SLDomain; returns E501 if unrecognized
 ```
 
 If the domain is neither `EMAIL_DOMAIN` nor a recognized `SLDomain`, the handler returns `E501` ("550 SL E501") immediately.
@@ -173,14 +166,7 @@ Source: `app/email_validation.py:25-38`
 
 ```python
 def normalize_reply_email(reply_email: str) -> str:
-    if not reply_email.isascii():
-        reply_email = convert_to_id(reply_email)
-    ret = []
-    for c in reply_email:
-        if c not in _ALLOWED_CHARS:
-            ret.append("_")
-        else:
-            ret.append(c)
+    ...  # replaces characters not in _ALLOWED_CHARS with "_"
     return "".join(ret)
 ```
 
@@ -293,9 +279,7 @@ if not user.can_send_or_receive():
 Source: `email_handler.py:1012-1016`
 
 ```python
-dmarc_delivery_status = apply_dmarc_policy_for_reply_phase(
-    alias, contact, envelope, msg
-)
+dmarc_delivery_status = apply_dmarc_policy_for_reply_phase(alias, contact, ...)
 if dmarc_delivery_status is not None:
     return False, dmarc_delivery_status
 ```
@@ -314,14 +298,7 @@ Source: `email_handler.py:1364-1387`
 
 ```python
 def get_mailbox_from_mail_from(mail_from: str, alias) -> Optional[Mailbox]:
-    def __check(email_address: str, alias: Alias) -> Optional[Mailbox]:
-        for mailbox in alias.mailboxes:
-            if mailbox.email == email_address:
-                return mailbox
-            for authorized_address in mailbox.authorized_addresses:
-                if authorized_address.email == email_address:
-                    return mailbox
-        return None
+    ...  # iterates alias.mailboxes, comparing email and authorized_addresses
     return __check(mail_from, alias) or __check(canonicalize_email(mail_from), alias)
 ```
 
@@ -331,11 +308,8 @@ Source: `email_handler.py:1020-1034`
 
 ```python
 if not mailbox:
-    if alias.disable_email_spoofing_check:
-        mailbox = alias.mailbox
-    else:
-        handle_unknown_mailbox(envelope, msg, reply_email, user, alias, contact)
-        return False, status.E214
+    if alias.disable_email_spoofing_check: mailbox = alias.mailbox
+    else: ...  # calls handle_unknown_mailbox(), returns E214
 ```
 
 **Runtime values at this point:**
@@ -358,13 +332,7 @@ Source: `email_handler.py:1042-1050`
 
 ```python
 email_log = EmailLog.create(
-    contact_id=contact.id,
-    alias_id=contact.alias_id,
-    is_reply=True,
-    user_id=contact.user_id,
-    mailbox_id=mailbox.id,
-    ...
-    commit=True,
+    contact_id=contact.id, alias_id=contact.alias_id, is_reply=True, ...
 )
 ```
 
@@ -391,9 +359,8 @@ Source: `email_handler.py:345-376`
 
 ```python
 def replace_header_when_reply(msg: Message, alias: Alias, header: str):
-    for _, reply_email in getaddresses(headers):
-        ...
-        contact = Contact.get_by(reply_email=reply_email)
+    ...  # iterates header addresses via getaddresses()
+    contact = Contact.get_by(reply_email=reply_email)
 ```
 
 **DKIM signing and delivery:**
@@ -403,13 +370,7 @@ Source: `email_handler.py:1220-1231`
 ```python
 if should_add_dkim_signature(alias_domain):
     add_dkim_signature(msg, alias_domain)
-try:
-    sl_sendmail(
-        generate_verp_email(VerpType.bounce_reply, email_log.id, alias_domain),
-        contact.website_email,
-        msg,
-        ...
-    )
+sl_sendmail(..., contact.website_email, msg, ...)
 ```
 
 The email is sent to `contact.website_email` — the external recipient — with a VERP bounce envelope for delivery tracking.
@@ -466,10 +427,8 @@ Source: `app/email_utils.py:1136-1153`
 
 ```python
 for _ in range(1000):
-    ...
-    if available_sl_email(reply_email):
-        return reply_email
-raise Exception("Cannot generate reply email")
+    ...  # generates candidate reply_email
+    if available_sl_email(reply_email): return reply_email
 ```
 
 The `random_string()` function uses `secrets.choice(string.ascii_lowercase)` for cryptographically secure random selection.
@@ -490,13 +449,8 @@ Source: `app/models.py:1425-1432`
 
 ```python
 def available_sl_email(email: str) -> bool:
-    if (
-        Alias.get_by(email=email)
-        or Contact.get_by(reply_email=email)
-        or DeletedAlias.get_by(email=email)
-    ):
+    if Alias.get_by(email=email) or Contact.get_by(reply_email=email) or ...:
         return False
-    return True
 ```
 
 This verifies that the candidate reply email is not already used as:
@@ -560,9 +514,7 @@ Source: `app/models.py:1872-1876`
 
 ```python
 __tablename__ = "contact"
-__table_args__ = (
-    sa.UniqueConstraint("alias_id", "website_email", name="uq_contact"),
-)
+__table_args__ = (sa.UniqueConstraint("alias_id", "website_email", name="uq_contact"),)
 ```
 
 The **only unique constraint** on the `contact` table is `uq_contact` on the pair `(alias_id, website_email)`. This ensures that for a given alias, there is at most one Contact per sender email address.
@@ -689,10 +641,7 @@ Source: `app/contact_utils.py:92-103`
 
 ```python
 contact = Contact.create(
-    ...
-    reply_email=reply_email,
-    ...
-    commit=True,
+    ..., reply_email=reply_email, ..., commit=True,
 )
 ```
 
@@ -725,17 +674,8 @@ Source: `app/contact_utils.py:90-119`
 
 ```python
 reply_email = generate_reply_email(email, alias)
-try:
-    contact = Contact.create(
-        ...
-        reply_email=reply_email,
-        ...
-        commit=True,
-    )
-except IntegrityError:
-    Session.rollback()
-    contact = Contact.get_by(alias_id=alias.id, website_email=email)
-    return __update_contact_if_needed(contact, name, mail_from)
+try: contact = Contact.create(..., reply_email=reply_email, commit=True)
+except IntegrityError: ...  # Session.rollback(); re-fetches by (alias_id, website_email)
 ```
 
 The `IntegrityError` handler at line 113 catches the `uq_contact` unique constraint violation on `(alias_id, website_email)` — the scenario where two concurrent requests try to create the same Contact for the same alias and sender email.
@@ -761,8 +701,7 @@ Source: `app/parallel_limiter.py:54-58`
 ```python
 if "id" in dir(current_user):
     lock_name = f"cl:{current_user.id}:{lock_suffix}"
-else:
-    lock_name = f"cl:{request.remote_addr}:{lock_suffix}"
+else: lock_name = f"cl:{request.remote_addr}:{lock_suffix}"
 ```
 
 These are **Flask/web-request concepts** — `current_user` comes from `flask_login` and `request` comes from `flask`:
