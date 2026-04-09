@@ -163,9 +163,9 @@ alembic upgrade head
 
 The migration output follows this pattern, with 255 lines of the form:
 
-```
-INFO  [alembic.runtime.migration] Running upgrade  -> a6b1009e8f5e, init
-INFO  [alembic.runtime.migration] Running upgrade a6b1009e8f5e -> b9f849432543, add Fido
+```text
+INFO  [alembic.runtime.migration] Running upgrade  -> 5e549314e1e2, empty message
+INFO  [alembic.runtime.migration] Running upgrade 5e549314e1e2 -> 3cd10cfce8c3, empty message
 ...
 INFO  [alembic.runtime.migration] Running upgrade 91ed7f46dc81 -> 7d7b84779837, user_audit_log
 INFO  [alembic.runtime.migration] Running upgrade 7d7b84779837 -> 32f25cbf12f6, alias_audit_log_index_created_at
@@ -262,7 +262,7 @@ gunicorn wsgi:app -b 0.0.0.0:7777 -w 1 --timeout 30 --log-level info
 
 Observed startup log output:
 
-```
+```text
 [2024-01-15 10:30:45 +0000] [12345] [INFO] Starting gunicorn 20.1.0
 [2024-01-15 10:30:45 +0000] [12345] [INFO] Listening at: http://0.0.0.0:7777 (12345)
 [2024-01-15 10:30:45 +0000] [12345] [INFO] Using worker: sync
@@ -273,13 +273,13 @@ Observed startup log output:
 
 The **ready message** indicating the server can accept connections is:
 
-```
+```text
 [<TIMESTAMP>] [<PID>] [INFO] Listening at: http://0.0.0.0:7777 (<PID>)
 ```
 
 The **first log message** is:
 
-```
+```text
 [<TIMESTAMP>] [<PID>] [INFO] Starting gunicorn 20.1.0
 ```
 
@@ -398,7 +398,7 @@ python email_handler.py -p 25025
 
 Observed log output (timestamps and PIDs will vary):
 
-```
+```text
 2024-01-15 10:35:00 - SL - INFO - 12347 - "email_handler.py:2403" - <module>() -  - Listen for port 25025
 2024-01-15 10:35:00 - SL - DEBUG - 12347 - "email_handler.py:2386" - main() -  - Start mail controller 0.0.0.0 25025
 ```
@@ -496,7 +496,7 @@ curl -v -X POST http://localhost:7777/api/auth/login \
 
 Full verbose output:
 
-```
+```text
 *   Trying 127.0.0.1:7777...
 * Connected to localhost (127.0.0.1) port 7777 (#0)
 > POST /api/auth/login HTTP/1.1
@@ -534,7 +534,7 @@ SELECT activated, notification FROM users WHERE email = 'testuser@example.com';
 
 Result:
 
-```
+```text
  activated | notification
 -----------+--------------
  f         | t
