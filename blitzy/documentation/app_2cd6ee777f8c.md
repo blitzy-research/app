@@ -157,7 +157,7 @@ The v2 endpoint (`new_custom_alias_v2`) is simpler than v3:
 | Prefix format validation (`check_alias_prefix`) | **No** | Yes (`new_custom_alias.py:167-168`) |
 | Request body must be `dict` | **No** | Yes (`new_custom_alias.py:153-154`) |
 | Multiple mailbox support (`mailbox_ids`) | **No** — always uses `user.default_mailbox_id` | Yes (`new_custom_alias.py:170-181`) |
-| Alias `name` field | **No** | Yes (`new_custom_alias.py:160`) |
+| Alias `name` field | **No** | Yes (`new_custom_alias.py:162`) |
 | Mailbox validation | **No** | Yes (existence, ownership, verified status) |
 
 Both endpoints share identical behavior for: rate limiting, authentication, quota checks, suffix signature verification, prefix/suffix validation, alias uniqueness, and consecutive dot checks.
