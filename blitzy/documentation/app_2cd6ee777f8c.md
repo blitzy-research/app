@@ -151,7 +151,7 @@ Finally, it creates the application logger `LOG = _get_logger("SL")` with a cust
 
 *Source: `app/log.py:48-64, 79`*
 
-**Timing note on COLOR_LOG:** There is a subtlety here. `local_main()` sets `config.COLOR_LOG = True` at line 573, *then* calls `create_app()`. However, `app/log.py` was already imported at the top of `server.py` (line 83), so by the time `config.COLOR_LOG = True` is set, the logger has already been created *without* colored output. The `COLOR_LOG` check happens at `app/log.py:61` during `_get_logger()`, which runs at import time when `COLOR_LOG` is still `False` (its value from `os.environ` at `app/config.py:73`). However, when `debug=True` is set and Flask's reloader forks a child process, the *second* import of `server.py` will see `config.COLOR_LOG = True` set by the parent process's `local_main()`. In practice, with the stat reloader, the module runs twice — and the environment variable `COLOR_LOG` from `os.environ` at config.py:73 (`"COLOR_LOG" in os.environ`) is what controls the first pass, while the second pass (in the reloader child) benefits from `config.COLOR_LOG = True` being set in-memory.
+**Timing note on COLOR_LOG:** There is a subtlety here. `local_main()` sets `config.COLOR_LOG = True` at line 573, *then* calls `create_app()`. However, `app/log.py` was already imported at the top of `server.py` (line 83), so by the time `config.COLOR_LOG = True` is set, the logger has already been created *without* colored output. The `COLOR_LOG` check happens at `app/log.py:61` during `_get_logger()`, which runs at import time when `COLOR_LOG` is still `False` (its value from `os.environ` at `app/config.py:73`). When `debug=True` is set and Flask's stat reloader is active, it spawns a child process via `os.execv()` — a fresh Python process that does *not* inherit in-memory state from the parent. The parent's `config.COLOR_LOG = True` assignment has no effect on the child. Instead, the child re-evaluates `COLOR_LOG = "COLOR_LOG" in os.environ` independently at `app/config.py:73`. In practice, with the stat reloader, the module runs twice — and in both passes, it is the presence of the `COLOR_LOG` key in `os.environ` (not any in-memory attribute) that determines whether colored logging is activated. Unless the `COLOR_LOG` environment variable is explicitly set in the shell or `.env` file, neither pass will produce colored output.
 
 #### 1.2.3 `app/db.py` — Database Connection
 
@@ -707,15 +707,15 @@ The development server binds to `127.0.0.1:7777` (localhost only, due to Flask's
 | Blueprint | URL Prefix | Source Definition |
 |-----------|------------|-------------------|
 | `auth_bp` | `/auth` | `app/auth/base.py:3-5` |
-| `monitor_bp` | *(from blueprint definition)* | `app/monitor/base.py` |
+| `monitor_bp` | `/` | `app/monitor/base.py:3` |
 | `dashboard_bp` | `/dashboard` | `app/dashboard/base.py:3-8` |
-| `developer_bp` | *(from blueprint definition)* | `app/developer/base.py` |
-| `phone_bp` | *(from blueprint definition)* | `app/phone/base.py` |
+| `developer_bp` | `/developer` | `app/developer/base.py:3-8` |
+| `phone_bp` | `/phone` | `app/phone/base.py:3-8` |
 | `oauth_bp` (1st) | `/oauth` | `server.py:240` (override) |
 | `oauth_bp` (2nd) | `/oauth2` | `server.py:241` (override) |
-| `onboarding_bp` | *(from blueprint definition)* | `app/onboarding/base.py` |
-| `discover_bp` | *(from blueprint definition)* | `app/discover/base.py` |
-| `internal_bp` | *(from blueprint definition)* | `app/internal/base.py` |
+| `onboarding_bp` | `/onboarding` | `app/onboarding/base.py:3-8` |
+| `discover_bp` | `/discover` | `app/discover/base.py:3-8` |
+| `internal_bp` | `/internal` | `app/internal/base.py:3-8` |
 | `api_bp` | `/api` | `app/api/base.py:11` |
 
 *Source: `server.py:233-246`*
@@ -727,7 +727,7 @@ The development server binds to `127.0.0.1:7777` (localhost only, due to Flask's
 | `/` | GET, POST | Redirects to `/dashboard` (authenticated) or `/auth/login` (unauthenticated) | `server.py:250-255` |
 | `/health` | GET | Returns `"success"`, 200 | `server.py:213-215` |
 | `/favicon.ico` | GET | Redirects to `/static/favicon.ico` | `server.py:397-400` |
-| `/.well-known/openid-configuration` | GET | OpenID Connect discovery document (CORS-enabled) | `server.py:300-323` |
+| `/.well-known/openid-configuration` | GET | OpenID Connect discovery document (CORS-enabled) | `server.py:299-323` |
 | `/jwks` | GET | JSON Web Key Set (CORS-enabled) | `server.py:325-329` |
 | `/dnt` | GET | Disables analytics via localStorage | `server.py:553-569` |
 | `/admin/` | GET | Flask-Admin dashboard (protected) | `server.py:441-458` |
@@ -895,6 +895,8 @@ def after_login(user, next_url, login_from_proton: bool = False):
 ```
 
 *Source: `app/auth/views/login_utils.py:12-45`*
+
+> **Note:** The excerpt above is simplified for clarity. The actual function also conditionally propagates the `next_url` parameter through FIDO and MFA redirects (only passing `next=next_url` when `next_url` is truthy) and redirects to `next_url` instead of the dashboard when present after successful non-MFA login — see `app/auth/views/login_utils.py:12-48` for the complete implementation with all `next_url` conditionals.
 
 The flow is:
 1. **FIDO (WebAuthn) enabled?** → Store `user.id` in `session[MFA_USER_ID]`, redirect to `/auth/fido`
@@ -1288,7 +1290,7 @@ if __name__ == "__main__":
 | `clear_alias_audit_log` | Every hour | Purge old alias audit log entries |
 | `clear_user_audit_log` | Every hour | Purge old user audit log entries |
 
-*Source: `crontab.yml:1-97`*
+*Source: `crontab.yml:1-96`*
 
 #### 3.2.3 `email_handler.py` — SMTP Email Handler
 
@@ -1413,7 +1415,7 @@ graph TB
 
 **Key architectural observation:** All six processes are completely independent. They share PostgreSQL as their common data store and coordinate through database state (the `Job` table for the job runner, `sync_event` table for the event listener, etc.). There is no inter-process communication via sockets, pipes, or message queues — PostgreSQL is the single source of truth and coordination mechanism.
 
-The web server and job runner also connect to Redis (when `MEM_STORE_URI` is configured) for session storage and rate limiting.
+The web server also connects to Redis (when `MEM_STORE_URI` is configured) for session storage and rate limiting.
 
 ---
 
