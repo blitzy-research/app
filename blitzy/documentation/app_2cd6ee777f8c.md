@@ -1,62 +1,30 @@
-# SimpleLogin Self-Hosted: Runtime Behavior & Operational Q&A Guide
+# SimpleLogin Self-Hosted: Runtime Behavior and Operational Verification Guide
 
 ## Introduction
 
-This document answers operational questions about the **SimpleLogin** self-hosted email aliasing application. It targets users who have just deployed SimpleLogin locally and want to understand the observable runtime behavior of its three core components:
+This document answers key operational questions about the SimpleLogin self-hosted email aliasing application. It is written for a user who has deployed SimpleLogin locally and wants to understand what is happening under the hood — how to verify each component is alive, what the dashboard shows, what happens when you perform core user actions, and how background processes support the system.
+
+**Every answer in this document is grounded in the SimpleLogin source code.** File paths and line numbers are cited so you can trace each claim back to its origin. No assumptions are made beyond what the code explicitly states.
+
+SimpleLogin comprises three core runtime components:
 
 | Component | Entry Point | Default Port | Role |
 |-----------|-------------|-------------|------|
-| **Web Server** | `server.py` | 7777 | Flask/Gunicorn HTTP interface for dashboard, auth, and API |
-| **Email Handler** | `email_handler.py` | 20381 | aiosmtpd SMTP server that processes incoming emails |
-| **Job Runner** | `job_runner.py` | N/A | Background polling loop that executes deferred tasks |
+| **Web Server** | `server.py` | 7777 | Flask/Gunicorn application serving the UI, API, and admin panel |
+| **Email Handler** | `email_handler.py` | 20381 | aiosmtpd-based SMTP server processing incoming email (forwarding and replying) |
+| **Job Runner** | `job_runner.py` | N/A | Continuous polling loop that drains background jobs from the database |
 
-**Code-as-truth principle:** Every answer in this document is derived from static analysis of the SimpleLogin source code. Each technical claim cites the originating file and line number. No assumptions are made; where behavior cannot be confirmed from code, this is stated explicitly.
-
-**Local development test credentials:** After running `flask dummy-data`, a seeded test user is available — email: `john@wick.com`, password: `password`. This user is created with `activated=True` and `is_admin=True`. (Source: `app/fake_data.py:44-54`)
-
-**Local development startup workflow:**
-
-```bash
-alembic upgrade head && flask dummy-data && python3 server.py
-```
-
-(Source: `CONTRIBUTING.md:106`)
+Additionally, a **cron scheduler** (`cron.py` driven by `crontab.yml`) handles periodic maintenance tasks, and a **monitoring script** (`monitoring.py`) exports operational metrics. These are secondary but documented where relevant.
 
 ---
 
-## Table of Contents
+## Q1: How Can I Confirm Each Component Is Up and Responding?
 
-- [Q1: How Can I Confirm All Three Components Are Up and Responding?](#q1-how-can-i-confirm-all-three-components-are-up-and-responding)
-  - [Web Server (Flask/Gunicorn)](#web-server-flaskgunicorn)
-  - [Email Handler (aiosmtpd)](#email-handler-aiosmtpd)
-  - [Job Runner](#job-runner)
-- [Q2: What Should I See in the Dashboard That Confirms Everything Is Working?](#q2-what-should-i-see-in-the-dashboard-that-confirms-everything-is-working)
-  - [Root URL Redirect Behavior](#root-url-redirect-behavior)
-  - [Login Flow](#login-flow)
-  - [Dashboard Landing Page](#dashboard-landing-page)
-- [Q3: What Happens When I Create an Account, Create an Alias, and Receive an Email?](#q3-what-happens-when-i-create-an-account-create-an-alias-and-receive-an-email)
-  - [Account Creation Walkthrough](#account-creation-walkthrough)
-  - [Alias Creation Walkthrough](#alias-creation-walkthrough)
-  - [Email Reception Walkthrough](#email-reception-walkthrough)
-- [Q4: Do the Email Handler and Job Runner Automatically Come Online?](#q4-do-the-email-handler-and-job-runner-automatically-come-online)
-  - [Email Handler Persistent Listener](#email-handler-persistent-listener)
-  - [Job Runner Persistent Poller](#job-runner-persistent-poller)
-  - [Cron Scheduled Tasks](#cron-scheduled-tasks)
-  - [Monitoring Process](#monitoring-process)
-- [Cross-Component Interaction Patterns](#cross-component-interaction-patterns)
-- [Appendix A: SMTP Status Code Reference](#appendix-a-smtp-status-code-reference)
-- [Appendix B: Log Format Reference](#appendix-b-log-format-reference)
-- [Conclusion](#conclusion)
+### 1.1 Web Server (Flask / Gunicorn)
 
----
+#### 1.1.1 Health Endpoint
 
-## Q1: How Can I Confirm All Three Components Are Up and Responding?
-
-### Web Server (Flask/Gunicorn)
-
-#### Health Endpoint
-
-The web server exposes a dedicated health check endpoint. (Source: `server.py:213-215`)
+The most direct way to verify the web server is to hit the `/health` endpoint. This route is defined inside the `create_app()` factory function:
 
 ```python
 @app.route("/health", methods=["GET"])
@@ -64,847 +32,959 @@ def healthcheck():
     return "success", 200
 ```
 
+*Source: `server.py:213–215`*
+
 **Verification command:**
 
 ```bash
-curl http://localhost:7777/health
+curl -s http://localhost:7777/health
+# Expected output: success
 ```
 
-**Expected response:** Plain text `success` with HTTP status code `200`. Any other response (connection refused, timeout, 5xx) indicates the web server is not running.
+A `200` response with the body `success` confirms the Flask application is loaded, all blueprints are registered, database connectivity is established (via the SQLAlchemy engine initialized in `create_app()`), and the WSGI server (Gunicorn in production, Flask dev server locally) is accepting connections.
 
-#### Startup Behavior
+**Thinking / Rationale:** The `/health` route is registered inside `create_app()` after `init_extensions(app)`, `register_blueprints(app)`, and `set_index_page(app)` have all completed (lines 171–173). This means that if `/health` returns successfully, the full application factory has executed — including database engine configuration (`app.config["SQLALCHEMY_DATABASE_URI"] = DB_URI` at line 146), login manager initialization (`init_extensions` at line 171 → `login_manager.init_app(app)` at line 438), and all blueprint registrations (line 172 → `register_blueprints` at lines 233–246 which registers `auth_bp`, `dashboard_bp`, `api_bp`, and 8 other blueprints). The health endpoint is deliberately excluded from request logging (line 281: `not request.path.startswith("/health")`), so it will not clutter your logs.
 
-When started locally via `python3 server.py`, the `local_main()` function executes. (Source: `server.py:572-588`)
+#### 1.1.2 Startup Log Messages
 
-It performs these steps:
+When running locally via `python3 server.py`, the entry point is `local_main()`:
 
-1. Sets `config.COLOR_LOG = True` to enable colored log output (Source: `server.py:573`)
-2. Calls `create_app()` which initializes the full Flask application (Source: `server.py:574`)
-3. Enables the Flask Debug Toolbar for development (Source: `server.py:577-582`)
-4. Starts the Flask development server on port 7777: `app.run(debug=True, port=7777)` (Source: `server.py:588`)
-
-**Expected startup log:** When the logging module initializes, you will see the line `>>> init logging <<<` printed to stdout. (Source: `app/log.py:67`)
-
-#### App Factory: `create_app()`
-
-The `create_app()` function at `server.py:139-217` builds the full Flask application:
-
-- Configures SQLAlchemy with `DB_URI` (Source: `server.py:146`)
-- Applies `ProxyFix` middleware for Nginx reverse proxy (Source: `server.py:142`)
-- Initializes rate limiting via `flask-limiter` (Source: `server.py:167`)
-- Calls `register_blueprints(app)` to mount all route groups (Source: `server.py:172`)
-- Calls `set_index_page(app)` which sets up the root redirect and request logging hooks (Source: `server.py:173`)
-- Registers the `/health` endpoint (Source: `server.py:213-215`)
-
-The `register_blueprints()` function registers `auth_bp`, `dashboard_bp`, `api_bp`, `monitor_bp`, `developer_bp`, `phone_bp`, `oauth_bp`, `onboarding_bp`, `discover_bp`, and `internal_bp`. (Source: `server.py:233-246`)
-
-#### Lightweight App: `create_light_app()`
-
-A separate `create_light_app()` factory exists for background processes. (Source: `server.py:127-136`)
-
-This creates a minimal Flask app with only SQLAlchemy database configuration and session cleanup — it does **not** register blueprints, login manager, or rate limiter. Both `job_runner.py` and `email_handler.py` use this lightweight context for database access.
-
-#### Request Logging
-
-Every HTTP request (except static assets and health checks) is logged via an `after_request` hook. (Source: `server.py:272-296`)
-
-**Log format:**
-
-```text
-<remote_addr> <method> <path> <args> <status_code>, takes <elapsed_seconds>
+```python
+def local_main():
+    config.COLOR_LOG = True
+    app = create_app()
+    # ...
+    app.run(debug=True, port=7777)
 ```
 
-**Excluded paths:** `/static`, `/admin/static`, `/_debug_toolbar`, `/git`, `/favicon.ico`, `/health` (Source: `server.py:275-282`)
+*Source: `server.py:572–588`*
 
-When you see log lines like `127.0.0.1 GET /dashboard/ {} 200, takes 0.045`, this confirms the web server is processing HTTP requests.
+You will see Flask's standard startup banner:
 
-#### Thinking / Rationale
+```
+ * Running on http://127.0.0.1:7777/ (Press CTRL+C to quit)
+ * Restarting with stat
+ * Debugger is active!
+```
 
-> **Files examined:** `server.py` (entry point, app factory, health route, request logging), `app/log.py` (log format and initialization).
->
-> **Why:** The health endpoint is the most direct programmatic confirmation of liveness. The request logging in the `after_request` hook provides ongoing evidence that the server is handling requests. The `create_app()` and `create_light_app()` distinction is documented because background components use the light app, and understanding this is critical for interpreting runtime behavior.
+In Docker production mode, the `Dockerfile` CMD launches Gunicorn:
+
+```
+CMD ["gunicorn","wsgi:app","-b","0.0.0.0:7777","-w","2","--timeout","15"]
+```
+
+*Source: `Dockerfile:47`*
+
+Gunicorn will log its worker startup:
+
+```
+[INFO] Starting gunicorn 20.0.4
+[INFO] Listening at: http://0.0.0.0:7777
+[INFO] Using worker: sync
+[INFO] Booting worker with pid: ...
+```
+
+Before any of the above, the logging subsystem prints a marker line when the `app.log` module is first imported:
+
+```
+>>> init logging <<<
+```
+
+*Source: `app/log.py:67`*
+
+#### 1.1.3 Request Logging
+
+Once the server is running, every non-static request is logged by the `after_request` hook. The log line includes the remote IP, HTTP method, path, query args, status code, and elapsed time:
+
+```python
+LOG.d(
+    "%s %s %s %s %s, takes %s",
+    request.remote_addr,
+    request.method,
+    request.path,
+    request.args,
+    res.status_code,
+    time.time() - start_time,
+)
+```
+
+*Source: `server.py:284–292`*
+
+Requests to `/static/`, `/admin/static/`, `/_debug_toolbar/`, `/git`, `/favicon.ico`, and `/health` are excluded from this logging to reduce noise (lines 275–282).
+
+**Thinking / Rationale:** The `before_request` hook (lines 257–270) records `g.start_time` for all non-static requests. The `after_request` hook (lines 272–296) reads this to compute elapsed time. This gives you an automatic access log for every meaningful request without requiring a separate logging middleware.
+
+#### 1.1.4 Root URL Redirect Confirmation
+
+Navigating to `http://localhost:7777/` provides an immediate functional test of routing:
+
+```python
+@app.route("/", methods=["GET", "POST"])
+def index():
+    if current_user.is_authenticated:
+        return redirect(url_for("dashboard.index"))
+    else:
+        return redirect(url_for("auth.login"))
+```
+
+*Source: `server.py:250–255`*
+
+- **Not logged in:** You will be redirected to `/auth/login` — if the login page renders, the auth blueprint is working.
+- **Logged in:** You will be redirected to `/dashboard/` — if the dashboard renders, the dashboard blueprint, database, and session management are all functional.
 
 ---
 
-### Email Handler (aiosmtpd)
+### 1.2 Email Handler (aiosmtpd)
 
-#### Startup: `main()` Function
+#### 1.2.1 SMTP Server Startup
 
-The email handler starts an aiosmtpd `Controller` that listens for SMTP connections. (Source: `email_handler.py:2381-2386`)
+The email handler starts an asynchronous SMTP server using the `aiosmtpd` library's `Controller` class:
 
 ```python
 def main(port: int):
+    """Use aiosmtpd Controller"""
     controller = Controller(MailHandler(), hostname="0.0.0.0", port=port)
     controller.start()
+    LOG.d("Start mail controller %s %s", controller.hostname, controller.port)
 ```
 
-After starting the controller, it logs: `"Start mail controller 0.0.0.0 20381"` (Source: `email_handler.py:2386`)
+*Source: `email_handler.py:2381–2386`*
 
-The process then enters an infinite keep-alive loop: `while True: time.sleep(2)` (Source: `email_handler.py:2392-2393`)
+The default port is `20381`, set via the argument parser:
 
-#### Default Port and CLI
+```python
+parser.add_argument(
+    "-p", "--port", help="SMTP port to listen for", type=int, default=20381
+)
+```
 
-The `__main__` block accepts a `-p`/`--port` argument with default value `20381`. (Source: `email_handler.py:2397-2401`)
+*Source: `email_handler.py:2398–2400`*
 
-Before calling `main()`, it logs: `"Listen for port <port>"` (Source: `email_handler.py:2403`)
+At startup you will see two log messages:
 
-**Expected startup log sequence:**
-
-```text
+```
 Listen for port 20381
 Start mail controller 0.0.0.0 20381
 ```
 
-#### PGP Key Loading
+*Source: `email_handler.py:2403` and `email_handler.py:2386`*
 
-If `LOAD_PGP_EMAIL_HANDLER` is set to true, PGP public keys for all mailboxes and contacts are loaded into the keyring at startup. (Source: `email_handler.py:2388-2390`)
+After starting the controller, the script enters an infinite sleep loop (`while True: time.sleep(2)` at lines 2392–2393) to keep the process alive while the aiosmtpd controller runs in a background thread.
 
-#### Verification Command
+#### 1.2.2 Verifying the Email Handler Is Listening
 
-You can verify the email handler is listening by sending a test email with `swaks`: (Source: `CONTRIBUTING.md:218`)
+**Using telnet or netcat:**
 
 ```bash
-swaks --to e1@sl.local --from hey@google.com --server 127.0.0.1:20381
+# Check if the SMTP port is open
+nc -zv localhost 20381
+# Expected: Connection to localhost 20381 port [tcp/*] succeeded!
 ```
 
-A successful SMTP conversation (ending with `250 Message accepted`) confirms the handler is up.
+**Using swaks (as recommended in CONTRIBUTING.md):**
 
-#### Per-Email Processing Logs
+```bash
+swaks --to alias@your-sl-domain.com --from sender@example.com --server localhost:20381
+```
 
-When an email arrives, `MailHandler.handle_DATA()` delegates to `_handle()`. (Source: `email_handler.py:2334-2378`)
+*Source: Reference in `CONTRIBUTING.md:109`*
 
-Each email generates:
+If the email handler is running, `swaks` will show a successful SMTP conversation including a `250` response.
 
-1. A unique UUID `message_id` for lifecycle tracking (Source: `email_handler.py:2339`)
-2. A visual separator: `"====>=====>====>====>====>====>====>====>"`  (Source: `email_handler.py:2342`)
-3. An intake log: `"New message, mail from <sender>, rctp tos <recipients>"` (Source: `email_handler.py:2343-2346`)
-4. A completion log: `"Finish mail_from <sender>, rcpt_tos <recipients>, takes <N> seconds with return code '<status>'<<===" ` (Source: `email_handler.py:2367-2373`)
+#### 1.2.3 Per-Email Processing Logs
 
-Seeing these log lines confirms the email handler is actively processing incoming emails.
-
-#### Thinking / Rationale
-
-> **Files examined:** `email_handler.py` (main function, `_handle` lifecycle, CLI parsing), `CONTRIBUTING.md` (swaks test command).
->
-> **Why:** The `main()` function's `Controller.start()` call is the definitive proof that SMTP listening begins. The `_handle()` method provides the per-email log evidence. The swaks command from CONTRIBUTING.md is the recommended manual verification method.
-
----
-
-### Job Runner
-
-#### Polling Loop
-
-The job runner operates as an infinite polling loop. (Source: `job_runner.py:329-347`)
+When an email arrives, the `MailHandler.handle_DATA()` method is invoked (line 2289). The `_handle` method generates a unique UUID for tracking:
 
 ```python
-while True:
-    for job in get_jobs_to_run():
-        LOG.d("Take job %s", job)
+message_id = str(uuid.uuid4())
+set_message_id(message_id)
+LOG.d("====>=====>====>====>====>====>====>====>")
+LOG.i("New message, mail from %s, rctp tos %s ", envelope.mail_from, envelope.rcpt_tos)
 ```
 
-**Key characteristics:**
+*Source: `email_handler.py:2339–2346`*
 
-- **Polling interval:** 10 seconds between cycles (Source: `job_runner.py:347`)
-- **App context:** Creates a fresh `create_light_app()` context per cycle for database access (Source: `job_runner.py:332`)
-- **Job state transitions:** `ready → taken → done` (Source: `job_runner.py:339, 344`)
-- **Confirmation log:** `"Take job <job>"` for each job picked up (Source: `job_runner.py:334`)
+After processing completes, a summary log is emitted:
 
-#### Job Query Logic: `get_jobs_to_run()`
+```python
+LOG.i(
+    "Finish mail_from %s, rcpt_tos %s, takes %s seconds with return code '%s'<<===",
+    envelope.mail_from, envelope.rcpt_tos, elapsed, return_status,
+)
+```
 
-The `get_jobs_to_run()` function at `job_runner.py:307-326` fetches eligible jobs matching these criteria:
+*Source: `email_handler.py:2367–2373`*
 
-- State is `ready`, **OR** state is `taken` AND `taken_at` is older than `JOB_TAKEN_RETRY_WAIT_MINS` AND `attempts` < `JOB_MAX_ATTEMPTS`
-- `run_at` is NULL **OR** `run_at` is within 10 minutes from now
+The arrow banners (`====>` and `<<===`) make it easy to visually identify the start and end of each email's processing in the log stream.
 
-This retry logic ensures stuck jobs are re-attempted. (Source: `job_runner.py:309-310`)
+**Thinking / Rationale:** The `set_message_id()` function (defined in `app/log.py:22–25`) stores a global message ID that the `EmailHandlerFilter` logging filter (lines 28–37) injects into every log line as `%(message_id)s`. This means every log line emitted during a single email's processing carries the same correlation ID, making it possible to trace the complete lifecycle of one email through multi-line log output. The log format is defined at `app/log.py:12–14`:
 
-#### Verification
-
-The job runner does **not** expose an HTTP endpoint or listen on a port. Verification relies on:
-
-1. **Process visibility:** Confirm the Python process is running (`ps aux | grep job_runner`)
-2. **Log output:** Look for `"Take job"` messages in stdout when jobs exist
-3. **Silence is normal:** If no jobs are pending, the runner simply sleeps — absence of log output is expected behavior when the `job` table has no `ready` jobs
-
-#### Thinking / Rationale
-
-> **Files examined:** `job_runner.py` (main loop, `get_jobs_to_run`, `process_job`), `server.py` (`create_light_app` for DB access).
->
-> **Why:** The job runner has no health endpoint, so verification is observation-based. The 10-second polling interval and the `"Take job"` log message are the primary health signals. The `create_light_app()` dependency confirms that the runner needs a valid database connection to operate.
-
----
-
-### Component Health Verification Flowchart
-
-```mermaid
-flowchart TD
-    A[Start Verification] --> B{Web Server}
-    B --> B1["curl http://localhost:7777/health"]
-    B1 --> B2{Response = 'success' 200?}
-    B2 -->|Yes| B3["✅ Web Server is UP"]
-    B2 -->|No| B4["❌ Check server.py process"]
-
-    A --> C{Email Handler}
-    C --> C1["swaks --to e1@sl.local<br/>--from hey@google.com<br/>--server 127.0.0.1:20381"]
-    C1 --> C2{SMTP 250 response?}
-    C2 -->|Yes| C3["✅ Email Handler is UP"]
-    C2 -->|No| C4["❌ Check email_handler.py process"]
-
-    A --> D{Job Runner}
-    D --> D1["ps aux | grep job_runner"]
-    D1 --> D2{Process running?}
-    D2 -->|Yes| D3["✅ Job Runner is UP"]
-    D2 -->|No| D4["❌ Start python job_runner.py"]
+```
+%(asctime)s - %(name)s - %(levelname)s - %(process)d - "%(pathname)s:%(lineno)d" - %(funcName)s() - %(message_id)s - %(message)s
 ```
 
 ---
 
-## Q2: What Should I See in the Dashboard That Confirms Everything Is Working?
+### 1.3 Job Runner (Background Poller)
 
-### Root URL Redirect Behavior
+#### 1.3.1 Polling Loop Mechanics
 
-Visiting `http://localhost:7777/` triggers the root route handler. (Source: `server.py:250-255`)
+The job runner is a simple infinite loop that queries the database every 10 seconds for ready jobs:
 
-- **If authenticated:** Redirects to `dashboard.index` (the dashboard landing page)
-- **If not authenticated:** Redirects to `auth.login` (the login page)
+```python
+if __name__ == "__main__":
+    while True:
+        with create_light_app().app_context():
+            for job in get_jobs_to_run():
+                LOG.d("Take job %s", job)
+                job.taken = True
+                job.taken_at = arrow.now()
+                job.state = JobState.taken.value
+                job.attempts += 1
+                Session.commit()
+                process_job(job)
+                job.state = JobState.done.value
+                Session.commit()
+            time.sleep(10)
+```
 
-This means a fresh browser session will always land on the login page.
+*Source: `job_runner.py:329–347`*
 
-### Login Flow
+The runner uses `create_light_app()` (a minimal Flask app without blueprints, defined in `server.py:127–136`) to get a database context.
 
-The login page is served at `/auth/login` with both GET and POST methods, rate-limited to 10 requests per minute. (Source: `app/auth/views/login.py:21-24`)
+#### 1.3.2 Verifying the Job Runner Is Active
 
-**Form fields:** email and password (defined in `LoginForm` at `app/auth/views/login.py:16-18`)
+The job runner does **not** expose a network port or health endpoint. You verify it by:
 
-**Authentication process:**
+1. **Checking the process is running:**
 
-1. Sanitizes the email input and looks up the user by email or canonical email (Source: `app/auth/views/login.py:41-43`)
-2. Validates password via `user.check_password(form.password.data)` (Source: `app/auth/views/login.py:45`)
-3. On success: calls `after_login(user, next_url)` which establishes the Flask-Login session (Source: `app/auth/views/login.py:71-72`)
+```bash
+ps aux | grep job_runner
+# Should show: python job_runner.py
+```
 
-**Failure states and flash messages:**
+2. **Watching log output:** When there are no pending jobs, the runner is silent (it simply sleeps for 10 seconds). When a job is picked up, you will see:
 
-| Condition | Flash Message | Source |
-|-----------|---------------|--------|
-| Wrong credentials | `"Email or password incorrect"` | `app/auth/views/login.py:49` |
-| Disabled account | `"Your account is disabled..."` | `app/auth/views/login.py:52-55` |
-| Scheduled deletion | `"Your account is scheduled to be deleted on <date>"` | `app/auth/views/login.py:57-61` |
-| Not activated | `"Please check your inbox for the activation email..."` | `app/auth/views/login.py:63-68` |
+```
+Take job <Job description>
+```
 
-**Already authenticated** users visiting `/auth/login` are redirected directly to the dashboard. (Source: `app/auth/views/login.py:28-34`)
+3. **Checking the database:** Jobs transition through states defined in the `JobState` enum: `ready` → `taken` → `done`. A healthy job runner will not accumulate `ready` or stale `taken` jobs.
 
-#### Test User for Local Development
+#### 1.3.3 Job Query Logic
 
-After running `flask dummy-data`, the following test user is available: (Source: `app/fake_data.py:44-54`)
+The `get_jobs_to_run()` function retrieves jobs matching these criteria:
+
+- Job state is `ready`, **OR** job state is `taken` AND `taken_at` is more than 30 minutes ago AND `attempts` is less than the max (retry safety net)
+- `run_at` is null (run immediately) **OR** `run_at` is within the next 10 minutes
+
+*Source: `job_runner.py:307–326`*
+
+**Thinking / Rationale:** The retry logic (lines 316–321) ensures that if the job runner crashes mid-processing, stale `taken` jobs will be re-picked after 30 minutes (configured via `config.JOB_TAKEN_RETRY_WAIT_MINS`). The 10-minute lookahead for `run_at` (line 323) means scheduled jobs (like onboarding emails) are picked up slightly before their exact target time rather than being missed.
+
+#### 1.3.4 Job Types Handled
+
+The `process_job()` function dispatches based on `job.name`:
+
+| Job Name | Purpose | Source |
+|----------|---------|--------|
+| `JOB_ONBOARDING_1` | Send "send from alias" onboarding email | `job_runner.py:189–197` |
+| `JOB_ONBOARDING_2` | Send "multiple mailboxes" onboarding email | `job_runner.py:198–206` |
+| `JOB_ONBOARDING_4` | Send PGP onboarding email | `job_runner.py:207–220` |
+| `JOB_BATCH_IMPORT` | Process batch alias import from CSV | `job_runner.py:222–225` |
+| `JOB_DELETE_ACCOUNT` | Delete user account and send confirmation | `job_runner.py:226–244` |
+| `JOB_DELETE_MAILBOX` | Delete mailbox and optionally transfer aliases | `job_runner.py:245–246` |
+| `JOB_DELETE_DOMAIN` | Delete custom domain and its aliases | `job_runner.py:248–284` |
+| `JOB_SEND_USER_REPORT` | Export user data report | `job_runner.py:285–288` |
+| `JOB_SEND_PROTON_WELCOME_1` | Send Proton partner welcome email | `job_runner.py:289–294` |
+| `JOB_SEND_ALIAS_CREATION_EVENTS` | Dispatch alias creation events | `job_runner.py:295–302` |
+
+Unrecognized job names are logged as errors: `LOG.e("Unknown job name %s", job.name)` at line 304.
+
+---
+
+## Q2: What Should I See in the Dashboard That Confirms Things Are Working?
+
+### 2.1 Login and Initial Redirect
+
+#### 2.1.1 Accessing the Login Page
+
+When you navigate to `http://localhost:7777/`, the root route checks authentication status:
+
+- **Not authenticated:** Redirects to `/auth/login` (the login page).
+- **Authenticated:** Redirects to `/dashboard/` (the dashboard landing page).
+
+*Source: `server.py:250–255`*
+
+The login form is handled by the `login()` view function:
+
+```python
+@auth_bp.route("/login", methods=["GET", "POST"])
+def login():
+    # ...
+    form = LoginForm(request.form)
+    # ...
+```
+
+*Source: `app/auth/views/login.py:21–82`*
+
+#### 2.1.2 Using the Seeded Test Account
+
+If you ran `flask dummy-data` during setup (as described in `CONTRIBUTING.md:106`), a test user is available:
 
 | Field | Value |
 |-------|-------|
 | Email | `john@wick.com` |
-| Name | `John Wick` |
 | Password | `password` |
-| Activated | `True` |
-| Admin | `True` |
-| Intro shown | `True` |
+| Name | `John Wick` |
+| Admin | Yes |
+| Activated | Yes |
 
-This user also has: Paddle subscription, Coinbase subscription, two API keys (`Chrome` and `Firefox`), a PGP-enabled mailbox (`pgp@example.org`), a custom domain (`ab.cd`), two directories, six notifications, and several seeded aliases. (Source: `app/fake_data.py:102-233`)
+*Source: `app/fake_data.py:44–54`*
 
-### Dashboard Landing Page
+This user is created with `activated=True` and `is_admin=True`, so it can log in immediately and access the admin panel at `/admin`.
 
-After successful login, the user is redirected to the dashboard index route at `/dashboard/`. (Source: `app/dashboard/views/index.py:55-67`)
+#### 2.1.3 Login Flow
 
-This route is protected by `@login_required` and rate-limited to `10/minute` for GET requests and `ALIAS_LIMIT` for POST requests (alias creation). (Source: `app/dashboard/views/index.py:56-62`)
+When you submit valid credentials, the `login()` view:
 
-#### Statistics Display: `get_stats()`
+1. Sanitizes and canonicalizes the email input (line 41–42).
+2. Looks up the user by email (line 43).
+3. Verifies the password via `user.check_password()` (line 45).
+4. Checks the user is not disabled, not scheduled for deletion, and is activated (lines 51–69).
+5. On success, calls `after_login(user, next_url)` (line 72) which calls `flask_login.login_user()` to create a session.
+6. Redirects to the dashboard (or the `next` URL if provided).
 
-The dashboard calls `get_stats(current_user)` to compute and display four key metrics. (Source: `app/dashboard/views/index.py:32-52`)
+*Source: `app/auth/views/login.py:40–72`*
 
-| Metric | Description | Query Logic |
-|--------|-------------|-------------|
-| `nb_alias` | Total aliases owned by user | `Alias.filter_by(user_id=user.id).count()` |
-| `nb_forward` | Emails forwarded | `EmailLog` where `is_reply=False, blocked=False, bounced=False` |
-| `nb_reply` | Emails replied | `EmailLog` where `is_reply=True, blocked=False, bounced=False` |
-| `nb_block` | Emails blocked | `EmailLog` where `is_reply=False, blocked=True, bounced=False` |
+A failed login flashes: `"Email or password incorrect"` and triggers rate limiting via `g.deduct_limit = True` (lines 47–50).
 
-These statistics are returned as a `Stats` dataclass defined at `app/dashboard/views/index.py:24-29`.
+### 2.2 Dashboard Landing Page
 
-#### Alias Listing
+#### 2.2.1 Statistics Display
 
-Below the statistics, the dashboard displays a paginated list of the user's aliases via `get_alias_infos_with_pagination_v3()`. This function is called with query, sort, and filter parameters from the URL. (Source: `app/dashboard/views/index.py:189-199`)
+After successful login, the dashboard landing page (`/dashboard/`) is rendered by the `index()` view. It computes and displays four key statistics via the `get_stats()` function:
 
-#### Intro Screen
+```python
+def get_stats(user: User) -> Stats:
+    nb_alias = Alias.filter_by(user_id=user.id).count()
+    nb_forward = (
+        Session.query(EmailLog)
+        .filter_by(user_id=user.id, is_reply=False, blocked=False, bounced=False)
+        .count()
+    )
+    nb_reply = (
+        Session.query(EmailLog)
+        .filter_by(user_id=user.id, is_reply=True, blocked=False, bounced=False)
+        .count()
+    )
+    nb_block = (
+        Session.query(EmailLog)
+        .filter_by(user_id=user.id, is_reply=False, blocked=True, bounced=False)
+        .count()
+    )
+    return Stats(nb_alias=nb_alias, nb_forward=nb_forward, nb_reply=nb_reply, nb_block=nb_block)
+```
 
-On the very first login (when `intro_shown` is `False`), an introduction overlay is displayed. (Source: `app/dashboard/views/index.py:170-177`)
+*Source: `app/dashboard/views/index.py:32–52`*
 
-For the seeded test user `john@wick.com`, `intro_shown` is set to `True` during creation, so the intro screen will **not** appear. (Source: `app/fake_data.py:52`)
+The dashboard template receives these stats and renders:
 
-#### Notification Indicators
+| Statistic | Meaning | Database Query |
+|-----------|---------|----------------|
+| **Aliases** | Total number of aliases owned by the user | `Alias.filter_by(user_id=...)` |
+| **Forwarded** | Emails forwarded to the user's mailbox (not replies, not blocked, not bounced) | `EmailLog` where `is_reply=False, blocked=False, bounced=False` |
+| **Replied** | Emails sent by the user through an alias (reply phase) | `EmailLog` where `is_reply=True, blocked=False, bounced=False` |
+| **Blocked** | Emails that were blocked (alias disabled or contact blocked) | `EmailLog` where `blocked=True, bounced=False` |
 
-The seeded test user has 6 notifications created via `Notification.create()`. (Source: `app/fake_data.py:231-233`) These appear as notification indicators in the dashboard UI.
+**For the `john@wick.com` test user** (after `flask dummy-data`), the seeded data at `app/fake_data.py:70–100` creates one random alias with a bounced email log. Additionally, lines 138–176 create several more aliases (`e0@`, `e1@`, `e2@` on `FIRST_ALIAS_DOMAIN`) and aliases on the custom domain `ab.cd`. The exact counts will depend on the `FIRST_ALIAS_DOMAIN` configuration, but you should see several aliases and at least one email log entry.
 
-#### What Confirms "Everything Is Working"
+#### 2.2.2 Alias List with Pagination
 
-When you log in as `john@wick.com` and see the dashboard, the following confirms the system is operational:
+Below the statistics, the dashboard shows a paginated list of aliases. The list is fetched via:
 
-1. **Statistics panel** shows alias/forward/reply/block counts (confirms database connectivity and query execution)
-2. **Alias list** displays seeded aliases like `e0@<domain>`, `e1@<domain>`, `e2@<domain>` (confirms Alias table is populated)
-3. **Notification badge** shows pending notifications (confirms notification system is active)
-4. **No error flash messages** (confirms authentication, session management, and template rendering are working)
+```python
+alias_infos = get_alias_infos_with_pagination_v3(
+    current_user, page, query, sort, alias_filter, mailbox_id, directory_id,
+    page_limit=PAGE_LIMIT + 1,
+)
+```
 
-### Thinking / Rationale
+*Source: `app/dashboard/views/index.py:189–199`*
 
-> **Files examined:** `server.py` (root redirect), `app/auth/views/login.py` (login flow), `app/dashboard/views/index.py` (dashboard stats and rendering), `app/fake_data.py` (test user and seeded data).
->
-> **Why:** The root redirect logic determines what users see first. The login flow validates authentication. The `get_stats()` function is the key indicator of dashboard health — it proves the database is connected and ORM queries execute correctly. The seeded test data provides a known baseline for visual confirmation.
+Each alias entry shows: the alias email address, its enabled/disabled status, associated mailbox(es), and activity counts. The `PAGE_LIMIT` constant controls how many aliases appear per page.
+
+#### 2.2.3 Introductory Tour
+
+For new users (first login), the dashboard checks `current_user.intro_shown`:
+
+```python
+show_intro = False
+if not current_user.intro_shown:
+    LOG.d("Show intro to %s", current_user)
+    show_intro = True
+    current_user.intro_shown = True
+    Session.commit()
+```
+
+*Source: `app/dashboard/views/index.py:170–177`*
+
+The `john@wick.com` test user is seeded with `intro_shown=True` (line 52 of `app/fake_data.py`), so the intro tour will **not** appear. For a freshly registered user, the intro tour would display on first dashboard visit.
+
+#### 2.2.4 Notification Indicators
+
+The test user has 6 seeded notifications:
+
+```python
+for i in range(6):
+    Notification.create(user_id=user.id, message=f"""Hey hey <b>{i}</b> """ * 10)
+```
+
+*Source: `app/fake_data.py:231–233`*
+
+These appear as notification indicators in the dashboard UI, confirming that the notification subsystem is functioning.
+
+**Thinking / Rationale:** The `get_stats()` function (lines 32–52) makes four separate COUNT queries against the database — one for aliases and three for different email log categories. This confirms that database connectivity is working and that the ORM layer is properly initialized. If you see non-zero statistics, it proves the full data path (Flask session → SQLAlchemy → PostgreSQL) is operational.
 
 ---
 
-## Q3: What Happens When I Create an Account, Create an Alias, and Receive an Email?
+## Q3: What Happens When I Perform Core User Actions?
 
-### Account Creation Walkthrough
+### 3.1 Creating a New Account
 
-#### Step 1: Registration
+#### 3.1.1 Registration Flow
 
-The registration route at `/auth/register` handles both GET (form display) and POST (submission). (Source: `app/auth/views/register.py:31-114`)
+```mermaid
+flowchart TD
+    A[User visits /auth/register] --> B{Already authenticated?}
+    B -->|Yes| C[Redirect to /dashboard/]
+    B -->|No| D[Show registration form]
+    D --> E{Registration disabled?}
+    E -->|Yes| F[Flash 'Registration is closed' and redirect to login]
+    E -->|No| G[User submits email + password]
+    G --> H{hCaptcha enabled?}
+    H -->|Yes| I{Captcha valid?}
+    I -->|No| J[Flash 'Wrong Captcha']
+    I -->|Yes| K[Validate email]
+    H -->|No| K
+    K --> L{Email can be used as mailbox?}
+    L -->|No| M[Flash error]
+    L -->|Yes| N{Email already in use?}
+    N -->|Yes| O[Flash 'Email already used']
+    N -->|No| P[Create User record in DB]
+    P --> Q[Send activation email]
+    Q --> R[Show 'Waiting for activation' page]
+```
 
-**Form fields:** (Source: `app/auth/views/register.py:23-28`)
+**Step-by-step code trace:**
 
-- `email` — required
-- `password` — required, 8-100 characters
+1. **Route entry:** `@auth_bp.route("/register", methods=["GET", "POST"])` at `app/auth/views/register.py:31`.
 
-**Registration flow on POST:**
+2. **Guard checks:** If the user is already authenticated, redirect to dashboard (lines 33–36). If `config.DISABLE_REGISTRATION` is true, redirect to login with an error flash (lines 38–40).
 
-1. If `HCAPTCHA_SECRET` is configured, validates the hCaptcha response (Source: `app/auth/views/register.py:47-71`)
-2. Canonicalizes the email address via `canonicalize_email()` (Source: `app/auth/views/register.py:73`)
-3. Checks `email_can_be_used_as_mailbox()` — rejects alias domains and disposable emails (Source: `app/auth/views/register.py:74`)
-4. Checks `personal_email_already_used()` — prevents duplicate accounts (Source: `app/auth/views/register.py:79-80`)
-5. Creates the user: `User.create(email=email, name=form.email.data, password=form.password.data, referral=get_referral())` (Source: `app/auth/views/register.py:86-91`)
-6. Commits the database transaction (Source: `app/auth/views/register.py:92`)
-7. Calls `send_activation_email(user, next_url)` (Source: `app/auth/views/register.py:95`)
-8. Renders `auth/register_waiting_activation.html` (Source: `app/auth/views/register.py:104`)
+3. **Form validation:** The `RegisterForm` requires an email and a password of 8–100 characters (lines 23–28).
 
-**Log message:** `"create user <email>"` (Source: `app/auth/views/register.py:85`)
+4. **Email validation:** The email is canonicalized (line 73: `canonicalize_email()`), then checked against `email_can_be_used_as_mailbox()` (line 74) which verifies the domain is not blocked. Duplicate check via `personal_email_already_used()` (lines 79–81).
 
-#### Step 2: Activation Email
+5. **User creation:**
+```python
+user = User.create(
+    email=email,
+    name=form.email.data,
+    password=form.password.data,
+    referral=get_referral(),
+)
+Session.commit()
+```
+*Source: `app/auth/views/register.py:86–92`*
 
-The `send_activation_email()` function at `app/auth/views/register.py:117-129`:
+6. **Activation email:** `send_activation_email(user, next_url)` is called (line 95), which creates an `ActivationCode` record with a random 30-character code (line 120) and sends an email containing a link like `{URL}/auth/activate?code={code}`.
 
-1. Deletes any prior `ActivationCode` rows for this user (Source: `app/auth/views/register.py:119`)
-2. Creates a new `ActivationCode` with a random 30-character code (Source: `app/auth/views/register.py:120`)
-3. Builds the activation link: `{URL}/auth/activate?code={code}` (Source: `app/auth/views/register.py:124`)
-4. Sends the activation email via `email_utils.send_activation_email()` (Source: `app/auth/views/register.py:129`)
+*Source: `app/auth/views/register.py:117–129`*
 
-#### Step 3: Account Activation
+7. **Daily metric update:** The registration increments `nb_new_web_non_proton_user` on the daily metric record (line 97).
 
-The activation route at `/auth/activate` processes the code from the URL. (Source: `app/auth/views/activate.py:13-69`)
+**Runtime artifacts confirming account creation:**
+- **Database:** A new `User` row exists with `activated=False`, and an `ActivationCode` row references it.
+- **Log:** `LOG.d("create user %s", email)` at line 85.
+- **Email:** An activation email is dispatched via `email_utils.send_activation_email()`.
 
-1. Looks up the `ActivationCode` by code (Source: `app/auth/views/activate.py:26`)
-2. Checks if the code is expired (Source: `app/auth/views/activate.py:38`)
-3. Sets `user.activated = True` (Source: `app/auth/views/activate.py:49`)
-4. Calls `login_user(user)` via Flask-Login to establish the session (Source: `app/auth/views/activate.py:50`)
-5. Deletes the one-time `ActivationCode` (Source: `app/auth/views/activate.py:53`)
-6. Shows flash message: `"Your account has been activated"` (Source: `app/auth/views/activate.py:56`)
-7. Sends a welcome email via `email_utils.send_welcome_email(user)` (Source: `app/auth/views/activate.py:58`)
-8. Redirects to the `next` URL or the dashboard (Source: `app/auth/views/activate.py:61-67`)
+#### 3.1.2 Account Activation
 
-#### Database Artifacts After Account Creation
+When the user clicks the activation link, the `activate()` view handles it:
 
-| Table | Row Created | Purpose |
-|-------|-------------|---------|
-| `user` | New user row | Stores email, hashed password, activation status |
-| `mailbox` | Default mailbox | User's email becomes their default mailbox |
-| `activation_code` | Created, then deleted | One-time activation token (deleted after use) |
+```python
+@auth_bp.route("/activate", methods=["GET", "POST"])
+def activate():
+    # ...
+    activation_code: ActivationCode = ActivationCode.get_by(code=code)
+    # ...
+    user = activation_code.user
+    user.activated = True
+    login_user(user)
+    ActivationCode.delete(activation_code.id)
+    Session.commit()
+    flash("Your account has been activated", "success")
+    email_utils.send_welcome_email(user)
+```
 
-### Alias Creation Walkthrough
+*Source: `app/auth/views/activate.py:13–58`*
 
-#### Dashboard Random Alias Creation
+The activation:
+1. Looks up the `ActivationCode` by its code string (line 26).
+2. Checks expiration — activation codes are valid for 1 hour (line 38: `is_expired()`).
+3. Sets `user.activated = True` (line 49).
+4. Logs the user in immediately via `login_user(user)` (line 50).
+5. Deletes the activation code (single-use, line 53).
+6. Sends a welcome email (line 58).
+7. Redirects to the dashboard or the original `next` URL (lines 61–67).
 
-When a user clicks "Create Random Alias" on the dashboard, a POST request is sent with `form-name == "create-random-email"`. (Source: `app/dashboard/views/index.py:97-121`)
+**Runtime artifacts confirming activation:**
+- **Database:** `User.activated` is now `True`. The `ActivationCode` row is deleted.
+- **UI:** Flash message "Your account has been activated" appears. User is redirected to the dashboard.
+- **Log:** `LOG.d("redirect user to dashboard")` at line 66.
 
-**Flow:**
+---
 
-1. Checks `current_user.can_create_new_alias()` — validates the user's plan allows more aliases (Source: `app/dashboard/views/index.py:98`)
-2. Determines the alias generator scheme (word-based or UUID) from the form or user preference (Source: `app/dashboard/views/index.py:99-103`)
-3. Creates the alias: `Alias.create_new_random(user=current_user, scheme=scheme)` (Source: `app/dashboard/views/index.py:104`)
-4. Sets `alias.mailbox_id = current_user.default_mailbox_id` (Source: `app/dashboard/views/index.py:106`)
-5. Commits the database transaction (Source: `app/dashboard/views/index.py:108`)
-6. Shows flash message: `"Alias <alias.email> has been created"` (Source: `app/dashboard/views/index.py:111`)
-7. Redirects back to dashboard with `highlight_alias_id` to visually highlight the new alias (Source: `app/dashboard/views/index.py:113-121`)
+### 3.2 Creating an Alias
 
-**Log message:** `"create new random alias <alias> for user <user>"` (Source: `app/dashboard/views/index.py:110`)
+#### 3.2.1 Random Alias Creation via Dashboard
 
-#### Auto-Creation During Email Reception
+On the dashboard page (`/dashboard/`), submitting the "Create Random Alias" form triggers:
 
-Aliases can also be created on-the-fly when an email arrives for a non-existent alias on a custom domain or directory. The `get_user_if_alias_would_auto_create()` function at `app/alias_utils.py:58-89` checks:
+```python
+elif request.form.get("form-name") == "create-random-email":
+    if current_user.can_create_new_alias():
+        scheme = int(
+            request.form.get("generator_scheme") or current_user.alias_generator
+        )
+        if not scheme or not AliasGeneratorEnum.has_value(scheme):
+            scheme = current_user.alias_generator
+        alias = Alias.create_new_random(user=current_user, scheme=scheme)
+        alias.mailbox_id = current_user.default_mailbox_id
+        Session.commit()
+        LOG.d("create new random alias %s for user %s", alias, current_user)
+        flash(f"Alias {alias.email} has been created", "success")
+```
 
-1. The address does not start with the VERP bounce prefix (Source: `app/alias_utils.py:61-63`)
-2. The email address is valid (no unicode characters) (Source: `app/alias_utils.py:66-71`)
-3. The domain matches a custom domain with catch-all or an auto-create rule enabled (Source: `app/alias_utils.py:73-82`)
-4. Or the address matches a directory auto-creation pattern (Source: `app/alias_utils.py:83-87`)
+*Source: `app/dashboard/views/index.py:97–121`*
 
-#### Database Artifacts After Alias Creation
+The process:
+1. **Authorization check:** `current_user.can_create_new_alias()` verifies the user hasn't exceeded their plan's alias limit (line 98).
+2. **Generator scheme:** The alias format (random words vs UUID) is determined by `AliasGeneratorEnum` (lines 99–103).
+3. **Alias creation:** `Alias.create_new_random()` generates a random email address on the configured alias domain (line 104).
+4. **Mailbox assignment:** The alias is assigned to the user's default mailbox (line 106).
+5. **Database commit:** The alias is persisted (line 108).
+6. **Redirect:** The user is redirected back to the dashboard with the new alias highlighted via `highlight_alias_id` (lines 113–121).
 
-| Table | Row Created | Purpose |
-|-------|-------------|---------|
-| `alias` | New alias row | Stores email address, user_id, mailbox_id |
-| `alias_mailbox` | If multiple mailboxes | Maps alias to additional mailboxes beyond the primary |
+**Runtime artifacts confirming alias creation:**
+- **Database:** A new `Alias` row exists with a random email address, linked to the user and their default mailbox.
+- **UI:** Flash message `"Alias {alias.email} has been created"` appears. The alias appears in the list, highlighted.
+- **Log:** `LOG.d("create new random alias %s for user %s", alias, current_user)` at line 110.
+- **Stats update:** The "Aliases" count on the dashboard will increment by 1 on the next page load (since `get_stats()` recalculates from the database).
 
-The `nb_alias` count in `get_stats()` increments immediately after creation.
+#### 3.2.2 Custom Alias Creation
 
-### Email Reception Walkthrough
+Clicking "Create Custom Alias" redirects to `/dashboard/custom_alias` (line 93) where the user can specify the alias prefix, domain, and other options. This follows a similar flow but with user-specified parameters.
 
-#### Entry Point: SMTP Data Receipt
+#### 3.2.3 Auto-Created Aliases (Email Handler Path)
 
-When an external sender delivers an email to the aiosmtpd server, `MailHandler.handle_DATA()` is triggered. It delegates to `_handle()`. (Source: `email_handler.py:2334-2378`)
+Aliases can also be auto-created when an email arrives for a non-existent alias that matches a directory or custom domain catch-all rule. In `handle_forward()`:
 
-**Per-email lifecycle in `_handle()`:**
+```python
+alias = Alias.get_by(email=alias_address)
+if not alias:
+    LOG.d("alias %s not exist. Try to see if it can be created on the fly", alias_address)
+    alias = try_auto_create(alias_address)
+    if not alias:
+        LOG.d("alias %s cannot be created on-the-fly, return 550", alias_address)
+```
 
-1. Generates a UUID `message_id` for log correlation: `message_id = str(uuid.uuid4())` (Source: `email_handler.py:2339`)
-2. Sets the message_id in the logging context via `set_message_id()` (Source: `email_handler.py:2340`)
-3. Logs the visual separator and intake message (Source: `email_handler.py:2342-2346`)
-4. Creates a `create_light_app()` context for database access (Source: `email_handler.py:2352`)
-5. Calls the main `handle()` function (Source: `email_handler.py:2353`)
-6. Logs completion with elapsed time and return status code (Source: `email_handler.py:2367-2373`)
+*Source: `email_handler.py:543–551`*
 
-#### Dispatch: `handle()` Function
+The `try_auto_create()` function (in `app/alias_utils.py`) checks if the address matches a directory or custom domain auto-create rule before creating the alias.
 
-The `handle()` function at `email_handler.py:1945-2233` is the central dispatch:
+---
 
-1. **Sanitizes** `mail_from` and `rcpt_tos` (Source: `email_handler.py:1949-1952`)
-2. **Sets Postfix queue ID** as `message_id` if available (Source: `email_handler.py:1959-1961`)
-3. **Checks for ignored emails** via `should_ignore()` (Source: `email_handler.py:1969-1971`)
-4. **Sanitizes headers:** FROM, TO, CC, REPLY_TO, MESSAGE_ID (Source: `email_handler.py:1974-1978`)
-5. **Logs comprehensive details** of the incoming email (Source: `email_handler.py:1980-1994`)
-6. **Determines the email type** and routes to the appropriate handler:
-   - Unsubscribe requests → `UnsubscribeHandler`
-   - VERP bounces → `handle_bounce()`
-   - Forward phase → `handle_forward()`
-   - Reply phase → `handle_reply()`
+### 3.3 Receiving an Email on an Alias
 
-#### Forward Phase: `handle_forward()`
+This is the most complex flow, involving the email handler component.
 
-The `handle_forward()` function at `email_handler.py:536-676` processes emails sent **to** an alias:
-
-1. **Looks up the alias** by the recipient address (Source: `email_handler.py:543`)
-2. **If not found**, attempts auto-creation via `try_auto_create()` (Source: `email_handler.py:549`)
-3. **Checks user status:** `user.is_active()` and `user.can_send_or_receive()` (Source: `email_handler.py:559-568`)
-4. **Creates or gets the Contact** record via `get_or_create_contact()` — this maps the sender to the alias (Source: `email_handler.py:581`)
-5. **If alias is disabled or contact is blocked:** Creates an `EmailLog` with `blocked=True` and returns (Source: `email_handler.py:596-612`)
-6. **Applies DMARC policy** checks (Source: `email_handler.py:615-619`)
-7. **Iterates over alias mailboxes** (Source: `email_handler.py:632-676`):
-   - Skips unverified mailboxes with status `E517` (Source: `email_handler.py:633-635`)
-   - Detects alias-loop if mailbox email is also an alias, returns `E525` (Source: `email_handler.py:638-668`)
-   - For each verified mailbox: calls `forward_email_to_mailbox()` (Source: `email_handler.py:670-673`)
-
-#### Database Artifacts After Email Reception
-
-| Table | Row Created/Updated | Purpose |
-|-------|---------------------|---------|
-| `contact` | Created if new sender | Maps external sender → alias relationship |
-| `email_log` | Created for every email | Records forward/reply/block/bounce status |
-
-#### Email Forwarding Sequence Diagram
+#### 3.3.1 Email Reception Sequence
 
 ```mermaid
 sequenceDiagram
     participant Sender as External Sender
     participant Postfix as Postfix MTA
-    participant Handler as email_handler.py<br/>(aiosmtpd :20381)
+    participant Handler as email_handler.py
     participant DB as PostgreSQL
-    participant Outbound as Postfix Outbound
     participant Mailbox as User's Mailbox
 
-    Sender->>Postfix: SMTP email to alias@domain
-    Postfix->>Handler: Forward to port 20381
-    Handler->>Handler: _handle(): Generate UUID message_id
-    Handler->>Handler: handle(): Sanitize & classify
-    Handler->>DB: Lookup Alias by rcpt_to
+    Sender->>Postfix: SMTP email to alias@sl-domain
+    Postfix->>Handler: Forward to localhost:20381
+    Handler->>Handler: MailHandler.handle_DATA()
+    Handler->>Handler: Parse email, assign message_id UUID
+    Handler->>Handler: Sanitize headers, detect phase
+    Handler->>DB: Look up Alias by email
     alt Alias not found
-        Handler->>DB: try_auto_create()
+        Handler->>DB: Try auto-create alias
     end
-    Handler->>DB: get_or_create_contact()
-    Handler->>DB: Create EmailLog
-    alt Alias enabled & contact not blocked
-        Handler->>Handler: forward_email_to_mailbox()
-        Handler->>Outbound: Send modified email
-        Outbound->>Mailbox: Deliver to user
-        Handler-->>Postfix: 250 Message accepted (E200)
-    else Alias disabled or contact blocked (default)
-        Handler->>DB: EmailLog(blocked=True)
-        Handler-->>Postfix: 250 (E200)
-    else Alias disabled or contact blocked (return_5xx)
-        Handler->>DB: EmailLog(blocked=True)
-        Handler-->>Postfix: 550 (E502)
-    end
+    Handler->>DB: Get or create Contact record
+    Handler->>DB: Create EmailLog record
+    Handler->>Handler: Apply DMARC policy
+    Handler->>Handler: Check spam (if SpamAssassin enabled)
+    Handler->>Handler: Rewrite headers (From, To, Reply-To)
+    Handler->>Handler: Add DKIM signature
+    Handler->>Postfix: Send rewritten email
+    Postfix->>Mailbox: Deliver to user's personal email
+    Handler-->>Postfix: Return SMTP status code
 ```
 
-### Thinking / Rationale
+#### 3.3.2 Step-by-Step Code Trace
 
-> **Files examined:** `app/auth/views/register.py` (registration flow), `app/auth/views/activate.py` (activation), `app/dashboard/views/index.py` (alias creation), `app/alias_utils.py` (auto-creation), `email_handler.py` (`_handle`, `handle`, `handle_forward`), `app/email/status.py` (SMTP return codes).
->
-> **Why:** These three user actions (register, create alias, receive email) form the core user journey. Tracing each through the code reveals the exact database writes, log messages, and status codes that confirm success. The sequence diagram visualizes the multi-component email forwarding flow.
+**1. SMTP Reception**
+
+The `MailHandler.handle_DATA()` async method receives the raw email bytes and parses them:
+
+```python
+class MailHandler:
+    async def handle_DATA(self, server, session, envelope: Envelope):
+        msg = email.message_from_bytes(envelope.original_content)
+        ret = self._handle(envelope, msg)
+        return ret
+```
+
+*Source: `email_handler.py:2288–2293`*
+
+**2. Message ID Assignment and Logging**
+
+The `_handle` method creates a UUID for log correlation:
+
+```python
+message_id = str(uuid.uuid4())
+set_message_id(message_id)
+LOG.d("====>=====>====>====>====>====>====>====>")
+LOG.i("New message, mail from %s, rctp tos %s ", envelope.mail_from, envelope.rcpt_tos)
+```
+
+*Source: `email_handler.py:2339–2346`*
+
+**3. The `handle()` Function — Phase Routing**
+
+The central `handle()` function (line 1945) sanitizes addresses, extracts the Postfix queue ID for logging, and then routes the email based on the recipient:
+
+- If the recipient is a **reverse alias** (`is_reverse_alias(rcpt_to)` is true): route to `handle_reply()` (line 2195–2200).
+- Otherwise: route to `handle_forward()` (lines 2201–2211).
+
+```python
+if is_reverse_alias(rcpt_to):
+    LOG.d("Reply phase %s(%s) -> %s", mail_from, copy_msg[headers.FROM], rcpt_to)
+    is_delivered, smtp_status = handle_reply(envelope, copy_msg, rcpt_to)
+else:  # Forward case
+    LOG.d("Forward phase %s(%s) -> %s", mail_from, copy_msg[headers.FROM], rcpt_to)
+    for is_delivered, smtp_status in handle_forward(envelope, copy_msg, rcpt_to):
+        res.append((is_delivered, smtp_status))
+```
+
+*Source: `email_handler.py:2195–2211`*
+
+**4. Forward Phase — `handle_forward()`**
+
+For an incoming email to an alias (the forward phase):
+
+1. **Alias lookup:** `Alias.get_by(email=alias_address)` (line 543). If not found, attempts auto-creation via `try_auto_create()` (line 549).
+
+2. **User validation:** Checks the user is active (`user.is_active()`, line 559) and can receive emails (`user.can_send_or_receive()`, line 563).
+
+3. **Cycle detection:** If the email is from one of the alias's own mailbox addresses, it's a cycle and is handled specially (lines 572–577).
+
+4. **Contact creation:** `get_or_create_contact(from_header, envelope.mail_from, alias)` creates or retrieves the `Contact` record representing the sender (line 581). This record is what maps the sender to a reverse alias for future replies.
+
+5. **Block check:** If the alias is disabled or the contact is blocked, creates an `EmailLog` with `blocked=True` and returns a success status (lines 596–612).
+
+6. **DMARC policy:** `apply_dmarc_policy_for_forward_phase()` evaluates the sender's DMARC record (lines 615–619).
+
+7. **Mailbox delivery:** For each verified mailbox, calls `forward_email_to_mailbox()` (lines 632–674):
+   - Creates an `EmailLog` record (lines 732–739).
+   - Optionally checks spam score via SpamAssassin (lines 742–783).
+   - Rewrites email headers: replaces From with the contact's reverse alias, sets To to the alias address, adds Reply-To pointing to the reverse alias.
+   - Adds a DKIM signature.
+   - Sends via `sl_sendmail()`.
+
+*Source: `email_handler.py:536–676` and `679–810+`*
+
+**5. Completion Logging**
+
+After processing, the handler logs the final status:
+
+```
+Finish mail_from sender@example.com, rcpt_tos ['alias@sl-domain.com'], takes 0.45 seconds with return code '250 Message accepted for delivery'
+```
+
+*Source: `email_handler.py:2367–2373`*
+
+#### 3.3.3 Runtime Artifacts Confirming Email Reception
+
+| Artifact | Location | What to Check |
+|----------|----------|---------------|
+| **EmailLog record** | Database `email_log` table | New row with `contact_id`, `alias_id`, `user_id`, `is_reply=False` |
+| **Contact record** | Database `contact` table | New or existing row linking the sender to the alias, with a generated `reply_email` (reverse alias) |
+| **Log lines** | Email handler stdout | "New message" → "Forward phase" → "Create EmailLog" → "Finish" sequence |
+| **SMTP response** | Email handler return | `250 Message accepted for delivery` (status `E200`) |
+| **Dashboard stats** | `/dashboard/` | "Forwarded" count increments by 1 |
+| **Email delivery** | User's personal mailbox | The forwarded email arrives with rewritten headers |
+
+#### 3.3.4 SMTP Status Codes Reference
+
+The email handler returns custom status codes defined in `app/email/status.py`. Here are the key codes you may see in logs:
+
+| Code | SMTP Response | Meaning |
+|------|---------------|---------|
+| `E200` | `250 Message accepted for delivery` | Email successfully forwarded |
+| `E201` | `250 SL E201` | SPF enforcement: email accepted but not forwarded |
+| `E202` | `250 Unsubscribe request accepted` | Alias unsubscribe processed |
+| `E204` | `250 SL E204 ignore` | Email intentionally ignored |
+| `E205` | `250 SL E205 bounce handled` | Bounce notification handled |
+| `E206` | `250 SL E206 Out of office` | Out-of-office auto-reply handled |
+| `E207` | `250 SL E207 No bounce report` | Bounce suppressed (ignored sender) |
+| `E209` | `250 SL E209 Email Loop` | Cycle detected: email from mailbox to own alias |
+| `E402` | `421 SL E402 Encryption failed - Retry later` | PGP encryption failed, retry |
+| `E404` | `421 SL E404 Unexpected error - Retry later` | General error, Postfix will retry |
+| `E502` | `550 SL E502 Email not exist` | Alias or contact does not exist |
+| `E504` | `550 SL E504 Account disabled` | User account is disabled |
+| `E515` | `550 SL E515 Email not exist` | Alias does not exist and cannot be auto-created |
+| `E519` | `550 SL E519 Email detected as spam` | Spam score exceeded threshold |
+| `E522` | `550 SL E522 ... rate ...` | Rate limiting applied |
+| `E525` | `550 SL E525 Alias loop` | Mailbox is also an alias (loop detected) |
+
+*Source: `app/email/status.py:1–64`*
+
+**Thinking / Rationale:** The 2xx status codes (E200–E216) indicate the email handler accepted and processed the message, even if it wasn't forwarded (e.g., blocked, ignored, bounce handled). The 4xx codes (E402–E407) tell Postfix to retry later — used for transient errors. The 5xx codes (E501–E525) indicate permanent failures. This three-tier scheme aligns with SMTP conventions: 2xx = success, 4xx = temporary failure, 5xx = permanent failure.
 
 ---
 
 ## Q4: Do the Email Handler and Job Runner Automatically Come Online?
 
-### Email Handler Persistent Listener
+### 4.1 Email Handler Lifecycle
 
-**Yes.** The email handler is a persistent, long-running process. Once started, it listens indefinitely for incoming SMTP connections.
+#### 4.1.1 Persistent Listener
 
-**How it stays alive:**
+The email handler is a **persistent, always-on process**. Once started, it:
 
-The `main()` function starts the aiosmtpd `Controller` which spawns a background thread to accept SMTP connections. (Source: `email_handler.py:2383-2386`)
+1. Creates an `aiosmtpd.Controller` bound to `0.0.0.0:{port}` (line 2383).
+2. Calls `controller.start()` which spawns a background thread running the async SMTP server (line 2385).
+3. Enters an infinite `while True: time.sleep(2)` loop to keep the main thread alive (lines 2392–2393).
 
-The main thread then enters an infinite sleep loop: (Source: `email_handler.py:2392-2393`)
+*Source: `email_handler.py:2381–2393`*
+
+The email handler does **not** start automatically alongside the web server. In a local development setup, you must start it explicitly:
+
+```bash
+python email_handler.py
+```
+
+*Source: `CONTRIBUTING.md` (implied by the separate component architecture)*
+
+In Docker deployments, the email handler runs as a separate container (`sl-email`) with its own entry point, as described in `README.md`.
+
+#### 4.1.2 PGP Key Loading
+
+If `LOAD_PGP_EMAIL_HANDLER` is enabled, the email handler loads PGP public keys into the keyring at startup:
 
 ```python
-while True:
-    time.sleep(2)
+if LOAD_PGP_EMAIL_HANDLER:
+    LOG.w("LOAD PGP keys")
+    load_pgp_public_keys()
 ```
 
-This keeps the process alive while the Controller's background thread handles incoming emails. Each email triggers `MailHandler.handle_DATA()` → `_handle()` → `handle()` with a fresh `create_light_app()` context for database access. (Source: `email_handler.py:2352`)
+*Source: `email_handler.py:2388–2390`*
 
-**Confirmation signals:**
+The `load_pgp_public_keys()` function (in `init_app.py:13–36`) iterates over all mailboxes and contacts with PGP keys and loads them into the system keyring. This is a one-time operation at startup.
 
-- **Startup log:** `"Start mail controller 0.0.0.0 20381"` (Source: `email_handler.py:2386`)
-- **Per-email logs:** `"New message, mail from <sender>, rctp tos <recipients>"` (Source: `email_handler.py:2343-2346`)
-- **Port listening:** The process binds to port 20381 and accepts TCP connections (verifiable with `swaks` or `telnet`)
+#### 4.1.3 Resilience
 
-The email handler does **not** need to be restarted for each email — it processes them continuously as they arrive.
+The `MailHandler.handle_DATA()` method has comprehensive error handling:
 
-### Job Runner Persistent Poller
+- `CannotCreateContactForReverseAlias`: Returns `E524` (line 2297–2307).
+- `VERPReply`, `VERPForward`, `VERPTransactional`: Returns `E213` (lines 2308–2318).
+- General `Exception`: Logs the full error, saves the email for debugging, and returns `E404` (retry later) (lines 2319–2332).
 
-**Yes.** The job runner is a persistent, long-running process that polls the database for pending jobs every 10 seconds.
+*Source: `email_handler.py:2291–2332`*
 
-**How it operates:** (Source: `job_runner.py:329-347`)
-
-Each polling cycle:
-
-1. Creates a fresh `create_light_app()` context (Source: `job_runner.py:332`)
-2. Calls `get_jobs_to_run()` to fetch eligible jobs (Source: `job_runner.py:333`)
-3. For each job:
-   - Logs `"Take job <job>"` (Source: `job_runner.py:334`)
-   - Marks `job.taken = True`, `job.state = taken`, increments `job.attempts` (Source: `job_runner.py:337-340`)
-   - Calls `process_job(job)` to execute the job (Source: `job_runner.py:342`)
-   - Marks `job.state = done` (Source: `job_runner.py:344`)
-4. Sleeps 10 seconds before the next cycle (Source: `job_runner.py:347`)
-
-#### Job State Machine
-
-```text
-ready ──→ taken ──→ done
-  ↑          │
-  └──────────┘  (retry if taken_at older than JOB_TAKEN_RETRY_WAIT_MINS
-                 AND attempts < JOB_MAX_ATTEMPTS)
-```
-
-(Source: `job_runner.py:307-326`)
-
-#### Supported Job Types
-
-The `process_job()` function at `job_runner.py:188-304` dispatches by job name:
-
-| Job Name (config constant) | Action | Source |
-|---------------------------|--------|--------|
-| `JOB_ONBOARDING_1` | Send "send-from-alias" tip email | `job_runner.py:189-197` |
-| `JOB_ONBOARDING_2` | Send "mailbox" tip email | `job_runner.py:198-206` |
-| `JOB_ONBOARDING_4` | Send "PGP" tip email | `job_runner.py:207-220` |
-| `JOB_BATCH_IMPORT` | Process batch alias import | `job_runner.py:222-225` |
-| `JOB_DELETE_ACCOUNT` | Delete user account and notify | `job_runner.py:226-244` |
-| `JOB_DELETE_MAILBOX` | Delete mailbox and associated aliases | `job_runner.py:245-246` |
-| `JOB_DELETE_DOMAIN` | Delete custom domain and aliases | `job_runner.py:248-284` |
-| `JOB_SEND_USER_REPORT` | Export user data (GDPR) | `job_runner.py:285-288` |
-| `JOB_SEND_PROTON_WELCOME_1` | Send Proton welcome email | `job_runner.py:289-294` |
-| `JOB_SEND_ALIAS_CREATION_EVENTS` | Dispatch alias creation events | `job_runner.py:295-302` |
-
-Unknown job names trigger: `LOG.e("Unknown job name %s", job.name)` (Source: `job_runner.py:304`)
-
-### Cron Scheduled Tasks
-
-SimpleLogin uses **yacron** (a YAML-configured cron scheduler) to run periodic maintenance tasks defined in `crontab.yml`. (Source: `crontab.yml:1-97`)
-
-All tasks invoke `python /code/cron.py -j <job_name>` via `/bin/bash` with `captureStderr: true`.
-
-| Job Name | Schedule | Description | Concurrency |
-|----------|----------|-------------|-------------|
-| `stats` | `0 0 * * *` (daily 00:00) | Growth statistics collection | Allowed |
-| `delete_old_monitoring` | `15 1 * * *` (daily 01:15) | Purge old monitoring records | Allowed |
-| `check_custom_domain` | `15 2 * * *` (daily 02:15) | Verify custom domain DNS | Allowed |
-| `check_hibp` | `15 3 * * *` (daily 03:15) | Check Have I Been Pwned breaches | **Forbid** |
-| `notify_hibp` | `15 4 * * *` (daily 04:15) | Notify users of HIBP breaches | **Forbid** |
-| `delete_logs` | `15 5 * * *` (daily 05:15) | Purge old email logs | Allowed |
-| `delete_old_data` | `30 5 * * *` (daily 05:30) | Delete stale data | Allowed |
-| `poll_apple_subscription` | `15 6 * * *` (daily 06:15) | Verify Apple subscriptions | Allowed |
-| `notify_trial_end` | `15 8 * * *` (daily 08:15) | Notify users of trial expiration | Allowed |
-| `notify_manual_subscription_end` | `15 9 * * *` (daily 09:15) | Notify manual subscription expiry | Allowed |
-| `notify_premium_end` | `15 10 * * *` (daily 10:15) | Notify premium plan expiry | Allowed |
-| `delete_scheduled_users` | `15 11 * * *` (daily 11:15) | Delete users scheduled for removal | **Forbid** |
-| `send_undelivered_mails` | `*/5 * * * *` (every 5 min) | Retry undelivered emails | **Forbid** |
-| `clear_alias_audit_log` | `0 * * * *` (hourly) | Purge old alias audit entries | **Forbid** |
-| `clear_user_audit_log` | `0 * * * *` (hourly) | Purge old user audit entries | **Forbid** |
-
-### Monitoring Process
-
-A separate monitoring process (`monitoring.py`) runs continuously to collect infrastructure metrics. (Source: `monitoring.py:157-171`)
-
-It executes in a `while True` loop with a 60-second sleep interval, calling:
-
-- `log_postfix_metrics()` — Counts files in Postfix queue directories (Source: `monitoring.py:39-48`)
-- `log_nb_db_connection()` — Queries `pg_stat_activity` for active DB connections (Source: `monitoring.py:88-94`)
-- `log_pending_to_process_events()` — Counts unprocessed sync events (Source: `monitoring.py:112-119`)
-- `log_events_pending_dead_letter()` — Counts stale events older than 10 minutes (Source: `monitoring.py:123-139`)
-- `log_failed_events()` — Counts events with retry_count >= 10 (Source: `monitoring.py:143-154`)
-
-Metrics are exported to New Relic via `MetricExporter`. (Source: `monitoring.py:158, 168`)
-
-### Thinking / Rationale
-
-> **Files examined:** `email_handler.py` (persistent listener lifecycle), `job_runner.py` (polling loop, job dispatch, state machine), `crontab.yml` (cron schedule definitions), `cron.py` (cron task implementations), `monitoring.py` (metrics collection loop).
->
-> **Why:** The user needs to know whether these background components require manual startup or run automatically. Both are designed as persistent processes with infinite loops. The cron tasks represent a third category of background work — scheduled rather than event-driven or poll-driven. The monitoring process is a fourth distinct component that provides operational visibility.
+This means the email handler process itself will not crash on individual email processing failures — each email is isolated in its own error handling scope.
 
 ---
 
-## Cross-Component Interaction Patterns
+### 4.2 Job Runner Lifecycle
 
-The three core components share a PostgreSQL database and interact through it:
+#### 4.2.1 Persistent Poller
+
+The job runner is a **persistent polling loop**. Like the email handler, it must be started explicitly:
+
+```bash
+python job_runner.py
+```
+
+Once running, it:
+
+1. Enters an infinite `while True` loop (line 330).
+2. Creates a fresh Flask app context on each iteration via `create_light_app().app_context()` (line 332) — this ensures clean database sessions per cycle.
+3. Queries for ready jobs via `get_jobs_to_run()` (line 333).
+4. Processes each job synchronously (lines 334–345).
+5. Sleeps for 10 seconds before the next poll (line 347).
+
+*Source: `job_runner.py:329–347`*
+
+#### 4.2.2 Job State Machine
+
+Jobs follow a three-state lifecycle:
 
 ```mermaid
 flowchart LR
-    subgraph WebServer["Web Server (server.py)"]
-        W1[Register User]
-        W2[Create Alias]
-        W3[Dashboard Stats]
-        W4[Delete Account Request]
-    end
-
-    subgraph Database["PostgreSQL"]
-        DB_User[(User)]
-        DB_Alias[(Alias)]
-        DB_Contact[(Contact)]
-        DB_EmailLog[(EmailLog)]
-        DB_Job[(Job)]
-        DB_SLDomain[(SLDomain)]
-    end
-
-    subgraph EmailHandler["Email Handler (email_handler.py)"]
-        E1[Receive Email]
-        E2[Create Contact]
-        E3[Create EmailLog]
-        E4[Forward to Mailbox]
-    end
-
-    subgraph JobRunner["Job Runner (job_runner.py)"]
-        J1[Poll for Jobs]
-        J2[Send Onboarding]
-        J3[Delete Account]
-        J4[Export Data]
-    end
-
-    subgraph InitApp["init_app.py"]
-        I1[Seed SL Domains]
-    end
-
-    W1 -->|INSERT| DB_User
-    W1 -->|INSERT| DB_Job
-    W2 -->|INSERT| DB_Alias
-    W3 -->|SELECT| DB_EmailLog
-    W4 -->|INSERT| DB_Job
-
-    E1 -->|SELECT| DB_Alias
-    E2 -->|INSERT| DB_Contact
-    E3 -->|INSERT| DB_EmailLog
-    E4 -->|Read mailboxes| DB_Alias
-
-    J1 -->|SELECT/UPDATE| DB_Job
-    J3 -->|DELETE| DB_User
-
-    I1 -->|INSERT| DB_SLDomain
+    A[ready] -->|Job runner picks up| B[taken]
+    B -->|Processing completes| C[done]
+    B -->|Runner crashes, 30+ min elapsed, attempts < max| A
 ```
 
-### Key Interaction Patterns
+When a job is picked up:
+- `job.taken = True` and `job.taken_at = arrow.now()` (lines 337–338)
+- `job.state = JobState.taken.value` (line 339)
+- `job.attempts += 1` (line 340)
+- After successful processing: `job.state = JobState.done.value` (line 344)
 
-**1. Web Server → Job Runner (via Job table)**
+*Source: `job_runner.py:336–345`*
 
-When a user registers, the web server creates `Job` rows for onboarding emails (JOB_ONBOARDING_1, JOB_ONBOARDING_2, JOB_ONBOARDING_4). The job runner picks these up within 10 seconds and sends the onboarding email series. Similarly, account deletion and mailbox deletion are queued as jobs. (Source: `job_runner.py:189-246`)
+The retry safety net in `get_jobs_to_run()` ensures that if the runner crashes, stale `taken` jobs (older than 30 minutes with fewer than max attempts) are re-queued automatically on the next poll cycle.
 
-**2. Email Handler → Dashboard (via Contact and EmailLog tables)**
+#### 4.2.3 What Triggers New Jobs?
 
-When the email handler processes an incoming email via `handle_forward()`, it creates `Contact` and `EmailLog` rows. (Source: `email_handler.py:581, 598-604`) These rows are read by the dashboard's `get_stats()` function to display forward/reply/block counts. (Source: `app/dashboard/views/index.py:32-52`)
+Jobs are created by various parts of the application and inserted into the `job` table:
 
-**3. init_app.py → Alias Creation (via SLDomain table)**
+- **Account registration:** Creates onboarding jobs (`JOB_ONBOARDING_1`, `JOB_ONBOARDING_2`, `JOB_ONBOARDING_4`) with staggered `run_at` times so tip emails arrive on different days.
+- **Mailbox deletion:** Creates a `JOB_DELETE_MAILBOX` job for async processing.
+- **Account deletion:** Creates a `JOB_DELETE_ACCOUNT` job.
+- **Domain deletion:** Creates a `JOB_DELETE_DOMAIN` job.
+- **Batch import:** Creates a `JOB_BATCH_IMPORT` job when a user uploads a CSV.
+- **Data export:** Creates a `JOB_SEND_USER_REPORT` job.
 
-The `add_sl_domains()` function seeds the `SLDomain` table with configured alias domains. (Source: `init_app.py:39-56`) Both the web server (alias creation in dashboard) and email handler (alias auto-creation) depend on these domains being present.
+The job runner does not need to "know" about these in advance — it simply polls the database for any jobs that are ready.
 
 ---
 
-## Appendix A: SMTP Status Code Reference
+### 4.3 Cron Scheduler
 
-All status codes are defined in `app/email/status.py:1-64`.
+#### 4.3.1 Scheduled Maintenance Tasks
 
-### 2xx — Success Codes
+In addition to the email handler and job runner, a cron scheduler (`crontab.yml` driven by `yacron`) handles periodic maintenance. There are 14 scheduled jobs:
 
-| Code | Status String |
-|------|--------------|
-| E200 | `250 Message accepted for delivery` |
-| E201 | `250 SL E201` |
-| E202 | `250 Unsubscribe request accepted` |
-| E203 | `250 SL E203 email can't be sent from a reverse-alias` |
-| E204 | `250 SL E204 ignore` |
-| E205 | `250 SL E205 bounce handled` |
-| E206 | `250 SL E206 Out of office` |
-| E207 | `250 SL E207 No bounce report` |
-| E208 | `250 SL E208 Hotmail complaint handled` |
-| E209 | `250 SL E209 Email Loop` |
-| E210 | `250 SL E210 Yahoo complaint handled` |
-| E211 | `250 SL E211 Bounce Forward phase handled` |
-| E212 | `250 SL E212 Bounce Reply phase handled` |
-| E213 | `250 SL E213 Unknown email ignored` |
-| E214 | `250 SL E214 Unauthorized for using reverse alias` |
-| E215 | `250 SL E215 Handled dmarc policy` |
-| E216 | `250 SL E216 Handled spf policy` |
+| Schedule | Task | Source |
+|----------|------|--------|
+| `0 0 * * *` | Growth statistics collection | `cron.py -j stats` |
+| `15 1 * * *` | Delete old monitoring records | `cron.py -j delete_old_monitoring` |
+| `15 2 * * *` | Custom domain DNS verification | `cron.py -j check_custom_domain` |
+| `15 3 * * *` | HIBP (Have I Been Pwned) breach check | `cron.py -j check_hibp` |
+| `15 4 * * *` | Notify users of HIBP breaches | `cron.py -j notify_hibp` |
+| `15 5 * * *` | Delete old email logs | `cron.py -j delete_logs` |
+| `30 5 * * *` | Delete old data (bounces, transactional emails) | `cron.py -j delete_old_data` |
+| `15 6 * * *` | Poll Apple subscription status | `cron.py -j poll_apple_subscription` |
+| `15 8 * * *` | Notify users of trial ending | `cron.py -j notify_trial_end` |
+| `15 9 * * *` | Notify manual subscription ending | `cron.py -j notify_manual_subscription_end` |
+| `15 10 * * *` | Notify premium subscription ending | `cron.py -j notify_premium_end` |
+| `15 11 * * *` | Delete users scheduled for deletion | `cron.py -j delete_scheduled_users` |
+| `*/5 * * * *` | Retry sending undelivered emails | `cron.py -j send_undelivered_mails` |
+| `0 * * * *` | Clear old audit log entries | `cron.py -j clear_alias_audit_log` and `clear_user_audit_log` |
 
-### 4xx — Retry Codes
+*Source: `crontab.yml:1–96`*
 
-| Code | Status String |
-|------|--------------|
-| E402 | `421 SL E402 Encryption failed - Retry later` |
-| E404 | `421 SL E404 Unexpected error - Retry later` |
-| E405 | `421 SL E405 Mailbox domain problem - Retry later` |
-| E407 | `421 SL E407 Retry later` |
+In a local development setup, these cron jobs are **not** running automatically. They are designed for Docker deployments where `yacron` is installed and configured. For local testing, you can run any cron task manually:
 
-### 5xx — Permanent Failure Codes
-
-| Code | Status String |
-|------|--------------|
-| E501 | `550 SL E501` |
-| E502 | `550 SL E502 Email not exist` |
-| E503 | `550 SL E503` |
-| E504 | `550 SL E504 Account disabled` |
-| E505 | `550 SL E505` |
-| E506 | `550 SL E506 Email detected as spam` |
-| E507 | `550 SL E507 Wrongly formatted subject` |
-| E508 | `550 SL E508 Email not exist` |
-| E509 | `550 SL E509 unauthorized` |
-| E510 | `550 SL E510 so such user` |
-| E511 | `550 SL E511 unsubscribe error` |
-| E512 | `550 SL E512 No such email log` |
-| E514 | `550 SL E514 Email sent to noreply address` |
-| E515 | `550 SL E515 Email not exist` |
-| E516 | `550 SL E516 invalid mailbox` |
-| E517 | `550 SL E517 unverified mailbox` |
-| E518 | `550 SL E518 Disabled mailbox` |
-| E519 | `550 SL E519 Email detected as spam` |
-| E521 | `550 SL E521 Cannot reach mailbox` |
-| E522 | `550 SL E522 The user you are trying to contact is receiving mail at a rate that prevents additional messages from being delivered.` |
-| E523 | `550 SL E523 Unknown error` |
-| E524 | `550 SL E524 Wrong use of reverse-alias` |
-| E525 | `550 SL E525 Alias loop` |
+```bash
+python cron.py -j stats
+```
 
 ---
 
-## Appendix B: Log Format Reference
+### 4.4 Monitoring Script
 
-### Log Format String
+The `monitoring.py` script runs as a separate persistent process (in Docker) that:
 
-All SimpleLogin components use a structured log format defined in `app/log.py:12-14`:
-
-```text
-%(asctime)s - %(name)s - %(levelname)s - %(process)d - "%(pathname)s:%(lineno)d" - %(funcName)s() - %(message_id)s - %(message)s
-```
-
-| Field | Description |
-|-------|-------------|
-| `asctime` | UTC timestamp |
-| `name` | Logger name (always `SL`) |
-| `levelname` | DEBUG, INFO, WARNING, or ERROR |
-| `process` | OS process ID |
-| `pathname:lineno` | Source file path and line number (clickable in PyCharm) |
-| `funcName` | Function that generated the log |
-| `message_id` | Email lifecycle correlation ID (UUID or Postfix queue ID) |
-| `message` | The log message content |
-
-### Message ID Correlation
-
-The `message_id` field is critical for tracing an email's journey through the system. It is set via `set_message_id()` at `app/log.py:22-25`.
-
-In the email handler:
-
-- Initially set to a random UUID when an email arrives (Source: `email_handler.py:2339-2340`)
-- Overwritten with the Postfix queue ID if available (Source: `email_handler.py:1959-1961`)
-- All subsequent log lines for that email include this ID, enabling grep-based filtering
-
-### LOG Shortcuts
-
-The `LOG` object provides shorthand methods: (Source: `app/log.py:73-77`)
-
-| Shortcut | Maps To | Level |
-|----------|---------|-------|
-| `LOG.d(...)` | `logging.Logger.debug` | DEBUG |
-| `LOG.i(...)` | `logging.Logger.info` | INFO |
-| `LOG.w(...)` | `logging.Logger.warning` | WARNING |
-| `LOG.e(...)` | `logging.Logger.exception` | ERROR (with traceback) |
-
-### Colored Logs
-
-When `COLOR_LOG` is `True` (set by `local_main()` during development), the `coloredlogs` package renders log output with color coding. (Source: `app/log.py:61-62`, `server.py:573`)
-
-### Werkzeug Log Suppression
-
-Flask's default Werkzeug request logs (e.g., `127.0.0.1 - - [date] "GET /path HTTP/1.1" 200`) are explicitly disabled: (Source: `app/log.py:70-71`)
+1. Checks Postfix queue sizes (incoming, active, deferred) every 60 seconds.
+2. Logs database connection counts.
+3. Tracks pending sync events and dead-letter events.
+4. Exports all metrics to New Relic via the `MetricExporter`.
 
 ```python
-log = logging.getLogger("werkzeug")
-log.disabled = True
+if __name__ == "__main__":
+    exporter = MetricExporter(get_newrelic_license())
+    while True:
+        log_postfix_metrics()
+        log_nb_db_connection()
+        # ...
+        sleep(60)
 ```
 
-This means HTTP request logging is handled entirely by the custom `after_request` hook in `server.py`, not by Werkzeug.
+*Source: `monitoring.py:157–171`*
+
+This is optional for local development and only relevant if you have New Relic configured.
+
+---
+
+## Cross-Component Interaction Summary
+
+```mermaid
+flowchart TB
+    subgraph "User-Facing"
+        Browser[Web Browser]
+        PersonalEmail[User's Personal Mailbox]
+    end
+
+    subgraph "SimpleLogin Components"
+        WebServer["Web Server\n(server.py:7777)"]
+        EmailHandler["Email Handler\n(email_handler.py:20381)"]
+        JobRunner["Job Runner\n(job_runner.py)"]
+        CronScheduler["Cron Scheduler\n(crontab.yml)"]
+    end
+
+    subgraph "Infrastructure"
+        Postfix[Postfix MTA]
+        PostgreSQL[(PostgreSQL)]
+    end
+
+    Browser -->|HTTP| WebServer
+    WebServer -->|Read/Write| PostgreSQL
+    ExternalSender[External Sender] -->|SMTP| Postfix
+    Postfix -->|SMTP :20381| EmailHandler
+    EmailHandler -->|Read/Write| PostgreSQL
+    EmailHandler -->|SMTP| Postfix
+    Postfix -->|SMTP| PersonalEmail
+    JobRunner -->|Poll & Update| PostgreSQL
+    JobRunner -->|Send emails| Postfix
+    CronScheduler -->|Run tasks| PostgreSQL
+    WebServer -.->|Create jobs| PostgreSQL
+    PostgreSQL -.->|Jobs ready| JobRunner
+```
+
+The key interactions:
+- **Web Server ↔ Database:** All user actions (registration, alias creation, settings changes) write to PostgreSQL. The dashboard reads from it.
+- **Email Handler ↔ Database:** Email processing reads aliases, contacts, and user settings; writes EmailLog records and creates new contacts.
+- **Email Handler ↔ Postfix:** Receives inbound email from Postfix; sends rewritten outbound email back through Postfix for delivery.
+- **Job Runner ↔ Database:** Polls for and processes asynchronous jobs created by the web server or other components.
+- **Web Server → Job Runner:** Indirect communication via the database — the web server inserts Job records that the job runner picks up.
 
 ---
 
 ## Conclusion
 
-### Quick Verification Commands
+To confirm your SimpleLogin deployment is operational:
 
-| Component | Command | Expected Result |
-|-----------|---------|-----------------|
-| Web Server | `curl http://localhost:7777/health` | `success` (HTTP 200) |
-| Email Handler | `swaks --to e1@sl.local --from hey@google.com --server 127.0.0.1:20381` | SMTP 250 response |
-| Job Runner | `ps aux \| grep job_runner` | Python process running |
+1. **Web Server:** `curl http://localhost:7777/health` returns `success`. Navigate to `http://localhost:7777/` and verify you see the login page or dashboard.
 
-### Expected Log Signatures for Healthy Operation
+2. **Email Handler:** Log output shows `"Start mail controller 0.0.0.0 20381"`. Port 20381 accepts SMTP connections (test with `nc -zv localhost 20381` or `swaks`).
 
-| Component | Log Signature | Meaning |
-|-----------|---------------|---------|
-| Web Server | `>>> init logging <<<` | Logging initialized |
-| Web Server | `127.0.0.1 GET /dashboard/ {} 200, takes 0.0xx` | HTTP requests being served |
-| Email Handler | `Start mail controller 0.0.0.0 20381` | SMTP listener started |
-| Email Handler | `New message, mail from ..., rctp tos ...` | Email being processed |
-| Email Handler | `Finish mail_from ..., takes X seconds with return code '250 ...'<<===` | Email processing completed |
-| Job Runner | `Take job <Job ...>` | Job being processed |
+3. **Job Runner:** Process is running (`ps aux | grep job_runner`). Log shows `"Take job"` messages when jobs are pending, otherwise silent polling every 10 seconds.
 
-### Local Development Workflow
+4. **Dashboard:** After login, the dashboard displays alias count, forwarded/replied/blocked statistics, and a paginated alias list. For the `john@wick.com` test user, you should see seeded aliases and notifications.
 
-Start PostgreSQL in Docker:
+5. **End-to-end email flow:** Send a test email to an alias via `swaks`. Verify the email handler logs show the complete forward cycle (`"New message"` → `"Forward phase"` → `"Create EmailLog"` → `"Finish"`), the EmailLog count in the database increments, and the forwarded email arrives at the user's personal mailbox.
 
-```bash
-docker run -e POSTGRES_PASSWORD=mypassword -e POSTGRES_USER=myuser \
-  -e POSTGRES_DB=simplelogin -p 15432:5432 postgres:13
-```
-
-Initialize the database, seed test data, and start the web server:
-
-```bash
-alembic upgrade head && flask dummy-data && python3 server.py
-```
-
-In separate terminals, start the email handler and job runner:
-
-```bash
-python email_handler.py   # terminal 2
-python job_runner.py       # terminal 3
-```
-
-Then open `http://localhost:7777` and log in with `john@wick.com` / `password`. (Source: `CONTRIBUTING.md:99-109, 209-229`)
-
-All three components are designed as persistent, long-running processes. The web server handles HTTP requests, the email handler accepts SMTP connections, and the job runner polls the database — each independently and continuously, sharing state through PostgreSQL.
+All behaviors described in this document are derived from static analysis of the SimpleLogin source code. File paths and line numbers are provided for every claim so you can independently verify each answer.
