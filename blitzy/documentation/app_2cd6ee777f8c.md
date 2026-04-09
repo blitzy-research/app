@@ -382,7 +382,7 @@ The exact format of the middle portion varies by Python version, but the structu
 - **Table name:** `message_id_matching`
 - **Fields:**
   - `id` — Integer, primary key, auto-increment (from `ModelMixin`, Source: `app/models.py:63`)
-  - `created_at` — ArrowType, default `arrow.utcnow()`, not nullable (from `ModelMixin`, Source: `app/models.py:64`)
+  - `created_at` — ArrowType, default `arrow.utcnow`, not nullable (from `ModelMixin`, Source: `app/models.py:64`)
   - `updated_at` — ArrowType, default None, set on update (from `ModelMixin`, Source: `app/models.py:65`)
   - `sl_message_id` — String(512), unique, not nullable
   - `original_message_id` — String(1024), unique, not nullable
@@ -570,8 +570,8 @@ LOG.d("From header, new:%s, old:%s", new_from_header, old_from_header)
 Every model in SimpleLogin inherits from `ModelMixin`, which provides three auto-managed fields:
 
 - `id` — Integer, primary key, auto-increment
-- `created_at` — ArrowType, default `arrow.utcnow()`, not nullable
-- `updated_at` — ArrowType, default `None`, set to `arrow.utcnow()` on update
+- `created_at` — ArrowType, default `arrow.utcnow`, not nullable
+- `updated_at` — ArrowType, default `None`, set to `arrow.utcnow` on update
 
 Source: `app/models.py:62-65`
 
@@ -588,7 +588,7 @@ Source: `app/models.py:1863-1962`
 | Field | Type | Nullable | Default | Description |
 |-------|------|----------|---------|-------------|
 | `id` | Integer | No | auto-increment | Primary key (from ModelMixin) |
-| `created_at` | ArrowType | No | `arrow.utcnow()` | Creation timestamp (from ModelMixin) |
+| `created_at` | ArrowType | No | `arrow.utcnow` | Creation timestamp (from ModelMixin) |
 | `updated_at` | ArrowType | Yes | `None` | Update timestamp (from ModelMixin) |
 | `user_id` | FK → User.id | No | — | Owner of the alias |
 | `alias_id` | FK → Alias.id | No | — | Associated alias |
@@ -602,6 +602,8 @@ Source: `app/models.py:1863-1962`
 | `block_forward` | Boolean | No | `False` | Whether to block forwards from this contact |
 | `automatic_created` | Boolean | Yes | `False` | Set to `True` in forward phase |
 | `flags` | Integer | No | `0` | Bitfield for contact flags |
+
+**Additional fields not shown:** `pgp_public_key` (Text, nullable) and `pgp_finger_print` (String(512), nullable, indexed) — these PGP-related fields are not populated during the forward contact creation flow. Source: `app/models.py:1904-1905`
 
 **Unique constraint:** `(alias_id, website_email)` — named `uq_contact`
 
@@ -644,14 +646,14 @@ Source: `app/models.py:3829-3843`
 | Field | Type | Nullable | Default | Description |
 |-------|------|----------|---------|-------------|
 | `id` | Integer | No | auto-increment | Primary key (from ModelMixin) |
-| `created_at` | ArrowType | No | `arrow.utcnow()` | Creation timestamp (from ModelMixin) |
+| `created_at` | ArrowType | No | `arrow.utcnow` | Creation timestamp (from ModelMixin) |
 | `updated_at` | ArrowType | Yes | `None` | Update timestamp (from ModelMixin) |
 | `user_id` | Integer | No | — | NOT a foreign key — plain integer |
 | `user_email` | String(255) | No | — | User's email at time of action |
 | `action` | String(255) | No | — | Action identifier string |
 | `message` | Text | Yes | `None` | Human-readable description |
 
-**Note:** `user_id` is deliberately NOT a foreign key (Source: `app/models.py:3834`) — it is a plain integer. This is likely a design choice to preserve audit logs even if the user is deleted.
+**Note:** `user_id` is deliberately NOT a foreign key (Source: `app/models.py:3834`) — it is a plain integer. Because there is no foreign key constraint, audit log records are preserved even if the referenced user is deleted from the `users` table.
 
 **Creation call chain:**
 
@@ -719,7 +721,7 @@ Source: `app/models.py:2152-2164`
 | Field | Type | Nullable | Default | Description |
 |-------|------|----------|---------|-------------|
 | `id` | Integer | No | auto-increment | Primary key |
-| `created_at` | ArrowType | No | `arrow.utcnow()` | Creation timestamp |
+| `created_at` | ArrowType | No | `arrow.utcnow` | Creation timestamp |
 | `updated_at` | ArrowType | Yes | `None` | Update timestamp |
 | `user_id` | FK → User.id | No | — | Owner |
 | `contact_id` | FK → Contact.id | No | — | Sender contact |
@@ -736,6 +738,8 @@ Source: `app/models.py:2152-2164`
 | `bounced_mailbox_id` | FK → Mailbox.id | Yes | — | Mailbox that bounced |
 | `message_id` | String(1024) | Yes | — | Original email Message-ID (deferred load) |
 | `sl_message_id` | String(512) | Yes | — | SL Message-ID — NOT set during forward phase |
+
+**Additional field not shown:** `spam_report` (JSON, nullable, deferred load) — not populated during the standard forward flow. Source: `app/models.py:2094`
 
 Source: `app/models.py:2060-2117`
 
