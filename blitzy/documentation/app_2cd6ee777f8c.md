@@ -95,7 +95,7 @@ When running via `python3 server.py`, the `local_main()` function (lines 572–5
 
 In the Docker container, Gunicorn serves the app:
 
-```
+```bash
 gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15
 ```
 
@@ -129,7 +129,7 @@ The inbound email handler (`email_handler.py`) uses aiosmtpd to receive SMTP tra
 
 The job runner (`job_runner.py`) polls the PostgreSQL `Job` table in an infinite loop:
 
-```
+```python
 while True:
     with create_light_app().app_context():
         for job in get_jobs_to_run():
@@ -350,7 +350,7 @@ With `NOT_SEND_EMAIL=true` (the default in `example.env:19`):
 - The **activation link** (containing the code) is **NOT included** in the log output — only the email metadata (subject, from, to) is logged.
 - **To obtain the activation code in local dev**, either:
   - Query the database: `SELECT code FROM activation_code WHERE user_id = <id>;`
-  - Or disable `NOT_SEND_EMAIL` and configure MailHog (see Section 5).
+  - Or disable `NOT_SEND_EMAIL` and configure MailHog (see Testing and Cleanup Notes → NOT_SEND_EMAIL Implications for Testing below).
 
 ---
 
@@ -610,6 +610,8 @@ The job runner polls the `Job` database table every 10 seconds and dispatches wo
 | `JOB_SEND_PROTON_WELCOME_1` | Proton welcome email | Sends Proton-specific welcome if user is activated | `job_runner.py:289-294` |
 | `JOB_SEND_ALIAS_CREATION_EVENTS` | Alias creation events | Sends protobuf events via `PostgresDispatcher` | `job_runner.py:295-302` |
 | Unknown | Error | Logs `"Unknown job name %s"` | `job_runner.py:304` |
+
+> **Note:** `JOB_ONBOARDING_3` is defined in `app/config.py:303` as `"onboarding-3"` but has no corresponding handler in `process_job()`. It appears to be a removed or unused job type, which explains the numbering skip from `JOB_ONBOARDING_2` to `JOB_ONBOARDING_4` in the table above.
 
 #### Job State Machine
 
