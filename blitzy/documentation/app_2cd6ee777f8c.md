@@ -15,7 +15,7 @@ This is an investigative code-trace document that answers four specific runtime 
 - `handle_forward(envelope, msg, rcpt_to)` — alias resolution, contact creation, per-mailbox dispatch
 - `forward_email_to_mailbox(alias, msg, contact, envelope, mailbox, user, reply_to_contact)` — header transformation, DB writes, SMTP delivery
 
-Source: `email_handler.py:2334-2378`, `email_handler.py:1980-2233`, `email_handler.py:536-555`, `email_handler.py:679-928`
+Source: `email_handler.py:2334-2378` (line 2334 is the `@newrelic.agent.background_task()` decorator; `def _handle` at line 2335), `email_handler.py:1945-2233`, `email_handler.py:536-676`, `email_handler.py:679-928`
 
 ### Scenario Used for Tracing
 
@@ -23,7 +23,7 @@ All example values in this document are derived from the following scenario:
 
 - **Sender:** `sender@example.com` with display name `"John Doe"`
 - **Alias:** `alias123@simplelogin.co` (enabled, belonging to an active user)
-- **User's personal mailbox:** `user@personal.com` (verified, not disabled)
+- **User's personal mailbox:** `user@example.net` (verified, not disabled)
 - **First-time contact:** No existing `Contact` record for this (alias, sender) pair
 - **User's `sender_format`:** Default — `SenderFormatEnum.AT` (value `0`), which produces `"John Doe - sender at example.com"`
 - **`EMAIL_DOMAIN`:** `simplelogin.co`
@@ -67,7 +67,7 @@ Source: `email_handler.py:2338-2340`, `app/log.py:22-25`
 
 ### Success Path — Log Messages in Execution Order
 
-The following traces every `LOG.*()` call on the happy path where an email is successfully forwarded from `sender@example.com` to the user's mailbox `user@personal.com` via alias `alias123@simplelogin.co`.
+The following traces every `LOG.*()` call on the happy path where an email is successfully forwarded from `sender@example.com` to the user's mailbox `user@example.net` via alias `alias123@simplelogin.co`.
 
 ---
 
@@ -150,7 +150,7 @@ The following traces every `LOG.*()` call on the happy path where an email is su
 
 - **Level:** DEBUG
 - **Code:** `LOG.d("Forward %s -> %s -> %s", contact, alias, mailbox)`
-- **Rendered:** `Forward <Contact 42 sender@example.com 101> -> <Alias 101 alias123@simplelogin.co> -> <Mailbox 5 user@personal.com>`
+- **Rendered:** `Forward <Contact 42 sender@example.com 101> -> <Alias 101 alias123@simplelogin.co> -> <Mailbox 5 user@example.net>`
 - Source: `email_handler.py:688`
 
 ---
@@ -159,7 +159,7 @@ The following traces every `LOG.*()` call on the happy path where an email is su
 
 - **Level:** DEBUG
 - **Code:** `LOG.d("Create %s for %s, %s, %s", email_log, contact, user, mailbox)`
-- **Rendered:** `Create <EmailLog 1001> for <Contact 42 sender@example.com 101>, <User 7>, <Mailbox 5 user@personal.com>`
+- **Rendered:** `Create <EmailLog 1001> for <Contact 42 sender@example.com 101>, <User 7 John user@example.net>, <Mailbox 5 user@example.net>`
 - Source: `email_handler.py:740`
 
 ---
@@ -193,7 +193,7 @@ The following traces every `LOG.*()` call on the happy path where an email is su
       contact.website_email, mailbox.email, envelope.mail_options, envelope.rcpt_options,
   )
   ```
-- **Rendered:** `Forward mail from sender@example.com to user@personal.com, mail_options:[], rcpt_options:[] `
+- **Rendered:** `Forward mail from sender@example.com to user@example.net, mail_options:[], rcpt_options:[] `
 - Source: `email_handler.py:893-899`
 
 ---
@@ -396,7 +396,7 @@ Source: `app/models.py:3365-3379`
 
 - **Email arrives** from `sender@example.com` with `Message-ID: <original123@sender-mta.example.com>`
 - **Forward phase** processes it: `replace_sl_message_id_by_original_message_id()` runs but does nothing (no SL Message-IDs in headers). The original `Message-ID: <original123@sender-mta.example.com>` is **preserved** in the forwarded email. **No `MessageIDMatching` record is created.**
-- **User replies** from `user@personal.com`: reply has `Message-ID: <user-reply456@personal-mta.com>` and `In-Reply-To: <original123@sender-mta.example.com>`
+- **User replies** from `user@example.net`: reply has `Message-ID: <user-reply456@example.net>` and `In-Reply-To: <original123@sender-mta.example.com>`
 - **Reply phase** processes it: `replace_original_message_id()` creates a new SL Message-ID:
   - `make_msgid("1001", "simplelogin.co")` → `<1001.20240115103045.7f3a2b1c@simplelogin.co>`
   - Creates `MessageIDMatching` record:
@@ -404,13 +404,13 @@ Source: `app/models.py:3365-3379`
     MessageIDMatching {
         id: 200,
         sl_message_id: "<1001.20240115103045.7f3a2b1c@simplelogin.co>",
-        original_message_id: "<user-reply456@personal-mta.com>",
+        original_message_id: "<user-reply456@example.net>",
         email_log_id: 1001
     }
     ```
   - The outgoing email's `Message-ID` header is replaced with the SL Message-ID
 - **Sender replies back** with `In-Reply-To: <1001.20240115103045.7f3a2b1c@simplelogin.co>`
-- **Forward phase** processes it: `replace_sl_message_id_by_original_message_id()` finds the `MessageIDMatching` record and replaces the SL Message-ID in `In-Reply-To` back to `<user-reply456@personal-mta.com>` — so the user's mail client correctly threads the conversation
+- **Forward phase** processes it: `replace_sl_message_id_by_original_message_id()` finds the `MessageIDMatching` record and replaces the SL Message-ID in `In-Reply-To` back to `<user-reply456@example.net>` — so the user's mail client correctly threads the conversation
 
 ---
 
@@ -451,7 +451,7 @@ Source: `app/email_utils.py:1144-1148`, `app/utils.py:41-47`
   - `sanitize_email()` — normalizes the email
   - Truncated to 45 characters
   - `@` replaced with `_at_`, `.` replaced with `_`
-  - `convert_to_alphanumeric()` — replaces any remaining non-alphanumeric characters with `_` (Source: `app/utils.py:62-71`)
+  - `convert_to_alphanumeric()` — replaces any character not in `[a-zA-Z0-9_-.]` with `_` (Source: `app/utils.py:59-71`)
 - Random length: `random.randint(5, 10)` (line 1138)
 - Format: `{sanitized_contact_email}_{random_string(random_length)}@{reply_domain}` (line 1142)
 - **Example:** `sender_at_example_com_abcde@simplelogin.co`
@@ -559,7 +559,7 @@ LOG.d("From header, new:%s, old:%s", new_from_header, old_from_header)
   - `sl_formataddr(("John Doe - sender at example.com", "qwertyuiopasdfghjklzxcvbn@simplelogin.co"))` → `"John Doe - sender at example.com" <qwertyuiopasdfghjklzxcvbn@simplelogin.co>`
 - **New From header:** `John Doe - sender at example.com <qwertyuiopasdfghjklzxcvbn@simplelogin.co>`
 
-**Rationale:** The From header is rewritten to hide the user's real email address (`user@personal.com`) from the sender. The reverse-alias (`qwertyuiopasdfghjklzxcvbn@simplelogin.co`) routes replies back through SimpleLogin. The display name preserves the original sender's identity so the user knows who sent the email.
+**Rationale:** The From header is rewritten to hide the user's real email address (`user@example.net`) from the sender. The reverse-alias (`qwertyuiopasdfghjklzxcvbn@simplelogin.co`) routes replies back through SimpleLogin. The display name preserves the original sender's identity so the user knows who sent the email.
 
 ---
 
@@ -674,7 +674,7 @@ Source: `app/contact_utils.py:104-108`, `app/user_audit_log_utils.py:35-44`, `ap
     "created_at": "2024-01-15T10:30:45.234567+00:00",
     "updated_at": null,
     "user_id": 7,
-    "user_email": "user@personal.com",
+    "user_email": "user@example.net",
     "action": "create_contact",
     "message": "Created contact 42 (sender@example.com)"
 }
@@ -785,7 +785,7 @@ Source: `email_handler.py:901-911`
   - `verp_type.value` = `0` (bounce_forward)
   - `object_id` = `email_log.id` = `1001`
   - `minutes_since_epoch` = `int((time.time() - 1640995200) / 60)` — minutes since 2022-01-01 00:00:00 UTC (Source: `app/email_utils.py:68`)
-- JSON-encodes the data: `json.dumps([0, 1001, 1055190]).encode("utf-8")` (example value for 2024-01-15 10:30)
+- JSON-encodes the data: `json.dumps([0, 1001, 1071990]).encode("utf-8")` (1071990 = minutes since 2022-01-01 00:00:00 UTC to 2024-01-15 10:30:00 UTC, computed as `int((1705314600 - 1640995200) / 60)`)
 - Signs with HMAC-SHA3-224 using `VERP_EMAIL_SECRET`, takes first 8 bytes (lines 1454-1456)
 - Base32-encodes both payload and signature, strips padding `=` characters (lines 1457-1458)
 - Final format: `{VERP_PREFIX}.{base32_payload}.{base32_signature}@{sender_domain}`
@@ -795,8 +795,11 @@ Source: `email_handler.py:901-911`
 **Example VERP address:**
 
 ```
-sl.giytemzqgq3s4mjsgmytemzu.onuhi3dfojuwizlz@simplelogin.co
+sl.lmycyibrgaydclbageydomjzheyf2.{hmac_signature_base32}@simplelogin.co
 ```
+
+- `lmycyibrgaydclbageydomjzheyf2` is the base32 encoding of `[0, 1001, 1071990]`
+- `{hmac_signature_base32}` depends on the secret value of `VERP_EMAIL_SECRET` — the first 8 bytes of HMAC-SHA3-224, base32-encoded and lowercased
 
 **Rationale:** The VERP (Variable Envelope Return Path) address encodes the `email_log.id` and a timestamp, signed with HMAC to prevent tampering. When the recipient's mail server bounces the email, the bounce goes to this VERP address, and SimpleLogin can decode it to identify exactly which `EmailLog` record the bounce belongs to — enabling precise bounce tracking per forwarded email.
 
@@ -906,7 +909,7 @@ sequenceDiagram
 
 ### Design Rationale
 
-- **Why the From header is rewritten:** To protect the user's real email address (`user@personal.com`) from being exposed to the sender. The reverse-alias address routes replies back through SimpleLogin, maintaining the privacy barrier. The display name preserves the original sender's identity so the user knows who sent the email.
+- **Why the From header is rewritten:** To protect the user's real email address (`user@example.net`) from being exposed to the sender. The reverse-alias address routes replies back through SimpleLogin, maintaining the privacy barrier. The display name preserves the original sender's identity so the user knows who sent the email.
 
 - **Why VERP is used:** The VERP (Variable Envelope Return Path) address encodes the `EmailLog.id` and a timestamp, signed with HMAC. This allows SimpleLogin to deterministically match any bounce notification back to the exact `EmailLog` record — and therefore the exact alias, contact, and mailbox — without relying on the bounce email's content, which varies wildly across mail servers.
 
