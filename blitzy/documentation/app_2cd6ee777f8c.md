@@ -477,15 +477,14 @@ Only created when multiple mailboxes are selected. The first mailbox becomes `al
 ```python
 alias = Alias.create(user_id=user.id, email=full_alias, mailbox_id=mailboxes[0].id, ...)
 Session.flush()
-for i in range(1, len(mailboxes)):
-    AliasMailbox.create(alias_id=alias.id, mailbox_id=mailboxes[i].id)
+AliasMailbox.create(alias_id=alias.id, mailbox_id=mailboxes[i].id)  # for each additional mailbox
 ```
 
 Source: `new_custom_alias.py:211-224`
 
 **Dashboard flow:** Identical pattern. Source: `custom_alias.py:139-156`
 
-**Model definition:** `AliasMailbox` has a unique constraint on `(alias_id, mailbox_id)` (Source: `app/models.py:2942`) and foreign keys to both `alias` and `mailbox` with `CASCADE` delete (Source: `models.py:2945-2949`).
+**Model definition:** `AliasMailbox` has a unique constraint on `(alias_id, mailbox_id)` (Source: `app/models.py:2942`) and foreign keys to both `alias` and `mailbox` with `CASCADE` delete (Source: `models.py:2945-2950`).
 
 **Rationale:** The first mailbox is stored directly on the `Alias` model's `mailbox_id` column for backward compatibility and fast lookup, while additional mailboxes use the junction table.
 
@@ -629,8 +628,8 @@ flowchart TD
     G -->|Yes| H{"mailboxes non-empty?"}
     H -->|No| H1["400: At least one mailbox must be selected"]
     H -->|Yes| I{"check_suffix_signature()?"}
-    I -->|Expired| I1["412: Alias creation time is expired"]
-    I -->|Tampered| I2["400: Tampered suffix"]
+    I -->|Returns None (expired or tampered)| I1["412: Alias creation time is expired"]
+    I -->|Unexpected exception| I2["400: Tampered suffix"]
     I -->|Valid| J{"verify_prefix_suffix()?"}
     J -->|Invalid| J1["400: wrong alias prefix or suffix"]
     J -->|Valid| K{"Alias/DeletedAlias/DomainDeletedAlias exists?"}
@@ -648,7 +647,7 @@ flowchart TD
 
 3. **Mailbox validation loop**: For each `mailbox_id`, verifies: (a) mailbox exists, (b) belongs to the requesting user, (c) is verified. Source: `new_custom_alias.py:174-178`
 
-4. **Suffix signature verification** (`check_suffix_signature()`): Uses `itsdangerous.TimestampSigner.unsign()` with `max_age=600` seconds. Returns `None` on expiry (→ 412), raises `BadSignature` on tampering (→ 400). Source: `app/alias_suffix.py:37-42`
+4. **Suffix signature verification** (`check_suffix_signature()`): Uses `itsdangerous.TimestampSigner.unsign()` with `max_age=600` seconds. Catches all `BadSignature` exceptions (both `SignatureExpired` and generic tampering) and returns `None` → HTTP 412. Only non-`BadSignature` exceptions (unexpected errors) reach the caller's `except Exception` handler → HTTP 400. Source: `app/alias_suffix.py:37-42`
 
 5. **Prefix-suffix verification** (`verify_prefix_suffix()`): Confirms the domain portion of the suffix is a valid SL domain or user custom domain, and that the suffix format matches expectations for that domain type. Source: `app/alias_suffix.py:45-91`
 
@@ -794,7 +793,7 @@ sequenceDiagram
     V3->>V3: Validate each mailbox_id
     V3--xClient: 400 (if invalid mailbox)
     V3->>V3: check_suffix_signature() [600s TTL]
-    V3--xClient: 412 (if expired) / 400 (if tampered)
+    V3--xClient: 412 (if None: expired or tampered) / 400 (if unexpected exception)
     V3->>V3: verify_prefix_suffix()
     V3--xClient: 400 (if wrong combo)
     V3->>DB: Check Alias + DeletedAlias + DomainDeletedAlias
@@ -811,9 +810,6 @@ sequenceDiagram
     AC->>DB: Session.add(new_alias)
     AC->>DB: DailyMetric.nb_alias += 1
     AC->>AC: Partner flag update (if applicable)
-
-    V3->>DB: Session.flush()
-
     AC->>ED: EventDispatcher.send_event(AliasCreated)
     ED->>ED: Check EVENT_WEBHOOK_DISABLE
     ED->>ED: Check partner user exists
@@ -824,7 +820,9 @@ sequenceDiagram
         ED->>NR: record "EventStoredToDb"
     end
     AC->>DB: AliasAuditLog.create(action="create")
+    Note over AC,V3: Alias.create() returns new_alias
 
+    V3->>DB: Session.flush()
     V3->>DB: AliasMailbox.create() (for mailboxes[1:])
     V3->>DB: Session.commit()
 
@@ -846,10 +844,10 @@ For completeness, two additional alias creation paths exist that share the same 
 - Delegates to `Alias.create()` at line 1750
 - Called by: dashboard random alias (`index.py:104`) and API random alias fallback (`new_random_alias.py:106`)
 
-**2. Auto-creation via email forwarding** (Source: `app/alias_utils.py:58-89`):
+**2. Auto-creation via email forwarding** (Source: `app/alias_utils.py:58-89,202-340`):
 - Triggered when an email arrives for a non-existent alias on a custom domain with catch-all or directory rules enabled
-- Uses `get_user_if_alias_would_auto_create()` to determine if auto-creation is appropriate
-- Also delegates to `Alias.create()` for persistence
+- Uses `get_user_if_alias_would_auto_create()` (lines 58-89) to determine if auto-creation is appropriate
+- Actual creation performed by `try_auto_create()` (line 202), `try_auto_create_directory()` (line 227), and `try_auto_create_via_domain()` (line 274), which delegate to `Alias.create()` for persistence
 - Touches the same database tables and emits the same events
 - **Not user-initiated** — triggered by incoming email, so it bypasses the HTTP-level rate limiting (Layers 1 and 3) but is still subject to the Redis bucket rate limiter (Layer 2) inside `Alias.create()`
 
