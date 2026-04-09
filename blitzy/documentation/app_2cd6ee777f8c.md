@@ -74,7 +74,7 @@ The following traces every `LOG.*()` call on the happy path where an email is su
 **Entry — `_handle()` separator**
 
 - **Level:** DEBUG
-- **Code:** `LOG.d("====>=====>====>====>====>====>====>====>")` 
+- **Code:** `LOG.d("====>=====>====>====>====>====>====>====>")`
 - **Rendered:** `====>=====>====>====>====>====>====>====>`
 - Source: `email_handler.py:2342`
 
@@ -90,7 +90,7 @@ The following traces every `LOG.*()` call on the happy path where an email is su
 **Complete example rendered log line (all format fields populated):**
 
 ```
-2024-01-15 10:30:45,123 - SL - INFO - 12345 - "email_handler.py:2343" - _handle() - a1b2c3d4-e5f6-7890-abcd-ef1234567890 - New message, mail from sender@example.com, rctp tos ['alias123@simplelogin.co'] 
+2024-01-15 10:30:45,123 - SL - INFO - 12345 - "email_handler.py:2343" - _handle() - a1b2c3d4-e5f6-7890-abcd-ef1234567890 - New message, mail from sender@example.com, rctp tos ['alias123@simplelogin.co']
 ```
 
 **Rationale:** The `message_id` field (`a1b2c3d4-e5f6-7890-abcd-ef1234567890`) is the correlation UUID set two lines earlier at `email_handler.py:2339-2340`, not the email's Message-ID header. This UUID appears in every subsequent log line for this email, enabling operators to trace the entire lifecycle with a single grep.
@@ -893,7 +893,7 @@ sequenceDiagram
     FwdMbox-->>Forward: (True, E200)
     Forward-->>Route: [(True, "250 Message accepted for delivery")]
     Route-->>Handle: "250 Message accepted for delivery"
-    Note over Handle: LOG.i "Finish... '250 Message accepted for delivery'<<===" 
+    Note over Handle: LOG.i "Finish... '250 Message accepted for delivery'<<==="
     Handle-->>Sender: 250 Message accepted for delivery
 ```
 
