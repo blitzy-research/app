@@ -267,7 +267,7 @@ This design means the health check will return `200` even if PostgreSQL is down 
 
 **Question:** What JSON response is returned when creating an alias through the API?
 
-**Short answer:** All alias creation endpoints return HTTP `201 Created` with a JSON object containing 17 fields serialized by `serialize_alias_info_v2()` from `app/api/serializer.py:55-93`, plus an `alias` top-level key from the route handler.
+**Short answer:** All alias creation endpoints return HTTP `201 Created` with a JSON object containing 16 fields serialized by `serialize_alias_info_v2()` from `app/api/serializer.py:55-93`, plus an `alias` top-level key from the route handler.
 
 ### 4.1 Endpoints Covered
 
@@ -730,7 +730,7 @@ All source files referenced in this document:
 | `app/config.py` | 65-80, 120-124, 192-198, 211-220 | Config loading, `print(">>> URL:", URL)`, `MAX_NB_EMAIL_FREE_PLAN` default, `DB_URI`, Paddle params |
 | `app/log.py` | 67-79 | Logger initialization, `print(">>> init logging <<<")`, `LOG` singleton |
 | `app/api/base.py` | 11, 16-43, 52-60 | API blueprint (`/api` prefix), `authorize_request()`, `require_api_auth` decorator |
-| `app/api/serializer.py` | 21-36, 55-93 | `AliasInfo` dataclass, `serialize_alias_info_v2()` with all 17 response fields |
+| `app/api/serializer.py` | 21-36, 55-93 | `AliasInfo` dataclass, `serialize_alias_info_v2()` with all 16 response fields |
 | `app/api/views/new_random_alias.py` | 21-117 | `POST /api/alias/random/new` route handler |
 | `app/api/views/new_custom_alias.py` | 28-112, 115-235 | `POST /api/v2/alias/custom/new` (v2) and `POST /api/v3/alias/custom/new` (v3) route handlers |
 | `app/models.py` | 62-65, 1469-1574, 1627-1692 | `ModelMixin` base columns, `Alias` model (23 columns), `Alias.create()` method with rate limiting, sanitization, event dispatch, audit logging |
