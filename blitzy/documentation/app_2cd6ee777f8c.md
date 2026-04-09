@@ -243,44 +243,36 @@ Flask-Login calls `load_user(alternative_id)` using the `_user_id` value from th
 stateDiagram-v2
     [*] --> PreAuth: First visit / New session
 
-    state PreAuth {
-        note right of PreAuth
-            Session keys: CSRF token only
-            TTL: 300 seconds
-            _user_id: absent
-        end note
-    }
+    note right of PreAuth
+        Session keys: CSRF token only
+        TTL: 300 seconds
+        _user_id: absent
+    end note
 
     PreAuth --> MFAPending: Credentials valid,\nMFA required\n(writes mfa_user_id)
 
-    state MFAPending {
-        note right of MFAPending
-            Session keys: mfa_user_id, CSRF token,\nfido_challenge (FIDO only)
-            TTL: 300 seconds
-            _user_id: absent
-        end note
-    }
+    note right of MFAPending
+        Session keys: mfa_user_id, CSRF token,\nfido_challenge (FIDO only)
+        TTL: 300 seconds
+        _user_id: absent
+    end note
 
     MFAPending --> Authenticated: MFA challenge passed\n(del mfa_user_id,\nlogin_user → _user_id,\nset sudo_time [FIDO only])
 
     PreAuth --> Authenticated: Credentials valid,\nno MFA\n(login_user → _user_id,\nset sudo_time)
 
-    state Authenticated {
-        note right of Authenticated
-            Session keys: _user_id, _fresh,\nsudo_time, _id, CSRF token
-            TTL: 7 days (604800s)
-        end note
-    }
+    note right of Authenticated
+        Session keys: _user_id, _fresh,\nsudo_time, _id, CSRF token
+        TTL: 7 days (604800s)
+    end note
 
     Authenticated --> LoggedOut: logout_session()\n(logout_user clears _user_id,\npurge_session deletes Redis key,\nnew session_id assigned)
 
-    state LoggedOut {
-        note right of LoggedOut
-            Redis key: DELETED
-            Cookie: DELETED (slapp, mfa, dark-mode)
-            New empty session created
-        end note
-    }
+    note right of LoggedOut
+        Redis key: DELETED
+        Cookie: DELETED (slapp, mfa, dark-mode)
+        New empty session created
+    end note
 
     LoggedOut --> PreAuth: Next request
     Authenticated --> Authenticated: sudo re-auth\n(updates sudo_time)
@@ -302,6 +294,7 @@ This section catalogs every session key used across the application, based on ex
 | `mfa_user_id` | `int` (User.id) | `after_login()` — `Source: app/auth/views/login_utils.py:23,29` | `del session[MFA_USER_ID]` in `mfa.py:71`, `fido.py:109`, `recovery.py:53` | Holds user ID during MFA challenge flow before full authentication |
 | `sudo_time` | `int` (Unix timestamp) | `after_login()` at `login_utils.py:37`, `fido.py:111`, `enter_sudo.py:34` | `exit_sudo.py:8` sets to `0` | Timestamp of last privilege escalation; `sudo_required` decorator checks 120-second gap (`Source: app/dashboard/views/enter_sudo.py:73-75`) |
 | `fido_challenge` | `str` | `Source: app/auth/views/fido.py:136` | Implicitly lost on session reset or logout | WebAuthn assertion challenge for FIDO key verification |
+| `fido_uuid` | `str` (UUID4) | `Source: app/dashboard/views/fido_setup.py:119` | Not explicitly cleared | UUID for WebAuthn key registration during FIDO setup; read at `fido_setup.py:43` for credential verification |
 | `slref` | `str` (referral code) | `Source: server.py:270` (`session["slref"] = ref_code` in `before_request` hook) | Not explicitly cleared | Stores referral code from URL query parameter `?slref=code` |
 | `oauth_state` | `str` | `facebook.py:47`, `google.py:43`, `github.py:34`, `oidc.py:44`, `proton.py:105` | Not explicitly cleared | OAuth2 state parameter for CSRF protection during social login flows |
 | `facebook_next_url` | `str` (URL) | `Source: app/auth/views/facebook.py:38` | Not explicitly cleared | Return URL after Facebook OAuth completion |
