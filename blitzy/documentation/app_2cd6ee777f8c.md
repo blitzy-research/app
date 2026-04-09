@@ -654,7 +654,7 @@ Response (default configuration):
 ```json
 {
   "name": "testuser@example.com",
-  "is_premium": false,
+  "is_premium": true,
   "email": "testuser@example.com",
   "in_trial": true,
   "max_alias_free_plan": 5,
@@ -683,7 +683,7 @@ API response for the **same user** (created when default was 5):
 ```json
 {
   "name": "testuser@example.com",
-  "is_premium": false,
+  "is_premium": true,
   "email": "testuser@example.com",
   "in_trial": true,
   "max_alias_free_plan": 10,
