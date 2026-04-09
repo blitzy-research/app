@@ -98,6 +98,7 @@ flowchart TD
     B -->|"api_code = None"| C{"ApiKey.get_by(code=None)"}
     B -->|"api_code = 'abc123'"| D["api_key = ApiKey.get_by(code='abc123')"]
     C -->|"api_key = None"| E{"current_user.is_authenticated?"}
+    D -->|"api_key = None (invalid key)"| E
     E -->|"Yes (browser session)"| F["g.user = current_user"]
     E -->|"No"| G["Return: {'error':'Wrong api key'}, 401"]
     D -->|"api_key found"| H["api_key.last_used = arrow.now()\napi_key.times += 1\nSession.commit()"]
@@ -418,9 +419,9 @@ The reasoning chain is:
 
 ---
 
-## Q4: Session Identifier Regeneration During Login
+## Q4: Session ID Regeneration During Login
 
-**Question:** Does the session identifier (cookie value) change during the login flow?
+**Question:** Does the session ID (cookie value) change during the login flow?
 
 ### Pre-Login: `open_session()` Flow
 
@@ -520,7 +521,7 @@ It is **NOT** called during login.
 
 ### Answer
 
-**The session identifier (cookie value) is NOT regenerated during the normal login flow.**
+**The session ID (cookie value) is NOT regenerated during the normal login flow.**
 
 The same `session_id` that was assigned when the browser first visited the site is preserved through the entire login process. `login_user()` only adds `_user_id` to the existing session dictionary without modifying the session ID. Session ID regeneration occurs exclusively in `purge_session()`, which is only called during logout.
 
@@ -974,7 +975,9 @@ def login():
 | Rate Limiter | Deducted (`g.deduct_limit = True`) | `app/auth/views/login.py:47` |
 | Rate Limit | 10 attempts per minute | `app/auth/views/login.py:22-24` |
 | Password Cleared | `form.password.data = None` | `app/auth/views/login.py:48` |
-| Analytics Event | `LoginEvent(ActionType.failed, Source.web)` | `app/auth/views/login.py:50` |
+| Analytics Event | `LoginEvent(LoginEvent.ActionType.failed)` | `app/auth/views/login.py:50` |
+
+> **Note:** All web login `LoginEvent` calls (lines 50, 56, 62, 69, 71) omit the `Source` parameter. The source defaults to `Source.web` via the constructor's default argument (`source: Source = Source.web` at `app/events/auth_event.py:18`). In contrast, the API login calls at `app/api/views/auth.py` explicitly pass `LoginEvent.Source.api`.
 
 **Additional web login failure scenarios:**
 
