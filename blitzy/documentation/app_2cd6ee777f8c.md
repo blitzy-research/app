@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-This analysis documents a security gap in SimpleLogin's bounce email handling system caused by the coexistence of two bounce address formats: a **legacy unsigned format** and a **newer HMAC-signed VERP format**. The legacy format (`bounce+{email_log_id}+@domain`) relies on `parse_id_from_bounce()` at `app/email_utils.py:1258-1259`, which performs **zero cryptographic validation** — it simply extracts the integer between `+` characters using string slicing and passes it directly to a database lookup. The newer signed format (`{VERP_PREFIX}.{base32_payload}.{base32_signature}@domain`) uses HMAC-SHA3-224 validation in `get_verp_info_from_email()` at `app/email_utils.py:1467-1498`, providing cryptographic integrity, timestamp expiration, and tamper resistance.
+This analysis documents a security gap in SimpleLogin's bounce email handling system caused by the coexistence of two bounce address formats: a **legacy unsigned format** and a **newer HMAC-signed VERP format**. The legacy format (`bounce+{email_log_id}+@domain`) relies on `parse_id_from_bounce()` at `app/email_utils.py:1258-1259`, which performs **zero cryptographic validation** — it simply extracts the integer between `+` characters using string slicing and passes it directly to a database lookup. The newer signed format (`{VERP_PREFIX}.{base32_payload}.{base32_signature}@domain`) uses HMAC-SHA3-224 validation in `get_verp_info_from_email()` at `app/email_utils.py:1467-1498`, providing cryptographic integrity, a forward-timestamp sanity check, and tamper resistance.
 
 The primary security finding is that the legacy format's unvalidated ID extraction, combined with **differential SMTP response codes**, creates an oracle that allows an external attacker to enumerate valid email log IDs. The `handle()` function in `email_handler.py:2057-2067` performs the `EmailLog.get()` database lookup **before** checking `is_bounce()` criteria — meaning even a regular (non-bounce) email sent to an old-format bounce address produces a `550 E512 No such email log` response for invalid IDs versus a `250 E213 Unknown email ignored` response for valid IDs. This 550-vs-250 differential is observable by the sending MTA and requires no spoofing of bounce criteria.
 
@@ -56,7 +56,7 @@ def parse_id_from_bounce(email_address: str) -> int:
 - No timestamp validation
 - No format validation beyond locating `+` characters
 
-The function extracts the substring between the first `+` and last `+` in the email address and converts it to an integer. Any email sent to `bounce+{any_integer}+@domain` will have that integer extracted and used as an `email_log_id` for a direct database lookup via `EmailLog.get()`.
+The function extracts the substring from the first `+` (inclusive) to the last `+` (exclusive) in the email address and converts it to an integer. For input `bounce+12345+@sl.local`, the slice yields `+12345`; Python's `int("+12345")` correctly parses this as `12345` because `int()` accepts a leading `+` sign. Any email sent to `bounce+{any_integer}+@domain` will have that integer extracted and used as an `email_log_id` for a direct database lookup via `EmailLog.get()`.
 
 ### 1.2 New Signed VERP Format
 
@@ -98,16 +98,16 @@ The validation function performs the following checks in sequence:
 3. Decodes base32 payload and signature with proper padding restoration (lines 1479-1484)
 4. Recomputes the HMAC using the same key and algorithm, then compares against the provided signature (lines 1487-1491)
 5. Parses the JSON payload and validates it has exactly 3 elements (lines 1492-1495)
-6. Checks timestamp expiration against `VERP_MESSAGE_LIFETIME` (line 1496-1497)
+6. Performs a forward-timestamp sanity check (line 1496-1497): rejects if `generation_time > (current_time + VERP_MESSAGE_LIFETIME - VERP_TIME_START) / 60` — i.e., rejects messages with timestamps claiming to be generated more than 5 days (`VERP_MESSAGE_LIFETIME` = 432000 seconds) in the future. **Note:** This does NOT expire old VERP addresses; messages generated in the past (even weeks or months old) always pass this check. It is a forward-looking sanity guard against tampered timestamps, not a backward-looking expiration mechanism.
 
-**On any failure** — bad format, bad base32, bad signature, expired timestamp — the function returns `None`. This is a critical security property: **no information is leaked about why validation failed.** On success, it returns the tuple `(VerpType, object_id)`.
+**On any failure** — bad format, bad base32, bad signature, or future-dated timestamp — the function returns `None`. This is a critical security property: **no information is leaked about why validation failed.** On success, it returns the tuple `(VerpType, object_id)`.
 
 ### 1.3 Comparative Security Assessment
 
 | Property | Legacy Format | Signed VERP Format |
 |---|---|---|
 | Cryptographic validation | **None** | HMAC-SHA3-224 (8-byte truncated) |
-| Timestamp validation | **None** | 5-day lifetime window (`VERP_MESSAGE_LIFETIME`) |
+| Timestamp validation | **None** | Forward-timestamp sanity check only: rejects timestamps >5 days in the future. Does **not** expire old addresses — past-generated messages always pass. |
 | ID extraction method | String slicing between `+` characters | JSON payload decoded from base32 |
 | Forgery resistance | **Zero** — any integer can be crafted | Requires knowledge of `VERP_EMAIL_SECRET` (min 32 chars) |
 | Information leakage on parse failure | N/A (parsing always "succeeds") | Returns `None` — no indication of failure reason |
@@ -129,11 +129,13 @@ The first action in this region is:
 verp_info = get_verp_info_from_email(rcpt_tos[0])
 ```
 
-This attempts to parse the first recipient address as a signed VERP address. The result is computed **once** at the top and reused across all three subsequent detection blocks. If parsing fails (invalid format, bad signature, expired timestamp), `verp_info` is `None`.
+This attempts to parse the first recipient address as a signed VERP address. The result is computed **once** at the top and reused across all three subsequent detection blocks. If parsing fails (invalid format, bad signature, or future-dated timestamp), `verp_info` is `None`.
 
 ### 2.2 Parallel Format Check Logic
 
 The VERP region contains three sequential detection blocks, each checking for both the old format and the new signed format in parallel using OR conditions.
+
+> **Note:** All three old-format entry conditions also include a `len(rcpt_tos) == 1` guard — the block is only entered via the old-format path when there is exactly one recipient. The signed VERP path (right side of the OR) does not include this guard. The simplified entry conditions below omit this for brevity.
 
 **Block 1: Transactional bounce detection (lines 2038-2054)**
 
@@ -141,7 +143,8 @@ The VERP region contains three sequential detection blocks, each checking for bo
 
 Entry condition:
 ```
-(rcpt_tos[0].startswith(TRANSACTIONAL_BOUNCE_PREFIX)
+(len(rcpt_tos) == 1
+ AND rcpt_tos[0].startswith(TRANSACTIONAL_BOUNCE_PREFIX)
  AND rcpt_tos[0].endswith(TRANSACTIONAL_BOUNCE_SUFFIX))
 OR (verp_info AND verp_info[0] == VerpType.transactional)
 ```
@@ -159,7 +162,8 @@ Note: The transactional block does **not** perform an `EmailLog.get()` lookup or
 
 Entry condition:
 ```
-(rcpt_tos[0].startswith(BOUNCE_PREFIX)
+(len(rcpt_tos) == 1
+ AND rcpt_tos[0].startswith(BOUNCE_PREFIX)
  AND rcpt_tos[0].endswith(BOUNCE_SUFFIX))
 OR (verp_info AND verp_info[0] == VerpType.bounce_forward)
 ```
@@ -172,7 +176,7 @@ Behavior within block:
 3. **Existence check** (lines 2065-2067): `if not email_log: return status.E512` — returns `"550 SL E512 No such email log"`
    - **CRITICAL: This check happens BEFORE `is_bounce()` is evaluated** — this is the information leakage point
 4. **Bounce criteria** (line 2069): `if is_bounce(envelope, msg): return handle_bounce(envelope, email_log, msg)`
-5. **OOO check** (line 2071): `elif is_automatic_out_of_office(msg):` → handles out-of-office
+5. **OOO check** (line 2071-2072): `elif is_automatic_out_of_office(msg):` → calls `handle_out_of_office_forward_phase()`, which modifies `envelope.rcpt_tos` to the contact's reverse alias but has **no return statement** — the code falls through the `if/elif/else` block and continues to subsequent routing, where the modified envelope is processed through normal email handling. **This does NOT return E206** — the E206 code is only returned from the transactional block (line 2052).
 6. **Fallthrough** (line 2073-2074): `else: raise VERPForward` (caught at line 2308, returns `E213`)
 
 **Block 3: Reply bounce detection (lines 2077-2098)**
@@ -181,7 +185,8 @@ Behavior within block:
 
 Entry condition:
 ```
-(rcpt_tos[0].startswith(f"{BOUNCE_PREFIX_FOR_REPLY_PHASE}+"))
+(len(rcpt_tos) == 1
+ AND rcpt_tos[0].startswith(f"{BOUNCE_PREFIX_FOR_REPLY_PHASE}+"))
 OR (verp_info AND verp_info[0] == VerpType.bounce_reply)
 ```
 
@@ -190,7 +195,7 @@ The behavior is structurally identical to Block 2:
 2. **Database lookup** (line 2083): `email_log = EmailLog.get(email_log_id)`
 3. **Existence check** (lines 2085-2087): `if not email_log: return status.E512`
 4. **Bounce criteria** (line 2090): `if is_bounce(envelope, msg): return handle_bounce(envelope, email_log, msg)`
-5. **OOO check** (line 2092): OOO handling
+5. **OOO check** (line 2092-2093): `elif is_automatic_out_of_office(msg):` → calls `handle_out_of_office_reply_phase()`, which modifies `envelope.rcpt_tos` to the alias address but has **no return statement** — the code falls through and continues to subsequent routing. As with the forward block, **this does NOT return E206**.
 6. **Fallthrough** (lines 2094-2098): `raise VERPReply` (caught at line 2308, returns `E213`)
 
 ### 2.3 Priority: Signed Over Unsigned
@@ -237,7 +242,7 @@ flowchart TD
     K -->|Yes| M{"is_bounce()?"}
     M -->|Yes| N["handle_bounce()<br/>→ E211 / E212 / E510"]
     M -->|No| O{"is_automatic_out_of_office()?"}
-    O -->|Yes| P["Handle OOO → E206"]
+    O -->|Yes| P["handle_out_of_office_forward_phase()<br/>Modifies envelope, falls through<br/>→ delivery-dependent 250"]
     O -->|No| Q["raise VERPForward → E213"]
     I -->|No| R{"Reply bounce format?<br/>(old prefix OR verp_info.type == bounce_reply)"}
     R -->|Yes| S["email_log_id = verp_info[1] OR parse_id_from_bounce()"]
@@ -246,7 +251,7 @@ flowchart TD
     T -->|Yes| V{"is_bounce()?"}
     V -->|Yes| W["handle_bounce()<br/>→ E211 / E212 / E510"]
     V -->|No| X{"is_automatic_out_of_office()?"}
-    X -->|Yes| Y["Handle OOO"]
+    X -->|Yes| Y["handle_out_of_office_reply_phase()<br/>Modifies envelope, falls through<br/>→ delivery-dependent 250"]
     X -->|No| Z["raise VERPReply → E213"]
     R -->|No| AA{"iCloud special case:<br/>mail_from matches bounce format?"}
     AA -->|Yes| AB["handle_bounce()"]
@@ -287,7 +292,7 @@ The following table documents the SMTP responses an external actor observes when
 | 3 | Invalid ID, proper bounce | Legacy | Yes | Invalid (no record) | Forward block → line 2065-2067 | `550 SL E512` | ID does **not** exist |
 | 4 | Valid ID, not a bounce | Legacy | No | Valid | Forward block → line 2065 (passes) → line 2069 (fails) → line 2073-2074 `raise VERPForward` → line 2308 | `250 SL E213` | ID exists (implicitly — E512 was not returned) |
 | 5 | Invalid ID, not a bounce | Legacy | No | Invalid | Forward block → line 2065-2067 | `550 SL E512` | ID does **not** exist |
-| 6 | Valid ID, OOO auto-reply | Legacy | No (`Auto-Submitted: auto-replied`) | Valid | Forward block → line 2071-2072 | `250 SL E206` | ID exists |
+| 6 | Valid ID, OOO auto-reply | Legacy | No (`Auto-Submitted: auto-replied`) | Valid | Forward block → line 2071-2072: `handle_out_of_office_forward_phase()` modifies envelope, **no return** — falls through to normal routing | Delivery-dependent `250` (not E206) | ID exists (E512 was not returned) |
 | 7 | Valid ID, inactive user, proper bounce | Legacy | Yes | Valid, user inactive | Forward block → `handle_bounce()` → line 1869-1871 | `550 SL E510` | ID exists; user is inactive/deleted |
 | 8 | Signed VERP, valid signature, proper bounce | Signed | Yes | Valid | Forward block → `handle_bounce()` | `250 SL E211` | Nothing useful (requires `VERP_EMAIL_SECRET`) |
 | 9 | Signed VERP, invalid signature | Signed | N/A | N/A | `verp_info=None`, old prefix check also fails → falls through VERP region | Depends on subsequent routing | Nothing — address not recognized as bounce |
@@ -354,7 +359,7 @@ What an attacker learns from each distinct SMTP response code:
 | `E211` (250) | Success | "The email log ID **exists** and a forward-phase bounce was processed" — confirms active forwarding |
 | `E212` (250) | Success | "The email log ID **exists** and a reply-phase bounce was processed" — confirms active reply phase; leaks `is_reply` flag |
 | `E213` (250) | Success | "The address matched a bounce pattern but my email didn't satisfy bounce criteria" — confirms the ID exists (since E512 was not returned before this point) |
-| `E206` (250) | Success | "The email log ID **exists** and OOO handling was triggered" — confirms existence |
+| `E206` (250) | Success | "An OOO auto-reply was received for a **transactional** bounce address" — E206 is **exclusively** returned from the transactional block (line 2052). The forward and reply block OOO paths do **not** return E206; they modify the envelope and fall through to normal routing. |
 | `E216` (250) | Success | "My email triggered a 5xx but it was downgraded due to SPF failure" — **ambiguous**, masks the real status |
 | `E404` (421) | Temporary failure | "An unexpected error occurred" — no useful information about ID validity |
 
@@ -455,7 +460,7 @@ flowchart TD
     D -->|"Yes"| F{"is_bounce()?<br/>(line 2069)"}
     F -->|"Yes"| G["handle_bounce()<br/>→ E211/E212/E510"]
     F -->|"No"| H{"is_automatic_out_of_office()?<br/>(line 2071)"}
-    H -->|"Yes"| I["Handle OOO → E206"]
+    H -->|"Yes"| I["handle_out_of_office_forward_phase()<br/>Modifies envelope, falls through<br/>→ delivery-dependent 250"]
     H -->|"No"| J["raise VERPForward<br/>→ E213 (250)<br/>ID EXISTS<br/>(line 2073-2074)"]
 
     style E fill:#ff6b6b,color:#000
@@ -497,7 +502,7 @@ For each distinguishable response an attacker observes during enumeration:
 | `250 SL E211 Bounce Forward phase handled` | The ID exists **and** the email log's `is_reply` flag is `False` (forward phase) — requires spoofing `is_bounce()` |
 | `250 SL E212 Bounce Reply phase handled` | The ID exists **and** the email log's `is_reply` flag is `True` (reply phase) — requires spoofing `is_bounce()` |
 | `550 SL E510 so such user` | The ID exists but the associated user is **inactive or deleted** — requires spoofing `is_bounce()` to reach `handle_bounce()` at line 1869-1871 |
-| `250 SL E206 Out of office` | The ID exists — requires setting `Auto-Submitted: auto-replied` header |
+| `250 SL E206 Out of office` | An OOO was received for a **transactional** bounce address — E206 is exclusively returned from the transactional block (line 2052). Forward/reply OOO paths fall through to normal routing and do not produce E206. |
 | `250 SL E216 Handled spf policy` | A 5xx was produced but masked due to SPF failure — **ambiguous**, no useful enumeration data |
 
 **Additional inference:** If an attacker spoofs bounce criteria and observes `E211` vs `E212`, they learn the `is_reply` flag value of the `EmailLog` record (*Source: app/models.py:2074-2075*), revealing whether the email associated with that log entry was a forward or a reply.
@@ -558,8 +563,8 @@ The signed VERP format, processed by `get_verp_info_from_email()` (*Source: app/
 
 - **HMAC-SHA3-224 signature validation** with 8-byte truncated digest — an attacker cannot forge a valid bounce address without knowledge of `VERP_EMAIL_SECRET` (minimum 32 characters, *Source: app/config.py:505-508*)
 - **Base32 payload encoding** — prevents injection of special characters into the address
-- **Timestamp expiration** — addresses expire after `VERP_MESSAGE_LIFETIME` (5 days / 432000 seconds, *Source: app/config.py:499*), limiting the window for replay
-- **Uniform failure response** — returns `None` on **any** validation failure (bad format, bad base32, bad HMAC, expired timestamp), with no indication of which check failed. This is a critical security property: no information is leaked about the nature of the failure.
+- **Forward-timestamp sanity check** — rejects messages with generation timestamps claiming to be more than `VERP_MESSAGE_LIFETIME` (5 days / 432000 seconds, *Source: app/config.py:499*) in the future. **Important:** This does NOT expire old VERP addresses — messages generated in the past (even weeks or months old) always pass this check. It prevents only future-dated timestamp tampering, not replay of legitimately-generated old addresses.
+- **Uniform failure response** — returns `None` on **any** validation failure (bad format, bad base32, bad HMAC, or future-dated timestamp), with no indication of which check failed. This is a critical security property: no information is leaked about the nature of the failure.
 
 When the signed format is successfully parsed, `verp_info[1]` provides the authenticated `object_id`, and `parse_id_from_bounce()` is **never called** due to Python's short-circuit evaluation in `(verp_info and verp_info[1]) or parse_id_from_bounce(rcpt_tos[0])`.
 
@@ -597,8 +602,8 @@ flowchart LR
         B1["New Format Address<br/>sl.payload.signature@domain"] --> B2["get_verp_info_from_email()<br/>app/email_utils.py:1467"]
         B2 --> B3{"HMAC valid?"}
         B3 -->|"No"| B4["Return None<br/>No information leaked"]
-        B3 -->|"Yes"| B5{"Timestamp valid?"}
-        B5 -->|"No"| B6["Return None<br/>No information leaked"]
+        B3 -->|"Yes"| B5{"Timestamp not<br/>future-dated?"}
+        B5 -->|"No (>5d future)"| B6["Return None<br/>No information leaked"]
         B5 -->|"Yes"| B7["(VerpType, object_id)<br/>Authenticated ID"]
         B7 --> B8["EmailLog.get(id)<br/>Authenticated DB lookup"]
     end
@@ -608,7 +613,7 @@ flowchart LR
 
 | Aspect | Unprotected (Legacy) | Protected (Signed VERP) |
 |---|---|---|
-| Address validation | None — string slicing only | HMAC-SHA3-224 + base32 + timestamp |
+| Address validation | None — string slicing only | HMAC-SHA3-224 + base32 + forward-timestamp sanity check |
 | ID forgery | Trivial — embed any integer | Requires `VERP_EMAIL_SECRET` |
 | Enumeration possible | **Yes** — differential 550/250 responses | **No** — invalid signatures return `None`, no block entered |
 | Rate limiting | Disabled (`return False`) | Disabled (same global rate limiter) |
