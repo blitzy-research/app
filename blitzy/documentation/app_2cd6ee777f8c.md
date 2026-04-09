@@ -128,6 +128,10 @@ The reasoning chain is:
 
 This is a **designed fallback path**, not a bug. The commented-out code at lines 22–24 shows the developers once considered gating this behind a header but chose to allow it unconditionally. The consequence is that any browser session can be used to call API endpoints directly.
 
+> **Security context — CORS configuration:** CORS is configured with wildcard origins at `server.py:200`: `CORS(app, resources={r"/api/*": {"origins": "*"}})`. The `supports_credentials` parameter is **not set** (defaults to `False`), which means cross-origin requests **cannot** include cookies or the `Authentication` header. This prevents a malicious third-party site from using `fetch()` with `credentials: "include"` to exploit a user's session cookie for cross-origin API calls. However, same-origin JavaScript (e.g., code running on the SimpleLogin domain itself) can still use session cookies to call API endpoints without an API key.
+
+> **Security context — CSRF protection on API endpoints:** API endpoints (under `app/api/`) do **not** verify CSRF tokens — no usage of `CSRFValidationForm` (defined at `app/utils.py:157`) exists in any API view. Web dashboard views (e.g., `app/dashboard/views/mailbox_detail.py:45`, `app/dashboard/views/setting.py:93`, `app/dashboard/views/domain_detail.py:41`) **do** use `CSRFValidationForm` for CSRF protection. When API endpoints are accessed via an API key (the `Authentication` header), the key itself serves as an implicit CSRF token since cross-origin JavaScript cannot read or set custom headers without CORS permission. When accessed via session cookie, CSRF protection relies on two mitigations: (1) the `SameSite=Lax` cookie attribute (`server.py:162`) prevents the browser from sending the `slapp` cookie on cross-site POST/PUT/DELETE requests, and (2) the CORS wildcard configuration without `supports_credentials` prevents cross-origin `fetch()` from including cookies.
+
 ---
 
 ## Q2: Privileged Operation Access with Browser Session
@@ -939,6 +943,8 @@ The reasoning chain is:
 4. `Session.commit()` ensures the update is persisted before the request handler runs
 5. The `ApiKey` model at `app/models.py:2358-2359` defines these columns with `default=None` and `default=0` respectively
 
+> **Security note — API key plaintext storage:** API keys are stored as **unhashed plaintext** strings in the `code` column (`sa.String(128)` at `app/models.py:2356`). The `ApiKey.create()` method at `app/models.py:2366-2370` generates a `random_string(60)` and stores it directly without any hashing transformation. This contrasts with password storage, where `app/pw_models.py:13-14` uses `bcrypt.hashpw()` with a random salt before persisting. The consequence is that a database compromise (e.g., SQL injection, backup leak, or unauthorized database access) would expose **all API keys in plaintext**, allowing an attacker to impersonate any user via the API. Hashing API keys (as done with passwords) would mitigate this risk, at the cost of requiring the full key on each request for hash comparison rather than a simple equality lookup.
+
 ---
 
 ## Q8: Failed Login Diagnostics
@@ -1133,6 +1139,7 @@ The reasoning chain is:
 | `HEADER_ALLOW_API_COOKIES` | `"X-Sl-Allowcookies"` | `app/constants.py:1` |
 | `SESSION_COOKIE_SAMESITE` | `"Lax"` | `server.py:162` |
 | `SESSION_COOKIE_SECURE` | `True` (when URL starts with `https`) | `server.py:161` |
+| `SESSION_COOKIE_HTTPONLY` | `True` (Flask default — not explicitly set in `server.py` or `app/config.py`) | Flask default; used at `app/session.py:87` via `self.get_cookie_httponly(app)` |
 | Session signer salt | `"session"` | `app/session.py:40` |
 | Session signer key derivation | `"hmac"` | `app/session.py:40` |
 | Alias token `max_age` | `600` seconds (10 minutes) | `app/alias_suffix.py:40` |
