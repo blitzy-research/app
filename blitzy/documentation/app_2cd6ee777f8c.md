@@ -458,7 +458,7 @@ The entire address is lowercased.
 | 1 | `bounce_reply` | Bounce during reply phase (user's mailbox → alias → external contact) |
 | 2 | `transactional` | Bounce of transactional/system email sent by SimpleLogin itself |
 
-**VERP message lifetime:** `VERP_MESSAGE_LIFETIME = 5 * 86400` (5 days, i.e., 432,000 seconds) — Source: `app/config.py:499`. Bounce notifications arriving after this window are rejected during VERP parsing.
+**VERP message lifetime:** `VERP_MESSAGE_LIFETIME = 5 * 86400` (5 days, i.e., 432,000 seconds) — Source: `app/config.py:499`. This constant defines how far into the future a VERP timestamp can extend before being rejected — it prevents acceptance of VERPs with spoofed or invalid future timestamps, but does **not** cause rejection of old VERPs.
 
 ### VERP Address Parsing
 
@@ -473,10 +473,10 @@ The parsing function `get_verp_info_from_email(email)` performs the following st
 3. **Restore base32 padding** (lines 1479-1484): Adds back the `=` padding that was stripped during generation: `(8 - (len(field) % 8)) % 8` padding characters.
 4. **Decode and verify** (lines 1487-1491): Decodes the base32 payload and signature, then recomputes the HMAC. If the computed signature doesn't match the decoded signature, returns `None` (tampered or invalid).
 5. **Parse JSON** (lines 1492-1494): Deserializes the payload and validates it has exactly 3 elements.
-6. **Expiry check** (line 1496): `data[2] > (time.time() + VERP_MESSAGE_LIFETIME - VERP_TIME_START) / 60` — if the time component is too far in the future (accounting for the message lifetime), the VERP is considered expired.
+6. **Timestamp validation check** (line 1496): `data[2] > (time.time() + VERP_MESSAGE_LIFETIME - VERP_TIME_START) / 60` — if the stored time component exceeds the current time plus 5 days (expressed in minutes since `VERP_TIME_START`), the VERP is considered invalid (timestamp too far in the future). This check rejects VERPs with spoofed or corrupted future timestamps but does **not** reject old VERPs — a bounce notification arriving days after the original email was sent will still be accepted.
 7. **Return** (line 1498): Returns a tuple `(VerpType(data[0]), data[1])` — the VERP type and the object ID.
 
-On any failure (format mismatch, signature mismatch, expiry, or decode error), the function returns `None`.
+On any failure (format mismatch, signature mismatch, invalid future timestamp, or decode error), the function returns `None`.
 
 ### Legacy Bounce Address Formats
 
@@ -582,7 +582,7 @@ Calls `should_disable(alias)` to determine if the alias should be automatically 
 The function `handle_bounce_reply_phase(envelope, msg, email_log)` performs:
 
 **Step 1 — Bounce record creation** (lines 1607-1618):
-Creates a `Bounce` record with `email=contact.website_email` (the **contact's** email address, not the user's mailbox). This is a key difference from forward-phase handling.
+Creates a `Bounce` record with `email=sanitize_email(contact.website_email, not_lower=True)` (the **contact's** email address, sanitized but preserving case, not the user's mailbox). The `sanitize_email()` wrapper strips leading/trailing whitespace and normalizes the address before storage. This is a key difference from forward-phase handling, which uses `mailbox.email` directly without a `sanitize_email()` wrapper.
 
 **Step 2 — S3 archival** (lines 1622-1635):
 Same pattern as forward phase: uploads full bounce report and original message to S3.
@@ -607,7 +607,7 @@ Creates a `Notification` and sends an email to the user about the bounce. **Cruc
 |--------|--------------|-------------|
 | **Function** | `handle_bounce_forward_phase()` | `handle_bounce_reply_phase()` |
 | **Source** | `email_handler.py:1432-1592` | `email_handler.py:1595-1687` |
-| **Bounce record email** | `mailbox.email` (user's mailbox) | `contact.website_email` (external contact) |
+| **Bounce record email** | `mailbox.email` (user's mailbox, no wrapper) | `sanitize_email(contact.website_email, not_lower=True)` (external contact, sanitized) |
 | **S3 archival** | Yes | Yes |
 | **RefusedEmail created** | Yes | Yes |
 | **EmailLog.bounced set** | Yes | Yes |
