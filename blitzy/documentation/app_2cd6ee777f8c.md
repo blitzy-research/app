@@ -110,7 +110,7 @@ Every HTTP request (except static assets and health checks) is logged via an `af
 
 **Log format:**
 
-```
+```text
 <remote_addr> <method> <path> <args> <status_code>, takes <elapsed_seconds>
 ```
 
@@ -150,7 +150,7 @@ Before calling `main()`, it logs: `"Listen for port <port>"` (Source: `email_han
 
 **Expected startup log sequence:**
 
-```
+```text
 Listen for port 20381
 Start mail controller 0.0.0.0 20381
 ```
@@ -197,11 +197,9 @@ Seeing these log lines confirms the email handler is actively processing incomin
 The job runner operates as an infinite polling loop. (Source: `job_runner.py:329-347`)
 
 ```python
-if __name__ == "__main__":
-    while True:
-        with create_light_app().app_context():
-            for job in get_jobs_to_run():
-                LOG.d("Take job %s", job)
+while True:
+    for job in get_jobs_to_run():
+        LOG.d("Take job %s", job)
 ```
 
 **Key characteristics:**
@@ -288,10 +286,10 @@ The login page is served at `/auth/login` with both GET and POST methods, rate-l
 
 | Condition | Flash Message | Source |
 |-----------|---------------|--------|
-| Wrong credentials | `"Email or password incorrect"` | `login.py:49` |
-| Disabled account | `"Your account is disabled..."` | `login.py:52-55` |
-| Scheduled deletion | `"Your account is scheduled to be deleted on <date>"` | `login.py:57-61` |
-| Not activated | `"Please check your inbox for the activation email..."` | `login.py:63-68` |
+| Wrong credentials | `"Email or password incorrect"` | `app/auth/views/login.py:49` |
+| Disabled account | `"Your account is disabled..."` | `app/auth/views/login.py:52-55` |
+| Scheduled deletion | `"Your account is scheduled to be deleted on <date>"` | `app/auth/views/login.py:57-61` |
+| Not activated | `"Please check your inbox for the activation email..."` | `app/auth/views/login.py:63-68` |
 
 **Already authenticated** users visiting `/auth/login` are redirected directly to the dashboard. (Source: `app/auth/views/login.py:28-34`)
 
@@ -375,38 +373,38 @@ The registration route at `/auth/register` handles both GET (form display) and P
 
 **Registration flow on POST:**
 
-1. If `HCAPTCHA_SECRET` is configured, validates the hCaptcha response (Source: `register.py:47-71`)
-2. Canonicalizes the email address via `canonicalize_email()` (Source: `register.py:73`)
-3. Checks `email_can_be_used_as_mailbox()` — rejects alias domains and disposable emails (Source: `register.py:74`)
-4. Checks `personal_email_already_used()` — prevents duplicate accounts (Source: `register.py:79-80`)
-5. Creates the user: `User.create(email=email, name=form.email.data, password=form.password.data, referral=get_referral())` (Source: `register.py:86-91`)
-6. Commits the database transaction (Source: `register.py:92`)
-7. Calls `send_activation_email(user, next_url)` (Source: `register.py:95`)
-8. Renders `auth/register_waiting_activation.html` (Source: `register.py:104`)
+1. If `HCAPTCHA_SECRET` is configured, validates the hCaptcha response (Source: `app/auth/views/register.py:47-71`)
+2. Canonicalizes the email address via `canonicalize_email()` (Source: `app/auth/views/register.py:73`)
+3. Checks `email_can_be_used_as_mailbox()` — rejects alias domains and disposable emails (Source: `app/auth/views/register.py:74`)
+4. Checks `personal_email_already_used()` — prevents duplicate accounts (Source: `app/auth/views/register.py:79-80`)
+5. Creates the user: `User.create(email=email, name=form.email.data, password=form.password.data, referral=get_referral())` (Source: `app/auth/views/register.py:86-91`)
+6. Commits the database transaction (Source: `app/auth/views/register.py:92`)
+7. Calls `send_activation_email(user, next_url)` (Source: `app/auth/views/register.py:95`)
+8. Renders `auth/register_waiting_activation.html` (Source: `app/auth/views/register.py:104`)
 
-**Log message:** `"create user <email>"` (Source: `register.py:85`)
+**Log message:** `"create user <email>"` (Source: `app/auth/views/register.py:85`)
 
 #### Step 2: Activation Email
 
 The `send_activation_email()` function at `app/auth/views/register.py:117-129`:
 
-1. Deletes any prior `ActivationCode` rows for this user (Source: `register.py:119`)
-2. Creates a new `ActivationCode` with a random 30-character code (Source: `register.py:120`)
-3. Builds the activation link: `{URL}/auth/activate?code={code}` (Source: `register.py:124`)
-4. Sends the activation email via `email_utils.send_activation_email()` (Source: `register.py:129`)
+1. Deletes any prior `ActivationCode` rows for this user (Source: `app/auth/views/register.py:119`)
+2. Creates a new `ActivationCode` with a random 30-character code (Source: `app/auth/views/register.py:120`)
+3. Builds the activation link: `{URL}/auth/activate?code={code}` (Source: `app/auth/views/register.py:124`)
+4. Sends the activation email via `email_utils.send_activation_email()` (Source: `app/auth/views/register.py:129`)
 
 #### Step 3: Account Activation
 
 The activation route at `/auth/activate` processes the code from the URL. (Source: `app/auth/views/activate.py:13-69`)
 
-1. Looks up the `ActivationCode` by code (Source: `activate.py:26`)
-2. Checks if the code is expired (Source: `activate.py:38`)
-3. Sets `user.activated = True` (Source: `activate.py:49`)
-4. Calls `login_user(user)` via Flask-Login to establish the session (Source: `activate.py:50`)
-5. Deletes the one-time `ActivationCode` (Source: `activate.py:53`)
-6. Shows flash message: `"Your account has been activated"` (Source: `activate.py:56`)
-7. Sends a welcome email via `email_utils.send_welcome_email(user)` (Source: `activate.py:58`)
-8. Redirects to the `next` URL or the dashboard (Source: `activate.py:61-67`)
+1. Looks up the `ActivationCode` by code (Source: `app/auth/views/activate.py:26`)
+2. Checks if the code is expired (Source: `app/auth/views/activate.py:38`)
+3. Sets `user.activated = True` (Source: `app/auth/views/activate.py:49`)
+4. Calls `login_user(user)` via Flask-Login to establish the session (Source: `app/auth/views/activate.py:50`)
+5. Deletes the one-time `ActivationCode` (Source: `app/auth/views/activate.py:53`)
+6. Shows flash message: `"Your account has been activated"` (Source: `app/auth/views/activate.py:56`)
+7. Sends a welcome email via `email_utils.send_welcome_email(user)` (Source: `app/auth/views/activate.py:58`)
+8. Redirects to the `next` URL or the dashboard (Source: `app/auth/views/activate.py:61-67`)
 
 #### Database Artifacts After Account Creation
 
@@ -424,24 +422,24 @@ When a user clicks "Create Random Alias" on the dashboard, a POST request is sen
 
 **Flow:**
 
-1. Checks `current_user.can_create_new_alias()` — validates the user's plan allows more aliases (Source: `index.py:98`)
-2. Determines the alias generator scheme (word-based or UUID) from the form or user preference (Source: `index.py:99-103`)
-3. Creates the alias: `Alias.create_new_random(user=current_user, scheme=scheme)` (Source: `index.py:104`)
-4. Sets `alias.mailbox_id = current_user.default_mailbox_id` (Source: `index.py:106`)
-5. Commits the database transaction (Source: `index.py:108`)
-6. Shows flash message: `"Alias <alias.email> has been created"` (Source: `index.py:111`)
-7. Redirects back to dashboard with `highlight_alias_id` to visually highlight the new alias (Source: `index.py:113-121`)
+1. Checks `current_user.can_create_new_alias()` — validates the user's plan allows more aliases (Source: `app/dashboard/views/index.py:98`)
+2. Determines the alias generator scheme (word-based or UUID) from the form or user preference (Source: `app/dashboard/views/index.py:99-103`)
+3. Creates the alias: `Alias.create_new_random(user=current_user, scheme=scheme)` (Source: `app/dashboard/views/index.py:104`)
+4. Sets `alias.mailbox_id = current_user.default_mailbox_id` (Source: `app/dashboard/views/index.py:106`)
+5. Commits the database transaction (Source: `app/dashboard/views/index.py:108`)
+6. Shows flash message: `"Alias <alias.email> has been created"` (Source: `app/dashboard/views/index.py:111`)
+7. Redirects back to dashboard with `highlight_alias_id` to visually highlight the new alias (Source: `app/dashboard/views/index.py:113-121`)
 
-**Log message:** `"create new random alias <alias> for user <user>"` (Source: `index.py:110`)
+**Log message:** `"create new random alias <alias> for user <user>"` (Source: `app/dashboard/views/index.py:110`)
 
 #### Auto-Creation During Email Reception
 
 Aliases can also be created on-the-fly when an email arrives for a non-existent alias on a custom domain or directory. The `get_user_if_alias_would_auto_create()` function at `app/alias_utils.py:58-89` checks:
 
-1. The address does not start with the VERP bounce prefix (Source: `alias_utils.py:61-63`)
-2. The email address is valid (no unicode characters) (Source: `alias_utils.py:66-71`)
-3. The domain matches a custom domain with catch-all or an auto-create rule enabled (Source: `alias_utils.py:73-82`)
-4. Or the address matches a directory auto-creation pattern (Source: `alias_utils.py:83-87`)
+1. The address does not start with the VERP bounce prefix (Source: `app/alias_utils.py:61-63`)
+2. The email address is valid (no unicode characters) (Source: `app/alias_utils.py:66-71`)
+3. The domain matches a custom domain with catch-all or an auto-create rule enabled (Source: `app/alias_utils.py:73-82`)
+4. Or the address matches a directory auto-creation pattern (Source: `app/alias_utils.py:83-87`)
 
 #### Database Artifacts After Alias Creation
 
@@ -530,9 +528,12 @@ sequenceDiagram
         Handler->>Outbound: Send modified email
         Outbound->>Mailbox: Deliver to user
         Handler-->>Postfix: 250 Message accepted (E200)
-    else Alias disabled or contact blocked
+    else Alias disabled or contact blocked (default)
         Handler->>DB: EmailLog(blocked=True)
-        Handler-->>Postfix: 250 (E200 or E502)
+        Handler-->>Postfix: 250 (E200)
+    else Alias disabled or contact blocked (return_5xx)
+        Handler->>DB: EmailLog(blocked=True)
+        Handler-->>Postfix: 550 (E502)
     end
 ```
 
@@ -590,7 +591,7 @@ Each polling cycle:
 
 #### Job State Machine
 
-```
+```text
 ready ──→ taken ──→ done
   ↑          │
   └──────────┘  (retry if taken_at older than JOB_TAKEN_RETRY_WAIT_MINS
@@ -808,7 +809,7 @@ All status codes are defined in `app/email/status.py:1-64`.
 
 All SimpleLogin components use a structured log format defined in `app/log.py:12-14`:
 
-```
+```text
 %(asctime)s - %(name)s - %(levelname)s - %(process)d - "%(pathname)s:%(lineno)d" - %(funcName)s() - %(message_id)s - %(message)s
 ```
 
@@ -884,24 +885,26 @@ This means HTTP request logging is handled entirely by the custom `after_request
 
 ### Local Development Workflow
 
+Start PostgreSQL in Docker:
+
 ```bash
-# 1. Start PostgreSQL
 docker run -e POSTGRES_PASSWORD=mypassword -e POSTGRES_USER=myuser \
   -e POSTGRES_DB=simplelogin -p 15432:5432 postgres:13
-
-# 2. Initialize database and seed test data
-alembic upgrade head && flask dummy-data && python3 server.py
-
-# 3. (Separate terminal) Start email handler
-python email_handler.py
-
-# 4. (Separate terminal) Start job runner
-python job_runner.py
-
-# 5. Open browser
-# http://localhost:7777 → login with john@wick.com / password
 ```
 
-(Source: `CONTRIBUTING.md:99-109, 209-229`)
+Initialize the database, seed test data, and start the web server:
+
+```bash
+alembic upgrade head && flask dummy-data && python3 server.py
+```
+
+In separate terminals, start the email handler and job runner:
+
+```bash
+python email_handler.py   # terminal 2
+python job_runner.py       # terminal 3
+```
+
+Then open `http://localhost:7777` and log in with `john@wick.com` / `password`. (Source: `CONTRIBUTING.md:99-109, 209-229`)
 
 All three components are designed as persistent, long-running processes. The web server handles HTTP requests, the email handler accepts SMTP connections, and the job runner polls the database — each independently and continuously, sharing state through PostgreSQL.
