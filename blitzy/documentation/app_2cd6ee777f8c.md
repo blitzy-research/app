@@ -203,13 +203,13 @@ The `LOG` singleton provides shortcut methods defined at `app/log.py:74–77`:
 
 ```python
 # Source: app/log.py:74-77
-LOG.d = LOG.debug       # DEBUG level
-LOG.i = LOG.info        # INFO level
-LOG.w = LOG.warning     # WARNING level
-LOG.e = LOG.exception   # ERROR level (includes stack trace)
+logging.Logger.d = logging.Logger.debug
+logging.Logger.i = logging.Logger.info
+logging.Logger.w = logging.Logger.warning
+logging.Logger.e = logging.Logger.exception
 ```
 
-Source: `app/log.py:79` — `LOG = _get_logger("SL")`
+These are **class-level** assignments on `logging.Logger` itself (not on a specific instance). By patching the `Logger` class, every logger instance — including the `LOG` singleton created at `app/log.py:79` (`LOG = _get_logger("SL")`) — inherits the `.d`, `.i`, `.w`, and `.e` shortcut methods. This means `LOG.d(...)` is equivalent to `LOG.debug(...)`, `LOG.w(...)` is equivalent to `LOG.warning(...)`, and so on.
 
 ### Specific Log Entries in the Validation Path
 
@@ -523,7 +523,7 @@ def max_alias_for_free_account(self) -> int:
 Both values are configurable via environment variables:
 
 ```python
-# Source: app/config.py:119-124
+# Source: app/config.py:120-124
 try:
     MAX_NB_EMAIL_FREE_PLAN = int(os.environ["MAX_NB_EMAIL_FREE_PLAN"])
 except Exception:
@@ -597,15 +597,16 @@ With the default configuration, this produces: `"You have reached the limitation
 
 ```mermaid
 flowchart TD
-    A["can_create_new_alias()"] --> B{"is_active()?\n(models.py:873)"}
+    A["can_create_new_alias()"] --> B{"is_active()?\n(models.py:872)"}
     B -->|"No (delete_on set\nand in future)"| C["return False\n→ 400 quota error"]
-    B -->|"Yes"| D{"disabled?\n(models.py:876)"}
+    B -->|"Yes"| D{"disabled?\n(models.py:875)"}
     D -->|"Yes"| C
     D -->|"No"| E{"lifetime_or_active_subscription()?\n(models.py:878)"}
     E -->|"Yes (lifetime deal\nor active sub)"| F["return True\n→ Unlimited aliases"]
     E -->|"No (free plan)"| G{"Alias.count < max_alias_for_free_account()?\n(models.py:881-883)"}
     G -->|"Yes"| H["return True\n→ Can create alias"]
     G -->|"No"| C
+    G -.->|"calls"| I
 
     subgraph "max_alias_for_free_account() (models.py:858-865)"
         I{"FLAG_FREE_OLD_ALIAS_LIMIT\nset?"}
