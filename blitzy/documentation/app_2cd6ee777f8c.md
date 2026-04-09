@@ -43,6 +43,8 @@ def local_main():
     app.debug = True
     DebugToolbarExtension(app)
 
+    # ... (commented-out SQLAlchemy debug panel configuration omitted)
+
     app.run(debug=True, port=7777)
 ```
 
@@ -310,7 +312,7 @@ Note that the header name is `Authentication` (not `Authorization`) — this is 
 All three endpoints construct the response using the same pattern. For example, from the random alias endpoint:
 
 ```python
-# Source: app/api/views/new_random_alias.py:114-116
+# Source: app/api/views/new_random_alias.py:114-117
 return (
     jsonify(alias=alias.email, **serialize_alias_info_v2(get_alias_info_v2(alias))),
     201,
@@ -733,6 +735,7 @@ All source files referenced in this document:
 | `app/api/views/new_custom_alias.py` | 28-112, 115-235 | `POST /api/v2/alias/custom/new` (v2) and `POST /api/v3/alias/custom/new` (v3) route handlers |
 | `app/models.py` | 62-65, 1469-1574, 1627-1692 | `ModelMixin` base columns, `Alias` model (23 columns), `Alias.create()` method with rate limiting, sanitization, event dispatch, audit logging |
 | `example.env` | 6, 75, 77 | `URL=http://localhost:7777`, `DB_URI=postgresql://...`, `FLASK_SECRET=secret` |
+| `docs/api.md` | 1-1108 | Existing API reference documentation — context for alias response format and authentication |
 
 ---
 
