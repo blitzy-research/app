@@ -134,14 +134,14 @@ This issues a SQL `SELECT` query against the `users` table (because `User.__tabl
 
 The exception raised is:
 
-```
+```text
 sqlalchemy.exc.ProgrammingError: (psycopg2.errors.UndefinedTable) relation "users" does not exist
 LINE 1: SELECT users.id AS users_id, ... FROM users WHERE users.email = ...
 ```
 
 The call chain producing this exception is:
 
-```
+```text
 app/auth/views/login.py:43    user = User.get_by(email=email)
   → app/models.py:84            return Session.query(cls).filter_by(**kw).first()
     → SQLAlchemy                   SELECT ... FROM users WHERE users.email = ?
@@ -385,6 +385,18 @@ lsof -i :20381
 ps aux | grep job_runner.py
 ```
 
+### Rationale
+
+The SimpleLogin local development stack requires exactly three services because the architecture separates concerns across distinct processes:
+
+1. **Why three services?** The web server (`server.py`) handles HTTP requests, the email handler (`email_handler.py`) handles inbound SMTP traffic, and the job runner (`job_runner.py`) processes asynchronous background tasks (e.g., GDPR data export). Each has a dedicated entry point under `if __name__ == "__main__"`, and `CONTRIBUTING.md:143–147` and `CONTRIBUTING.md:225–229` document them as the required local development processes.
+
+2. **`create_app()` vs `create_light_app()` architectural split:** The web server uses `create_app()` (`server.py:139–217`), which builds the full Flask application with all blueprints, error handlers, admin interface, CORS, session management, rate limiting, and the debug toolbar. The email handler and job runner use `create_light_app()` (`server.py:127–136`), which creates a minimal Flask app with only the database session configured — no HTTP routing or web middleware. This split exists because the email handler and job runner only need a Flask application context for SQLAlchemy database access; they do not serve HTTP traffic.
+
+3. **Port binding evidence:** The web server binds to port `7777` via `app.run(debug=True, port=7777)` at `server.py:588`. The email handler binds to port `20381` via `Controller(MailHandler(), hostname="0.0.0.0", port=port)` at `email_handler.py:2383`, with the default port set by `argparse` at `email_handler.py:2399`. The job runner has no port binding — it is a pure polling loop with `time.sleep(10)` at `job_runner.py:347`.
+
+4. **Log output evidence:** All three services share the logging infrastructure from `app/log.py`. The `>>> init logging <<<` message at `app/log.py:67` is printed at import time. The structured log format at `app/log.py:12–14` produces the `<timestamp> - SL - <LEVEL> - <pid> - "<file>:<line>" - <func>() - <message_id> - <message>` pattern seen in the email handler and job runner output. The web server's werkzeug request logger is explicitly disabled at `app/log.py:70–71`.
+
 ### Component Diagram: Service Topology
 
 ```mermaid
@@ -612,7 +624,7 @@ Source: `email_handler.py:2357–2365`
 
 The exact SMTP status string returned to the sender is:
 
-```
+```text
 550 SL E515 Email not exist
 ```
 
@@ -641,7 +653,7 @@ The complete log output sequence for this email lifecycle:
 
 Each log line follows the format defined at `app/log.py:12–14`:
 
-```
+```text
 %(asctime)s - %(name)s - %(levelname)s - %(process)d - "%(pathname)s:%(lineno)d" - %(funcName)s() - %(message_id)s - %(message)s
 ```
 
