@@ -98,14 +98,14 @@ openssl rsa -in local_data/jwtRS256.key -pubout -outform PEM -out local_data/jwt
 
 ### Domain Seeding
 
-After running database migrations (see Q1 below), the `init_app.py` script must be executed to seed the `sl_domain` table with the configured `EMAIL_DOMAIN`. Without this step, user registration will fail because alias creation requires at least one entry in the domain table.
+After running database migrations (see Q1 below), the `init_app.py` script must be executed to seed the `public_domain` table with the configured `EMAIL_DOMAIN`. Without this step, user registration will fail because alias creation requires at least one entry in the domain table.
 
 ```bash
 # Run domain seeding after migrations
 python init_app.py
 ```
 
-The `init_app.py` script calls `add_sl_domains()` which iterates over `ALIAS_DOMAINS` (defaults to `[EMAIL_DOMAIN]`) and inserts each domain into the `sl_domain` table if it doesn't already exist:
+The `init_app.py` script calls `add_sl_domains()` which iterates over `ALIAS_DOMAINS` (defaults to `[EMAIL_DOMAIN]`) and inserts each domain into the `public_domain` table (ORM class: `SLDomain`) if it doesn't already exist:
 
 ```python
 # Source: init_app.py:39-56
@@ -203,12 +203,9 @@ grep -c '__tablename__' app/models.py
 
 ### Last Table Identification
 
-The migration chain has **three head revisions** (multi-head):
-- `32f25cbf12f6` — `alias_audit_log_index_created_at`
-- `01e2997e90d3` — adds `use_as_reverse_alias` column to `public_domain`
-- `2d89315ac650` — adds index on `partner_subscription.end_at`
+The migration chain converges to a **single head revision**: `32f25cbf12f6` (`alias_audit_log_index_created_at`). While intermediate branch points exist in the migration history (e.g., `01e2997e90d3` and `2d89315ac650` are separate branches that were merged by revision `2634b41f54db`), all branches ultimately converge so that `32f25cbf12f6` is the sole head.
 
-The migration `32f25cbf12f6` (file: `2024_101616_32f25cbf12f6_alias_audit_log_index_created_at.py`) is the chronologically latest head but **only creates an INDEX**, not a table:
+The head migration `32f25cbf12f6` (file: `2024_101616_32f25cbf12f6_alias_audit_log_index_created_at.py`) **only creates an INDEX**, not a table:
 
 ```python
 # Source: migrations/versions/2024_101616_32f25cbf12f6_alias_audit_log_index_created_at.py:20-22
@@ -245,7 +242,7 @@ def upgrade():
 | 77 total tables | `information_schema.tables` query | `SELECT COUNT(*) ... WHERE table_schema = 'public'` → 77 |
 | Last `create_table` is `user_audit_log` | `migrations/versions/2024_101611_7d7b84779837_user_audit_log.py:22` | `op.create_table('user_audit_log', ...)` |
 | Head revision `32f25cbf12f6` is index-only | `migrations/versions/2024_101616_32f25cbf12f6_alias_audit_log_index_created_at.py:21-22` | Only `op.create_index(...)`, no `op.create_table()` |
-| Multi-head migration | Revisions `32f25cbf12f6`, `01e2997e90d3`, `2d89315ac650` | Each file has no downstream revision referencing it |
+| Single head revision | `32f25cbf12f6` (branches like `01e2997e90d3` and `2d89315ac650` merged by `2634b41f54db`) | Only `32f25cbf12f6` has no downstream revision referencing it |
 
 ---
 
@@ -570,7 +567,7 @@ sequenceDiagram
 **Registration endpoint** (`app/api/views/auth.py:87-141`):
 
 ```python
-# Source: app/api/views/auth.py:87-88
+# Source: app/api/views/auth.py:87-89
 @api_bp.route("/auth/register", methods=["POST"])
 @limiter.limit("10/minute")
 def auth_register():
@@ -807,6 +804,6 @@ MAX_NB_EMAIL_OLD_FREE_PLAN = int(os.environ.get("MAX_NB_EMAIL_OLD_FREE_PLAN", 15
 
 4. **`MAX_NB_EMAIL_FREE_PLAN` is global, not per-user:** The alias limit is a runtime configuration value, not a database column. Changing it and restarting the server affects all users immediately, regardless of when they were created.
 
-5. **`init_app.py` must be run after migrations:** User registration requires at least one domain in the `sl_domain` table. Without running `init_app.py` (or `flask dummy-data`), alias creation during registration will fail.
+5. **`init_app.py` must be run after migrations:** User registration requires at least one domain in the `public_domain` table. Without running `init_app.py` (or `flask dummy-data`), alias creation during registration will fail.
 
 6. **`jwcrypto` version compatibility:** `jwcrypto ^0.8` may conflict with newer `cryptography` library versions. Upgrading to `jwcrypto 0.9.1` resolves `TypeError` issues related to `load_pem_private_key()`.
