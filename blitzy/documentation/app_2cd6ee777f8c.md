@@ -738,7 +738,7 @@ The development server binds to `127.0.0.1:7777` (localhost only, due to Flask's
 flowchart TD
     START["python server.py"] --> MAIN["if __name__ == '__main__':"]
     MAIN --> LM["local_main()"]
-    
+
     subgraph IMPORTS["Module-Level Import Side Effects"]
         direction TB
         I1["import app.config<br/>→ load_dotenv(), print('>>> URL:'), env var parsing"]
@@ -748,10 +748,10 @@ flowchart TD
         I5["Sentry init (conditional)<br/>os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'"]
         I1 --> I2 --> I3 --> I4 --> I5
     end
-    
+
     LM --> COLOR["config.COLOR_LOG = True"]
     COLOR --> CA["create_app()"]
-    
+
     subgraph CREATEAPP["create_app() — server.py:139-217"]
         direction TB
         CA1["Flask(__name__) + ProxyFix"]
@@ -767,7 +767,7 @@ flowchart TD
         CA11["CORS, session permanence, teardown, /health"]
         CA1 --> CA2 --> CA3 --> CA4 --> CA5 --> CA6 --> CA7 --> CA8 --> CA9 --> CA10 --> CA11
     end
-    
+
     CA --> CREATEAPP
     CREATEAPP --> DT["DebugToolbarExtension(app)"]
     DT --> RUN["app.run(debug=True, port=7777)"]
@@ -1097,7 +1097,7 @@ sequenceDiagram
     Decorator->>AuthFn: authorize_request()
     AuthFn->>AuthFn: api_code = request.headers.get("Authentication")
     AuthFn->>DB: ApiKey.get_by(code=api_code)
-    
+
     alt API Key Found
         DB-->>AuthFn: ApiKey object
         AuthFn->>DB: Update api_key.last_used, api_key.times += 1, commit
@@ -1111,7 +1111,7 @@ sequenceDiagram
             Decorator-->>Client: 401 Response
         end
     end
-    
+
     AuthFn->>AuthFn: Check g.user.disabled → 403
     AuthFn->>AuthFn: Check g.user.is_active() → 401
     AuthFn->>AuthFn: g.api_key = api_key
@@ -1373,33 +1373,33 @@ graph TB
         Redis[(Redis)]
         Postfix["Postfix MTA"]
     end
-    
+
     subgraph Web_Server["Web Server Process"]
         WS["server.py / wsgi.py<br/>Flask + Gunicorn<br/>Port 7777"]
     end
-    
+
     subgraph Job_Runner["Job Runner Process"]
         JR["job_runner.py<br/>Polls Job table every 10s"]
     end
-    
+
     subgraph Cron_Scheduler["Cron Scheduler"]
         YC["yacron + crontab.yml"]
         CR["cron.py -j &lt;task&gt;<br/>15 scheduled tasks"]
         YC --> CR
     end
-    
+
     subgraph Email_Handler["Email Handler Process"]
         EH["email_handler.py<br/>aiosmtpd SMTP server"]
     end
-    
+
     subgraph Event_Listener["Event Listener Process"]
         EL["event_listener.py<br/>PostgreSQL LISTEN/NOTIFY"]
     end
-    
+
     subgraph Monitoring_Process["Monitoring Process"]
         MO["monitoring.py<br/>60s metric export loop"]
     end
-    
+
     WS --> PG
     WS --> Redis
     JR --> PG
@@ -1409,7 +1409,7 @@ graph TB
     EL --> PG
     MO --> PG
     MO --> Postfix
-    
+
     Postfix --> EH
 ```
 
