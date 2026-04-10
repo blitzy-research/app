@@ -224,6 +224,16 @@ iCloud mail servers return bounces with an unusual addressing: `mail_from=bounce
 4. **Directly calls `handle_bounce()`** — no `is_bounce()` check is performed (line 2116)
 5. Returns whatever `handle_bounce()` returns
 
+**Secondary security impacts of the iCloud path:**
+
+Because the iCloud block calls `handle_bounce()` directly without a prior `is_bounce()` gate, the behavior inside `handle_bounce()` (*Source: email_handler.py:1851-1914*) determines what happens next based on the `email_log.is_reply` flag and the actual email content:
+
+- **When `email_log.is_reply` is `False`** (forward phase): `handle_bounce()` unconditionally calls `handle_bounce_forward_phase()` at line 1912-1913. This function (*Source: email_handler.py:1432-1593*) creates a `Bounce` record (line 1449-1454), sets `email_log.bounced = True` (line 1493), stores the email to S3 as a `RefusedEmail` (line 1487-1489), and invokes `should_disable(alias)` at line 1500. If the bounce count exceeds the thresholds in `should_disable()` (*Source: app/email_utils.py:1166-1255*), the alias is **automatically disabled** via `change_alias_status(alias, enabled=False)` at line 1505-1507. An attacker who can trigger this path with a spoofed old-format iCloud-style bounce address could accumulate `Bounce` records against a target alias and eventually trigger its auto-disable.
+
+- **When `email_log.is_reply` is `True`** and the email does **not** satisfy the DSN criteria (`content_type != "multipart/report"` or `mail_from != "<>"`): `handle_bounce()` enters the auto-reply forwarding path at lines 1873-1908. This path sets `email_log.auto_replied = True` (line 1887), replaces the `To` header with the alias email (line 1891), sets `envelope.rcpt_tos = [alias.email]` (line 1892), and calls `handle_forward()` (line 1899) — effectively **forwarding the attacker's email to the alias owner's mailbox**. This occurs because the iCloud path bypasses `is_bounce()`, and `handle_bounce()` interprets a non-DSN email to a reply-phase log entry as an auto-reply that should be forwarded.
+
+These secondary effects extend beyond information leakage into potential denial-of-service (alias auto-disable) and unsolicited email delivery (auto-reply forwarding) vectors, both reachable through the same unvalidated legacy bounce address format.
+
 ### 2.5 Bounce Routing Decision Flowchart
 
 ```mermaid
@@ -299,6 +309,7 @@ The following table documents the SMTP responses an external actor observes when
 | 10 | Any probe producing 5xx + SPF fail | Either | Any | Any (producing 5xx) | `_handle()` SPF check → line 2357-2365 | `250 SL E216` | 5xx is masked to 250 |
 | 11 | Valid ID via reply-format address, not a bounce | Legacy (reply) | No | Valid | Reply block → line 2085 (passes) → line 2094-2098 `raise VERPReply` → line 2308 | `250 SL E213` | ID exists |
 | 12 | Invalid ID via reply-format address | Legacy (reply) | No | Invalid | Reply block → line 2085-2087 | `550 SL E512` | ID does **not** exist |
+| 13 | Non-integer/malformed ID (e.g. `bounce+abc+@domain`, `bounce++@domain`, `bounce+-1+@domain`) | Legacy | Any | Malformed | `parse_id_from_bounce()` → `int("+abc")` raises `ValueError` → propagates uncaught through forward/reply block → generic `except Exception` handler at line 2319-2332 → *Source: email_handler.py:2319-2332* | `421 SL E404` | Address format recognized as bounce (confirms `BOUNCE_PREFIX`/`BOUNCE_SUFFIX` match), but no information about ID validity. Creates a **3-way response differential**: 421 (malformed ID) vs 550 (valid integer, no record) vs 250 (valid integer, record exists). The 421 response confirms the recipient address matched the bounce format pattern. |
 
 **Key observation from scenarios 4 and 5:** The **critical ordering insight** is that `EmailLog.get()` (line 2063) is evaluated **before** `is_bounce()` (line 2069). When an invalid ID is probed:
 - Invalid ID → `E512` (550) returned at line 2065-2067, regardless of bounce criteria
@@ -361,7 +372,7 @@ What an attacker learns from each distinct SMTP response code:
 | `E213` (250) | Success | "The address matched a bounce pattern but my email didn't satisfy bounce criteria" — confirms the ID exists (since E512 was not returned before this point) |
 | `E206` (250) | Success | "An OOO auto-reply was received for a **transactional** bounce address" — E206 is **exclusively** returned from the transactional block (line 2052). The forward and reply block OOO paths do **not** return E206; they modify the envelope and fall through to normal routing. |
 | `E216` (250) | Success | "My email triggered a 5xx but it was downgraded due to SPF failure" — **ambiguous**, masks the real status |
-| `E404` (421) | Temporary failure | "An unexpected error occurred" — no useful information about ID validity |
+| `E404` (421) | Temporary failure | "An unexpected error occurred" — no useful information about ID **validity**, but the 421 response confirms the recipient address matched the bounce format pattern (the code entered the bounce handling block and the `ValueError` from `parse_id_from_bounce()` propagated to the generic exception handler). This creates a 3-way differential: 421 (malformed ID, format recognized), 550 (valid integer format, no record), 250 (valid integer format, record exists). |
 
 ---
 
@@ -553,6 +564,8 @@ Beyond simple ID existence, the enumeration reveals several categories of metada
 
 **Data retention windows:** `Bounce` records have 7-day retention — *Source: app/models.py:3290-3291* (docstring: "Deleted after 7 days"). `TransactionalEmail` records also have 7-day retention — *Source: app/models.py:3300-3302*. However, `EmailLog` records may persist longer, as no explicit retention policy is documented in the model definition (*Source: app/models.py:2060-2100*).
 
+**SL_EMAIL_LOG_ID header exposure:** Email log IDs are embedded in forwarded and replied emails via the `SL_EMAIL_LOG_ID` header. During forward-phase processing, the ID is set at `msg[headers.SL_EMAIL_LOG_ID] = str(email_log.id)` — *Source: email_handler.py:845*. During reply-phase processing, the same header is set at `msg[headers.SL_EMAIL_LOG_ID] = str(email_log.id)` — *Source: email_handler.py:1210*. This is the design-intent mechanism by which email log IDs become visible to mailbox owners receiving forwarded emails. However, the enumeration attack described in Section 5.1 does not depend on obtaining IDs through this header — sequential integer probing from 1 upward is sufficient because the IDs are auto-increment integers.
+
 ---
 
 ## 6. Security Boundary Map
@@ -631,7 +644,9 @@ All files examined during this analysis, with the specific line ranges reference
 | `email_handler.py` | 1813-1818 | `is_bounce()` — DSN detection via null sender + `multipart/report` |
 | `email_handler.py` | 1821-1849 | `handle_transactional_bounce()` — transactional bounce processing |
 | `email_handler.py` | 1851-1914 | `handle_bounce()` — central bounce dispatch, `E512`/`E510`/`E211`/`E212` return paths |
-| `email_handler.py` | 1432-1470 | `handle_bounce_forward_phase()` — forward bounce processing, `Bounce` record creation |
+| `email_handler.py` | 845 | `SL_EMAIL_LOG_ID` header set in forward-phase email processing |
+| `email_handler.py` | 1210 | `SL_EMAIL_LOG_ID` header set in reply-phase email processing |
+| `email_handler.py` | 1432-1593 | `handle_bounce_forward_phase()` — forward bounce processing, `Bounce` record creation, `should_disable()` invocation at line 1500 |
 | `email_handler.py` | 1595-1640 | `handle_bounce_reply_phase()` — reply bounce processing |
 | `email_handler.py` | 1945-1960 | `handle()` — main routing entry point, sanitization |
 | `email_handler.py` | 2034-2054 | Transactional VERP detection block |
@@ -640,9 +655,11 @@ All files examined during this analysis, with the specific line ranges reference
 | `email_handler.py` | 2100-2116 | iCloud special case bounce handling |
 | `email_handler.py` | 2145-2160 | `rate_limited()` call site (disabled) |
 | `email_handler.py` | 2288-2318 | `MailHandler.handle_DATA()` — exception handling for VERP exceptions → `E213` |
+| `email_handler.py` | 2319-2332 | Generic `except Exception` handler — `ValueError` from malformed bounce IDs → `E404` |
 | `email_handler.py` | 2334-2378 | `MailHandler._handle()` — SPF-based 5xx downgrade to `E216` |
 | `app/email_utils.py` | 67-69 | `VERP_TIME_START` (1640995200), `VERP_HMAC_ALGO` ("sha3-224") constants |
 | `app/email_utils.py` | 1258-1259 | `parse_id_from_bounce()` — **unvalidated** legacy ID extraction |
+| `app/email_utils.py` | 1166-1255 | `should_disable()` — alias auto-disable based on multi-tier bounce count thresholds |
 | `app/email_utils.py` | 1361-1366 | `should_ignore_bounce()` — bounce sender ignore list |
 | `app/email_utils.py` | 1438-1464 | `generate_verp_email()` — signed VERP address generation |
 | `app/email_utils.py` | 1467-1498 | `get_verp_info_from_email()` — signed VERP validation and parsing |
