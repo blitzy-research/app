@@ -263,7 +263,7 @@ Source: `server.py:572–588`
 
 ```text
 >>> init logging <<<
- * Serving Flask app "app" (lazy loading)
+ * Serving Flask app "server" (lazy loading)
  * Environment: production
    WARNING: This is a development server. Do not use it in a production deployment.
    Use a production WSGI server instead.
@@ -275,7 +275,9 @@ Source: `server.py:572–588`
  * Debugger PIN: xxx-xxx-xxx
 ```
 
-**Note:** The `>>> init logging <<<` message (from `app/log.py:67`) appears twice because Flask's debug mode reloader restarts the process. The werkzeug request logger is disabled at `app/log.py:70–71` (`log = logging.getLogger("werkzeug"); log.disabled = True`), so individual HTTP request logs will not appear in the console. However, the Flask startup banner is printed directly by `app.run()` before the logger is disabled.
+**Note on the app name:** Flask's `name` property (in `Flask` class) resolves `__name__` = `"__main__"` to the basename of `__file__` without extension, yielding `"server"` when started via `python server.py`. Source: Flask 1.1.2 `Flask.name` property.
+
+**Note on logging suppression:** The `>>> init logging <<<` message (from `app/log.py:67`) appears twice because Flask's debug mode reloader restarts the process. The werkzeug logger is disabled at `app/log.py:70–71` (`log = logging.getLogger("werkzeug"); log.disabled = True`) at import time — before `app.run()` is called. This suppresses individual HTTP request logs in the console. The Flask startup banner lines ("Serving Flask app", "Environment", "Debug mode") still appear because `show_server_banner()` uses `click.echo()` (direct stdout), which bypasses the werkzeug logger entirely. The Werkzeug-internal lines ("Running on", "Restarting with stat", "Debugger is active!", "Debugger PIN") are emitted via the werkzeug logger's `_log()` function and **may be suppressed** by the disabled logger — their visibility depends on the exact Werkzeug version's initialization order for the logger handler (Werkzeug 1.0.1 per `poetry.lock`).
 
 Source: `app/log.py:67, 70–71`
 
