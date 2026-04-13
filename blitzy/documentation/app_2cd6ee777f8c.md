@@ -140,7 +140,7 @@ The `create_app()` function at **`server.py:139`** is the Flask application fact
 
 Database connectivity is established at module import time, before any request handling begins:
 
-- **`app/db.py:9-10`**: `engine = create_engine(config.DB_URI, connect_args={"application_name": config.DB_CONN_NAME})` — creates the SQLAlchemy engine using the `DB_URI` from configuration and tags connections with `application_name` (defaulting to `"webapp"` per `app/config.py:193`).
+- **`app/db.py:9-11`**: `engine = create_engine(config.DB_URI, connect_args={"application_name": config.DB_CONN_NAME})` — creates the SQLAlchemy engine using the `DB_URI` from configuration and tags connections with `application_name` (defaulting to `"webapp"` per `app/config.py:193`).
 - **`app/db.py:12`**: `connection = engine.connect()` — a physical database connection is established immediately at import time. If PostgreSQL is unreachable, this line raises an `OperationalError` and the application fails to start.
 - **`app/db.py:14`**: `Session = scoped_session(sessionmaker(bind=connection))` — creates a thread-local scoped session factory used throughout the application.
 
@@ -455,7 +455,7 @@ After initial activation, returning users log in via the login page.
    user = User.get_by(email=email) or User.get_by(email=canonical_email)
    ```
 
-5. **`login.py:45-49`**: **Credential check** — if user is not found OR `user.check_password(form.password.data)` fails (bcrypt verification via `app/pw_models.py:16-21`):
+5. **`login.py:45-50`**: **Credential check** — if user is not found OR `user.check_password(form.password.data)` fails (bcrypt verification via `app/pw_models.py:16-21`):
    - Rate limiter triggered (`g.deduct_limit = True`)
    - Flash: `"Email or password incorrect"`
    - Telemetry: `LoginEvent(LoginEvent.ActionType.failed).send()`
@@ -584,8 +584,8 @@ When `DISABLE_ONBOARDING` is not set, three onboarding jobs are created during r
 | Job Name | Handler | Timing | Purpose |
 |----------|---------|--------|---------|
 | `onboarding-1` | `onboarding_send_from_alias(user)` at `job_runner.py:27-45` | +1 day | Tip email: "Send emails from your alias" |
-| `onboarding-2` | `onboarding_pgp(user)` at `job_runner.py:48-61` | +2 days | Tip email: "Secure your emails with PGP" |
-| `onboarding-4` | `onboarding_final(user)` at `job_runner.py:64-77` | +3 days | Final tip email |
+| `onboarding-2` | `onboarding_mailbox(user)` at `job_runner.py:90-104` | +2 days | Tip email: "Multiple mailboxes" |
+| `onboarding-4` | `onboarding_pgp(user)` at `job_runner.py:48-62` (with Proton mailbox check at `process_job()` lines 207-221) | +3 days | Tip email: "Secure your emails with PGP" |
 
 Each handler retrieves the user's communication email via `user.get_communication_email()`, renders the email template, and sends it via `send_email()`.
 
