@@ -75,7 +75,7 @@ curl -s -o /dev/null -w "%{http_code}" http://localhost:7777/health
 
 #### A1.3 Local Development Entry Point: `local_main()`
 
-For local development, the entry point is `local_main()` at **`server.py:L565-588`**, invoked when the script is run directly (`server.py:L598-599`):
+For local development, the entry point is `local_main()` at **`server.py:L572-588`**, invoked when the script is run directly (`server.py:L598-599`):
 
 ```python
 if __name__ == "__main__":
@@ -426,7 +426,7 @@ The registration endpoint is defined at **`app/auth/views/register.py:L31`**:
 def register():
 ```
 
-The `auth_bp` blueprint (defined in `app/auth/base.py`) is mounted with no URL prefix, making the route accessible at `/auth/register`.
+The `auth_bp` blueprint (defined in `app/auth/base.py`) has `url_prefix="/auth"` set in its constructor (`app/auth/base.py:L4`), making the route accessible at `/auth/register`.
 
 #### B1.2 Registration Guards
 
@@ -644,7 +644,7 @@ def custom_alias():
 Key steps:
 1. Checks `current_user.can_create_new_alias()` (`custom_alias.py:L36`) — if false, logs `"%s can't create new alias"` (`custom_alias.py:L37`) and flashes an upgrade warning.
 2. Validates the alias prefix with `check_alias_prefix()` (`custom_alias.py:L64`) — allows lowercase letters, numbers, dashes, dots, and underscores up to 40 characters.
-3. Validates the signed suffix with `check_suffix_signature()` (`custom_alias.py:L55-60`).
+3. Validates the signed suffix with `check_suffix_signature()` (`custom_alias.py:L89-95`).
 4. Creates `Alias` and `AliasMailbox` records on success.
 
 ---
@@ -719,7 +719,7 @@ This async method is called by aiosmtpd for every inbound SMTP message. It:
 
 ### C2. Message Lifecycle Tracking: `_handle()`
 
-The `_handle()` method at **`email_handler.py:L2334-2378`** wraps the core processing with lifecycle tracking:
+The `_handle()` method at **`email_handler.py:L2335-2378`** (decorated with `@newrelic.agent.background_task()` at `L2334`) wraps the core processing with lifecycle tracking:
 
 1. **Records start time**: `start = time.time()` (`email_handler.py:L2336`).
 2. **Generates unique message ID**: `message_id = str(uuid.uuid4())` (`email_handler.py:L2339`).
