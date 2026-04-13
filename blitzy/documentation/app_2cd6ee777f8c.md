@@ -425,7 +425,7 @@ if not mailbox:
         # only mailbox can send email to the reply-email
         handle_unknown_mailbox(envelope, msg, reply_email, user, alias, contact)
         # return 2** to avoid Postfix sending out bounces and avoid backscatter issue
-        return False, status.E214  # line 1034 — "250 SL E214 Unauthorized"
+        return False, status.E214  # line 1034 — "250 SL E214 Unauthorized for using reverse alias"
 ```
 
 ---
@@ -708,7 +708,7 @@ The code comment at lines 1385–1386 explicitly acknowledges this design trade-
 - If `alias.disable_email_spoofing_check` is `False` → `handle_unknown_mailbox()` is called (line 1032), user receives an alert, and the reply is rejected with `status.E214`.
 - If `alias.disable_email_spoofing_check` is `True` → the system silently falls back to `alias.mailbox` (line 1029), which may be a different mailbox than the actual sender.
 
-**Existing test coverage:** `test_send_email_from_non_canonical_address_on_reply` at `tests/test_email_handler.py:315` tests the scenario where the user's default mailbox email IS the canonical form, and they send from the non-canonical form. This specific test passes because `Mailbox.create()` at `app/models.py:2819-2822` calls `sanitize_email()` (which lowercases but does NOT canonicalize), and the user was created with the canonical form. The test does NOT cover the reverse case (stored non-canonical, sending canonical).
+**Existing test coverage:** `test_send_email_from_non_canonical_address_on_reply` at `tests/test_email_handler.py:315` tests the scenario where the user's default mailbox email IS the canonical form, and they send from the non-canonical form. This specific test passes because `Mailbox.create()` at `app/models.py:2818-2822` calls `sanitize_email()` (which lowercases but does NOT canonicalize), and the user was created with the canonical form. The test does NOT cover the reverse case (stored non-canonical, sending canonical).
 
 ---
 
@@ -799,7 +799,7 @@ The `IntegrityError` is caught due to the unique constraint on `(alias_id, websi
 - Only applies to domains: `gmail.com`, `protonmail.com`, `proton.me`, `pm.me` (line 84)
 - For all other domains, returns the address unchanged after `sanitize_email()` (line 85)
 
-**`Mailbox.create()` at `app/models.py:2819-2822`** sanitizes via `sanitize_email()` (lowercase, strip whitespace) but does **NOT** canonicalize:
+**`Mailbox.create()` at `app/models.py:2818-2822`** sanitizes via `sanitize_email()` (lowercase, strip whitespace) but does **NOT** canonicalize:
 ```python
 @classmethod
 def create(cls, **kw):
@@ -828,7 +828,7 @@ The canonical matching only works when the **stored** email is already in canoni
 1. `mailbox.email == email_address` (line 1371)
 2. Each `mailbox.authorized_addresses` (lines 1374–1382)
 
-**Order dependency:** If two mailboxes have emails that are canonically equivalent (e.g., `john.doe@gmail.com` and `johndoe@gmail.com`), the one that appears first in the sorted list would always be matched, regardless of which one the user actually sent from. Since mailboxes are sorted alphabetically by email (line 1587), `johndoe@gmail.com` would sort before `john.doe@gmail.com` (because `d` < `.`), so the canonical form would always win.
+**Order dependency:** If two mailboxes have emails that are canonically equivalent (e.g., `john.doe@gmail.com` and `johndoe@gmail.com`), the one that appears first in the sorted list would always be matched, regardless of which one the user actually sent from. Since mailboxes are sorted alphabetically by email (line 1587), `john.doe@gmail.com` would sort before `johndoe@gmail.com` (because `.` < `d` in ASCII ordering), so the non-canonical (dotted) form would always be matched first.
 
 ---
 
@@ -891,7 +891,7 @@ flowchart TD
     L -->|"DMARC pass or disabled"| N{"get_mailbox_from_mail_from()<br/>email_handler.py:1364<br/>Match envelope sender to mailbox"}
     N -->|"No match"| O{"alias.disable_email_spoofing_check?<br/>email_handler.py:1021"}
     O -->|"True"| P["⚠️ Use alias.mailbox (default)<br/>SILENT FALLBACK<br/>email_handler.py:1029"]
-    O -->|"False"| Q["❌ handle_unknown_mailbox()<br/>status.E214<br/>'250 SL E214 Unauthorized'"]
+    O -->|"False"| Q["❌ handle_unknown_mailbox()<br/>status.E214<br/>'250 SL E214 Unauthorized for using reverse alias'"]
     N -->|"Matched"| R["Create EmailLog<br/>email_handler.py:1042<br/>(is_reply=True)"]
     P --> R
     R --> S["Spam Check<br/>email_handler.py:1054"]
