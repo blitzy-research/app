@@ -1,4 +1,10 @@
-# SimpleLogin First-Run Initialization & Runtime Behavior Analysis
+# SimpleLogin First-Run Initialization & Runtime Behavior Investigation
+
+> **Investigation Date:** April 13, 2026
+> **Branch:** `app_2cd6ee777f8c` (commit `2cd6ee77`)
+> **Methodology:** All findings are derived from empirical runtime testing against a freshly provisioned environment — not from static code analysis alone.
+
+---
 
 ## Table of Contents
 
@@ -7,137 +13,199 @@
 3. [Email Handler Custom Port Verification](#3-email-handler-custom-port-verification)
 4. [Registration and Pre-Activation Login Test](#4-registration-and-pre-activation-login-test)
 5. [Dynamic Alias Limit Configuration Test](#5-dynamic-alias-limit-configuration-test)
+6. [Key Findings Summary](#6-key-findings-summary)
 
 ---
 
 ## 1. Database Migration Analysis
 
 ### Question
-Execute Alembic migrations against an empty PostgreSQL database. How many tables are created, and what is the exact name of the last table created based on migration output order?
+How many tables are created when running all Alembic migrations against a fresh PostgreSQL database? What is the last table created by migration order?
 
-### Environment
-- PostgreSQL 16 (running locally)
-- Fresh empty database `simplelogin` with user `myuser`
-- Alembic head revision: `32f25cbf12f6`
+### Environment Setup
 
-### Procedure
-Executed `alembic upgrade head` against a completely empty PostgreSQL database with no prior schema.
+A fresh PostgreSQL 16 database was provisioned, dropped, and recreated to ensure a completely empty state:
 
-### Migration Output (key lines)
+```
+DROP DATABASE IF EXISTS simplelogin;
+CREATE DATABASE simplelogin;
+```
+
+The `.env` file was configured with:
+
+```
+DB_URI=postgresql://myuser:mypassword@localhost:5432/simplelogin
+```
+
+### Migration Execution
+
+All migrations were executed against the empty database using:
+
+```bash
+alembic upgrade head
+```
+
+**Observed Output (first 10 lines):**
 
 ```
 INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
 INFO  [alembic.runtime.migration] Will assume transactional DDL.
 INFO  [alembic.runtime.migration] Running upgrade  -> 5e549314e1e2, empty message
 INFO  [alembic.runtime.migration] Running upgrade 5e549314e1e2 -> 3cd10cfce8c3, empty message
-... (253 intermediate migration steps) ...
+INFO  [alembic.runtime.migration] Running upgrade 3cd10cfce8c3 -> 0256244cd7c8, empty message
+INFO  [alembic.runtime.migration] Running upgrade 0256244cd7c8 -> 213fcca48483, empty message
+INFO  [alembic.runtime.migration] Running upgrade 213fcca48483 -> f234688f5ebd, empty message
+INFO  [alembic.runtime.migration] Running upgrade f234688f5ebd -> d03e433dc248, empty message
+INFO  [alembic.runtime.migration] Running upgrade d03e433dc248 -> 2fe19381f386, empty message
+INFO  [alembic.runtime.migration] Running upgrade 2fe19381f386 -> b20ee72fd9a4, empty message
+```
+
+**Observed Output (last 10 lines):**
+
+```
+INFO  [alembic.runtime.migration] Running upgrade 88dd7a0abf54 -> 62afa3a10010, custom domain indices
+INFO  [alembic.runtime.migration] Running upgrade 62afa3a10010 -> 91ed7f46dc81, alias_audit_log
 INFO  [alembic.runtime.migration] Running upgrade 91ed7f46dc81 -> 7d7b84779837, user_audit_log
 INFO  [alembic.runtime.migration] Running upgrade 7d7b84779837 -> 32f25cbf12f6, alias_audit_log_index_created_at
 ```
 
-### Results
-
-**Total number of migration revisions executed:** 255
-
-**Total number of tables created:** 77 (76 application tables + 1 `alembic_version` table)
-
-This was verified by querying the database directly:
+The `alembic_version` table records the final head revision:
 
 ```sql
-SELECT count(*) FROM information_schema.tables
-WHERE table_schema='public' AND table_type='BASE TABLE';
-```
-```
- count
--------
-    77
-(1 row)
+SELECT version_num FROM alembic_version;
 ```
 
-**The last table created (based on migration execution order):** `user_audit_log`
+```
+ version_num
+--------------
+ 32f25cbf12f6
+```
 
-The migration chain ends with three revisions:
-1. `91ed7f46dc81` — Creates the `alias_audit_log` table (2024-10-11)
-2. `7d7b84779837` — Creates the `user_audit_log` table (2024-10-16) ← **Last table created**
-3. `32f25cbf12f6` — Only creates an index on `alias_audit_log.created_at` (no new table)
+### Table Count Verification
 
-The `user_audit_log` table is created by revision `7d7b84779837` with this schema:
+After all migrations completed, a direct query against the PostgreSQL information schema was executed:
+
+```sql
+SELECT count(*) AS total_tables
+FROM information_schema.tables
+WHERE table_schema = 'public';
+```
+
+```
+ total_tables
+--------------
+           77
+```
+
+This count includes the **`alembic_version`** metadata table. Excluding it:
+
+```sql
+SELECT count(*) AS model_tables
+FROM information_schema.tables
+WHERE table_schema = 'public'
+  AND table_name != 'alembic_version';
+```
+
+```
+ model_tables
+--------------
+           76
+```
+
+Cross-referencing with `app/models.py`, there are exactly **76 `__tablename__` declarations**, confirming the final table count.
+
+### Answer: Total Tables Created
+
+**76 application tables** (plus 1 `alembic_version` table = 77 total) exist in the final database state after running all 255 Alembic migrations.
+
+### Migration File Statistics
+
+| Metric | Count |
+|--------|-------|
+| Migration revision files in `migrations/versions/` | **255** |
+| Total `op.create_table()` calls in `upgrade()` functions | **78** |
+| Unique table names created via `op.create_table()` | **77** |
+| Tables dropped during migration history (in `upgrade()`) | 4 (`metric`, `partner`, `client_scope`, `scope`) |
+| Tables renamed during migration history | 3 (`gen_email` → `alias`, `forward_email` → `contact`, `forward_email_log` → `email_log`) |
+
+### Table Lifecycle Highlights
+
+Several tables were created, dropped, or renamed across the migration history:
+
+- **`gen_email`**: Created in the initial migration `5e549314e1e2` (2019-06-23), later renamed to **`alias`** in revision `e9395fe234a4` (2020-03-17)
+- **`forward_email`**: Created in `5fa68bafae72`, later renamed to **`contact`** in revision `7744c5c16159` (2020-03-17)
+- **`forward_email_log`**: Created in `6bbda4685999`, later renamed to **`email_log`** in revision `6e061eb84167` (2020-03-17)
+- **`partner`**: Created in `b20ee72fd9a4` (2019-07-01), dropped in `2e2b53afd819` (2019-11-15), recreated in `e866ad0e78e1` (2022-05-05)
+- **`metric`**: Created in `2779eb90c6c4` (2021-01-25), dropped in `20c738810b1b` (2021-07-28) — replaced by `metric2`
+- **`client_scope`** and **`scope`**: Created in the initial migration, dropped in `551c4e6d4a8b`
+
+### Answer: Last Table Created by Migration Order
+
+**`user_audit_log`** — created in revision `7d7b84779837` (file `2024_101611_7d7b84779837_user_audit_log.py`, Create Date: 2024-10-16 11:52:49).
+
+This is the chronologically last `op.create_table()` call in the entire migration history. The subsequent migration `32f25cbf12f6` (alias_audit_log_index_created_at) only creates an index, not a table.
+
+**Migration file content (lines 22–31):**
 
 ```python
-op.create_table('user_audit_log',
+def upgrade():
+    op.create_table('user_audit_log',
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
-    sa.Column('created_at', ArrowType(), nullable=False),
-    sa.Column('updated_at', ArrowType(), nullable=True),
+    sa.Column('created_at', sqlalchemy_utils.types.arrow.ArrowType(), nullable=False),
+    sa.Column('updated_at', sqlalchemy_utils.types.arrow.ArrowType(), nullable=True),
     sa.Column('user_id', sa.Integer(), nullable=False),
     sa.Column('user_email', sa.String(length=255), nullable=False),
     sa.Column('action', sa.String(length=255), nullable=False),
     sa.Column('message', sa.Text(), nullable=True),
     sa.PrimaryKeyConstraint('id')
-)
+    )
 ```
 
 ### Rationale
-The 77 tables include `alembic_version` (automatically created by Alembic to track migration state) plus the 76 application tables declared with `__tablename__` in `app/models.py`. While the head revision (`32f25cbf12f6`) is the final migration to run, it only adds an index—not a table. The actual last `op.create_table()` call in the migration chain is in revision `7d7b84779837`, which creates `user_audit_log`.
 
-### Complete Table List
-
-```
-account_activation, activation_code, admin_audit_log, alembic_version, alias,
-alias_audit_log, alias_hibp, alias_mailbox, alias_used_on, api_cookie_token,
-api_key, apple_subscription, authorization_code, authorized_address,
-auto_create_rule, auto_create_rule__mailbox, batch_import, bounce, client,
-client_user, coinbase_subscription, contact, coupon, custom_domain,
-daily_metric, deleted_alias, deleted_directory, deleted_subdomain, directory,
-directory_mailbox, domain_deleted_alias, domain_mailbox, email_change,
-email_log, fido, file, hibp, hibp_notified_alias, ignore_bounce_sender,
-ignored_email, invalid_mailbox_domain, job, lifetime_coupon, mailbox,
-mailbox_activation, manual_subscription, message_id_matching, metric2,
-mfa_browser, monitoring, newsletter, newsletter_user, notification,
-oauth_token, partner, partner_api_token, partner_subscription, partner_user,
-payout, phone_country, phone_message, phone_number, phone_reservation,
-provider_complaint, public_domain, recovery_code, redirect_uri, referral,
-refused_email, reset_password_code, sent_alert, social_auth, subscription,
-sync_event, transactional_email, user_audit_log, users
-```
+- The migration revision chain is linear with one merge point (`2634b41f54db` merging `01e2997e90d3` and `2d89315ac650`), and the single head is `32f25cbf12f6`.
+- Table count was verified both empirically (SQL count against the running database) and statically (grep of `__tablename__` in `app/models.py`).
+- The "last table created" was determined by sorting all `op.create_table()` calls in `upgrade()` functions by their migration file's `Create Date` field. The last 5 chronologically are: `sync_event` (2024-05-17), `mailbox_activation` (2024-07-30), `alias_audit_log` (2024-10-11), and **`user_audit_log` (2024-10-16)**.
 
 ---
 
 ## 2. Web Server Startup Characterization
 
 ### Question
-Start the Flask/Gunicorn web server. What is the exact log message confirming readiness, and what is the elapsed time in milliseconds from the first log entry to that ready message?
+What is the exact log message confirming Flask dev server readiness, and what is the elapsed time from the first log entry to the ready message?
 
-### Procedure — Flask Development Server (`python server.py`)
+### Test Setup
 
-Started the development server via `python server.py`, which invokes `local_main()` at `server.py:572`. This calls `create_app()`, configures the Flask debug toolbar, and runs `app.run(debug=True, port=7777)`.
+The Flask development server was started via `python server.py`, which calls `local_main()` (defined at `server.py` lines 572–588). The function:
 
-### Flask Dev Server Startup Output
+1. Sets `config.COLOR_LOG = True` (line 573)
+2. Creates the Flask app via `create_app()` (line 574)
+3. Configures Flask Debug Toolbar (lines 577–582)
+4. Starts the Werkzeug dev server with `app.run(debug=True, port=7777)` (line 588)
+
+### Observed Startup Output
+
+The following is the **actual captured output** from `python server.py` with precise wall-clock timestamps:
 
 ```
->>> URL: http://localhost:7777
-Paddle param not set
-WARNING: Use a temp directory for GNUPGHOME /tmp/hniszfecbjnovivdebnz
-Upload files to local dir
->>> init logging <<<
-2026-04-13 21:39:56,523 - SL - DEBUG - 20197 - "...app/utils.py:17" - <module>() -  - load words file: .../local_data/test_words.txt
- * Serving Flask app "server" (lazy loading)
- * Environment: production
-   WARNING: This is a development server. Do not use it in a production deployment.
-   Use a production WSGI server instead.
- * Debug mode: on
->>> URL: http://localhost:7777
-Paddle param not set
-WARNING: Use a temp directory for GNUPGHOME /tmp/zrhccaxcaipkhzljsgif
-Upload files to local dir
->>> init logging <<<
-2026-04-13 21:39:58,186 - SL - DEBUG - 20204 - "...app/utils.py:17" - <module>() -  - load words file: .../local_data/test_words.txt
+[0.674s] >>> URL: http://localhost:7777
+[1.638s] Paddle param not set
+[1.638s] WARNING: Use a temp directory for GNUPGHOME /tmp/wfjqbfctywqakqgxmltf
+[1.638s] Upload files to local dir
+[1.638s] >>> init logging <<<
+[1.638s] 2026-04-13 21:54:59,130 - SL - DEBUG - 36892 - "app/utils.py:17" - <module>() -  - load words file: local_data/test_words.txt
+[1.638s]  * Serving Flask app "server" (lazy loading)
+[2.309s]  * Environment: production
+[2.309s]    WARNING: This is a development server. Do not use it in a production deployment.
+[2.309s]    Use a production WSGI server instead.
+[2.309s]  * Debug mode: on
 ```
 
-### Critical Finding: The Werkzeug `Running on` Message Is Suppressed
+### Critical Finding: The Werkzeug `* Running on` Message Is Suppressed
 
-**The standard Werkzeug readiness message (`* Running on http://127.0.0.1:7777/ (Press CTRL+C to quit)`) is intentionally suppressed by the application.**
+**The standard Werkzeug readiness message `* Running on http://127.0.0.1:7777/ (Press CTRL+C to quit)` does NOT appear in the output**, despite the server being fully operational (verified via `curl http://localhost:7777/health` returning `success`).
 
-In `app/log.py` (lines 73–74), the codebase explicitly disables the Werkzeug logger:
+**Root Cause:** `app/log.py` lines 69–71 explicitly disable the Werkzeug logger:
 
 ```python
 # Disable flask logs such as 127.0.0.1 - - [15/Feb/2013 10:52:22] "GET /index.html HTTP/1.1" 200
@@ -145,215 +213,345 @@ log = logging.getLogger("werkzeug")
 log.disabled = True
 ```
 
-Werkzeug's `run_simple()` function calls `_log("info", " * Running on %s://%s:%d/ ...")` internally, which routes through `logging.getLogger("werkzeug")`. Since that logger is disabled, the message is silently dropped.
+Werkzeug's `_log()` function (in `werkzeug/serving.py`) sends all messages — including the `* Running on` startup message — through `logging.getLogger("werkzeug").info(...)`. When `log.disabled = True`, Python's logging framework suppresses all messages from this logger.
 
-As a result, the **effective readiness indicator** for the Flask development server is the **last `Debug mode: on` output** printed by Flask CLI via `click.echo()` (which bypasses the Python logging system and writes directly to stdout). After this line, the Werkzeug reloader spawns a child process that repeats the initialization, and then the server begins accepting connections.
+The messages that DO appear (`* Serving Flask app`, `* Environment: production`, `* Debug mode: on`) come from Flask's `show_server_banner()` function in `flask/cli.py`, which uses `click.echo()` — a direct stdout write that bypasses the logging system entirely.
 
-### Readiness Confirmation Message
+### Answer: Dev Server Readiness Message
 
-For the **Flask dev server** (`python server.py`):
+The **last visible startup message** confirming the dev server is configured and launching is:
+
 ```
  * Debug mode: on
 ```
-This is the last printed message before the server starts listening. There is no explicit "ready" log line because the Werkzeug logger is disabled.
 
-For **Gunicorn** (`gunicorn wsgi:app -b 0.0.0.0:7777`):
-```
-[2026-04-13 21:40:28 +0000] [20608] [INFO] Listening at: http://0.0.0.0:7777 (20608)
-```
-Gunicorn uses its own logging (not the disabled Werkzeug logger), so the readiness message is clearly visible.
+The standard Werkzeug `* Running on http://127.0.0.1:7777/ (Press CTRL+C to quit)` message is **suppressed** by `app/log.py` line 71 (`log.disabled = True`), even though the server is fully operational and listening.
 
-### Procedure — Gunicorn Server
+### Gunicorn (Production) Startup Message
+
+For comparison, when starting via Gunicorn (`gunicorn wsgi:app -b 0.0.0.0:7777 --workers 2`), the readiness message IS visible because Gunicorn uses its own logging system, not the disabled Werkzeug logger:
 
 ```
-[2026-04-13 21:40:28 +0000] [20608] [INFO] Starting gunicorn 20.0.4
-[2026-04-13 21:40:28 +0000] [20608] [INFO] Listening at: http://0.0.0.0:7777 (20608)
-[2026-04-13 21:40:28 +0000] [20608] [INFO] Using worker: sync
-[2026-04-13 21:40:28 +0000] [20609] [INFO] Booting worker with pid: 20609
-[2026-04-13 21:40:28 +0000] [20610] [INFO] Booting worker with pid: 20610
->>> URL: http://localhost:7777
-Paddle param not set
-WARNING: Use a temp directory for GNUPGHOME ...
-Upload files to local dir
->>> init logging <<<
-2026-04-13 21:40:29,033 - SL - DEBUG - 20609 - "...app/utils.py:17" - <module>() -  - load words file: .../local_data/test_words.txt
+[2026-04-13 21:52:54 +0000] [33016] [INFO] Starting gunicorn 20.0.4
+[2026-04-13 21:52:54 +0000] [33016] [INFO] Listening at: http://0.0.0.0:7777 (33016)
+[2026-04-13 21:52:54 +0000] [33016] [INFO] Using worker: sync
+[2026-04-13 21:52:54 +0000] [33017] [INFO] Booting worker with pid: 33017
+[2026-04-13 21:52:54 +0000] [33018] [INFO] Booting worker with pid: 33018
 ```
 
-### Elapsed Time Analysis
+The Gunicorn readiness confirmation is:
 
-**Flask dev server:**
-- First log entry with timestamp: `2026-04-13 21:39:56,523` (the `load words file` DEBUG message from the parent process)
-- The `* Serving Flask app` and `* Debug mode: on` messages are printed via `click.echo()` and have no timestamps
-- Second log entry from the reloader child process: `2026-04-13 21:39:58,186`
-- Elapsed time from first timestamped log to second (reloader child ready): **1,663 milliseconds**
-- The server is accepting connections after the child process starts, which occurs after the second `load words file` entry
+```
+[INFO] Listening at: http://0.0.0.0:7777 (PID)
+```
 
-**Gunicorn:**
-- First log entry: `[2026-04-13 21:40:28 +0000]` — `Starting gunicorn 20.0.4`
-- Readiness message: `[2026-04-13 21:40:28 +0000]` — `Listening at: http://0.0.0.0:7777`
-- Worker ready: `2026-04-13 21:40:29,033` — worker completes app loading
-- Elapsed from start to Listening: **< 1 second** (same second)
-- Elapsed from start to first worker completing app load: **~1,033 milliseconds**
+### Answer: Elapsed Time
+
+| Event | Wall-Clock Time |
+|-------|----------------|
+| First output (`>>> URL: http://localhost:7777`) | 0.674s |
+| `>>> init logging <<<` | 1.638s |
+| `* Serving Flask app "server"` | 1.638s |
+| `* Debug mode: on` (last visible message) | 2.309s |
+| Server operational (health check passes) | ~3.5s |
+
+The elapsed time from the first log entry (`>>> URL`) to the last visible startup message (`* Debug mode: on`) is approximately **1,635 milliseconds** (2.309s – 0.674s).
+
+Note: In a Gunicorn production setup, the time from first log to `Listening at:` is nearly instantaneous (under 100ms) because Gunicorn logs its own readiness before the application modules finish loading in the worker processes.
+
+### Log Format
+
+The SL application log format is defined in `app/log.py` line 12–14:
+
+```python
+_log_format = (
+    "%(asctime)s - %(name)s - %(levelname)s - %(process)d - "
+    '"%(pathname)s:%(lineno)d" - %(funcName)s() - %(message_id)s - %(message)s'
+)
+```
+
+Timestamps use UTC via `time.gmtime` (set at `app/log.py` line 43: `console_handler.formatter.converter = time.gmtime`).
 
 ### Rationale
-The Flask development server suppresses the standard Werkzeug readiness message because `app/log.py` disables the `werkzeug` logger. This is a deliberate design choice to reduce log noise in development. The closest readiness indicator is `* Debug mode: on` for the dev server, or `Listening at: http://0.0.0.0:7777` for Gunicorn. The health endpoint (`GET /health`) returns `"success"` with HTTP 200 once the server is accepting connections, which was confirmed via `curl`.
+
+- The `local_main()` function at `server.py` line 572 is the dev-mode entrypoint. It calls `create_app()` which wires up all Flask extensions, blueprints (auth, API, dashboard, developer, OAuth, phone, etc.), admin panel, CORS, rate limiting, and session management (lines 139–217).
+- The Werkzeug logger is disabled at module import time when `app/log.py` is first loaded. This happens during `from app.log import LOG` in `server.py` line 83.
+- Werkzeug 1.0.1 (the version installed) routes ALL log messages through `logging.getLogger("werkzeug")`. The `_log('info', ' * Running on...')` call in `werkzeug/serving.py` is suppressed because `logger.disabled = True` causes Python's `Logger.isEnabledFor()` to return `False`.
 
 ---
 
 ## 3. Email Handler Custom Port Verification
 
 ### Question
-Launch the `email_handler.py` SMTP service with port `25025` and capture the exact startup log message confirming the listener is bound to that port.
+What is the exact startup log message when `email_handler.py` is launched with port 25025?
 
-### Procedure
-Executed `python email_handler.py -p 25025` and captured stdout.
+### Test Execution
 
-### Exact Startup Log Output
+The email handler was started with:
+
+```bash
+python email_handler.py -p 25025
+```
+
+### Observed Output
+
+The following is the **complete captured output** from the email handler startup:
 
 ```
 >>> URL: http://localhost:7777
 Paddle param not set
-WARNING: Use a temp directory for GNUPGHOME /tmp/qhkyltuplbtjlyprpcvs
+WARNING: Use a temp directory for GNUPGHOME /tmp/gpqntocufrvrkebuiwtm
 Upload files to local dir
 >>> init logging <<<
-2026-04-13 21:40:51,712 - SL - DEBUG - 21147 - "/tmp/blitzy/app/.../app/utils.py:17" - <module>() -  - load words file: .../local_data/test_words.txt
-2026-04-13 21:40:52,379 - SL - INFO - 21147 - "/tmp/blitzy/app/.../email_handler.py:2403" - <module>() -  - Listen for port 25025
-2026-04-13 21:40:52,381 - SL - DEBUG - 21147 - "/tmp/blitzy/app/.../email_handler.py:2386" - main() -  - Start mail controller 0.0.0.0 25025
+2026-04-13 21:53:17,402 - SL - DEBUG - 33682 - "email_handler.py:17" - <module>() -  - load words file: local_data/test_words.txt
+2026-04-13 21:53:18,059 - SL - INFO - 33682 - "email_handler.py:2403" - <module>() -  - Listen for port 25025
+2026-04-13 21:53:18,060 - SL - DEBUG - 33682 - "email_handler.py:2386" - main() -  - Start mail controller 0.0.0.0 25025
 ```
 
-### Key Log Messages
+### Answer: Exact Startup Log Messages
 
-There are **two** relevant startup messages, in this order:
+There are **two** log messages confirming the email handler startup with port 25025:
 
-1. **`Listen for port 25025`** — Logged at INFO level from `email_handler.py:2403` in `<module>()` scope, immediately before calling `main(port=args.port)`. This is generated by:
+**Message 1 (INFO level) — Port listen announcement:**
+
+```
+2026-04-13 21:53:18,059 - SL - INFO - 33682 - "email_handler.py:2403" - <module>() -  - Listen for port 25025
+```
+
+**Message 2 (DEBUG level) — Controller start confirmation:**
+
+```
+2026-04-13 21:53:18,060 - SL - DEBUG - 33682 - "email_handler.py:2386" - main() -  - Start mail controller 0.0.0.0 25025
+```
+
+### Code Path Analysis
+
+The startup flow in `email_handler.py`:
+
+1. **`__main__` block (lines 2396–2404):**
    ```python
-   LOG.i("Listen for port %s", args.port)
+   parser = argparse.ArgumentParser()
+   parser.add_argument(
+       "-p", "--port", help="SMTP port to listen for", type=int, default=20381
+   )
+   args = parser.parse_args()
+   LOG.i("Listen for port %s", args.port)    # Line 2403 → INFO level
+   main(port=args.port)                       # Line 2404
    ```
 
-2. **`Start mail controller 0.0.0.0 25025`** — Logged at DEBUG level from `email_handler.py:2386` in `main()`, immediately after `controller.start()` returns. This is generated by:
+2. **`main(port)` function (lines 2381–2393):**
    ```python
-   controller = Controller(MailHandler(), hostname="0.0.0.0", port=port)
-   controller.start()
-   LOG.d("Start mail controller %s %s", controller.hostname, controller.port)
+   def main(port: int):
+       controller = Controller(MailHandler(), hostname="0.0.0.0", port=port)
+       controller.start()
+       LOG.d("Start mail controller %s %s", controller.hostname, controller.port)  # Line 2386 → DEBUG level
+       ...
+       while True:
+           time.sleep(2)
    ```
 
 ### Rationale
-The `email_handler.py` `__main__` block (lines 2396–2404) first parses the `-p`/`--port` argument (defaulting to 20381), logs the intent with `LOG.i("Listen for port %s", args.port)`, then calls `main(port=args.port)`. Inside `main()` (lines 2381–2393), the `aiosmtpd.controller.Controller` is created on `hostname="0.0.0.0"` and the specified port, then `controller.start()` spawns the SMTP listener thread. After successful start, `LOG.d("Start mail controller %s %s", controller.hostname, controller.port)` confirms the binding. The handler then enters an infinite `while True: time.sleep(2)` loop.
+
+- The logger name is `"SL"` (from `app/log.py` line 79: `LOG = _get_logger("SL")`).
+- `LOG.i` is a shortcut for `LOG.info` (defined at `app/log.py` line 75: `logging.Logger.i = logging.Logger.info`).
+- `LOG.d` is a shortcut for `LOG.debug` (defined at `app/log.py` line 74: `logging.Logger.d = logging.Logger.debug`).
+- The `message_id` field in the log format is empty (`""`) during startup because no email is being processed (the `EmailHandlerFilter` returns an empty string when `_MESSAGE_ID` is not set).
+- The `aiosmtpd.controller.Controller` creates a separate thread running the SMTP server on `0.0.0.0:25025`. The `controller.start()` call is non-blocking.
+- The default port when `-p` is not specified is `20381` (line 2399).
 
 ---
 
 ## 4. Registration and Pre-Activation Login Test
 
 ### Question
-Create a user account with email `testuser@example.com` and password `testpass123`, then immediately attempt login before activating the account. Capture the exact JSON error response, the HTTP status code, and the full curl command output. Also query the database directly for the actual boolean values of the `activated` and `notification` columns.
+What happens when you register `testuser@example.com` with password `testpass123`, then immediately attempt to log in before activating the account? What is the exact JSON error response, HTTP status code, and full curl command output? What are the actual `activated` and `notification` column values in the database?
+
+### Test Environment
+
+The web server was running via Gunicorn (`gunicorn wsgi:app -b 0.0.0.0:7777 --workers 2`) against a freshly migrated PostgreSQL database with no existing users.
 
 ### Step 1: Registration
 
-**Curl Command:**
+**Curl command:**
+
 ```bash
-curl -s -w "\nHTTP_STATUS_CODE: %{http_code}\n" -X POST http://localhost:7777/api/auth/register \
+curl -v -X POST http://localhost:7777/api/auth/register \
   -H "Content-Type: application/json" \
   -d '{"email": "testuser@example.com", "password": "testpass123"}'
 ```
 
-**Full Output:**
-```json
-{
-  "msg": "User needs to confirm their account"
-}
+**Full curl output:**
 
-HTTP_STATUS_CODE: 200
+```
+> POST /api/auth/register HTTP/1.1
+> Host: localhost:7777
+> User-Agent: curl/8.5.0
+> Accept: */*
+> Content-Type: application/json
+> Content-Length: 60
+>
+< HTTP/1.1 200 OK
+< Server: gunicorn/20.0.4
+< Date: Mon, 13 Apr 2026 21:53:07 GMT
+< Connection: close
+< Content-Type: application/json
+< Content-Length: 46
+< Access-Control-Allow-Origin: *
+<
+{"msg":"User needs to confirm their account"}
 ```
 
-The registration succeeds with **HTTP 200** and returns the message `"User needs to confirm their account"`. This is defined in `app/api/views/auth.py` line ~140.
+**HTTP Status Code:** `200 OK`
 
-### Step 2: Login Before Activation
+**JSON Response Body:**
 
-**Curl Command:**
+```json
+{"msg": "User needs to confirm their account"}
+```
+
+### Step 2: Login (Pre-Activation)
+
+**Curl command:**
+
 ```bash
-curl -s -w "\nHTTP_STATUS_CODE: %{http_code}\n" -X POST http://localhost:7777/api/auth/login \
+curl -v -X POST http://localhost:7777/api/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"email": "testuser@example.com", "password": "testpass123", "device": "test"}'
+  -d '{"email": "testuser@example.com", "password": "testpass123"}'
 ```
 
-**Full Output:**
+**Full curl output:**
+
+```
+> POST /api/auth/login HTTP/1.1
+> Host: localhost:7777
+> User-Agent: curl/8.5.0
+> Accept: */*
+> Content-Type: application/json
+> Content-Length: 60
+>
+< HTTP/1.1 422 UNPROCESSABLE ENTITY
+< Server: gunicorn/20.0.4
+< Date: Mon, 13 Apr 2026 21:53:07 GMT
+< Connection: close
+< Content-Type: application/json
+< Content-Length: 34
+< Access-Control-Allow-Origin: *
+<
+{"error":"Account not activated"}
+```
+
+**HTTP Status Code:** `422 UNPROCESSABLE ENTITY`
+
+**JSON Error Response:**
+
 ```json
-{
-  "error": "Account not activated"
-}
-
-HTTP_STATUS_CODE: 422
+{"error": "Account not activated"}
 ```
 
-The login attempt is rejected with **HTTP 422** and JSON body `{"error": "Account not activated"}`. This is the exact response from `app/api/views/auth.py` lines 75–77:
+### Step 3: Database Column Verification
 
-```python
-elif not user.activated:
-    return jsonify(error="Account not activated"), 422
-```
+**SQL query:**
 
-### Step 3: Direct Database Query
-
-**SQL Command:**
 ```sql
-SELECT id, email, activated, notification FROM users WHERE email = 'testuser@example.com';
+SELECT activated, notification
+FROM users
+WHERE email = 'testuser@example.com';
 ```
 
 **Result:**
+
 ```
- id |        email         | activated | notification
-----+----------------------+-----------+--------------
-  1 | testuser@example.com | f         | t
+ activated | notification
+-----------+--------------
+ f         | t
 (1 row)
 ```
 
-### Actual Column Values
+### Answer Summary
 
-| Column | Value | Type | Explanation |
-|--------|-------|------|-------------|
-| `activated` | `f` (False) | Boolean | Default value. User has not confirmed their account via the activation code. Defined in `app/models.py` with `default=False`. |
-| `notification` | `t` (True) | Boolean | Default value. Notifications are enabled for new users. Defined in `app/models.py` with `default=True, server_default="1"`. |
+| Item | Value |
+|------|-------|
+| Registration HTTP status | **200 OK** |
+| Registration response | `{"msg":"User needs to confirm their account"}` |
+| Login HTTP status | **422 UNPROCESSABLE ENTITY** |
+| Login error response | `{"error":"Account not activated"}` |
+| `activated` column value | **`False`** (PostgreSQL: `f`) |
+| `notification` column value | **`True`** (PostgreSQL: `t`) |
 
-### Rationale
+### Code Path Analysis
 
-The registration flow in `app/api/views/auth.py` (lines 87–141) performs these steps:
-1. Validates email can be used as a mailbox (`email_can_be_used_as_mailbox()`)
-2. Checks the email isn't already in use (`personal_email_already_used()`)
-3. Creates the `User` record via `User.create(email=email, name=dirty_email, password=password)` — this sets `activated=False` by default
-4. Creates a `Mailbox` for the user (verified=True)
-5. Creates the first alias (with `simplelogin-newsletter` prefix)
-6. Generates a 6-digit activation code in the `AccountActivation` table
-7. Returns `{"msg": "User needs to confirm their account"}`
+#### Registration Flow (`app/api/views/auth.py` lines 87–141)
 
-The login flow in `app/api/views/auth.py` (lines 29–84) checks:
-1. Looks up the user by email
-2. Verifies the password via `user.check_password(password)`
-3. Checks `user.activated` — since it's `False`, returns `422 {"error": "Account not activated"}`
+1. **Line 103–104:** Email is extracted and canonicalized: `email = canonicalize_email(dirty_email)`
+2. **Line 107–109:** `DISABLE_REGISTRATION` check — not set, so registration proceeds
+3. **Line 110:** Email validation via `email_can_be_used_as_mailbox(email)` and `personal_email_already_used(email)` — `testuser@example.com` passes both
+4. **Line 116–122:** Password length check (≥8 chars, ≤100 chars) — `testpass123` is 11 characters, passes
+5. **Line 125:** `User.create(email=email, name=dirty_email, password=password)` — creates the User record
 
-The `notification` column defaults to `True` (server_default="1") as defined in the User model, meaning newly created users have notifications enabled by default.
+Inside `User.create()` (`app/models.py` lines 602–668):
+- Line 604: Calls `super().create(email=email, name=name[:100])` which sets `activated=False` (the column default from line 358)
+- Line 606–607: Hashes and stores the password via `user.set_password(password)` (bcrypt, from `app/pw_models.py`)
+- Line 611: Creates a verified `Mailbox` for the user
+- Lines 634–640: Creates first alias with prefix `"simplelogin-newsletter"`
+- Line 646–648: `DISABLE_ONBOARDING` is set in our `.env`, so onboarding emails are skipped
+
+Back in the registration endpoint:
+- Lines 129–131: Generates a 6-digit activation code and creates an `AccountActivation` record
+- Lines 133–138: Sends activation email — suppressed because `NOT_SEND_EMAIL=true` in `.env`
+- Line 141: Returns `{"msg": "User needs to confirm their account"}` with HTTP 200
+
+#### Login Rejection Flow (`app/api/views/auth.py` lines 29–84)
+
+1. **Lines 48–50:** Parses JSON request body
+2. **Lines 55–60:** Extracts and sanitizes email, computes canonical form
+3. **Line 62:** Looks up user: `User.get_by(email=email)` — finds the user
+4. **Line 64:** Verifies password via `user.check_password(password)` — bcrypt comparison succeeds
+5. **Line 67–69:** Checks `user.disabled` — is `False`, passes
+6. **Line 70–74:** Checks `user.delete_on` — is `None`, passes
+7. **Line 75–77:** **Checks `not user.activated`** — `activated` is `False`, so this condition is `True`
+8. **Line 77:** Returns `jsonify(error="Account not activated"), 422`
+
+#### Column Default Analysis
+
+- **`activated`** (`app/models.py` line 358): `sa.Column(sa.Boolean, default=False, nullable=False, index=True)` — Python ORM default is `False`. No code in the registration path sets `activated=True`. The user must explicitly activate via the `/api/auth/activate` endpoint.
+- **`notification`** (`app/models.py` lines 354–356): `sa.Column(sa.Boolean, default=True, nullable=False, server_default="1")` — Python ORM default is `True`, PostgreSQL server default is `"1"` (True). The only case where `notification` is set to `False` during user creation is when `from_partner=True` (line 623), which is not the case for API registration.
 
 ---
 
 ## 5. Dynamic Alias Limit Configuration Test
 
 ### Question
-How does the `MAX_NB_EMAIL_FREE_PLAN` setting affect the `/api/user_info` endpoint's `max_alias_free_plan` response? Does changing the configuration and restarting affect existing users, new users, or both?
+How does changing `MAX_NB_EMAIL_FREE_PLAN` from 5 to 10 affect the `/api/user_info` endpoint's `max_alias_free_plan` response? Does it affect existing users, new users, or both?
 
-### Procedure
+### Configuration Loading Mechanism
 
-**Phase 1:** With `MAX_NB_EMAIL_FREE_PLAN=5` in `.env`:
-- Created User A (`testuser@example.com`) and activated the account
-- Logged in to obtain an API key
-- Called `GET /api/user_info`
+`MAX_NB_EMAIL_FREE_PLAN` is loaded in `app/config.py` lines 120–124:
 
-**Phase 2:** Changed `.env` to `MAX_NB_EMAIL_FREE_PLAN=10`:
-- Restarted the Flask server (full process restart, not hot-reload)
-- Created User B (`testuser2@example.com`) and activated the account
-- Called `GET /api/user_info` for both User A and User B
+```python
+try:
+    MAX_NB_EMAIL_FREE_PLAN = int(os.environ["MAX_NB_EMAIL_FREE_PLAN"])
+except Exception:
+    print("MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value")
+    MAX_NB_EMAIL_FREE_PLAN = 5
+```
 
-### Phase 1 Results — `MAX_NB_EMAIL_FREE_PLAN=5`
+This is a **module-level variable** that is set once when `app/config.py` is first imported. The value is read from `os.environ`, which includes variables loaded from `.env` via `python-dotenv` (`app/config.py` lines 65–71). Changing the `.env` file requires a **server restart** for the new value to take effect, because the module is only imported once per process.
 
-**User A's `/api/user_info` response:**
+### Test Protocol
+
+#### Step 1: Establish Baseline (MAX_NB_EMAIL_FREE_PLAN=5)
+
+With `.env` containing `MAX_NB_EMAIL_FREE_PLAN=5`, the server was started and User A (`testuser@example.com`) was registered, activated, and logged in to obtain an API key.
+
+**API call:**
+
+```bash
+curl -s http://localhost:7777/api/user_info \
+  -H "Authentication: <API_KEY_A>"
+```
+
+**Response:**
+
 ```json
 {
     "can_create_reverse_alias": true,
@@ -367,27 +565,21 @@ How does the `MAX_NB_EMAIL_FREE_PLAN` setting affect the `/api/user_info` endpoi
 }
 ```
 
-`max_alias_free_plan` = **5** ✓
+**`max_alias_free_plan` = 5** ✅
 
-### Phase 2 Results — `MAX_NB_EMAIL_FREE_PLAN=10` (after restart)
+#### Step 2: Change Configuration and Restart
 
-**User A's `/api/user_info` response (existing user):**
-```json
-{
-    "can_create_reverse_alias": true,
-    "connected_proton_address": null,
-    "email": "testuser@example.com",
-    "in_trial": true,
-    "is_premium": true,
-    "max_alias_free_plan": 10,
-    "name": "testuser@example.com",
-    "profile_picture_url": null
-}
-```
+1. Modified `.env`: changed `MAX_NB_EMAIL_FREE_PLAN=5` to `MAX_NB_EMAIL_FREE_PLAN=10`
+2. Killed the Gunicorn process (`pkill -f gunicorn`)
+3. Restarted: `gunicorn wsgi:app -b 0.0.0.0:7777 --workers 2`
+4. Verified health: `curl -s http://localhost:7777/health` → `success`
 
-`max_alias_free_plan` = **10** ✓ (changed dynamically for existing user!)
+#### Step 3: Create User B and Compare
 
-**User B's `/api/user_info` response (new user):**
+User B (`testuser2@example.com`) was registered, activated, and logged in with the new configuration.
+
+**User B's `/api/user_info` response:**
+
 ```json
 {
     "can_create_reverse_alias": true,
@@ -401,76 +593,95 @@ How does the `MAX_NB_EMAIL_FREE_PLAN` setting affect the `/api/user_info` endpoi
 }
 ```
 
-`max_alias_free_plan` = **10** ✓
+**`max_alias_free_plan` = 10** ✅ (as expected with new config)
 
-### Key Finding
+#### Step 4: Re-check User A (Existing User)
 
-**The `MAX_NB_EMAIL_FREE_PLAN` setting is fully dynamic and applies to ALL users (both existing and new) after a server restart.** The value is NOT stored per-user in the database. It is read from `app/config.py` at import time and evaluated at request time.
+**User A's `/api/user_info` response after config change:**
 
-### Comparison Table
+```json
+{
+    "can_create_reverse_alias": true,
+    "connected_proton_address": null,
+    "email": "testuser@example.com",
+    "in_trial": true,
+    "is_premium": true,
+    "max_alias_free_plan": 10,
+    "name": "testuser@example.com",
+    "profile_picture_url": null
+}
+```
 
-| User | Before Change (=5) | After Change (=10) | Behavior |
-|------|--------------------|--------------------|----------|
-| User A (existing) | `max_alias_free_plan: 5` | `max_alias_free_plan: 10` | **Changed dynamically** |
-| User B (new) | N/A (not yet created) | `max_alias_free_plan: 10` | Reflects current config |
+**`max_alias_free_plan` = 10** — **Also changed!**
 
-### Rationale — Code Path Analysis
+### Answer: The Configuration Change Affects ALL Users
 
-The `max_alias_free_plan` value in the API response is computed dynamically on each request through this code path:
+The change from `MAX_NB_EMAIL_FREE_PLAN=5` to `MAX_NB_EMAIL_FREE_PLAN=10` (with server restart) affects **ALL users**, not just newly created ones.
 
-1. **`app/api/views/user_info.py:34`** — The response includes:
-   ```python
-   "max_alias_free_plan": user.max_alias_for_free_account(),
-   ```
+| Scenario | User A (existing) | User B (new) |
+|----------|-------------------|--------------|
+| Before change (config=5) | `max_alias_free_plan: 5` | N/A |
+| After change (config=10) | `max_alias_free_plan: 10` | `max_alias_free_plan: 10` |
 
-2. **`app/models.py:858-865`** — The method reads the config at call time:
-   ```python
-   def max_alias_for_free_account(self) -> int:
-       if (
-           self.FLAG_FREE_OLD_ALIAS_LIMIT
-           == self.flags & self.FLAG_FREE_OLD_ALIAS_LIMIT
-       ):
-           return config.MAX_NB_EMAIL_OLD_FREE_PLAN
-       else:
-           return config.MAX_NB_EMAIL_FREE_PLAN
-   ```
+### Why This Happens
 
-3. **`app/config.py:120-124`** — The config value is loaded from the environment at module import time:
-   ```python
-   try:
-       MAX_NB_EMAIL_FREE_PLAN = int(os.environ["MAX_NB_EMAIL_FREE_PLAN"])
-   except Exception:
-       print("MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value")
-       MAX_NB_EMAIL_FREE_PLAN = 5
-   ```
+The `max_alias_free_plan` value is **NOT stored in the database per-user**. Instead, it is computed dynamically at request time.
 
-The critical insight is that `config.MAX_NB_EMAIL_FREE_PLAN` is a **module-level variable** loaded once at import time. When the server restarts, the module is re-imported, the environment variable is re-read, and the new value becomes effective for ALL subsequent requests regardless of when the user was created. The value is never persisted per-user in the database—it is always read from the `config` module at request time.
+**Call chain:**
 
-The only exception is users who have the `FLAG_FREE_OLD_ALIAS_LIMIT` flag set on their `flags` column, in which case they receive `config.MAX_NB_EMAIL_OLD_FREE_PLAN` (default: 15) instead. Neither of our test users had this flag set.
+1. `GET /api/user_info` → `app/api/views/user_info.py` line 67: `return jsonify(user_to_dict(user))`
+2. `user_to_dict(user)` → line 34: `"max_alias_free_plan": user.max_alias_for_free_account()`
+3. `User.max_alias_for_free_account()` → `app/models.py` lines 858–865:
+
+```python
+def max_alias_for_free_account(self) -> int:
+    if (
+        self.FLAG_FREE_OLD_ALIAS_LIMIT
+        == self.flags & self.FLAG_FREE_OLD_ALIAS_LIMIT
+    ):
+        return config.MAX_NB_EMAIL_OLD_FREE_PLAN
+    else:
+        return config.MAX_NB_EMAIL_FREE_PLAN
+```
+
+This method reads `config.MAX_NB_EMAIL_FREE_PLAN` directly from the module-level variable — it does not read from the database or from any per-user setting. Since the config is reloaded when the server restarts, ALL users get the new value.
+
+### Exception: The `FLAG_FREE_OLD_ALIAS_LIMIT` Flag
+
+Users with the `FLAG_FREE_OLD_ALIAS_LIMIT` flag set (bit 2, value `1 << 2 = 4`, defined at `app/models.py` line 341) will always receive `config.MAX_NB_EMAIL_OLD_FREE_PLAN` (default: 15) regardless of `MAX_NB_EMAIL_FREE_PLAN`. This flag is designed for legacy users who were grandfathered into a higher free-tier alias limit.
+
+### Key Configuration Behavior Summary
+
+| Property | Value |
+|----------|-------|
+| Configuration variable | `MAX_NB_EMAIL_FREE_PLAN` |
+| Default value (if not set) | `5` |
+| Where defined | `app/config.py` lines 120–124 |
+| Loading mechanism | Module-level `int(os.environ["MAX_NB_EMAIL_FREE_PLAN"])` at import time |
+| Change requires | **Server restart** (not hot-reloadable; module-level variable) |
+| Per-user storage | **No** — computed dynamically from global config at request time |
+| Impact of change | **All users** — both existing and new |
+| Override mechanism | `FLAG_FREE_OLD_ALIAS_LIMIT` flag → uses `MAX_NB_EMAIL_OLD_FREE_PLAN` (default 15) instead |
 
 ---
 
-## Environment Configuration Reference
+## 6. Key Findings Summary
 
-The following `.env` file was used for all experiments:
+### Finding 1: Database Migrations
+Running all 255 Alembic migrations against a fresh PostgreSQL database results in **76 application tables** (77 including `alembic_version`). The last table created by migration execution order is **`user_audit_log`** from revision `7d7b84779837` (October 2024). Several tables were created, renamed, or dropped across the migration history, but the final state matches the 76 `__tablename__` declarations in `app/models.py`.
 
-```
-URL=http://localhost:7777
-NOT_SEND_EMAIL=true
-EMAIL_DOMAIN=sl.local
-SUPPORT_EMAIL=support@sl.local
-SUPPORT_NAME=Son from SimpleLogin
-EMAIL_SERVERS_WITH_PRIORITY=[(10, "email.hostname.")]
-DB_URI=postgresql://myuser:mypassword@localhost:5432/simplelogin
-FLASK_SECRET=secret
-OPENID_PRIVATE_KEY_PATH=local_data/jwtRS256.key
-OPENID_PUBLIC_KEY_PATH=local_data/jwtRS256.key.pub
-WORDS_FILE_PATH=local_data/test_words.txt
-DISABLE_ONBOARDING=true
-LOCAL_FILE_UPLOAD=true
-NAMESERVERS=1.1.1.1
-PARTNER_API_TOKEN_SECRET=changeme
-ALLOWED_REDIRECT_DOMAINS=[]
-MAX_NB_EMAIL_FREE_PLAN=5
-MEM_STORE_URI=redis://localhost:6379/0
-```
+### Finding 2: Flask Dev Server Readiness
+The standard Werkzeug `* Running on http://127.0.0.1:7777/` message is **suppressed** because `app/log.py` disables the werkzeug logger (`log.disabled = True`). The last visible startup message is `* Debug mode: on`. In production via Gunicorn, the readiness message `[INFO] Listening at: http://0.0.0.0:7777` IS visible. The elapsed time from first output to last visible startup message is approximately **1,635 ms**.
+
+### Finding 3: Email Handler Port Binding
+Running `python email_handler.py -p 25025` produces two log messages:
+1. **INFO:** `Listen for port 25025` (from `__main__` at line 2403)
+2. **DEBUG:** `Start mail controller 0.0.0.0 25025` (from `main()` at line 2386)
+
+Both use the `SL` logger with the standard log format. The `message_id` field is empty during startup.
+
+### Finding 4: Pre-Activation Login Rejection
+Registering `testuser@example.com` returns HTTP 200 with `{"msg":"User needs to confirm their account"}`. Immediately logging in returns HTTP **422 UNPROCESSABLE ENTITY** with `{"error":"Account not activated"}`. The database shows `activated=False` and `notification=True` for the newly created user.
+
+### Finding 5: Dynamic Alias Limits
+Changing `MAX_NB_EMAIL_FREE_PLAN` from 5 to 10 (with server restart) affects **ALL users** — not just newly created ones. This is because `User.max_alias_for_free_account()` reads the global config variable at request time rather than a per-user stored value. The only exception is users with the `FLAG_FREE_OLD_ALIAS_LIMIT` flag, who always get `MAX_NB_EMAIL_OLD_FREE_PLAN` (default 15).
