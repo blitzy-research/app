@@ -106,16 +106,16 @@ The `create_app()` function at **`server.py:139`** is the Flask application fact
 | Blueprint | Source Module | URL Prefix | Purpose |
 |-----------|---------------|------------|---------|
 | `auth_bp` | `app/auth/base.py:3` | `/auth` | Registration, login, activation, MFA, logout |
-| `monitor_bp` | `app/monitor/base.py` | (default) | Internal monitoring endpoints |
+| `monitor_bp` | `app/monitor/base.py` | `/` | Internal monitoring endpoints |
 | `dashboard_bp` | `app/dashboard/base.py:3` | `/dashboard` | Alias management, settings, account |
-| `developer_bp` | `app/developer/base.py` | (default) | OAuth app management for developers |
-| `phone_bp` | `app/phone/base.py` | (default) | Phone number alias feature |
+| `developer_bp` | `app/developer/base.py` | `/developer` | OAuth app management for developers |
+| `phone_bp` | `app/phone/base.py` | `/phone` | Phone number alias feature |
 | `oauth_bp` | `app/oauth/base.py` | `/oauth` | OAuth2 provider (first registration) |
 | `oauth_bp` | `app/oauth/base.py` | `/oauth2` | OAuth2 provider (second registration, for compatibility) |
-| `onboarding_bp` | `app/onboarding/base.py` | (default) | New user onboarding flow |
-| `discover_bp` | `app/discover/base.py` | (default) | Service discovery / recommendations |
-| `internal_bp` | `app/internal/base.py` | (default) | Internal API endpoints |
-| `api_bp` | `app/api/base.py` | (default) | Public REST API |
+| `onboarding_bp` | `app/onboarding/base.py` | `/onboarding` | New user onboarding flow |
+| `discover_bp` | `app/discover/base.py` | `/discover` | Service discovery / recommendations |
+| `internal_bp` | `app/internal/base.py` | `/internal` | Internal API endpoints |
+| `api_bp` | `app/api/base.py` | `/api` | Public REST API |
 
 **Why it matters:** Blueprint registration confirms that all URL routes are active. If any blueprint import fails (e.g., due to a missing dependency), `create_app()` will raise an `ImportError` and the application will not start.
 
@@ -331,8 +331,8 @@ The `User.create()` classmethod at **`app/models.py:601-668`** performs a rich s
 | 634-640 | `Alias.create_new(user, prefix="simplelogin-newsletter", mailbox_id=mb.id, ...)` | Creates the user's first email alias |
 | 643 | `user.newsletter_alias_id = alias.id` | Links newsletter alias to user |
 | 646-648 | If `config.DISABLE_ONBOARDING` is set, return early | Skips onboarding job scheduling |
-| 651-654 | `Job.create(name=JOB_ONBOARDING_1, run_at=arrow.now().shift(days=1))` | Schedules onboarding email #1 for +1 day |
-| 656-659 | `Job.create(name=JOB_ONBOARDING_2, run_at=arrow.now().shift(days=2))` | Schedules onboarding email #2 for +2 days |
+| 651-655 | `Job.create(name=JOB_ONBOARDING_1, run_at=arrow.now().shift(days=1))` | Schedules onboarding email #1 for +1 day |
+| 656-660 | `Job.create(name=JOB_ONBOARDING_2, run_at=arrow.now().shift(days=2))` | Schedules onboarding email #2 for +2 days |
 | 661-665 | `Job.create(name=JOB_ONBOARDING_4, run_at=arrow.now().shift(days=3))` | Schedules onboarding email #3 for +3 days |
 | 666 | `Session.flush()` | Persists all pending changes |
 
