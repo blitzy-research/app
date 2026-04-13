@@ -26,14 +26,14 @@ How many tables are created when running all Alembic migrations against a fresh 
 
 A fresh PostgreSQL 16 database was provisioned, dropped, and recreated to ensure a completely empty state:
 
-```
+```sql
 DROP DATABASE IF EXISTS simplelogin;
 CREATE DATABASE simplelogin;
 ```
 
 The `.env` file was configured with:
 
-```
+```text
 DB_URI=postgresql://myuser:mypassword@localhost:5432/simplelogin
 ```
 
@@ -47,7 +47,7 @@ alembic upgrade head
 
 **Observed Output (first 10 lines):**
 
-```
+```text
 INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
 INFO  [alembic.runtime.migration] Will assume transactional DDL.
 INFO  [alembic.runtime.migration] Running upgrade  -> 5e549314e1e2, empty message
@@ -62,7 +62,7 @@ INFO  [alembic.runtime.migration] Running upgrade 2fe19381f386 -> b20ee72fd9a4, 
 
 **Observed Output (last 10 lines):**
 
-```
+```text
 INFO  [alembic.runtime.migration] Running upgrade 88dd7a0abf54 -> 62afa3a10010, custom domain indices
 INFO  [alembic.runtime.migration] Running upgrade 62afa3a10010 -> 91ed7f46dc81, alias_audit_log
 INFO  [alembic.runtime.migration] Running upgrade 91ed7f46dc81 -> 7d7b84779837, user_audit_log
@@ -75,7 +75,7 @@ The `alembic_version` table records the final head revision:
 SELECT version_num FROM alembic_version;
 ```
 
-```
+```text
  version_num
 --------------
  32f25cbf12f6
@@ -91,7 +91,7 @@ FROM information_schema.tables
 WHERE table_schema = 'public';
 ```
 
-```
+```text
  total_tables
 --------------
            77
@@ -106,7 +106,7 @@ WHERE table_schema = 'public'
   AND table_name != 'alembic_version';
 ```
 
-```
+```text
  model_tables
 --------------
            76
@@ -123,8 +123,8 @@ Cross-referencing with `app/models.py`, there are exactly **76 `__tablename__` d
 | Metric | Count |
 |--------|-------|
 | Migration revision files in `migrations/versions/` | **255** |
-| Total `op.create_table()` calls in `upgrade()` functions | **78** |
-| Unique table names created via `op.create_table()` | **77** |
+| Total `op.create_table()` calls in `upgrade()` functions | **80** |
+| Unique table names created via `op.create_table()` | **79** |
 | Tables dropped during migration history (in `upgrade()`) | 4 (`metric`, `partner`, `client_scope`, `scope`) |
 | Tables renamed during migration history | 3 (`gen_email` → `alias`, `forward_email` → `contact`, `forward_email_log` → `email_log`) |
 
@@ -187,7 +187,7 @@ The Flask development server was started via `python server.py`, which calls `lo
 
 The following is the **actual captured output** from `python server.py` with precise wall-clock timestamps:
 
-```
+```text
 [0.674s] >>> URL: http://localhost:7777
 [1.638s] Paddle param not set
 [1.638s] WARNING: Use a temp directory for GNUPGHOME /tmp/wfjqbfctywqakqgxmltf
@@ -221,7 +221,7 @@ The messages that DO appear (`* Serving Flask app`, `* Environment: production`,
 
 The **last visible startup message** confirming the dev server is configured and launching is:
 
-```
+```text
  * Debug mode: on
 ```
 
@@ -231,7 +231,7 @@ The standard Werkzeug `* Running on http://127.0.0.1:7777/ (Press CTRL+C to quit
 
 For comparison, when starting via Gunicorn (`gunicorn wsgi:app -b 0.0.0.0:7777 --workers 2`), the readiness message IS visible because Gunicorn uses its own logging system, not the disabled Werkzeug logger:
 
-```
+```text
 [2026-04-13 21:52:54 +0000] [33016] [INFO] Starting gunicorn 20.0.4
 [2026-04-13 21:52:54 +0000] [33016] [INFO] Listening at: http://0.0.0.0:7777 (33016)
 [2026-04-13 21:52:54 +0000] [33016] [INFO] Using worker: sync
@@ -241,7 +241,7 @@ For comparison, when starting via Gunicorn (`gunicorn wsgi:app -b 0.0.0.0:7777 -
 
 The Gunicorn readiness confirmation is:
 
-```
+```text
 [INFO] Listening at: http://0.0.0.0:7777 (PID)
 ```
 
@@ -297,7 +297,7 @@ python email_handler.py -p 25025
 
 The following is the **complete captured output** from the email handler startup:
 
-```
+```text
 >>> URL: http://localhost:7777
 Paddle param not set
 WARNING: Use a temp directory for GNUPGHOME /tmp/gpqntocufrvrkebuiwtm
@@ -314,13 +314,13 @@ There are **two** log messages confirming the email handler startup with port 25
 
 **Message 1 (INFO level) — Port listen announcement:**
 
-```
+```text
 2026-04-13 21:53:18,059 - SL - INFO - 33682 - "email_handler.py:2403" - <module>() -  - Listen for port 25025
 ```
 
 **Message 2 (DEBUG level) — Controller start confirmation:**
 
-```
+```text
 2026-04-13 21:53:18,060 - SL - DEBUG - 33682 - "email_handler.py:2386" - main() -  - Start mail controller 0.0.0.0 25025
 ```
 
@@ -382,7 +382,7 @@ curl -v -X POST http://localhost:7777/api/auth/register \
 
 **Full curl output:**
 
-```
+```http
 > POST /api/auth/register HTTP/1.1
 > Host: localhost:7777
 > User-Agent: curl/8.5.0
@@ -421,7 +421,7 @@ curl -v -X POST http://localhost:7777/api/auth/login \
 
 **Full curl output:**
 
-```
+```http
 > POST /api/auth/login HTTP/1.1
 > Host: localhost:7777
 > User-Agent: curl/8.5.0
@@ -460,7 +460,7 @@ WHERE email = 'testuser@example.com';
 
 **Result:**
 
-```
+```text
  activated | notification
 -----------+--------------
  f         | t
