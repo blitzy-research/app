@@ -145,7 +145,7 @@ Several tables were created, dropped, or renamed across the migration history:
 
 This is the chronologically last `op.create_table()` call in the entire migration history. The subsequent migration `32f25cbf12f6` (alias_audit_log_index_created_at) only creates an index, not a table.
 
-**Migration file content (lines 22–31):**
+**Migration file content (lines 20–31):**
 
 ```python
 def upgrade():
@@ -165,7 +165,7 @@ def upgrade():
 
 - The migration revision chain is linear with one merge point (`2634b41f54db` merging `01e2997e90d3` and `2d89315ac650`), and the single head is `32f25cbf12f6`.
 - Table count was verified both empirically (SQL count against the running database) and statically (grep of `__tablename__` in `app/models.py`).
-- The "last table created" was determined by sorting all `op.create_table()` calls in `upgrade()` functions by their migration file's `Create Date` field. The last 5 chronologically are: `sync_event` (2024-05-17), `mailbox_activation` (2024-07-30), `alias_audit_log` (2024-10-11), and **`user_audit_log` (2024-10-16)**.
+- The "last table created" was determined by sorting all `op.create_table()` calls in `upgrade()` functions by their migration file's `Create Date` field. The last 5 chronologically are: `daily_metric` (2022-10-14), `sync_event` (2024-05-17), `mailbox_activation` (2024-07-30), `alias_audit_log` (2024-10-11), and **`user_audit_log` (2024-10-16)**.
 
 ---
 
@@ -303,7 +303,7 @@ Paddle param not set
 WARNING: Use a temp directory for GNUPGHOME /tmp/gpqntocufrvrkebuiwtm
 Upload files to local dir
 >>> init logging <<<
-2026-04-13 21:53:17,402 - SL - DEBUG - 33682 - "email_handler.py:17" - <module>() -  - load words file: local_data/test_words.txt
+2026-04-13 21:53:17,402 - SL - DEBUG - 33682 - "app/utils.py:17" - <module>() -  - load words file: local_data/test_words.txt
 2026-04-13 21:53:18,059 - SL - INFO - 33682 - "email_handler.py:2403" - <module>() -  - Listen for port 25025
 2026-04-13 21:53:18,060 - SL - DEBUG - 33682 - "email_handler.py:2386" - main() -  - Start mail controller 0.0.0.0 25025
 ```
