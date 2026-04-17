@@ -121,9 +121,7 @@ def main(port: int):
 
     if LOAD_PGP_EMAIL_HANDLER:
         LOG.w("LOAD PGP keys")
-        app = create_light_app()
-        with app.app_context():
-            load_pgp_public_keys()
+        load_pgp_public_keys()
 
     while True:
         time.sleep(2)
@@ -183,7 +181,7 @@ The job runner has no HTTP endpoint, no listening socket, and no dedicated start
 ```python
 if __name__ == "__main__":
     while True:
-        # run a job 1 by 1
+        # wrap in an app context to benefit from app setup like database cleanup, sentry integration, etc
         with create_light_app().app_context():
             for job in get_jobs_to_run():
                 LOG.d("Take job %s", job)
@@ -212,19 +210,28 @@ Who puts jobs into the table? The helper `get_jobs_to_run()` at **`job_runner.py
 
 ```python
 def get_jobs_to_run() -> List[Job]:
-    min_dt = arrow.now().shift(minutes=-JOB_TAKEN_RETRY_WAIT_MINS)
-    taken_jobs = Job.filter(
-        Job.state == JobState.taken.value,
-        Job.taken_at < min_dt,
-        Job.attempts < JOB_MAX_ATTEMPTS,
+    # Get jobs that match all conditions:
+    #  - Job.state == ready OR (Job.state == taken AND Job.taken_at < now - 30 mins AND Job.attempts < 5)
+    #  - Job.run_at is Null OR Job.run_at < now + 10 mins
+    taken_at_earliest = arrow.now().shift(minutes=-config.JOB_TAKEN_RETRY_WAIT_MINS)
+    run_at_earliest = arrow.now().shift(minutes=+10)
+    query = Job.filter(
+        and_(
+            or_(
+                Job.state == JobState.ready.value,
+                and_(
+                    Job.state == JobState.taken.value,
+                    Job.taken_at < taken_at_earliest,
+                    Job.attempts < config.JOB_MAX_ATTEMPTS,
+                ),
+            ),
+            or_(Job.run_at.is_(None), and_(Job.run_at <= run_at_earliest)),
+        )
     )
-    ready_jobs = Job.filter(
-        Job.state == JobState.ready.value, Job.run_at <= arrow.now()
-    )
-    return list(taken_jobs.all()) + list(ready_jobs.all())
+    return query.all()
 ```
 
-Two categories of rows are collected — rows in `ready` state whose `run_at` has arrived, and rows that were previously `taken` but appear stuck (taken more than `JOB_TAKEN_RETRY_WAIT_MINS` ago and still below `JOB_MAX_ATTEMPTS`). The set of recognised job names lives in `process_job()` at `job_runner.py:188-304`; anything not in that dispatcher drops to the fall-through `LOG.e("Unknown job name %s", job.name)` on line 304.
+A single combined filter collects two categories of rows in one query: rows in `ready` state (`Job.state == JobState.ready.value`), and rows that were previously `taken` but appear stuck (`taken` more than `config.JOB_TAKEN_RETRY_WAIT_MINS` ago and still below `config.JOB_MAX_ATTEMPTS`). Both are further constrained to jobs whose `run_at` is either NULL or at most 10 minutes in the future (`run_at_earliest`). The set of recognised job names lives in `process_job()` at `job_runner.py:188-304`; anything not in that dispatcher drops to the fall-through `LOG.e("Unknown job name %s", job.name)` on line 304.
 
 **Captured runtime evidence — startup.** Everything in `/tmp/job_runner.log` after launching `python job_runner.py`:
 
@@ -296,12 +303,11 @@ LOG = _get_logger("SL")
 
 Every log record SimpleLogin emits therefore begins `<timestamp> - SL - <LEVEL> - <pid>`. If you grep for records whose name column is `SL`, you get only application records — infrastructure noise is filtered out by name.
 
-**werkzeug access log is suppressed — `app/log.py:69-71`:**
+**werkzeug access log is suppressed — `app/log.py:70-71`:**
 
 ```python
 log = logging.getLogger("werkzeug")
 log.disabled = True
-log.propagate = False
 ```
 
 This disables the default Flask development-server access log. The practical consequence for a new self-hoster: if you start the server at `INFO` level (or silently wonder why gunicorn is not logging request lines), the *only* per-request record you will see from the Flask layer is the one emitted by `after_request` — and that record is emitted at DEBUG level. Set the log level to DEBUG, or else the app looks "silent" even while happily serving traffic.
@@ -316,17 +322,18 @@ def set_message_id(message_id):
 
 
 class EmailHandlerFilter(logging.Filter):
-    def filter(self, record):
-        message_id = _MESSAGE_ID or ""
-        if message_id:
-            record.message_id = f"{message_id} - "
-        else:
-            record.message_id = ""
+    """automatically add message-id to keep track of an email processing"""
 
+    def filter(self, record):
+        message_id = self.get_message_id()
+        record.message_id = message_id if message_id else ""
         return True
+
+    def get_message_id(self):
+        return _MESSAGE_ID
 ```
 
-Once `_handle()` in the email handler generates a new UUID and calls `set_message_id(uuid)`, every subsequent log record in that process carries that UUID in the `%(message_id)s` slot of the format string, so a single email's end-to-end journey can be extracted by filtering on that UUID. Q3c shows the captured log with that UUID visible.
+Once `_handle()` in the email handler generates a new UUID and calls `set_message_id(uuid)`, every subsequent log record in that process carries that UUID in the `%(message_id)s` slot of the format string (the ` - ` separator surrounding the message-id in each log line comes from the format-string definition at `app/log.py:12-15`, not from the filter). A single email's end-to-end journey can therefore be extracted by filtering on that UUID. Q3c shows the captured log with that UUID visible.
 
 ### 2.2 The per-request web log — `after_request`
 
@@ -345,7 +352,6 @@ def after_request(res):
         and not request.path.startswith("/health")
     ):
         start_time = g.start_time or time.time()
-
         LOG.d(
             "%s %s %s %s %s, takes %s",
             request.remote_addr,
@@ -355,7 +361,9 @@ def after_request(res):
             res.status_code,
             time.time() - start_time,
         )
-
+        newrelic.agent.record_custom_event(
+            "HttpResponseStatus", {"code": res.status_code}
+        )
     return res
 ```
 
@@ -364,6 +372,7 @@ Key details:
 - Severity is `LOG.d` — DEBUG. If your logger is configured at INFO, these records will not appear.
 - Six request paths are filtered out: `/static/...`, `/admin/static/...`, `/_debug_toolbar/...`, `/git/...`, `/favicon.ico/...`, and `/health/...`. The `/health` filter (line 281) is why a health-checking load balancer does not flood the log.
 - `g.start_time` is populated by the matching `before_request` hook at `server.py:257-270` (not reproduced here — it is the mirror of `after_request` and is what makes the `takes %s` latency field non-zero).
+- After the `LOG.d(...)` call, `server.py:293-295` also emits a New Relic custom event (`newrelic.agent.record_custom_event("HttpResponseStatus", {"code": res.status_code})`) on every non-filtered response. This is only observable in a New Relic APM environment — it produces no log output — but it is part of the `after_request` body in the source.
 
 **Captured runtime evidence** — three real request lines from `/tmp/gunicorn.log` during the login smoke test (see Q2.3 for how these arose):
 
@@ -390,7 +399,7 @@ The login view is an if/elif cascade over `LoginEvent.ActionType` values that pr
 
   ```python
   flash(
-      "Your account is disabled. Please contact SimpleLogin team",
+      "Your account is disabled. Please contact SimpleLogin team to re-enable your account.",
       "error",
   )
   LoginEvent(LoginEvent.ActionType.disabled_login).send()
@@ -410,7 +419,7 @@ The login view is an if/elif cascade over `LoginEvent.ActionType` values that pr
 
   ```python
   flash(
-      "Please check your inbox for the activation email. You can also request another email by clicking on the button below.",
+      "Please check your inbox for the activation email. You can also have this email re-sent",
       "error",
   )
   LoginEvent(LoginEvent.ActionType.not_activated).send()
