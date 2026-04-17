@@ -76,13 +76,14 @@ SUPPORT_NAME=Son from SimpleLogin
 DB_URI=postgresql://myuser:mypassword@localhost:5432/simplelogin
 FLASK_SECRET=secret
 NOT_SEND_EMAIL=true            # critical: enables log-only email simulation
-COLOR_LOG=true                 # enables coloredlogs (app/log.py:62)
+COLOR_LOG=true                 # enables coloredlogs (app/log.py:62); see note below about TTY detection
 EMAIL_SERVERS_WITH_PRIORITY=[(10, "email.hostname.")]
 ```
 
 Two of these deserve special attention because they govern observable behaviour:
 
 - **`NOT_SEND_EMAIL=true`** (`example.env:19`) is the flag that tells `MailSender.send()` in `app/mail_sender.py:130` to log the email metadata and return `True` **without** opening an SMTP socket. It is the single most important variable for local verification — without it, every outbound send attempts a real SMTP handshake.
+- **`COLOR_LOG=true`** activates `coloredlogs.install()` at `app/log.py:62`, but the `coloredlogs` library itself auto-detects whether stdout is a TTY. ANSI escape codes are therefore **only visible when the process writes to an interactive terminal**. If you redirect stdout to a file (e.g. `python server.py > /tmp/sl_startup.log 2>&1`), the log contents will be plain ASCII without color — this is expected library behaviour, not a misconfiguration.
 - **`DISABLE_ONBOARDING=true`** is explicitly enabled in `example.env:150` (`# For self-hosted instance`). When this is truthy, `User.create()` in `app/models.py:646-647` takes an **early return** and **no onboarding jobs are scheduled**. If you want to see the three onboarding rows in the `job` table, you must **unset** or comment out `DISABLE_ONBOARDING` in your `.env`.
 
 ### Bootstrap Commands
@@ -204,18 +205,25 @@ Two hooks installed by `set_index_page(app)` at `server.py:249` govern every HTT
   ```text
   %s %s %s %s %s, takes %s
   ```
-  where the substitutions are `remote_addr | method | path | args | status_code | elapsed_time`, and additionally records `newrelic.agent.record_custom_event("HttpResponseStatus", {"code": res.status_code})`. This is **your per-request audit trail** — every served request produces exactly one of these lines.
+  where the substitutions are `remote_addr | method | path | args | status_code | elapsed_time`, and additionally records `newrelic.agent.record_custom_event("HttpResponseStatus", {"code": res.status_code})`. This is **your per-request audit trail** — every served request produces exactly one of these lines, **except** for the six excluded path prefixes filtered at `server.py:275-283`: `/static`, `/admin/static`, `/_debug_toolbar`, `/git`, `/favicon.ico`, and `/health`. Requests whose path starts with any of those prefixes produce **no** `@after_request` log line (so grepping logs for `/health` hits will always return zero matches — this is by design).
 
 The index page itself is mounted at `server.py:249-254`: `/` redirects authenticated users to the dashboard and unauthenticated users to `auth.login`.
 
 ### 1.2 Observed Startup Log Output
 
-When the app is launched in dev mode (`python server.py` → `local_main()` at `server.py:572`), the live investigation captured exactly this output:
+When the app is launched in dev mode (`python server.py` → `local_main()` at `server.py:572`), the live investigation captured exactly this output (captured verbatim from a clean run with stdout redirected to a file):
 
 ```text
 >>> URL: http://localhost:7777
+MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value
+Paddle param not set
+WARNING: Use a temp directory for GNUPGHOME /tmp/<random>
+Upload files to local dir
 >>> init logging <<<
  * Serving Flask app "server" (lazy loading)
+ * Environment: production
+   WARNING: This is a development server. Do not use it in a production deployment.
+   Use a production WSGI server instead.
  * Debug mode: on
 ```
 
@@ -224,9 +232,17 @@ Each line is traceable to a specific source location:
 | Line | Source | Meaning |
 |---|---|---|
 | `>>> URL: http://localhost:7777` | `app/config.py:80` — `print(">>> URL:", URL)` | `.env` loaded; `URL` env var resolved |
+| `MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value` | `app/config.py` — printed when the free-plan alias quota env var is unset | Informational; the default cap of 5 aliases for free-plan accounts is applied |
+| `Paddle param not set` | `app/config.py` — printed when the Paddle (billing provider) credentials are missing | Informational; local dev has no billing integration |
+| `WARNING: Use a temp directory for GNUPGHOME /tmp/<random>` | `app/pgp_utils.py` via `app/config.py` — `GNUPGHOME` env var unset, so a fresh temp directory is provisioned via `tempfile.mkdtemp()` | Warning only; PGP features still function against the temp keyring |
+| `Upload files to local dir` | `app/config.py` — when `LOCAL_FILE_UPLOAD=true` (or equivalent local-dev switch) and `BUCKET` is unset | Uploads are persisted to `LOCAL_FILE_UPLOAD_DIRECTORY` instead of S3 |
 | `>>> init logging <<<` | `app/log.py:67` — `print(">>> init logging <<<")` | `app.log` imported; `LOG = _get_logger("SL")` built (line 79); `coloredlogs` installed (line 62) when `COLOR_LOG` is set |
 | `* Serving Flask app "server" (lazy loading)` | emitted by Flask's Werkzeug dev server at `app.run(...)` | Dev-mode only — fires from `local_main()` (see `server.py:572`) |
+| `* Environment: production` | Werkzeug dev-server banner (Flask 1.1.x default when `FLASK_ENV` is unset) | Dev server IS running; the "production" label here refers to Werkzeug's own default environment flag, **not** to the `app.debug` state |
+| `WARNING: This is a development server. Do not use it in a production deployment. / Use a production WSGI server instead.` | Werkzeug dev-server banner | Expected when launched via `python server.py`; Gunicorn runs do not print this |
 | `* Debug mode: on` | from `app.run(debug=True, port=7777)` at `server.py:588` | `app.debug = True` is set at `server.py:581` |
+
+Note that the four "bootstrap" lines between `>>> URL:` and `>>> init logging <<<` (`MAX_NB_EMAIL_FREE_PLAN`, `Paddle param`, `GNUPGHOME`, `Upload files`) originate from module-level `print()` / warning calls in `app/config.py` that fire as a side-effect of the first `import app.config`. They therefore appear under **both** dev-mode and Gunicorn startup paths.
 
 **Under Gunicorn** the Werkzeug "Serving Flask app" / "Debug mode" lines are replaced with Gunicorn's own bootstrap output, which looks roughly like:
 
@@ -261,13 +277,15 @@ curl -s -o /dev/null -w "%{http_code}\n" http://localhost:7777/auth/register
 curl -s -o /dev/null -w "%{http_code}\n" http://localhost:7777/.well-known/openid-configuration
 ```
 
-Each of these will also produce a matching line in the web process stdout through the `@after_request` hook, e.g.:
+Four of the five probes above produce a matching line in the web process stdout through the `@after_request` hook. **`/health` does not** — it is one of the six path prefixes explicitly excluded at `server.py:275-283` (`/static`, `/admin/static`, `/_debug_toolbar`, `/git`, `/favicon.ico`, `/health`). The format is `%s %s %s %s %s, takes %s` where `args` is Werkzeug's `ImmutableMultiDict`, which renders as `ImmutableMultiDict([])` when the request had no query parameters. Observed verbatim output (captured live):
 
 ```text
-127.0.0.1 - GET /health {} 200, takes 0.0021
-127.0.0.1 - GET / {} 302, takes 0.0013
-127.0.0.1 - GET /auth/login {} 200, takes 0.0154
+127.0.0.1 GET / ImmutableMultiDict([]) 302, takes 0.0006682872772216797
+127.0.0.1 GET /auth/login ImmutableMultiDict([]) 200, takes 0.10135126113891602
+127.0.0.1 GET /auth/register ImmutableMultiDict([]) 200, takes 0.03267025947570801
 ```
+
+Note: the fields are **space-separated** (no dash delimiters), and the `args` column is the literal `repr()` of `request.args` (not a Python dict). For a request carrying query parameters (e.g. `GET /auth/activate?code=xyz`), the same slot prints as `ImmutableMultiDict([('code', 'xyz')])`.
 
 ### 1.4 Database Readiness
 
@@ -432,7 +450,7 @@ During the live walkthrough these lines appeared in stdout (in order):
 
 ```text
 create user testuser@example.com
-send email with subject 'Just one more step to join SimpleLogin', from 'Son from SimpleLogin <support@sl.local>' to 'testuser@example.com'
+send email with subject 'Just one more step to join SimpleLogin', from '"noreply@sl.local" <noreply@sl.local>' to 'testuser@example.com'
 Not sending events because webhook is not configured and allowed to be empty
 ```
 
@@ -444,6 +462,8 @@ Each line maps to a source location:
 | `send email with subject '...', from '...' to '...'` | `app/mail_sender.py:131-136` — inside the `if config.NOT_SEND_EMAIL:` short-circuit | Logs the composed message and returns `True` **without** opening an SMTP connection |
 | `Not sending events because webhook is not configured and allowed to be empty` | `app/events/event_dispatcher.py:62-64` | Fires in `EventDispatcher.send_event()` when `EVENT_WEBHOOK` is unset and `skip_if_webhook_missing=True`. This is the expected message on a local dev setup. |
 
+> **Note on the `from` address.** `email_utils.send_activation_email()` at `app/email_utils.py:125` calls `send_email(user.email, "Just one more step…", …)` **without** supplying `from_name` or `from_addr`. The `send_email()` helper at `app/email_utils.py:303-306` defaults both parameters to `config.NOREPLY`, which `app/config.py:435` resolves as `os.environ.get("NOREPLY", f"noreply@{EMAIL_DOMAIN}")` → `noreply@sl.local` in the local-dev env. The helper composes the header as `f'"{from_name}" <{from_addr}>'`, producing the literal string `"noreply@sl.local" <noreply@sl.local>`. It deliberately does **not** use `SUPPORT_EMAIL` / `SUPPORT_NAME` — those are reserved for transactional replies sent by `send_email_with_rate_control()` and similar helpers. The same `NOREPLY` defaulting applies to `send_welcome_email()` (Step 2) and most other automated mails; grepping for `noreply@sl.local` in the log is the reliable way to confirm the email subsystem is exercising the short-circuit path.
+
 > **Note on the last log line.** The AAP §0.5.3 shorthand reads `"Not sending events because webhook is not configured"` but the actual emitted message (per `app/events/event_dispatcher.py:63`) is the **longer** `"Not sending events because webhook is not configured and allowed to be empty"`. This document uses the full literal string.
 
 #### Database state after Step 1
@@ -454,10 +474,14 @@ After a single successful registration the database has been mutated as follows:
 |---|---|---|
 | `users` | +1 | `email=<input>`, `activated=False`, `password=<bcrypt hash>`, `default_mailbox_id=<mb.id>`, `alternative_id=<uuid>`, `newsletter_alias_id=<alias.id>`, `notification=True` |
 | `mailbox` | +1 | `user_id=<user.id>`, `email=<user.email>`, `verified=True` |
-| `alias` | +1 | `prefix="simplelogin-newsletter"`, `suffix=.<random>@sl.local`, `mailbox_id=<mb.id>`, `note="This is your first alias..."` |
+| `alias` | +1 | `user_id=<user.id>`, `email="simplelogin-newsletter.<random>@sl.local"`, `mailbox_id=<mb.id>`, `enabled=True`, `note="This is your first alias…"` |
 | `activation_code` | +1 | `user_id=<user.id>`, `code=<30-char random>`, `expired ≈ now + 1h` |
-| `job` | +3 (only if `DISABLE_ONBOARDING` unset) | `name` in `{onboarding-1, onboarding-2, onboarding-4}`, `run_at` at +1 / +2 / +3 days, `state="ready"`, `attempts=0`, `payload={"user_id": ...}` |
+| `job` | +3 (only if `DISABLE_ONBOARDING` unset) | `name` in `{onboarding-1, onboarding-2, onboarding-4}`, `run_at` at +1 / +2 / +3 days, `state=0` (`JobState.ready`), `attempts=0`, `payload={"user_id": ...}` |
 | `daily_metric` | +1 (first reg of day) or updated | `date=CURRENT_DATE`, `nb_new_web_non_proton_user += 1` |
+
+> **Note on `alias` columns.** The `alias` table has **no** `prefix` or `suffix` columns — the full address is stored in the single `email` column (varchar 128, unique, not null). `prefix="simplelogin-newsletter"`, `suffix=".<random>@sl.local"`, and the random middle component are keyword **arguments** passed to `Alias.create_new()` in `app/models.py` (around line 634); the factory concatenates them into the final `email` value before `INSERT`. Live `\d alias` from PostgreSQL shows 24 columns — `id, created_at, updated_at, user_id, email, enabled, custom_domain_id, automatic_creation, directory_id, note, mailbox_id, name, disable_pgp, cannot_be_disabled, disable_email_spoofing_check, batch_import_id, original_owner_id, pinned, transfer_token, transfer_token_expiration, hibp_last_check, ts_vector, last_email_log_id, flags` — none of which is `prefix` or `suffix`. A working inspection query is therefore `SELECT id, email, user_id, mailbox_id, enabled, note FROM alias WHERE user_id = <USER_ID>`.
+
+> **Note on `job.state`.** `state` is an **integer** column (`sa.Integer`, `server_default='0'`, `default=JobState.ready.value`), not a string. The `JobState` enum at `app/models.py:253` maps `ready=0, taken=1, done=2, error=3`. So a freshly-scheduled onboarding job has `state=0`, not `state='ready'`. Filter queries must compare against integers — e.g. `SELECT id, name, state, run_at FROM job WHERE state = 0 ORDER BY id;` — otherwise PostgreSQL returns `operator does not exist: integer = unknown`.
 
 Sample `psql` inspection commands:
 
@@ -660,10 +684,10 @@ Trace:
 There are of course also the per-request DEBUG lines from `server.py:272-297` (the `@after_request` hook), for example:
 
 ```text
-127.0.0.1 GET /dashboard/ {} 200, takes 0.123
+127.0.0.1 GET /dashboard/ ImmutableMultiDict([]) 200, takes 0.123
 ```
 
-The exact format string in `server.py:285` is `"%s %s %s %s %s, takes %s"` populated with (`remote_addr`, `method`, `path`, `args`, `status_code`, `elapsed`) — there is **no** user/session field in this log. (The identity of the signed-in user during the request is instead emitted separately by the view-level logs such as `Show intro to <User ...>` and `log user <User ...> in`.)
+The exact format string in `server.py:285` is `"%s %s %s %s %s, takes %s"` populated with (`remote_addr`, `method`, `path`, `args`, `status_code`, `elapsed`) — there is **no** user/session field in this log. The four fields `remote_addr`, `method`, `path`, and `args` are space-separated with no delimiters; `args` is the Werkzeug `ImmutableMultiDict` repr, which is `ImmutableMultiDict([])` for an empty query string. (The identity of the signed-in user during the request is instead emitted separately by the view-level logs such as `Show intro to <User ...>` and `log user <User ...> in`.)
 
 #### Visible UI elements on the dashboard
 
@@ -681,8 +705,8 @@ Putting all four requests together, a first-time user's session produces exactly
 
 | # | HTTP | Status | Redirect target | DB effect | Canonical log line |
 |---|---|---|---|---|---|
-| 1 | `GET /` | 302 | `/auth/login` | none | `- - GET / {} 302, takes ...` |
-| 2 | `GET /auth/register` | 200 | – | none | `- - GET /auth/register {} 200, takes ...` |
+| 1 | `GET /` | 302 | `/auth/login` | none | `127.0.0.1 GET / ImmutableMultiDict([]) 302, takes ...` |
+| 2 | `GET /auth/register` | 200 | – | none | `127.0.0.1 GET /auth/register ImmutableMultiDict([]) 200, takes ...` |
 | 3 | `POST /auth/register` | 200 (renders waiting page) | – | `users +1`, `mailbox +1`, `alias +1`, `activation_code +1`, `job +3` (if `DISABLE_ONBOARDING` unset), `daily_metric +1` | `create user testuser@example.com` |
 | 4 | `GET /auth/activate?code=...` | 302 | `/dashboard/` | `users.activated=true`, `activation_code -1` | `redirect user to dashboard` |
 | 5 | `GET /dashboard/` (first time) | 200 | – | `users.intro_shown=true` | `Show intro to <User 3 ...>` |
@@ -730,13 +754,13 @@ During a local single-user smoke test, **only the web process is strictly requir
 1. Enter `create_light_app().app_context()` (imported from `server.py:127`). `create_light_app` creates a stripped-down Flask app with only DB access — no blueprints, no Flask-Login, no Limiter. This keeps the background worker memory-light.
 2. Call `get_jobs_to_run()` at `job_runner.py:307`:
    ```sql
-   -- Conceptually:
+   -- Conceptually (remember `state` is an integer enum — JobState.ready=0, taken=1, done=2, error=3):
    SELECT * FROM job
-    WHERE (state = 'ready' OR (state = 'taken' AND taken_at < NOW() - INTERVAL 'JOB_TAKEN_RETRY_WAIT_MINS minutes'))
+    WHERE (state = 0 /* ready */ OR (state = 1 /* taken */ AND taken_at < NOW() - INTERVAL 'JOB_TAKEN_RETRY_WAIT_MINS minutes'))
       AND attempts < JOB_MAX_ATTEMPTS
       AND (run_at IS NULL OR run_at <= NOW() + INTERVAL '10 minutes')
    ```
-3. For each returned `Job`: mark `state='taken'`, `taken_at=now()`, `taken=True`, `attempts += 1`, commit, then call `process_job(job)` at line 188, then `state='done'`, commit.
+3. For each returned `Job`: mark `state=1` (`JobState.taken`), `taken_at=now()`, `taken=True`, `attempts += 1`, commit, then call `process_job(job)` at line 188, then `state=2` (`JobState.done`), commit.
 4. `time.sleep(10)` at `job_runner.py:347` — **10-second poll interval**.
 
 **`process_job(job)`** (line 188) dispatches on `job.name`:
@@ -766,7 +790,7 @@ SELECT id, name, run_at, state, attempts
   ORDER BY id DESC LIMIT 5;
 ```
 
-After a fresh registration (with `DISABLE_ONBOARDING` unset) you see three rows with `state='ready'`, `attempts=0`, and `run_at` one/two/three days in the future.
+After a fresh registration (with `DISABLE_ONBOARDING` unset) you see three rows with `state=0` (`JobState.ready`; `state` is an integer column, **not** a string — see the note in §2.1), `attempts=0`, and `run_at` one/two/three days in the future.
 
 #### Observable evidence — **with** the job runner running
 
@@ -959,8 +983,10 @@ Every attempted email produces exactly one `send email with subject '...', from 
 
 | # | Subject | From | To | Triggered by |
 |---|---|---|---|---|
-| 1 | `Just one more step to join SimpleLogin` | `Son from SimpleLogin <support@sl.local>` | `testuser@example.com` | `email_utils.send_activation_email()` at line 125 |
-| 2 | `Welcome to SimpleLogin` | `...@sl.local` | `simplelogin-newsletter.<random>@sl.local` | `email_utils.send_welcome_email()` at line 97 |
+| 1 | `Just one more step to join SimpleLogin` | `"noreply@sl.local" <noreply@sl.local>` | `testuser@example.com` | `email_utils.send_activation_email()` at line 125 |
+| 2 | `Welcome to SimpleLogin` | `"noreply@sl.local" <noreply@sl.local>` | `simplelogin-newsletter.<random>@sl.local` | `email_utils.send_welcome_email()` at line 97 |
+
+Both mails use `config.NOREPLY` as both the display name and the SMTP-From address — the `send_email()` helper at `app/email_utils.py:303-306` defaults `from_name` and `from_addr` to `config.NOREPLY` when the caller does not override them, and `app/config.py:435` resolves `NOREPLY` to `noreply@{EMAIL_DOMAIN}` → `noreply@sl.local` for the local-dev env. Neither helper routes through `SUPPORT_EMAIL` / `SUPPORT_NAME`, so grepping for `support@sl.local` in the log will **not** locate either of these lines.
 
 ### 3.7 Inbound SMTP Handler — `email_handler.py`
 
