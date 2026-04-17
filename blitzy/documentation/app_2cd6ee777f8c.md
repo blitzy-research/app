@@ -212,9 +212,11 @@ Two hooks installed by `set_index_page(app)` at `server.py:249` govern every HTT
 
 - **`@app.before_request`** (`server.py:257-258`) — captures `g.start_time = time.time()` and handles the `slref` referral cookie. **Skipped** for `/static`, `/admin/static`, and `/_debug_toolbar` paths to keep static-asset loading fast.
 - **`@app.after_request`** (`server.py:272-273`) — emits the per-request DEBUG log in the format
+
   ```text
   %s %s %s %s %s, takes %s
   ```
+
   where the substitutions are `remote_addr | method | path | args | status_code | elapsed_time`, and additionally records `newrelic.agent.record_custom_event("HttpResponseStatus", {"code": res.status_code})`. This is **your per-request audit trail** — every served request produces exactly one of these lines, **except** for the six excluded path prefixes filtered at `server.py:275-283`: `/static`, `/admin/static`, `/_debug_toolbar`, `/git`, `/favicon.ico`, and `/health`. Requests whose path starts with any of those prefixes produce **no** `@after_request` log line (so grepping logs for `/health` hits will always return zero matches — this is by design).
 
 The index page itself is mounted at `server.py:249-254`: `/` redirects authenticated users to the dashboard and unauthenticated users to `auth.login`.
@@ -406,9 +408,11 @@ The subsections below walk through each of these four HTTP requests in the same 
 4. **hCaptcha verification.** Lines 47-70 — only runs when `config.HCAPTCHA_SECRET` is set. In a local deployment (where `HCAPTCHA_SECRET` is unset), this block is skipped entirely. A failed captcha fires `RegisterEvent(RegisterEvent.ActionType.catpcha_failed).send()` and re-renders the form.
 5. **Email canonicalisation.** Line 73 — `email = canonicalize_email(email)`, then `email_can_be_used_as_mailbox(email)` (line 76) and `personal_email_already_used(email)` (line 83) are re-checked against both the canonical and original form.
 6. **Log the creation.** Line 85:
+
    ```python
    LOG.d("create user %s", email)
    ```
+
    This produces the `create user testuser@example.com` DEBUG line visible in stdout.
 7. **Call `User.create()`.** Lines 86-91 — invokes `User.create(email=email, name=name, password=password, from_partner=False, ...)` defined at `app/models.py:602`. See the sub-section below for what `User.create()` actually does.
 8. **Send the activation email.** Line 95 — wrapped in `try/except` (the `try` opens at line 95); on failure a `RegisterEvent(ActionType.invalid_email)` is emitted (line 101) and the form is re-rendered with an error flash.
@@ -473,7 +477,7 @@ Each line maps to a source location:
 | `Not sending events because webhook is not configured and allowed to be empty` | `app/events/event_dispatcher.py:62-64` | Fires in `EventDispatcher.send_event()` when `EVENT_WEBHOOK` is unset and `skip_if_webhook_missing=True`. This is the expected message on a local dev setup. |
 
 > **Note on the `from` address.** `email_utils.send_activation_email()` at `app/email_utils.py:125` calls `send_email(user.email, "Just one more step…", …)` **without** supplying `from_name` or `from_addr`. The `send_email()` helper at `app/email_utils.py:303-306` defaults both parameters to `config.NOREPLY`, which `app/config.py:435` resolves as `os.environ.get("NOREPLY", f"noreply@{EMAIL_DOMAIN}")` → `noreply@sl.local` in the local-dev env. The helper composes the header as `f'"{from_name}" <{from_addr}>'`, producing the literal string `"noreply@sl.local" <noreply@sl.local>`. It deliberately does **not** use `SUPPORT_EMAIL` / `SUPPORT_NAME` — those are reserved for transactional replies sent by `send_email_with_rate_control()` and similar helpers. The same `NOREPLY` defaulting applies to `send_welcome_email()` (Step 2) and most other automated mails; grepping for `noreply@sl.local` in the log is the reliable way to confirm the email subsystem is exercising the short-circuit path.
-
+>
 > **Note on the last log line.** The AAP §0.5.3 shorthand reads `"Not sending events because webhook is not configured"` but the actual emitted message (per `app/events/event_dispatcher.py:63`) is the **longer** `"Not sending events because webhook is not configured and allowed to be empty"`. This document uses the full literal string.
 
 #### Database state after Step 1
@@ -490,7 +494,7 @@ After a single successful registration the database has been mutated as follows:
 | `daily_metric` | +1 (first reg of day) or updated | `date=CURRENT_DATE`, `nb_new_web_non_proton_user += 1` |
 
 > **Note on `alias` columns.** The `alias` table has **no** `prefix` or `suffix` columns — the full address is stored in the single `email` column (varchar 128, unique, not null). `prefix="simplelogin-newsletter"`, `suffix=".<random>@sl.local"`, and the random middle component are keyword **arguments** passed to `Alias.create_new()` in `app/models.py` (around line 634); the factory concatenates them into the final `email` value before `INSERT`. Live `\d alias` from PostgreSQL shows 24 columns — `id, created_at, updated_at, user_id, email, enabled, custom_domain_id, automatic_creation, directory_id, note, mailbox_id, name, disable_pgp, cannot_be_disabled, disable_email_spoofing_check, batch_import_id, original_owner_id, pinned, transfer_token, transfer_token_expiration, hibp_last_check, ts_vector, last_email_log_id, flags` — none of which is `prefix` or `suffix`. A working inspection query is therefore `SELECT id, email, user_id, mailbox_id, enabled, note FROM alias WHERE user_id = <USER_ID>`.
-
+>
 > **Note on `job.state`.** `state` is an **integer** column (`sa.Integer`, `server_default='0'`, `default=JobState.ready.value`), not a string. The `JobState` enum at `app/models.py:253` maps `ready=0, taken=1, done=2, error=3`. So a freshly-scheduled onboarding job has `state=0`, not `state='ready'`. Filter queries must compare against integers — e.g. `SELECT id, name, state, run_at FROM job WHERE state = 0 ORDER BY id;` — otherwise PostgreSQL returns `operator does not exist: integer = unknown`.
 
 Sample `psql` inspection commands:
@@ -530,12 +534,14 @@ SELECT date, nb_new_web_non_proton_user FROM daily_metric WHERE date = CURRENT_D
 2. `activation_code = ActivationCode.get_by(code=code)` at line 24. If `None` → return 400 with `g.deduct_limit = True`.
 3. Check expiry via `activation_code.is_expired()` (`app/models.py:1214-1215` — compares `self.expired < arrow.now()`). The default expiry is **1 hour** (`_expiration_1h` at `app/models.py:1186` returns `arrow.now().shift(hours=1)`). Expired → 400.
 4. **Success path (lines 48-51):**
+
    ```python
    user.activated = True
    login_user(user)
    ActivationCode.delete(activation_code.id)  # single-use
    Session.commit()
    ```
+
    - `login_user` is Flask-Login's function — it writes the `_user_id` key into the signed Flask session cookie.
    - The activation code is **deleted immediately**, so the same code cannot be reused.
 5. `flash("Your account has been activated", "success")` — flash message for the next rendered page. In this codebase `templates/base.html` does *not* render flashes as static Bootstrap alerts; instead, it emits a `<script>toastr.success("Your account has been activated");</script>` call that is executed client-side. The banner therefore only becomes **visible** when the `toastr` vendor library is reachable at `/static/node_modules/toastr/build/toastr.min.js`. If `npm ci` was skipped in the `static/` directory, the flash is still in the HTML source but the browser raises `ReferenceError: toastr is not defined` in the console and no banner is drawn — see the prerequisites section for the one-time fix (`cd static && npm ci`).
@@ -612,6 +618,7 @@ Note that the activation flow in §2.2 calls `login_user()` itself, so the user 
    Each failure path calls `LoginEvent(LoginEvent.ActionType.<value>).send()` at `app/events/auth_event.py:23`, which records a New Relic custom event `"LoginEvent"` with `{"action": "<value>", "source": "web"}`.
 
 5. **Success path (line 71):**
+
    ```python
    LoginEvent(LoginEvent.ActionType.success).send()
    return after_login(user, next_url)
@@ -663,6 +670,7 @@ def __repr__(self):
    - `nb_forward`, `nb_reply`, `nb_block` = counts from `EmailLog` joined on the user's aliases — for a new user these are **0** because no mail has been forwarded yet.
 2. `mailboxes = current_user.mailboxes()` — returns a list of the user's verified mailboxes, ordered. For a new user this is the single default mailbox created during registration.
 3. **Intro tour logic.** Lines 170-177 (approximately):
+
    ```python
    show_intro = False
    if not current_user.intro_shown:
@@ -671,6 +679,7 @@ def __repr__(self):
        current_user.intro_shown = True
        Session.commit()
    ```
+
    Because `intro_shown` is persisted to the `users` table, **the `Show intro to ...` log fires exactly once per account** — a perfect single-shot signal that the user has reached the dashboard for the first time.
 4. `alias_infos = get_alias_infos_with_pagination_v3(current_user, page_id=page, ...)` — returns the current page of aliases (fetches `PAGE_LIMIT + 1` rows to detect whether a "next page" link is needed).
 5. Renders `templates/dashboard/index.html` with `alias_infos`, `mailboxes`, `show_intro`, `stats`, and pagination variables.
@@ -785,6 +794,7 @@ During a local single-user smoke test, **only the web process is strictly requir
 
 1. Enter `create_light_app().app_context()` (imported from `server.py:127`). `create_light_app` creates a stripped-down Flask app with only DB access — no blueprints, no Flask-Login, no Limiter. This keeps the background worker memory-light.
 2. Call `get_jobs_to_run()` at `job_runner.py:307`:
+
    ```sql
    -- Conceptually (remember `state` is an integer enum — JobState.ready=0, taken=1, done=2, error=3):
    SELECT * FROM job
@@ -792,6 +802,7 @@ During a local single-user smoke test, **only the web process is strictly requir
       AND attempts < JOB_MAX_ATTEMPTS
       AND (run_at IS NULL OR run_at <= NOW() + INTERVAL '10 minutes')
    ```
+
 3. For each returned `Job`: mark `state=1` (`JobState.taken`), `taken_at=now()`, `taken=True`, `attempts += 1`, commit, then call `process_job(job)` at line 188, then `state=2` (`JobState.done`), commit.
 4. `time.sleep(10)` at `job_runner.py:347` — **10-second poll interval**.
 
@@ -1149,7 +1160,7 @@ The user's explicit rule (AAP §0.7.1) requires that **any test users, aliases, 
 > - `users.default_mailbox_id → mailbox.id` has **no** explicit `ondelete=` clause, so SQLAlchemy falls back to the SQL default (`NO ACTION`). **This** is why step 5 (`UPDATE users SET default_mailbox_id = NULL …`) is required before deleting the mailbox: without nulling this FK first, the mailbox `DELETE` would fail with a foreign-key violation.
 > - `users.newsletter_alias_id → alias.id` is declared with `ondelete="SET NULL"`, so the database would null it automatically when the alias is removed. Step 3 nulls it explicitly anyway, for clarity and so the script does not depend on the server-side cascade evaluation order.
 > - Every `*.user_id` FK (alias, mailbox, job, activation_code, etc.) is `ondelete="cascade"`. In principle a single `DELETE FROM users WHERE id = <id>` would cascade through most of these, but the step-by-step ordering in the script keeps every intermediate table auditable and makes failure diagnostics (which step rolled back?) trivial.
-
+>
 > **Preferred path: `User.delete()`.** In production SimpleLogin code, the canonical way to tear down a user is `User.delete(user_id)` at `app/models.py:671` — it cascades through owned records and emits a `UserDeleted` sync event via `EventDispatcher.send_event()`. That event path is unwanted in a pure observability cleanup (and would just log "Not sending events because webhook is not configured and allowed to be empty" anyway in local dev), so for a read-only smoke test the direct SQL below is both sufficient and auditable.
 
 ### FK-Safe Cleanup SQL
