@@ -1051,12 +1051,59 @@ the new value.
 
    - `FLAG_FREE_OLD_ALIAS_LIMIT` is defined at `app/models.py` line 341: `FLAG_FREE_OLD_ALIAS_LIMIT = 1 << 2`
      (i.e. `4`).
-   - For a freshly-registered user, the `flags` column is `0` by default. Therefore
-     `self.flags & self.FLAG_FREE_OLD_ALIAS_LIMIT == 0`, which is **not equal** to
-     `FLAG_FREE_OLD_ALIAS_LIMIT` (which is `4`). The `else` branch is taken and the method returns
-     `config.MAX_NB_EMAIL_FREE_PLAN` — the current runtime value.
+   - The `flags` column is declared at `app/models.py` lines 545–550:
+
+     ```python
+     flags = sa.Column(
+         sa.BigInteger,
+         default=FLAG_DISABLE_CREATE_CONTACTS,
+         server_default="0",
+         nullable=False,
+     )
+     ```
+
+     Here the **SQLAlchemy Python-level** default is `FLAG_DISABLE_CREATE_CONTACTS` (defined at
+     `app/models.py` line 339 as `1 << 0`, i.e. `1`), while the **PostgreSQL column-level**
+     `server_default` is the string `"0"`. When a new `User` row is created via `User.create(...)` —
+     the path taken by `POST /api/auth/register` at `app/api/views/auth.py` line 125 — SQLAlchemy
+     supplies the Python default at `INSERT` time, so the `server_default` is not used. Therefore a
+     freshly-registered user has `flags = 1` (= `FLAG_DISABLE_CREATE_CONTACTS`), NOT `0`, in the
+     database row.
+
+     This was verified at runtime against both test users:
+
+     ```
+     PGPASSWORD=test psql -U test -d test -h localhost -p 15432 \
+       -c "SELECT email, flags FROM users WHERE email IN ('testuser@example.com','user2@example.com');"
+     ```
+
+     Output:
+
+     ```
+             email         | flags
+     ----------------------+-------
+      testuser@example.com |     1
+      user2@example.com    |     1
+     (2 rows)
+     ```
+
+   - The bitwise check in `max_alias_for_free_account()` still evaluates to `0` for both users,
+     because only the `FLAG_FREE_OLD_ALIAS_LIMIT` bit (bit 2, value `4`) is masked off and bit 0 is
+     outside that mask:
+
+     ```
+     self.flags & self.FLAG_FREE_OLD_ALIAS_LIMIT
+       = 1 & 4
+       = 0b001 & 0b100
+       = 0
+     ```
+
+     `0` is **not equal** to `FLAG_FREE_OLD_ALIAS_LIMIT` (which is `4`), so the `if` condition is
+     false and the `else` branch is taken. The method returns `config.MAX_NB_EMAIL_FREE_PLAN` — the
+     current runtime value.
    - Neither user in this experiment (`testuser@example.com` or `user2@example.com`) has the
-     `FLAG_FREE_OLD_ALIAS_LIMIT` bit set, so both hit the `else` branch.
+     `FLAG_FREE_OLD_ALIAS_LIMIT` bit set (only `FLAG_DISABLE_CREATE_CONTACTS` is set), so both hit
+     the `else` branch.
 
 3. **Value surfaced to the API response — `app/api/views/user_info.py` line 34:**
 
