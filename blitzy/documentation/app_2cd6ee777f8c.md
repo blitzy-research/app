@@ -513,7 +513,7 @@ SUCCESS — result: .test-suffix@sl.local
 check_suffix_signature result: .test-suffix@sl.local
 
 --- Test 6: Tampered signature ---
-BadSignature: Signature b'JayFjy80p5Go3tsYLHhp-zXXXXX' does not match
+BadTimeSignature: Signature b'JayFjy80p5Go3tsYLHhp-zXXXXX' does not match
 
 --- Test 7: check_suffix_signature on tampered token ---
 check_suffix_signature (tampered) result: None
@@ -528,7 +528,7 @@ check_suffix_signature (tampered) result: None
 | 3 | `1` | 4 s after signing | ❌ `itsdangerous.SignatureExpired: "Signature age 4 > 1 seconds"` |
 | 4 | `600` | ~4 s after signing | ✅ VALID — returns `.test-suffix@sl.local` |
 | 5 | (hard-coded 600) | ~4 s | ✅ `check_suffix_signature()` returns `.test-suffix@sl.local` |
-| 6 | `600` (tampered) | ~4 s | ❌ `itsdangerous.BadSignature: "Signature b'…XXXXX' does not match"` |
+| 6 | `600` (tampered) | ~4 s | ❌ `itsdangerous.BadTimeSignature: "Signature b'…XXXXX' does not match"` (a subclass of `BadSignature`) |
 | 7 | (hard-coded 600, tampered) | ~4 s | `check_suffix_signature()` returns `None` |
 
 **The expiration window is exactly 600 seconds (10 minutes).** The boundary tests at `max_age=0` and `max_age=1` produce `SignatureExpired` with messages of the form `"Signature age <elapsed> > <max_age> seconds"`, confirming that `itsdangerous` compares elapsed time against the supplied `max_age` and raises as soon as `elapsed > max_age`.
