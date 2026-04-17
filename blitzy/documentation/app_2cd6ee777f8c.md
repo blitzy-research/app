@@ -810,7 +810,7 @@ This is the richest of the three sub-flows: a single inbound SMTP message produc
 def _handle(self, envelope: Envelope, msg: Message):
     start = time.time()
 
-    # generate a different message_id for each email
+    # generate a different message_id to keep track of an email lifecycle
     message_id = str(uuid.uuid4())
     set_message_id(message_id)
 
