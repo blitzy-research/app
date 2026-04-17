@@ -59,7 +59,7 @@ SimpleLogin is a multi-process Flask application whose behaviour is driven almos
 |---|---|---|
 | **PostgreSQL** | 13+ (tested with v16) | Primary relational store; holds `users`, `mailbox`, `alias`, `job`, `activation_code`, `daily_metric`, `public_domain`, `sync_event`, etc. |
 | **Redis** | 6+ (tested with v7) | Session store, Flask-Limiter backend, distributed locks. Only wired in when `MEM_STORE_URI` is set (see `server.py:163-165`). |
-| **Node.js** | 10.17.0 in the Dockerfile (newer works too) | Builds the frontend assets under `static/` at image build time (Dockerfile Stage 1 `FROM node:10.17.0-alpine AS npm`). Not required to run the backend. |
+| **Node.js** | 10.17.0 in the Dockerfile (newer works too) | Builds the frontend assets under `static/` at image build time (Dockerfile Stage 1 `FROM node:10.17.0-alpine AS npm`). Not required to run the backend, but **required** for a fully-functional authenticated UI — see the `npm ci` note below. |
 | **Postfix / MTA** | optional | Required only when delivering real email. With `NOT_SEND_EMAIL=true` the Postfix dependency disappears. |
 
 The database `simplelogin` must exist, owned by user `myuser` (or whatever role you use in `DB_URI`). Alembic will manage the schema.
@@ -91,22 +91,32 @@ Two of these deserve special attention because they govern observable behaviour:
 After the environment variables are in place, run these in order **exactly once** per fresh database:
 
 ```bash
-# 1. Apply all schema migrations (256 revisions under migrations/versions/).
+# 1. Install the frontend vendor libraries that the authenticated UI depends on.
+#    This mirrors Dockerfile Stage 1 (`FROM node:10.17.0-alpine AS npm` → `cd /code/static && npm ci`).
+#    WITHOUT this step, the dashboard, activation flash, and intro tour silently degrade
+#    because `/static/node_modules/...` assets return 404 and the browser raises
+#    `toastr is not defined`, `bootbox is not defined`, `introJs is not defined`, etc.
+#    `static/node_modules/` is `.gitignore`d, so running this does not alter tracked source.
+cd static && npm ci && cd ..
+
+# 2. Apply all schema migrations (256 revisions under migrations/versions/).
 alembic upgrade head
 
-# 2. Seed the public_domain table and load PGP keys (idempotent).
+# 3. Seed the public_domain table and load PGP keys (idempotent).
 python3 init_app.py
 
-# 3. Launch the app. Two flavours:
+# 4. Launch the app. Two flavours:
 
-# 3a. Production-style (matches Dockerfile CMD):
+# 4a. Production-style (matches Dockerfile CMD):
 gunicorn wsgi:app -b 0.0.0.0:7777 -w 1 --timeout 15
 
-# 3b. Development-style (debug toolbar, reloader, flask dev server):
+# 4b. Development-style (debug toolbar, reloader, flask dev server):
 python server.py
 ```
 
 The Dockerfile's default CMD is `gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15` (see the last line of `Dockerfile`). The container exposes port **7777** (`EXPOSE 7777`).
+
+> **Why the `npm ci` step matters.** The Flask backend, database, and background workers all come up correctly without any Node.js toolchain. But the *authenticated-user UI* (dashboard, intro tour, flash banners, modal confirmations, client-side form validation, multi-select dropdowns, htmx interactions) is wired through `<script src="/static/node_modules/...">` tags in `templates/base.html` and `templates/dashboard/index.html`. If those files are missing you will see HTTP **200** responses and green URL probes but a broken experience in the browser — the post-activation flash toast never appears, the `introJs` first-visit tour never starts, and the JS console fills with `ReferenceError: toastr is not defined`, `bootbox is not defined`, `introJs is not defined`, `Vue is not defined`, and `$(...).multipleSelect is not a function`. Run `cd static && npm ci` once (the Dockerfile does this automatically in Stage 1); it installs the 17-package vendor tree described in `static/package.json` into the gitignored `static/node_modules/` directory.
 
 `wsgi.py` is a three-line file:
 
@@ -528,7 +538,7 @@ SELECT date, nb_new_web_non_proton_user FROM daily_metric WHERE date = CURRENT_D
    ```
    - `login_user` is Flask-Login's function — it writes the `_user_id` key into the signed Flask session cookie.
    - The activation code is **deleted immediately**, so the same code cannot be reused.
-5. `flash("Your account has been activated", "success")` — Bootstrap-style flash message for the next rendered page.
+5. `flash("Your account has been activated", "success")` — flash message for the next rendered page. In this codebase `templates/base.html` does *not* render flashes as static Bootstrap alerts; instead, it emits a `<script>toastr.success("Your account has been activated");</script>` call that is executed client-side. The banner therefore only becomes **visible** when the `toastr` vendor library is reachable at `/static/node_modules/toastr/build/toastr.min.js`. If `npm ci` was skipped in the `static/` directory, the flash is still in the HTML source but the browser raises `ReferenceError: toastr is not defined` in the console and no banner is drawn — see the prerequisites section for the one-time fix (`cd static && npm ci`).
 6. `email_utils.send_welcome_email(user)` at line 58.
 7. Redirect:
    - If the request carried a `next` query parameter → `redirect(sanitize_next_url(next))` and `LOG.d("redirect user to %s", next_url)` at line 63.
@@ -669,6 +679,8 @@ def __repr__(self):
 
 The template wraps its `introJs().start()` invocation inside `{% if show_intro %}`. Additionally the client-side JS checks `window.innerWidth >= 1024` before kicking off the tour, so on narrow viewports (mobile) the highlight overlay is silently suppressed. The DEBUG log line still fires server-side regardless of viewport — the log is a **reliable** first-visit indicator; the UI overlay is not.
 
+There is one additional silent-failure mode worth highlighting: the overlay also depends on the `intro.js` vendor bundle being loaded from `/static/node_modules/intro.js/minified/intro.min.js`. If the Node.js dependencies in `static/` were **not** installed (i.e. `cd static && npm ci` was never run), the `<script>introJs().start();</script>` fragment still renders in the DOM *and* the viewport guard still evaluates to `true` on desktop, but the call raises `ReferenceError: introJs is not defined` in the browser console and no overlay appears. The server-side `Show intro to <User ...>` log line and the `intro_shown` flag flip still happen correctly — so from a database/log standpoint the "first visit" is recorded, but the user sees no tour. See the prerequisites section for the install step that unblocks this.
+
 #### Observed logs for Step 4 (AAP §0.5.3)
 
 ```text
@@ -693,11 +705,31 @@ The exact format string in `server.py:285` is `"%s %s %s %s %s, takes %s"` popul
 
 Per `templates/dashboard/index.html` and the rendered page, a first-visit dashboard shows:
 
-- A stats strip near the top showing `nb_alias / nb_forward / nb_reply / nb_block` — all `0` except `nb_alias=1` for a brand-new user.
-- The single alias row: `simplelogin-newsletter.<random>@sl.local`, labelled as the user's first alias.
-- Two primary buttons above the alias list: **"Create random alias"** and **"Create custom alias"**.
-- A sidebar/menu with links to *Mailboxes*, *Custom Domains*, *Settings*, and *API Keys*.
-- An IntroJS guided-tour overlay (only when `show_intro=True` **and** viewport ≥ 1024 px).
+- **Top-level header/navbar**: the SimpleLogin logo (left) and the user-profile area (right). The user-profile area is a dropdown trigger showing the user's email plus, on trial/premium accounts, a small green legend such as **"Premium expires in a week"** followed by an information "ⓘ" glyph. The header dropdown — *not* the sidebar — is where the **API Keys** link lives (`/dashboard/api_key`), along with *Sign out*, *Settings*, and related account actions.
+- **Stats strip** showing the four counters computed by `get_stats(user)` (`app/dashboard/views/index.py:32`). The template variables are `nb_alias`, `nb_forward`, `nb_reply`, `nb_block`; the *rendered* card labels are the user-facing forms **ALIASES**, **FORWARDED**, **REPLIES/SENT**, and **BLOCKED** (uppercase). For a freshly-activated user the values are `1 / 0 / 0 / 0`.
+
+  | Template variable (`get_stats()` key) | Rendered card label |
+  |---|---|
+  | `nb_alias` | `ALIASES` |
+  | `nb_forward` | `FORWARDED` |
+  | `nb_reply` | `REPLIES/SENT` |
+  | `nb_block` | `BLOCKED` |
+
+- **Action bar** (above the alias list): two primary buttons — **"Random Alias"** (green, Bootstrap `.btn-success` — creates a randomly-generated alias) and **"New Custom Alias"** (blue, `.btn-primary` — opens a modal to craft a custom alias prefix). These are the actual rendered button texts in `templates/dashboard/index.html`; the documented SimpleLogin *feature* is conventionally described as "create random alias / create custom alias", but the on-screen button labels are the shorter forms above.
+- **The single alias row**: `simplelogin-newsletter.<random>@sl.local`, labelled as the user's first alias (this is the newsletter alias created by `User.create()` — see §2.1).
+- **Horizontal sidebar/menu** (below the header on the dashboard, rendered from `templates/partials/menu.html`). The five items actually present are:
+
+  | Sidebar label | Route |
+  |---|---|
+  | **Aliases** | `/dashboard/` |
+  | **Mailboxes** | `/dashboard/mailbox` |
+  | **Domains** | `/dashboard/custom_domain` |
+  | **Directories** | `/dashboard/directory` |
+  | **Settings** | `/dashboard/setting` |
+
+  Two things are worth noting: the sidebar label is **"Domains"** (not "Custom Domains", although the route still points at `custom_domain`), and **API Keys is *not* in the sidebar** — it is reached via the user-profile dropdown in the header.
+- An **IntroJS guided-tour overlay** (only when `show_intro=True` **and** viewport ≥ 1024 px **and** the `intro.js` vendor bundle actually loaded — i.e. `cd static && npm ci` was run; see the prerequisites above).
+- On smaller viewports (≤ 992 px, Bootstrap's `lg` breakpoint) the horizontal sidebar collapses behind a hamburger-menu toggler (the `.header-toggler` element with a `d-lg-none` class), the stats grid reflows from `1×4` to `2×2`, and the user-profile header collapses to just the avatar initial (e.g. "Q"), hiding the email and premium-expiry legend.
 
 ### 2.5 End-to-End Verification Timeline
 
