@@ -51,7 +51,7 @@
 
 ## Local Environment Prerequisites
 
-SimpleLogin is a multi-process Flask application whose behaviour is driven almost entirely by environment variables loaded through `python-dotenv` in `app/config.py` (see `app/config.py:9` — `from dotenv import load_dotenv` — and `app/config.py:66-72` where the file is actually loaded). The reference set of variables is `example.env` at the repository root.
+SimpleLogin is a multi-process Flask application whose behaviour is driven almost entirely by environment variables loaded through `python-dotenv` in `app/config.py` (see `app/config.py:9` — `from dotenv import load_dotenv` — and `app/config.py:64-71` where the file is actually loaded). The reference set of variables is `example.env` at the repository root.
 
 ### Required Services
 
@@ -131,7 +131,7 @@ The process of going from `gunicorn wsgi:app` (or `python server.py`) to a reque
 
 The very first side-effect on the console comes from **module-level** `print()` calls in `app/config.py`. When Python imports `server.py`, it imports `app.config`, which at import time:
 
-1. Executes the `.env` loading branch at `app/config.py:66-72`: **if** `CONFIG` environment variable is set, `load_dotenv(config_file)` is called for that explicit path (`app/config.py:70`); **else** `load_dotenv()` is called with no arguments, which auto-discovers the default `.env` (`app/config.py:72`). The two calls are mutually exclusive — only one runs per process.
+1. Executes the `.env` loading branch at `app/config.py:64-71`: **if** `CONFIG` environment variable is set, `load_dotenv(get_abs_path(config_file))` is called for that explicit path (`app/config.py:69`); **else** `load_dotenv()` is called with no arguments, which auto-discovers the default `.env` (`app/config.py:71`). The two calls are mutually exclusive — only one runs per process.
 2. Reads `URL = os.environ["URL"]` (`app/config.py:79`)
 3. Emits `print(">>> URL:", URL)` (`app/config.py:80`)
 
@@ -226,7 +226,7 @@ Each line is traceable to a specific source location:
 | `>>> URL: http://localhost:7777` | `app/config.py:80` — `print(">>> URL:", URL)` | `.env` loaded; `URL` env var resolved |
 | `>>> init logging <<<` | `app/log.py:67` — `print(">>> init logging <<<")` | `app.log` imported; `LOG = _get_logger("SL")` built (line 79); `coloredlogs` installed (line 62) when `COLOR_LOG` is set |
 | `* Serving Flask app "server" (lazy loading)` | emitted by Flask's Werkzeug dev server at `app.run(...)` | Dev-mode only — fires from `local_main()` (see `server.py:572`) |
-| `* Debug mode: on` | from `app.run(debug=True, port=7777)` at `server.py:588` | `app.debug = True` is set at `server.py:585` |
+| `* Debug mode: on` | from `app.run(debug=True, port=7777)` at `server.py:588` | `app.debug = True` is set at `server.py:581` |
 
 **Under Gunicorn** the Werkzeug "Serving Flask app" / "Debug mode" lines are replaced with Gunicorn's own bootstrap output, which looks roughly like:
 
@@ -298,7 +298,7 @@ sync_event       -- outbound event queue (consumed by event_listener.py)
 - `add_sl_domains()` at `init_app.py:39-56` — iterates over `config.ALIAS_DOMAINS` and `config.PREMIUM_ALIAS_DOMAINS` and creates a row in the `public_domain` table for each (via `SLDomain.create(...)`). The function is **idempotent**:
   - If the domain already exists → `LOG.d("%s is already a SL domain", domain)` (DEBUG).
   - Otherwise → `LOG.i("Add %s to SL domain", domain)` (INFO) before creating.
-- `add_proton_partner()` is **defined** in `init_app.py` (and at `app/proton/proton_partner.py`) but is **not** invoked from `init_app.py`'s `__main__` block. It is called at web-app bootstrap time from `server.py` (inside the `dummy-data` CLI handler) and from the pytest fixture at `tests/conftest.py:39`. Running `python3 init_app.py` therefore does **not** create the Proton partner row; that row appears only when the main Flask app boots or when the test suite runs.
+- `add_proton_partner()` is **defined** in `init_app.py:59` but is **not** invoked from `init_app.py`'s `__main__` block. It is called at web-app bootstrap time from `server.py` (inside the `dummy-data` CLI handler) and from the pytest fixture at `tests/conftest.py:39`. Running `python3 init_app.py` therefore does **not** create the Proton partner row; that row appears only when the main Flask app boots or when the test suite runs.
 
 The `if __name__ == "__main__":` block at the end of `init_app.py` (lines 69-73) wraps the two seed calls in `create_light_app().app_context()` so they can run standalone without starting the web server. The call order is: **first** `load_pgp_public_keys()`, **then** `add_sl_domains()` — `add_proton_partner()` is **not** in this block.
 
@@ -374,7 +374,7 @@ The subsections below walk through each of these four HTTP requests in the same 
 
 1. **Guard: already authenticated.** Line 33 — if `current_user.is_authenticated` is true, 302-redirect to the dashboard. This prevents a logged-in user from registering a second account.
 2. **Guard: registration disabled.** Line 38 — if `config.DISABLE_REGISTRATION` is truthy (`app/config.py:138` — `DISABLE_REGISTRATION = "DISABLE_REGISTRATION" in os.environ`), flash a warning and redirect to login.
-3. **Form validation.** `RegisterForm` (class defined at line 23) declares `email` as a `StringField` with the `validators.DataRequired()` validator only (line 24) and `password` as a `PasswordField` with `DataRequired()` plus `validators.Length(min=8, max=100)` (line 26). Dedicated email-shape validation is deferred to the handler body via `is_valid_email()`, `canonicalize_email()`, and `email_can_be_used_as_mailbox()`, which run after WTForms has confirmed the field is non-empty.
+3. **Form validation.** `RegisterForm` (class defined at line 23) declares `email` as a `StringField` with the `validators.DataRequired()` validator only (line 24) and `password` as a `StringField` with `DataRequired()` plus `validators.Length(min=8, max=100)` (line 25). Note that `password` is declared as `StringField` (not `PasswordField`); the HTML `type="password"` comes from the template layer (`templates/auth/register.html`), not from the form class. Dedicated email-shape validation is deferred to the handler body via `is_valid_email()`, `canonicalize_email()`, and `email_can_be_used_as_mailbox()`, which run after WTForms has confirmed the field is non-empty.
 4. **hCaptcha verification.** Lines 47-70 — only runs when `config.HCAPTCHA_SECRET` is set. In a local deployment (where `HCAPTCHA_SECRET` is unset), this block is skipped entirely. A failed captcha fires `RegisterEvent(RegisterEvent.ActionType.catpcha_failed).send()` and re-renders the form.
 5. **Email canonicalisation.** Line 73 — `email = canonicalize_email(email)`, then `email_can_be_used_as_mailbox(email)` (line 76) and `personal_email_already_used(email)` (line 83) are re-checked against both the canonical and original form.
 6. **Log the creation.** Line 85:
@@ -424,7 +424,7 @@ The private `send_activation_email(user, next_url)` helper at `app/auth/views/re
 1. Deletes any prior `ActivationCode` rows for this user (forces a single outstanding code)
 2. Creates a new `ActivationCode` row: `code=random_string(30)`, `user_id=user.id`, `expired=arrow.now().shift(hours=1)` (the default via `_expiration_1h` at `app/models.py:1186`)
 3. Builds the activation link: `f"{URL}/auth/activate?code={activation.code}"` plus optional `&next=<next_url>`
-4. Calls `email_utils.send_activation_email(user, activation_link)` at `app/email_utils.py:125` which composes a message with subject **"Just one more step to join SimpleLogin"** using the `transactional/activation.txt` and `transactional/activation.html` templates.
+4. Calls `email_utils.send_activation_email(user, activation_link)` at `app/email_utils.py:125` which composes a message with subject **"Just one more step to join SimpleLogin"** using the `transactional/activation.txt` and `transactional/activation.html` templates. These template paths are resolved **relative to the `templates/emails/` prefix** added by the internal `render()` helper at `app/email_utils.py:72`; on disk the files live at `templates/emails/transactional/activation.txt` and `templates/emails/transactional/activation.html`.
 
 #### Observed logs for Step 1 (AAP §0.5.3)
 
@@ -441,7 +441,7 @@ Each line maps to a source location:
 | Log line | Source | Notes |
 |---|---|---|
 | `create user testuser@example.com` | `app/auth/views/register.py:85` — `LOG.d("create user %s", email)` | Fires **before** `User.create()` so you see it even if `User.create()` fails |
-| `send email with subject '...', from '...' to '...'` | `app/mail_sender.py:131-135` — inside the `if config.NOT_SEND_EMAIL:` short-circuit | Logs the composed message and returns `True` **without** opening an SMTP connection |
+| `send email with subject '...', from '...' to '...'` | `app/mail_sender.py:131-136` — inside the `if config.NOT_SEND_EMAIL:` short-circuit | Logs the composed message and returns `True` **without** opening an SMTP connection |
 | `Not sending events because webhook is not configured and allowed to be empty` | `app/events/event_dispatcher.py:62-64` | Fires in `EventDispatcher.send_event()` when `EVENT_WEBHOOK` is unset and `skip_if_webhook_missing=True`. This is the expected message on a local dev setup. |
 
 > **Note on the last log line.** The AAP §0.5.3 shorthand reads `"Not sending events because webhook is not configured"` but the actual emitted message (per `app/events/event_dispatcher.py:63`) is the **longer** `"Not sending events because webhook is not configured and allowed to be empty"`. This document uses the full literal string.
@@ -536,7 +536,7 @@ redirect user to dashboard
 
 | Log line | Source |
 |---|---|
-| `send email with subject 'Welcome to SimpleLogin', ...` | `app/mail_sender.py:131-135` (via `email_utils.py:97` call) |
+| `send email with subject 'Welcome to SimpleLogin', ...` | `app/mail_sender.py:131-136` (via `email_utils.py:97` call) |
 | `redirect user to dashboard` | `app/auth/views/activate.py:66` — `LOG.d("redirect user to dashboard")` |
 
 #### Database state after Step 2
@@ -572,7 +572,7 @@ Note that the activation flow in §2.2 calls `login_user()` itself, so the user 
    |---|---|---|
    | Missing user, or wrong password (line 50) | `failed` | Re-render login form with error flash |
    | `user.disabled` (line 56) | `disabled_login` | Re-render with "account disabled" flash |
-   | `user.delete_on is not None` (line 63) | `scheduled_to_be_deleted` | Re-render with "pending deletion" message |
+   | `user.delete_on is not None` (line 62) | `scheduled_to_be_deleted` | Re-render with "pending deletion" message |
    | `not user.activated` (line 69) | `not_activated` | Re-render with the "resend activation" link |
 
    Each failure path calls `LoginEvent(LoginEvent.ActionType.<value>).send()` at `app/events/auth_event.py:23`, which records a New Relic custom event `"LoginEvent"` with `{"action": "<value>", "source": "web"}`.
@@ -1031,7 +1031,7 @@ The following table is a one-page reference for the key runtime signals a local 
 | Config load | `>>> URL: http://localhost:7777` | stdout (process start) | `app/config.py:80` — `dotenv` parsed, `URL` resolved |
 | Per-request log | `<ip> <method> <path> <args> <status>, takes <sec>` | web stdout | `server.py:272-297` — `@after_request` fired; format string is `"%s %s %s %s %s, takes %s"` (`server.py:285`) populated with 6 positional fields — **no** user/session field |
 | User create | `create user <email>` | web stdout | `app/auth/views/register.py:85` reached |
-| Email composed (`NOT_SEND_EMAIL`) | `send email with subject '...', from '...' to '...'` | web stdout | `app/mail_sender.py:131-135` — email composed; no SMTP attempted |
+| Email composed (`NOT_SEND_EMAIL`) | `send email with subject '...', from '...' to '...'` | web stdout | `app/mail_sender.py:131-136` — email composed; no SMTP attempted |
 | Event dispatch skip (local) | `Not sending events because webhook is not configured and allowed to be empty` | web stdout | `app/events/event_dispatcher.py:63` — expected in local dev |
 | Login success | `log user <User X ...> in` | web stdout | `app/auth/views/login_utils.py:35` |
 | Auth redirect | `redirect user to dashboard` | web stdout | `app/auth/views/login_utils.py:44` **or** `app/auth/views/activate.py:66` |
@@ -1160,7 +1160,7 @@ Every behavioural claim made in this document maps to a specific file and line i
 ### Configuration & Logging
 
 - `app/config.py:9` — `from dotenv import load_dotenv`
-- `app/config.py:66-72` — `if config_file: load_dotenv(config_file) else: load_dotenv()` — reads `.env` at import time; the two branches are mutually exclusive, exactly one runs per process
+- `app/config.py:64-71` — `if config_file: load_dotenv(get_abs_path(config_file)) else: load_dotenv()` — reads `.env` at import time; the two branches are mutually exclusive, exactly one runs per process
 - `app/config.py:73` — `COLOR_LOG = "COLOR_LOG" in os.environ`
 - `app/config.py:79` — `URL = os.environ["URL"]`
 - `app/config.py:80` — `print(">>> URL:", URL)` — startup URL log line
@@ -1186,7 +1186,7 @@ Every behavioural claim made in this document maps to a specific file and line i
 - `server.py:111-114` — Sentry SDK init gated on `SENTRY_DSN`
 - `server.py:127` — `create_light_app()` — lightweight app used by `job_runner.py` and `cron.py`
 - `server.py:139` — `create_app()` — main Flask factory
-- `server.py:142` — `app.wsgi_app = ProxyFix(app.wsgi_app, x_for=..., x_proto=..., x_host=..., x_port=...)`
+- `server.py:142` — `app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_host=1)`
 - `server.py:159` — `app.config["SESSION_COOKIE_NAME"] = ...`
 - `server.py:163-165` — conditional `initialize_redis_services(app, MEM_STORE_URI)` when `MEM_STORE_URI` is set
 - `server.py:167` — `limiter.init_app(app)` (Flask-Limiter)
@@ -1216,7 +1216,7 @@ Every behavioural claim made in this document maps to a specific file and line i
 - `app/auth/base.py` — defines `auth_bp = Blueprint("auth", __name__, url_prefix="/auth")`; the `/auth` prefix is baked into the blueprint itself, **not** passed at `register_blueprint()` time in `server.py`
 - `app/auth/views/register.py:23` — `class RegisterForm(FlaskForm)` — WTForms definition
 - `app/auth/views/register.py:24` — `email = StringField(..., validators=[validators.DataRequired()])` — **only** `DataRequired()` is declared at the form level; email-shape validation happens in the handler via `is_valid_email()` and `email_can_be_used_as_mailbox()`
-- `app/auth/views/register.py:26` — `password = PasswordField(..., validators=[DataRequired(), validators.Length(min=8, max=100)])`
+- `app/auth/views/register.py:25` — `password = StringField("Password", validators=[validators.DataRequired(), validators.Length(min=8, max=100)])` — note the form declares `StringField` (not `PasswordField`); the HTML `type="password"` comes from the template layer (`templates/auth/register.html`), not from the form class
 - `app/auth/views/register.py:31` — `@auth_bp.route("/register", methods=["GET","POST"])`
 - `app/auth/views/register.py:33` — `if current_user.is_authenticated:` authenticated-guard redirect
 - `app/auth/views/register.py:38` — `if config.DISABLE_REGISTRATION:` disabled-registration guard
@@ -1235,10 +1235,10 @@ Every behavioural claim made in this document maps to a specific file and line i
 - `app/auth/views/activate.py:13` — `@auth_bp.route("/activate")`
 - `app/auth/views/activate.py:14-15` — `@limiter.limit("10/minute", deduct_when=...)`
 - `app/auth/views/activate.py:26` — `activation_code = ActivationCode.get_by(code=code)`
-- `app/auth/views/activate.py:49-54` — success path: `user.activated = True` (line 49); `login_user(user)` (line 50); `ActivationCode.delete(activation_code.id, commit=False)` (line 53); `Session.commit()` (line 54)
+- `app/auth/views/activate.py:49-54` — success path: `user.activated = True` (line 49); `login_user(user)` (line 50); `ActivationCode.delete(activation_code.id)` (line 53); `Session.commit()` (line 54)
 - `app/auth/views/activate.py:58` — `email_utils.send_welcome_email(user)`
-- `app/auth/views/activate.py:64` — `LOG.d("redirect user to %s", next_url)`
-- `app/auth/views/activate.py:67` — `LOG.d("redirect user to dashboard")` — emits `redirect user to dashboard` log
+- `app/auth/views/activate.py:63` — `LOG.d("redirect user to %s", next_url)`
+- `app/auth/views/activate.py:66` — `LOG.d("redirect user to dashboard")` — emits `redirect user to dashboard` log
 - `app/auth/views/login.py:21` — `@auth_bp.route("/login", methods=["GET","POST"])`
 - `app/auth/views/login.py:50` — `LoginEvent(ActionType.failed).send()` — wrong password or missing user
 - `app/auth/views/login.py:56` — `LoginEvent(ActionType.disabled_login).send()`
@@ -1261,7 +1261,7 @@ Every behavioural claim made in this document maps to a specific file and line i
 
 ### Models
 
-- `app/models.py:336` — `class User(Base, ModelMixin, UserMixin)`
+- `app/models.py:336` — `class User(Base, ModelMixin, UserMixin, PasswordOracle)`
 - `app/models.py:408` — `default_mailbox_id` column — declared **without** an `ondelete=` clause on its `ForeignKey`, so the database falls back to `NO ACTION`; the cleanup SQL in §4 must null this column explicitly before deleting the mailbox
 - `app/models.py:447-451` — `newsletter_alias_id` column — declared with `ondelete="SET NULL"`; when the alias is deleted the FK is nulled automatically by PostgreSQL
 - `app/models.py:602` — `User.create(...)` classmethod — full registration orchestration
@@ -1278,9 +1278,9 @@ Every behavioural claim made in this document maps to a specific file and line i
 - `app/models.py:671` — `User.delete(obj_id)` classmethod — canonical user-deletion path
 - `app/models.py:1041` — `User.get_communication_email()` — returns newsletter alias for activated/notifying users, else `user.email`
 - `app/models.py:1182-1183` — `User.__repr__` → `f"<User {self.id} {self.name} {self.email}>"`
-- `app/models.py:1186` — `_expiration_1h = lambda: arrow.now().shift(hours=1)` — default for `ActivationCode.expired`
+- `app/models.py:1186-1187` — `def _expiration_1h(): return arrow.now().shift(hours=1)` — regular function (not a lambda), used as the default factory for `ActivationCode.expired`
 - `app/models.py:1202` — `class ActivationCode`
-- `app/models.py:1212` — `expired = db.Column(ArrowType, default=_expiration_1h, ...)`
+- `app/models.py:1212` — `expired = sa.Column(ArrowType, default=_expiration_1h, ...)`
 - `app/models.py:1214-1215` — `def is_expired(self) -> bool: return self.expired < arrow.now()`
 - `app/models.py:3116` — `class SLDomain(Base, ModelMixin)` — the SQLAlchemy model class
 - `app/models.py:3119` — `__tablename__ = "public_domain"` — **the Python class is `SLDomain` but the underlying table name is `public_domain`**; every SQL example in this document uses the correct on-disk name
@@ -1293,8 +1293,8 @@ Every behavioural claim made in this document maps to a specific file and line i
 - `app/email_utils.py:125` — `send_activation_email(user, activation_link)` — subject `"Just one more step to join SimpleLogin"`, recipient `user.email`
 - `app/mail_sender.py:126` — `def send(self, send_request: SendRequest, retries: int = 2) -> bool`
 - `app/mail_sender.py:130` — `if config.NOT_SEND_EMAIL:` — short-circuit gate
-- `app/mail_sender.py:131-135` — `LOG.d("send email with subject '%s', from '%s' to '%s'", ...)` — emits the `send email with subject ...` DEBUG line
-- `app/mail_sender.py:136` — `return True` — pretends delivery succeeded in local dev
+- `app/mail_sender.py:131-136` — `LOG.d("send email with subject '%s', from '%s' to '%s'", ...)` — emits the `send email with subject ...` DEBUG line
+- `app/mail_sender.py:137` — `return True` — pretends delivery succeeded in local dev
 
 ### Events
 
@@ -1305,8 +1305,8 @@ Every behavioural claim made in this document maps to a specific file and line i
 - `app/events/event_dispatcher.py:61-64` — `if not config.EVENT_WEBHOOK and skip_if_webhook_missing: LOG.i("Not sending events because webhook is not configured and allowed to be empty"); return`
 - `app/events/event_dispatcher.py:67-69` — `if partner_user is None: LOG.i(f"Not sending events because there's no partner user for user {user}"); return`
 - `app/events/auth_event.py` — top: `LoginEvent` and `RegisterEvent` classes with `ActionType` and `Source` enums
-- `app/events/auth_event.py:23-24` — `LoginEvent.send()` → `newrelic.agent.record_custom_event("LoginEvent", {"action": self.action.name, "source": self.source.name})` — emits the enum member **name** (human-readable string like `"success"` / `"catpcha_failed"` / `"web"`), **not** `.value`
-- `app/events/auth_event.py:45-46` — `RegisterEvent.send()` → `newrelic.agent.record_custom_event("RegisterEvent", {"action": self.action.name, "source": self.source.name})` — same `.name` convention
+- `app/events/auth_event.py:23-25` — `LoginEvent.send()` → `newrelic.agent.record_custom_event("LoginEvent", {"action": self.action.name, "source": self.source.name})` — emits the enum member **name** (human-readable string like `"success"` / `"catpcha_failed"` / `"web"`), **not** `.value`
+- `app/events/auth_event.py:45-47` — `RegisterEvent.send()` → `newrelic.agent.record_custom_event("RegisterEvent", {"action": self.action.name, "source": self.source.name})` — same `.name` convention
 
 ### Background Processes
 
@@ -1339,7 +1339,7 @@ Every behavioural claim made in this document maps to a specific file and line i
 - `cron.py:954` — `def delete_old_monitoring()`
 - `cron.py:964` — `def delete_expired_tokens()`
 - `cron.py:1171` — `def notify_hibp()`
-- `cron.py:1223` — `def clear_users_scheduled_to_be_deleted()`
+- `cron.py:1223` — `def clear_users_scheduled_to_be_deleted(dry_run=False)`
 - `cron.py:1245` — `def delete_old_data()`
 - `cron.py:1252` — `def clear_alias_audit_log()`
 - `cron.py:1257` — `def clear_user_audit_log()`
@@ -1383,7 +1383,7 @@ Every behavioural claim made in this document maps to a specific file and line i
 The following eight insights were surfaced during the investigation and are worth calling out explicitly because they are common sources of surprise:
 
 1. **`DISABLE_ONBOARDING=true` is the default in `example.env`.** With the shipped `example.env` copied verbatim to `.env`, the three onboarding jobs are **not** scheduled during registration. To observe them, delete or comment out the line at `example.env:150` (see `app/models.py:646`).
-2. **Mail-sender log format is verbose.** The actual format string at `app/mail_sender.py:131-135` is `send email with subject '%s', from '%s' to '%s'` — not the shortened "send email to X, subject 'Y'" some notes use.
+2. **Mail-sender log format is verbose.** The actual format string at `app/mail_sender.py:131-136` is `send email with subject '%s', from '%s' to '%s'` — not the shortened "send email to X, subject 'Y'" some notes use.
 3. **EventDispatcher log message is verbose.** The full literal emitted at `app/events/event_dispatcher.py:63` is `"Not sending events because webhook is not configured and allowed to be empty"` — do not paraphrase.
 4. **The SimpleLogin-managed-domain table is `public_domain`, not `sl_domain`.** The Python **class** is `SLDomain` (defined at `app/models.py:3116`), but its `__tablename__` is `"public_domain"` (`app/models.py:3119`) — so every `psql` query and every FK reference (e.g. `users.default_alias_public_domain_id` → `public_domain.id` at `app/models.py:383`) uses `public_domain`. `init_app.py:39-56`'s `add_sl_domains()` inserts into `public_domain`.
 5. **Gunicorn vs Flask dev server produce different startup logs.** Under `gunicorn wsgi:app` you see `[INFO] Starting gunicorn 20.1.0`, `[INFO] Listening at: http://0.0.0.0:7777`, and `[INFO] Booting worker with pid: ...`. Under `python server.py → local_main()` you see `* Serving Flask app "server" (lazy loading)` and `* Debug mode: on`. The `>>> URL:` and `>>> init logging <<<` banners appear in **both** cases because they fire at import time in `app/config.py:80` and `app/log.py:67`.
