@@ -51,13 +51,13 @@
 
 ## Local Environment Prerequisites
 
-SimpleLogin is a multi-process Flask application whose behaviour is driven almost entirely by environment variables loaded through `python-dotenv` in `app/config.py` (see `app/config.py:9` — `from dotenv import load_dotenv` — and `app/config.py:69-71` where the file is actually loaded). The reference set of variables is `example.env` at the repository root.
+SimpleLogin is a multi-process Flask application whose behaviour is driven almost entirely by environment variables loaded through `python-dotenv` in `app/config.py` (see `app/config.py:9` — `from dotenv import load_dotenv` — and `app/config.py:66-72` where the file is actually loaded). The reference set of variables is `example.env` at the repository root.
 
 ### Required Services
 
 | Component | Version | Role |
 |---|---|---|
-| **PostgreSQL** | 13+ (tested with v16) | Primary relational store; holds `users`, `mailbox`, `alias`, `job`, `activation_code`, `daily_metric`, `sl_domain`, `sync_event`, etc. |
+| **PostgreSQL** | 13+ (tested with v16) | Primary relational store; holds `users`, `mailbox`, `alias`, `job`, `activation_code`, `daily_metric`, `public_domain`, `sync_event`, etc. |
 | **Redis** | 6+ (tested with v7) | Session store, Flask-Limiter backend, distributed locks. Only wired in when `MEM_STORE_URI` is set (see `server.py:163-165`). |
 | **Node.js** | 10.17.0 in the Dockerfile (newer works too) | Builds the frontend assets under `static/` at image build time (Dockerfile Stage 1 `FROM node:10.17.0-alpine AS npm`). Not required to run the backend. |
 | **Postfix / MTA** | optional | Required only when delivering real email. With `NOT_SEND_EMAIL=true` the Postfix dependency disappears. |
@@ -83,7 +83,7 @@ EMAIL_SERVERS_WITH_PRIORITY=[(10, "email.hostname.")]
 Two of these deserve special attention because they govern observable behaviour:
 
 - **`NOT_SEND_EMAIL=true`** (`example.env:19`) is the flag that tells `MailSender.send()` in `app/mail_sender.py:130` to log the email metadata and return `True` **without** opening an SMTP socket. It is the single most important variable for local verification — without it, every outbound send attempts a real SMTP handshake.
-- **`DISABLE_ONBOARDING=true`** is explicitly enabled in `example.env:150` (`# For self-hosted instance`). When this is truthy, `User.create()` in `app/models.py:646-648` takes an **early return** and **no onboarding jobs are scheduled**. If you want to see the three onboarding rows in the `job` table, you must **unset** or comment out `DISABLE_ONBOARDING` in your `.env`.
+- **`DISABLE_ONBOARDING=true`** is explicitly enabled in `example.env:150` (`# For self-hosted instance`). When this is truthy, `User.create()` in `app/models.py:646-647` takes an **early return** and **no onboarding jobs are scheduled**. If you want to see the three onboarding rows in the `job` table, you must **unset** or comment out `DISABLE_ONBOARDING` in your `.env`.
 
 ### Bootstrap Commands
 
@@ -93,7 +93,7 @@ After the environment variables are in place, run these in order **exactly once*
 # 1. Apply all schema migrations (256 revisions under migrations/versions/).
 alembic upgrade head
 
-# 2. Seed the sl_domain table and load PGP keys (idempotent).
+# 2. Seed the public_domain table and load PGP keys (idempotent).
 python3 init_app.py
 
 # 3. Launch the app. Two flavours:
@@ -131,10 +131,9 @@ The process of going from `gunicorn wsgi:app` (or `python server.py`) to a reque
 
 The very first side-effect on the console comes from **module-level** `print()` calls in `app/config.py`. When Python imports `server.py`, it imports `app.config`, which at import time:
 
-1. Runs `load_dotenv(config_file)` for a project-level config file (`app/config.py:69`)
-2. Runs `load_dotenv()` to pull in the default `.env` (`app/config.py:71`)
-3. Reads `URL = os.environ["URL"]` (`app/config.py:79`)
-4. Emits `print(">>> URL:", URL)` (`app/config.py:80`)
+1. Executes the `.env` loading branch at `app/config.py:66-72`: **if** `CONFIG` environment variable is set, `load_dotenv(config_file)` is called for that explicit path (`app/config.py:70`); **else** `load_dotenv()` is called with no arguments, which auto-discovers the default `.env` (`app/config.py:72`). The two calls are mutually exclusive — only one runs per process.
+2. Reads `URL = os.environ["URL"]` (`app/config.py:79`)
+3. Emits `print(">>> URL:", URL)` (`app/config.py:80`)
 
 So the **first line** you see on stdout is always the `URL:` echo. If this line is missing, `dotenv` didn't find your `.env` file and the process will eventually crash with `KeyError: "URL"`.
 
@@ -179,9 +178,9 @@ Sentry SDK is initialised only when `SENTRY_DSN` is set (`server.py:111-114`). N
 
 ```python
 # (paraphrased for clarity; actual code at server.py:233-246)
-app.register_blueprint(auth_bp,      url_prefix="/auth")
+app.register_blueprint(auth_bp)
 app.register_blueprint(monitor_bp)
-app.register_blueprint(dashboard_bp, url_prefix="/dashboard")
+app.register_blueprint(dashboard_bp)
 app.register_blueprint(developer_bp)
 app.register_blueprint(phone_bp)
 app.register_blueprint(oauth_bp,     url_prefix="/oauth")
@@ -192,7 +191,7 @@ app.register_blueprint(internal_bp)
 app.register_blueprint(api_bp)
 ```
 
-The `oauth_bp` **double-registration** at both `/oauth` and `/oauth2` is easy to miss when counting — it is there to support both the legacy and current OAuth spec URL conventions. If you grep `server.py` for `register_blueprint`, you should see **11 matches**.
+The `oauth_bp` **double-registration** at both `/oauth` and `/oauth2` is easy to miss when counting — it is there to support both the legacy and current OAuth spec URL conventions. If you grep `server.py` for `register_blueprint`, you should see **11 matches**. Note that **only `oauth_bp` carries an explicit `url_prefix=` at the registration call site**: every other blueprint — including `auth_bp` and `dashboard_bp` — is registered with no `url_prefix` argument because each blueprint defines its own prefix inside its module's `base.py` (e.g. `auth_bp = Blueprint("auth", __name__, url_prefix="/auth")` in `app/auth/base.py`, and the analogous declaration in `app/dashboard/base.py`). The effective URL prefixes (`/auth`, `/dashboard`, etc.) are therefore built into the blueprint objects themselves.
 
 The blueprint objects come from `app/auth/base.py` (`auth_bp`), `app/dashboard/base.py` (`dashboard_bp`), and their respective `app/<module>/base.py` files for the rest.
 
@@ -248,7 +247,7 @@ The most reliable way to confirm a fresh deployment is healthy is to issue a han
 |---|---|---|---|
 | **Liveness** | `GET /health` | `200 "success"` | `server.py:213-215` |
 | **Root redirect (unauthenticated)** | `GET /` | `302 → /auth/login` | `server.py:249-254` — redirects via `url_for("auth.login")` |
-| **Login page** | `GET /auth/login` | `200` HTML | `app/auth/views/login.py:23` — `@auth_bp.route("/login", ...)` |
+| **Login page** | `GET /auth/login` | `200` HTML | `app/auth/views/login.py:21` — `@auth_bp.route("/login", ...)` |
 | **Register page** | `GET /auth/register` | `200` HTML | `app/auth/views/register.py:31` — `@auth_bp.route("/register", ...)` |
 | **OpenID discovery** | `GET /.well-known/openid-configuration` | `200` JSON | `server.py:299` — `setup_openid_metadata(app)` |
 
@@ -289,24 +288,24 @@ alias            -- alias email addresses
 activation_code  -- short-lived codes for email verification
 job              -- background-job queue
 daily_metric     -- daily aggregate counters (e.g. registrations/day)
-sl_domain        -- SimpleLogin-managed alias domains (seeded by init_app.py)
+public_domain    -- SimpleLogin-managed alias domains (seeded by init_app.py)
 sync_event       -- outbound event queue (consumed by event_listener.py)
 ```
 
 **2. Seed SL domains and load PGP keys.** `init_app.py` (73 lines) is the seed step:
 
-- `load_pgp_public_keys()` at `init_app.py:12` — iterates over users' configured PGP public keys and loads them into the GnuPG keyring used by the forwarding pipeline (`Mailbox.pgp_public_key` and `Contact.pgp_public_key`).
-- `add_sl_domains()` at `init_app.py:39-55` — iterates over `config.ALIAS_DOMAINS` and `config.PREMIUM_ALIAS_DOMAINS` and creates a row in the `sl_domain` table for each (via `SLDomain.create(...)`). The function is **idempotent**:
+- `load_pgp_public_keys()` at `init_app.py:13` — iterates over users' configured PGP public keys and loads them into the GnuPG keyring used by the forwarding pipeline (`Mailbox.pgp_public_key` and `Contact.pgp_public_key`).
+- `add_sl_domains()` at `init_app.py:39-56` — iterates over `config.ALIAS_DOMAINS` and `config.PREMIUM_ALIAS_DOMAINS` and creates a row in the `public_domain` table for each (via `SLDomain.create(...)`). The function is **idempotent**:
   - If the domain already exists → `LOG.d("%s is already a SL domain", domain)` (DEBUG).
   - Otherwise → `LOG.i("Add %s to SL domain", domain)` (INFO) before creating.
-- `add_proton_partner()` — creates the Proton partner row used by partner-linked accounts.
+- `add_proton_partner()` is **defined** in `init_app.py` (and at `app/proton/proton_partner.py`) but is **not** invoked from `init_app.py`'s `__main__` block. It is called at web-app bootstrap time from `server.py` (inside the `dummy-data` CLI handler) and from the pytest fixture at `tests/conftest.py:39`. Running `python3 init_app.py` therefore does **not** create the Proton partner row; that row appears only when the main Flask app boots or when the test suite runs.
 
-The `if __name__ == "__main__":` block (end of `init_app.py`) wraps these in `create_light_app().app_context()` so they can run standalone without starting the web server.
+The `if __name__ == "__main__":` block at the end of `init_app.py` (lines 69-73) wraps the two seed calls in `create_light_app().app_context()` so they can run standalone without starting the web server. The call order is: **first** `load_pgp_public_keys()`, **then** `add_sl_domains()` — `add_proton_partner()` is **not** in this block.
 
-**Note on terminology:** the AAP informally refers to a `public_domain` table. The actual table name in this codebase is **`sl_domain`** (the SQLAlchemy model is `SLDomain`). Use this name in any `psql` queries:
+**Note on terminology:** the SQLAlchemy model class is named `SLDomain` (defined in `app/models.py`), but its `__tablename__` is **`public_domain`** (see `app/models.py:3119`). Use `public_domain` in any `psql` queries:
 
 ```sql
-SELECT domain FROM sl_domain ORDER BY id;
+SELECT domain FROM public_domain ORDER BY id;
 ```
 
 After `init_app.py` you should see `sl.local` (the value of `EMAIL_DOMAIN`) in that table.
@@ -322,7 +321,7 @@ Tick the following off in order. If any item fails, stop and fix the correspondi
 - ✅ `curl -I http://localhost:7777/` returns `302 Found` with `Location: /auth/login`
 - ✅ `curl http://localhost:7777/auth/login` returns `200` (the login form renders)
 - ✅ No `sqlalchemy.exc.OperationalError` / `psycopg2.OperationalError` stack traces in stdout (DB connection is live)
-- ✅ `sl_domain` table contains `EMAIL_DOMAIN` (e.g. `sl.local`)
+- ✅ `public_domain` table contains `EMAIL_DOMAIN` (e.g. `sl.local`)
 - ✅ If Sentry configured: no `Failed to initialize Sentry` warnings
 - ✅ If Redis configured (`MEM_STORE_URI` set): no `redis.exceptions.ConnectionError` in stdout
 
@@ -375,18 +374,18 @@ The subsections below walk through each of these four HTTP requests in the same 
 
 1. **Guard: already authenticated.** Line 33 — if `current_user.is_authenticated` is true, 302-redirect to the dashboard. This prevents a logged-in user from registering a second account.
 2. **Guard: registration disabled.** Line 38 — if `config.DISABLE_REGISTRATION` is truthy (`app/config.py:138` — `DISABLE_REGISTRATION = "DISABLE_REGISTRATION" in os.environ`), flash a warning and redirect to login.
-3. **Form validation.** `RegisterForm` (class defined at line 23) validates `email` (StringField with `Email()` validator) and `password` (min=8, max=100) via WTForms.
+3. **Form validation.** `RegisterForm` (class defined at line 23) declares `email` as a `StringField` with the `validators.DataRequired()` validator only (line 24) and `password` as a `PasswordField` with `DataRequired()` plus `validators.Length(min=8, max=100)` (line 26). Dedicated email-shape validation is deferred to the handler body via `is_valid_email()`, `canonicalize_email()`, and `email_can_be_used_as_mailbox()`, which run after WTForms has confirmed the field is non-empty.
 4. **hCaptcha verification.** Lines 47-70 — only runs when `config.HCAPTCHA_SECRET` is set. In a local deployment (where `HCAPTCHA_SECRET` is unset), this block is skipped entirely. A failed captcha fires `RegisterEvent(RegisterEvent.ActionType.catpcha_failed).send()` and re-renders the form.
-5. **Email canonicalisation.** Line 71 — `email = canonicalize_email(email)`, then `email_can_be_used_as_mailbox(email)` and `personal_email_already_used(email)` are re-checked against both the canonical and original form.
+5. **Email canonicalisation.** Line 73 — `email = canonicalize_email(email)`, then `email_can_be_used_as_mailbox(email)` (line 76) and `personal_email_already_used(email)` (line 83) are re-checked against both the canonical and original form.
 6. **Log the creation.** Line 85:
    ```python
    LOG.d("create user %s", email)
    ```
    This produces the `create user testuser@example.com` DEBUG line visible in stdout.
 7. **Call `User.create()`.** Lines 86-91 — invokes `User.create(email=email, name=name, password=password, from_partner=False, ...)` defined at `app/models.py:602`. See the sub-section below for what `User.create()` actually does.
-8. **Send the activation email.** Line 93 — wrapped in `try/except`; on failure a `RegisterEvent(ActionType.invalid_email)` is emitted and the form is re-rendered with an error flash.
-9. **Record the success.** Lines 94-95 — `RegisterEvent(RegisterEvent.ActionType.success).send()` (records a New Relic custom event with action="success", source="web") and `DailyMetric.get_or_create_today_metric().nb_new_web_non_proton_user += 1` (increments today's registration counter in the `daily_metric` table).
-10. **Render the waiting page.** Line 100 — `render_template("auth/register_waiting_activation.html", email=email)`, a small page telling the user to check their inbox for the activation link.
+8. **Send the activation email.** Line 95 — wrapped in `try/except` (the `try` opens at line 95); on failure a `RegisterEvent(ActionType.invalid_email)` is emitted (line 101) and the form is re-rendered with an error flash.
+9. **Record the success.** Lines 96-97 — `RegisterEvent(RegisterEvent.ActionType.success).send()` (records a New Relic custom event with action="success", source="web") and `DailyMetric.get_or_create_today_metric().nb_new_web_non_proton_user += 1` (increments today's registration counter in the `daily_metric` table).
+10. **Render the waiting page.** Line 104 — `render_template("auth/register_waiting_activation.html")` — the template is rendered with **no** keyword arguments; it does not need the submitted email because the page simply asks the user to check their inbox.
 
 #### What `User.create()` does internally
 
@@ -395,15 +394,15 @@ The orchestration logic lives at `app/models.py:602` and is the single biggest s
 | Line | Action | DB effect |
 |---|---|---|
 | 602 | `User.create(...)` insert into `users` | `users` +1 row with `activated=False` |
-| 610 | `Mailbox.create(user_id=user.id, email=user.email, verified=True, commit=True)` | `mailbox` +1 row, marked verified |
+| 611 | `Mailbox.create(user_id=user.id, email=user.email, verified=True)` — the call takes no `commit=True` argument; the commit is performed later by the outer caller after all related rows are inserted. | `mailbox` +1 row, marked verified |
 | 613 | `user.default_mailbox_id = mb.id` | Updates the `users` row |
-| 616 | `alternative_id = str(uuid.uuid4())` assigned to user | Updates the `users` row |
-| 635-640 | `Alias.create_new(user, prefix="simplelogin-newsletter", mailbox_id=mb.id, ...)` — the user's first alias | `alias` +1 row; the alias email is `simplelogin-newsletter.<random>@<FIRST_ALIAS_DOMAIN or EMAIL_DOMAIN>`. The alias record has a `note` populated with "This is your first alias..." |
+| 616 | `if "alternative_id" not in kwargs: user.alternative_id = str(uuid.uuid4())` — only auto-generated when the caller did not supply an explicit `alternative_id` kwarg. | Updates the `users` row (conditional) |
+| 634-641 | `Alias.create_new(user, prefix="simplelogin-newsletter", mailbox_id=mb.id, ...)` — the user's first alias | `alias` +1 row; the alias email is `simplelogin-newsletter.<random>@<FIRST_ALIAS_DOMAIN or EMAIL_DOMAIN>`. The alias record has a `note` populated with "This is your first alias..." |
 | 643 | `user.newsletter_alias_id = alias.id` | Updates the `users` row |
-| **646** | **`if config.DISABLE_ONBOARDING:`** (truthy by default per `example.env:150`) | **Early return** — no onboarding jobs are scheduled. `LOG.d("Disable onboarding emails")` is emitted at line 647. |
-| 651-654 | (if `DISABLE_ONBOARDING` unset) `Job.create(name=config.JOB_ONBOARDING_1, payload={"user_id": user.id}, run_at=arrow.now().shift(days=1), commit=True)` | `job` +1 row, `state=ready`, `run_at = now + 1 day` |
-| 656-659 | `Job.create(name=config.JOB_ONBOARDING_2, ..., run_at=now + 2 days)` | `job` +1 row |
-| 661-664 | `Job.create(name=config.JOB_ONBOARDING_4, ..., run_at=now + 3 days)` | `job` +1 row |
+| **646** | **`if config.DISABLE_ONBOARDING:`** (truthy by default per `example.env:150`) | **Early return** — no onboarding jobs are scheduled. `LOG.d("Disable onboarding emails")` is emitted on line 647. |
+| 651-655 | (if `DISABLE_ONBOARDING` unset) `Job.create(name=config.JOB_ONBOARDING_1, payload={"user_id": user.id}, run_at=arrow.now().shift(days=1))` — no `commit=True` argument is passed; `Job.create` does not accept one at this call site. | `job` +1 row, `state=ready`, `run_at = now + 1 day` |
+| 656-660 | `Job.create(name=config.JOB_ONBOARDING_2, ..., run_at=now + 2 days)` — likewise no `commit=True`. | `job` +1 row |
+| 661-665 | `Job.create(name=config.JOB_ONBOARDING_4, ..., run_at=now + 3 days)` — likewise no `commit=True`. | `job` +1 row |
 
 > **⚠️ `DISABLE_ONBOARDING` caveat.** `example.env` **turns this flag on** at line 150 with the comment `# For self-hosted instance`. With the default `.env` copy the three onboarding jobs **will not** be created and the `job` table will remain empty after registration. To see the three rows in `job`, delete or comment out `DISABLE_ONBOARDING=true` before launching. This is a common source of confusion for first-time operators who expect to see onboarding jobs.
 
@@ -420,7 +419,7 @@ Note that `JOB_ONBOARDING_3` exists as a constant but is **not scheduled** durin
 
 #### Activation-code creation (inside `register.py`)
 
-The private `send_activation_email(user, next_url)` helper at `app/auth/views/register.py:112` performs:
+The private `send_activation_email(user, next_url)` helper at `app/auth/views/register.py:117` performs:
 
 1. Deletes any prior `ActivationCode` rows for this user (forces a single outstanding code)
 2. Creates a new `ActivationCode` row: `code=random_string(30)`, `user_id=user.id`, `expired=arrow.now().shift(hours=1)` (the default via `_expiration_1h` at `app/models.py:1186`)
@@ -556,7 +555,7 @@ SELECT count(*) FROM activation_code WHERE user_id = <USER_ID>;  -- -> 0
 
 ### 2.3 Login — `POST /auth/login`
 
-**Endpoint:** `app/auth/views/login.py:23` — `@auth_bp.route("/login", methods=["GET", "POST"])`
+**Endpoint:** `app/auth/views/login.py:21` — `@auth_bp.route("/login", methods=["GET", "POST"])`
 
 **Rate limit:** `10/minute`.
 
@@ -619,13 +618,13 @@ def __repr__(self):
 
 ### 2.4 Dashboard — `GET /dashboard/`
 
-**Endpoint:** `app/dashboard/views/index.py:56` — `@dashboard_bp.route("/", methods=["GET", "POST"])`, `@login_required`
+**Endpoint:** `app/dashboard/views/index.py:55` — `@dashboard_bp.route("/", methods=["GET", "POST"])`, `@login_required`
 
 **Rate limits:** Alias creation rate limit on POST; `10/minute` GET per `current_user.id`.
 
 **Key operations on a first visit:**
 
-1. `get_stats(user)` at `app/dashboard/views/index.py:30` computes the four dashboard counters:
+1. `get_stats(user)` at `app/dashboard/views/index.py:32` computes the four dashboard counters:
    - `nb_alias` = `Alias.filter_by(user_id=user.id).count()` — for a freshly-activated user this is **1** (the newsletter alias).
    - `nb_forward`, `nb_reply`, `nb_block` = counts from `EmailLog` joined on the user's aliases — for a new user these are **0** because no mail has been forwarded yet.
 2. `mailboxes = current_user.mailboxes()` — returns a list of the user's verified mailboxes, ordered. For a new user this is the single default mailbox created during registration.
@@ -661,8 +660,10 @@ Trace:
 There are of course also the per-request DEBUG lines from `server.py:272-297` (the `@after_request` hook), for example:
 
 ```text
-127.0.0.1 user=<User 3 testuser@example.com> GET /dashboard/ {} 200, takes 0.123
+127.0.0.1 GET /dashboard/ {} 200, takes 0.123
 ```
+
+The exact format string in `server.py:285` is `"%s %s %s %s %s, takes %s"` populated with (`remote_addr`, `method`, `path`, `args`, `status_code`, `elapsed`) — there is **no** user/session field in this log. (The identity of the signed-in user during the request is instead emitted separately by the view-level logs such as `Show intro to <User ...>` and `log user <User ...> in`.)
 
 #### Visible UI elements on the dashboard
 
@@ -715,7 +716,7 @@ A fully-deployed SimpleLogin instance runs the following processes in parallel. 
 | 2 | **Job Runner** | `python job_runner.py` | Polls the `job` table every 10 s and executes queued work (onboarding emails, account/mailbox/domain deletion, batch imports, user reports, etc.) |
 | 3 | **Cron Scheduler** | `yacron -c crontab.yml` (primary host) + `yacron -c crontab-all-hosts.yml` (per-host) | Fires scheduled maintenance tasks (stats, HIBP checks, subscription notifications, cleanup) by shelling out to `python /code/cron.py -j <function_name>` |
 | 4 | **Inbound SMTP Handler** | `python email_handler.py` (aiosmtpd) | Receives mail on an SMTP port, routes forwards and replies through aliases, handles bounces |
-| 5 | **Event Listener** | `python event_listener.py --mode listener` | PostgreSQL `LISTEN simplelogin_sync_events` consumer; pushes protobuf events to the Proton webhook when configured |
+| 5 | **Event Listener** | `python event_listener.py listener` | PostgreSQL `LISTEN simplelogin_sync_events` consumer; pushes protobuf events to the Proton webhook when configured. (The CLI uses `argparse` subparsers, so the mode is passed as a **positional** sub-command — `listener`, `dead_letter`, `debug`, or `run` — **not** as a `--mode` flag.) |
 | 6 | **Monitoring** | `python monitoring.py` | Every 60 s: Postfix queue depth, PG connection counts, `sync_event` backlog; pushes custom metrics to New Relic |
 
 During a local single-user smoke test, **only the web process is strictly required** — the other five produce side-effects in the database that can be inspected even if those processes are not running. Running them in parallel (e.g. via `honcho` or separate terminals) surfaces additional observable log lines.
@@ -781,7 +782,7 @@ The first line is emitted from `job_runner.py:334` (`LOG.d("Take job %s", job)`)
 
 ### 3.3 Cron Scheduler — `cron.py` + `crontab.yml` + `crontab-all-hosts.yml`
 
-**`crontab.yml`** (primary-host schedule, per the file observed at repo root) defines 8 jobs, each shelling out to `python /code/cron.py -j <function>`:
+**`crontab.yml`** (primary-host schedule, per the file observed at repo root) defines **15** jobs, each shelling out to `python /code/cron.py -j <function>`:
 
 | Time (UTC) | Job | Function in `cron.py` | Purpose |
 |---|---|---|---|
@@ -793,10 +794,17 @@ The first line is emitted from `job_runner.py:334` (`LOG.d("Take job %s", job)`)
 | `15 5 * * *` | `delete_logs` | `delete_logs` (line 92) | Prune old `email_log` rows |
 | `30 5 * * *` | `delete_old_data` | `delete_old_data` (line 1245) | Purge audit logs, deleted-user artefacts, expired tokens, etc. |
 | `15 6 * * *` | `poll_apple_subscription` | `poll_apple_subscription` (line 287) | Reconcile Apple IAP subscription state |
+| `15 8 * * *` | `notify_trial_end` | `notify_trial_end` (line 75) | Email users whose free trial is ending |
+| `15 9 * * *` | `notify_manual_subscription_end` | `notify_manual_sub_end` (line 188) | Warn manual-subscription users their subscription is ending |
+| `15 10 * * *` | `notify_premium_end` | `notify_premium_end` (line 156) | Warn Premium users about upcoming renewal / expiry |
+| `15 11 * * *` (Forbid) | `delete_scheduled_users` | `clear_users_scheduled_to_be_deleted` (line 1223) | Finalise account deletions past the grace period |
+| `*/5 * * * *` (Forbid) | `send_undelivered_mails` | `send_undelivered_mails` in `cron.py` | Retry messages persisted to the filesystem dead-letter directory by `mail_sender.py` when SMTP delivery failed |
+| `0 * * * *` (hourly, Forbid) | `clear_alias_audit_log` | `clear_alias_audit_log` (line 1252) | Prune alias audit log entries older than retention |
+| `0 * * * *` (hourly, Forbid) | `clear_user_audit_log` | `clear_user_audit_log` (line 1257) | Prune user audit log entries older than retention |
 
-`concurrencyPolicy: Forbid` on `check_hibp` and `notify_hibp` guarantees only a single instance runs at once — these tasks are long-running and idempotency-sensitive.
+`concurrencyPolicy: Forbid` appears on `check_hibp`, `notify_hibp`, `delete_scheduled_users`, `send_undelivered_mails`, `clear_alias_audit_log`, and `clear_user_audit_log` — these tasks are long-running and/or idempotency-sensitive, so yacron refuses to start a new instance while a previous one is still active.
 
-**`crontab-all-hosts.yml`** holds distributed/per-host tasks (e.g. `send_undelivered_mails` retries, local queue draining). This file is intended to be run on every SimpleLogin host in a multi-host deployment.
+**`crontab-all-hosts.yml`** is the per-host variant, intended to be deployed on every SimpleLogin host in a multi-host deployment. In this repository it currently contains a single job — `send_undelivered_mails` (same `*/5 * * * *` schedule, `concurrencyPolicy: Forbid`) — so that every worker node independently re-tries its own local filesystem dead-letter queue.
 
 **`cron.py`** exposes 25+ top-level `def` functions. A representative list (with line numbers verified against the source):
 
@@ -888,22 +896,24 @@ These are the **New Relic** custom events for login/registration analytics. They
 | `failed` | `login.py:50` — wrong password or missing user |
 | `disabled_login` | `login.py:56` — user account is disabled |
 | `not_activated` | `login.py:69` — user hasn't activated yet |
-| `scheduled_to_be_deleted` | `login.py:63` — user is pending deletion |
+| `scheduled_to_be_deleted` | `login.py:62` — user is pending deletion |
 
 `LoginEvent.send()` at line 23 calls:
 
 ```python
-newrelic.agent.record_custom_event("LoginEvent", {"action": self.action.value, "source": self.source.value})
+newrelic.agent.record_custom_event("LoginEvent", {"action": self.action.name, "source": self.source.name})
 ```
+
+Because `ActionType` and `Source` are declared via Python's `enum.Enum`, `.name` returns the human-readable identifier (e.g. `"success"`, `"failed"`, `"catpcha_failed"`, `"web"`, `"api"`), whereas `.value` would return the underlying enum member value. The `.name` string is what appears on New Relic's dashboards — so operators filtering custom events search by `action = "success"` / `action = "catpcha_failed"` (note the verbatim typo preserved from the source enum), not by numeric value.
 
 **`RegisterEvent`** (same file):
 
 | `ActionType` | Emitted from |
 |---|---|
-| `success` | `register.py:94` — successful registration |
+| `success` | `register.py:96` — successful registration |
 | `catpcha_failed` | `register.py:65` — failed hCaptcha (note: typo in source; kept verbatim) |
-| `email_in_use` | `register.py:74,78` — email already registered |
-| `invalid_email` | `register.py:99` — activation-email dispatch failed |
+| `email_in_use` | `register.py:76,83` — email already registered |
+| `invalid_email` | `register.py:101` — activation-email dispatch failed |
 | `failed` | generic fallback |
 
 `RegisterEvent.send()` at line 46 records `"RegisterEvent"` as the NR event name.
@@ -956,7 +966,7 @@ Every attempted email produces exactly one `send email with subject '...', from 
 
 Not strictly required for the new-user flow (registration and login do not receive any inbound mail), but documented here for completeness because email forwarding is SimpleLogin's core value proposition.
 
-**Entry:** `python email_handler.py` — an aiosmtpd-based SMTP server bound to the configured port (default `POSTFIX_SUBMISSION_TLS_PORT` or `25`).
+**Entry:** `python email_handler.py` — an aiosmtpd-based SMTP server. The listening port is taken from the `--port` argparse argument whose `default=20381` (the numeric default hard-coded in `email_handler.py`'s `argparse.ArgumentParser` definition). In a production deployment Postfix forwards mail to this port on the loopback interface, so the port is usually left at the default or overridden via CLI.
 
 **Three actors** (per the docstring at the top of the file):
 - **Contact** — the external sender who emailed `alias@sl.co`.
@@ -971,7 +981,9 @@ Not strictly required for the new-user flow (registration and login do not recei
 
 ### 3.8 Event Listener — `event_listener.py`
 
-**Entry:** `python event_listener.py --mode listener` (or `--mode dead_letter`).
+**Entry:** `python event_listener.py listener` (or `python event_listener.py dead_letter`, `python event_listener.py debug`, `python event_listener.py run`).
+
+The CLI uses `argparse` sub-parsers, so the mode is passed as a **positional** sub-command — not a `--mode` flag.
 
 **`listener` mode:**
 
@@ -986,9 +998,9 @@ Not strictly required for the new-user flow (registration and login do not recei
 
 ### 3.9 Monitoring — `monitoring.py`
 
-**Entry:** `if __name__ == "__main__":` block at `monitoring.py:165-174`.
+**Entry:** `if __name__ == "__main__":` block at `monitoring.py:157-171`.
 
-**Loop:** `while True`, `sleep(60)` at line 174 — **60-second tick**.
+**Loop:** `while True`, `sleep(60)` at line 171 — **60-second tick**.
 
 **Per-tick actions (in order):**
 
@@ -1017,7 +1029,7 @@ The following table is a one-page reference for the key runtime signals a local 
 |---|---|---|---|
 | Logger init | `>>> init logging <<<` | stdout (process start) | `app/log.py:67` — logger initialised |
 | Config load | `>>> URL: http://localhost:7777` | stdout (process start) | `app/config.py:80` — `dotenv` parsed, `URL` resolved |
-| Per-request log | `<ip> user=<User ...> <method> <path> <args> <status>, takes <sec>` | web stdout | `server.py:272-297` — `@after_request` fired |
+| Per-request log | `<ip> <method> <path> <args> <status>, takes <sec>` | web stdout | `server.py:272-297` — `@after_request` fired; format string is `"%s %s %s %s %s, takes %s"` (`server.py:285`) populated with 6 positional fields — **no** user/session field |
 | User create | `create user <email>` | web stdout | `app/auth/views/register.py:85` reached |
 | Email composed (`NOT_SEND_EMAIL`) | `send email with subject '...', from '...' to '...'` | web stdout | `app/mail_sender.py:131-135` — email composed; no SMTP attempted |
 | Event dispatch skip (local) | `Not sending events because webhook is not configured and allowed to be empty` | web stdout | `app/events/event_dispatcher.py:63` — expected in local dev |
@@ -1025,7 +1037,7 @@ The following table is a one-page reference for the key runtime signals a local 
 | Auth redirect | `redirect user to dashboard` | web stdout | `app/auth/views/login_utils.py:44` **or** `app/auth/views/activate.py:66` |
 | Intro tour (first dashboard hit) | `Show intro to <User X ...>` | web stdout | `app/dashboard/views/index.py:172` — fires exactly once per account |
 | Activation-code table | Row with fresh `expired ≈ NOW + 1h` | `activation_code` | `ActivationCode._expiration_1h` at `app/models.py:1186` |
-| Job scheduled | Rows in `job` with `name IN ('onboarding-1','onboarding-2','onboarding-4')` | `job` table | `app/models.py:651-664` — requires `DISABLE_ONBOARDING` unset |
+| Job scheduled | Rows in `job` with `name IN ('onboarding-1','onboarding-2','onboarding-4')` | `job` table | `app/models.py:651-665` — requires `DISABLE_ONBOARDING` unset |
 | Job pickup | `Take job <Job id=... name=... run_at=...>` | job_runner stdout | `job_runner.py:334` |
 | Job send | `send onboarding send-from-alias email to user <User ...>` | job_runner stdout | `job_runner.py:196` |
 | Cron tick | yacron task output on the configured schedule | cron stdout | `crontab.yml` + `cron.py` |
@@ -1043,7 +1055,7 @@ A few read-only commands an operator can run to confirm background-service healt
 curl -sS -o /dev/null -w 'GET /health → %{http_code}\n' http://localhost:7777/health
 
 # 2. Confirm the database has the expected SL domain seed
-psql -U myuser -d simplelogin -c "SELECT domain FROM sl_domain ORDER BY id;"
+psql -U myuser -d simplelogin -c "SELECT domain FROM public_domain ORDER BY id;"
 
 # 3. Confirm the latest registration created the expected rows
 psql -U myuser -d simplelogin -c \
@@ -1072,9 +1084,15 @@ psql -U myuser -d simplelogin -c \
 
 ## 4. Post-Verification Cleanup
 
-The user's explicit rule (AAP §0.7.1) requires that **any test users, aliases, or temporary data created during verification be removed after verification is complete**. This section documents the SQL used for cleanup, in the correct foreign-key order so the statements succeed even with `ON DELETE RESTRICT` constraints.
+The user's explicit rule (AAP §0.7.1) requires that **any test users, aliases, or temporary data created during verification be removed after verification is complete**. This section documents the SQL used for cleanup, in a foreign-key-safe order.
 
-> **Preferred path: `User.delete()`.** In production SimpleLogin code, the canonical way to tear down a user is `User.delete(user_id)` at `app/models.py:667` — it cascades through owned records and emits a `UserDeleted` sync event via `EventDispatcher.send_event()`. That event path is unwanted in a pure observability cleanup (and would just log "Not sending events because webhook is not configured and allowed to be empty" anyway in local dev), so for a read-only smoke test the direct SQL below is both sufficient and auditable.
+> **FK-constraint reality (per `app/models.py`).** The cleanup order below is **not** driven by `ON DELETE RESTRICT` — in fact, no user-owned FK uses `RESTRICT`. The specific mix that this script has to cope with is:
+>
+> - `users.default_mailbox_id → mailbox.id` has **no** explicit `ondelete=` clause, so SQLAlchemy falls back to the SQL default (`NO ACTION`). **This** is why step 5 (`UPDATE users SET default_mailbox_id = NULL …`) is required before deleting the mailbox: without nulling this FK first, the mailbox `DELETE` would fail with a foreign-key violation.
+> - `users.newsletter_alias_id → alias.id` is declared with `ondelete="SET NULL"`, so the database would null it automatically when the alias is removed. Step 3 nulls it explicitly anyway, for clarity and so the script does not depend on the server-side cascade evaluation order.
+> - Every `*.user_id` FK (alias, mailbox, job, activation_code, etc.) is `ondelete="cascade"`. In principle a single `DELETE FROM users WHERE id = <id>` would cascade through most of these, but the step-by-step ordering in the script keeps every intermediate table auditable and makes failure diagnostics (which step rolled back?) trivial.
+
+> **Preferred path: `User.delete()`.** In production SimpleLogin code, the canonical way to tear down a user is `User.delete(user_id)` at `app/models.py:671` — it cascades through owned records and emits a `UserDeleted` sync event via `EventDispatcher.send_event()`. That event path is unwanted in a pure observability cleanup (and would just log "Not sending events because webhook is not configured and allowed to be empty" anyway in local dev), so for a read-only smoke test the direct SQL below is both sufficient and auditable.
 
 ### FK-Safe Cleanup SQL
 
@@ -1123,15 +1141,15 @@ SELECT count(*) FROM activation_code WHERE user_id = <TEST_USER_ID>;
 SELECT count(*) FROM job          WHERE payload::text LIKE '%"user_id": <TEST_USER_ID>%';
 
 -- The SL domain seed should still be present (idempotent from init_app.py):
-SELECT domain FROM sl_domain;  -- should include 'sl.local'
+SELECT domain FROM public_domain;  -- should include 'sl.local'
 ```
 
 ### What *Remains* After Cleanup (by design)
 
-- The `sl_domain` table row for `EMAIL_DOMAIN` (e.g. `sl.local`) — seeded by `init_app.py:39-55`, idempotent, harmless, and required for the next registration.
-- All 256 Alembic migration records in the `alembic_version` table.
-- PGP keys loaded into the GnuPG keyring by `load_pgp_public_keys()` at `init_app.py:12` — these live in the GnuPG home directory on the filesystem, not in PostgreSQL.
-- The Proton partner record created by `add_proton_partner()` in the `__main__` block of `init_app.py` (if it ran) — this is infrastructure seed data, not user data.
+- The `public_domain` table row for `EMAIL_DOMAIN` (e.g. `sl.local`) — seeded by `init_app.py:39-56`, idempotent, harmless, and required for the next registration. (The SQLAlchemy model class is `SLDomain`, but the underlying table name on disk is `public_domain` — see `app/models.py:3116-3119`.)
+- All Alembic migration records in the `alembic_version` table.
+- PGP keys loaded into the GnuPG keyring by `load_pgp_public_keys()` at `init_app.py:13` — these live in the GnuPG home directory on the filesystem, not in PostgreSQL.
+- The Proton partner record created by `add_proton_partner()` — this helper is defined in `init_app.py:59` but is **not** invoked by `init_app.py`'s `if __name__ == "__main__":` block. It is invoked automatically on normal app bootstrap from `server.py:497` (inside the `dummy-data` CLI command) and from `tests/conftest.py:39` (during pytest setup), so it may or may not exist in your local database depending on which entry points you have run. It is infrastructure seed data, not user data, so it is left in place.
 
 ---
 
@@ -1142,7 +1160,7 @@ Every behavioural claim made in this document maps to a specific file and line i
 ### Configuration & Logging
 
 - `app/config.py:9` — `from dotenv import load_dotenv`
-- `app/config.py:69-71` — `load_dotenv(...)` — reads `.env` at import time
+- `app/config.py:66-72` — `if config_file: load_dotenv(config_file) else: load_dotenv()` — reads `.env` at import time; the two branches are mutually exclusive, exactly one runs per process
 - `app/config.py:73` — `COLOR_LOG = "COLOR_LOG" in os.environ`
 - `app/config.py:79` — `URL = os.environ["URL"]`
 - `app/config.py:80` — `print(">>> URL:", URL)` — startup URL log line
@@ -1191,38 +1209,40 @@ Every behavioural claim made in this document maps to a specific file and line i
 - `server.py:441` — `init_admin()`
 - `server.py:572` — `local_main()` — sets `COLOR_LOG=True`, instantiates app, attaches Flask-DebugToolbar
 - `server.py:588` — `app.run(debug=True, port=7777)`
-- `server.py:599` — `if __name__ == "__main__": local_main()`
+- `server.py:598-599` — `if __name__ == "__main__": local_main()`
 
 ### Authentication Views
 
-- `app/auth/base.py` — defines `auth_bp` blueprint with `url_prefix="/auth"`
+- `app/auth/base.py` — defines `auth_bp = Blueprint("auth", __name__, url_prefix="/auth")`; the `/auth` prefix is baked into the blueprint itself, **not** passed at `register_blueprint()` time in `server.py`
 - `app/auth/views/register.py:23` — `class RegisterForm(FlaskForm)` — WTForms definition
+- `app/auth/views/register.py:24` — `email = StringField(..., validators=[validators.DataRequired()])` — **only** `DataRequired()` is declared at the form level; email-shape validation happens in the handler via `is_valid_email()` and `email_can_be_used_as_mailbox()`
+- `app/auth/views/register.py:26` — `password = PasswordField(..., validators=[DataRequired(), validators.Length(min=8, max=100)])`
 - `app/auth/views/register.py:31` — `@auth_bp.route("/register", methods=["GET","POST"])`
 - `app/auth/views/register.py:33` — `if current_user.is_authenticated:` authenticated-guard redirect
 - `app/auth/views/register.py:38` — `if config.DISABLE_REGISTRATION:` disabled-registration guard
 - `app/auth/views/register.py:47-70` — hCaptcha verification block
 - `app/auth/views/register.py:65` — `RegisterEvent(ActionType.catpcha_failed).send()` on captcha failure
-- `app/auth/views/register.py:71` — `email = canonicalize_email(email)`
-- `app/auth/views/register.py:74, 78` — `RegisterEvent(ActionType.email_in_use).send()`
+- `app/auth/views/register.py:73` — `email = canonicalize_email(email)`
+- `app/auth/views/register.py:76, 83` — `RegisterEvent(ActionType.email_in_use).send()`
 - `app/auth/views/register.py:85` — `LOG.d("create user %s", email)` — emits `create user <email>` log
 - `app/auth/views/register.py:86-91` — `User.create(...)` call
-- `app/auth/views/register.py:93` — `send_activation_email(user, next_url)` in `try/except`
-- `app/auth/views/register.py:94` — `RegisterEvent(ActionType.success).send()`
-- `app/auth/views/register.py:95` — `DailyMetric.get_or_create_today_metric().nb_new_web_non_proton_user += 1`
-- `app/auth/views/register.py:99` — `RegisterEvent(ActionType.invalid_email).send()` on email-dispatch failure
-- `app/auth/views/register.py:100` — `render_template("auth/register_waiting_activation.html", email=email)`
-- `app/auth/views/register.py:112` — `def send_activation_email(user, next_url)`: deletes prior `ActivationCode` rows, creates new one with `random_string(30)`, builds `{URL}/auth/activate?code=...` link, calls `email_utils.send_activation_email`
+- `app/auth/views/register.py:95` — `send_activation_email(user, next_url)` in `try/except`
+- `app/auth/views/register.py:96` — `RegisterEvent(ActionType.success).send()`
+- `app/auth/views/register.py:97` — `DailyMetric.get_or_create_today_metric().nb_new_web_non_proton_user += 1`
+- `app/auth/views/register.py:101` — `RegisterEvent(ActionType.invalid_email).send()` on email-dispatch failure
+- `app/auth/views/register.py:104` — `render_template("auth/register_waiting_activation.html")` — **no** keyword arguments are passed; the template renders from a static context
+- `app/auth/views/register.py:117` — `def send_activation_email(user, next_url)`: deletes prior `ActivationCode` rows, creates new one with `random_string(30)`, builds `{URL}/auth/activate?code=...` link, calls `email_utils.send_activation_email`
 - `app/auth/views/activate.py:13` — `@auth_bp.route("/activate")`
 - `app/auth/views/activate.py:14-15` — `@limiter.limit("10/minute", deduct_when=...)`
-- `app/auth/views/activate.py:24` — `activation_code = ActivationCode.get_by(code=code)`
-- `app/auth/views/activate.py:48-51` — success path: `user.activated = True; login_user(user); ActivationCode.delete(...); Session.commit()`
+- `app/auth/views/activate.py:26` — `activation_code = ActivationCode.get_by(code=code)`
+- `app/auth/views/activate.py:49-54` — success path: `user.activated = True` (line 49); `login_user(user)` (line 50); `ActivationCode.delete(activation_code.id, commit=False)` (line 53); `Session.commit()` (line 54)
 - `app/auth/views/activate.py:58` — `email_utils.send_welcome_email(user)`
-- `app/auth/views/activate.py:63` — `LOG.d("redirect user to %s", next_url)`
-- `app/auth/views/activate.py:66` — `LOG.d("redirect user to dashboard")` — emits `redirect user to dashboard` log
-- `app/auth/views/login.py:23` — `@auth_bp.route("/login", methods=["GET","POST"])`
+- `app/auth/views/activate.py:64` — `LOG.d("redirect user to %s", next_url)`
+- `app/auth/views/activate.py:67` — `LOG.d("redirect user to dashboard")` — emits `redirect user to dashboard` log
+- `app/auth/views/login.py:21` — `@auth_bp.route("/login", methods=["GET","POST"])`
 - `app/auth/views/login.py:50` — `LoginEvent(ActionType.failed).send()` — wrong password or missing user
 - `app/auth/views/login.py:56` — `LoginEvent(ActionType.disabled_login).send()`
-- `app/auth/views/login.py:63` — `LoginEvent(ActionType.scheduled_to_be_deleted).send()`
+- `app/auth/views/login.py:62` — `LoginEvent(ActionType.scheduled_to_be_deleted).send()`
 - `app/auth/views/login.py:69` — `LoginEvent(ActionType.not_activated).send()`
 - `app/auth/views/login.py:71-72` — `LoginEvent(ActionType.success).send()` → `return after_login(user, next_url)`
 - `app/auth/views/login_utils.py:12` — `def after_login(user, next_url)` — MFA decision tree
@@ -1232,34 +1252,38 @@ Every behavioural claim made in this document maps to a specific file and line i
 
 ### Dashboard Views
 
-- `app/dashboard/base.py` — defines `dashboard_bp` with `url_prefix="/dashboard"`
-- `app/dashboard/views/index.py:30` — `def get_stats(user) -> Stats` — computes `nb_alias`, `nb_forward`, `nb_reply`, `nb_block`
-- `app/dashboard/views/index.py:56` — `@dashboard_bp.route("/", methods=["GET","POST"])` `@login_required`
+- `app/dashboard/base.py` — defines `dashboard_bp = Blueprint("dashboard", __name__, url_prefix="/dashboard")`; the `/dashboard` prefix is baked into the blueprint itself, **not** passed at `register_blueprint()` time in `server.py`
+- `app/dashboard/views/index.py:25` — `class Stats` — small dataclass of alias counters returned by `get_stats`
+- `app/dashboard/views/index.py:32` — `def get_stats(user) -> Stats` — computes `nb_alias`, `nb_forward`, `nb_reply`, `nb_block`
+- `app/dashboard/views/index.py:55` — `@dashboard_bp.route("/", methods=["GET","POST"])` `@login_required`
+- `app/dashboard/views/index.py:67` — `def index()` — handler body
 - `app/dashboard/views/index.py:172` — `LOG.d("Show intro to %s", current_user)` — emits `Show intro to <User ...>` log (one-shot per account because `intro_shown` is persisted)
 
 ### Models
 
 - `app/models.py:336` — `class User(Base, ModelMixin, UserMixin)`
-- `app/models.py:408` — `default_mailbox_id` column
-- `app/models.py:447` — `newsletter_alias_id` column
+- `app/models.py:408` — `default_mailbox_id` column — declared **without** an `ondelete=` clause on its `ForeignKey`, so the database falls back to `NO ACTION`; the cleanup SQL in §4 must null this column explicitly before deleting the mailbox
+- `app/models.py:447-451` — `newsletter_alias_id` column — declared with `ondelete="SET NULL"`; when the alias is deleted the FK is nulled automatically by PostgreSQL
 - `app/models.py:602` — `User.create(...)` classmethod — full registration orchestration
-- `app/models.py:610` — `Mailbox.create(user_id=user.id, email=user.email, verified=True, commit=True)`
+- `app/models.py:611` — `Mailbox.create(user_id=user.id, email=user.email, verified=True)` — no `commit=True` kwarg; the commit happens later in `User.create()`
 - `app/models.py:613` — `user.default_mailbox_id = mb.id`
-- `app/models.py:616` — `alternative_id = str(uuid.uuid4())`
-- `app/models.py:635-640` — `Alias.create_new(user, prefix="simplelogin-newsletter", mailbox_id=mb.id, note=..., commit=True)`
+- `app/models.py:616` — `if "alternative_id" not in kwargs:` — conditional assignment: `user.alternative_id = str(uuid.uuid4())` is applied **only** when the caller has not already supplied an explicit `alternative_id` kwarg
+- `app/models.py:634` — `alias = Alias.create_new(user, prefix="simplelogin-newsletter", mailbox_id=mb.id, note=...)` — creates the first newsletter alias
 - `app/models.py:643` — `user.newsletter_alias_id = alias.id`
 - `app/models.py:646` — `if config.DISABLE_ONBOARDING:` — early return, **no onboarding jobs** when flag set
 - `app/models.py:647` — `LOG.d("Disable onboarding emails")`
-- `app/models.py:651-654` — `Job.create(name=config.JOB_ONBOARDING_1, payload={"user_id": user.id}, run_at=arrow.now().shift(days=1), commit=True)`
-- `app/models.py:656-659` — `Job.create(name=config.JOB_ONBOARDING_2, ..., run_at=now + 2d)`
-- `app/models.py:661-664` — `Job.create(name=config.JOB_ONBOARDING_4, ..., run_at=now + 3d)`
-- `app/models.py:667` — `User.delete(obj_id)` classmethod — canonical user-deletion path
+- `app/models.py:651-655` — `Job.create(name=config.JOB_ONBOARDING_1, payload={"user_id": user.id}, run_at=arrow.now().shift(days=1))` — no `commit=True` kwarg (the surrounding `Session.commit()` at the end of `User.create()` is what persists everything atomically)
+- `app/models.py:656-660` — `Job.create(name=config.JOB_ONBOARDING_2, ..., run_at=now + 2d)` — no `commit=True`
+- `app/models.py:661-665` — `Job.create(name=config.JOB_ONBOARDING_4, ..., run_at=now + 3d)` — no `commit=True`
+- `app/models.py:671` — `User.delete(obj_id)` classmethod — canonical user-deletion path
 - `app/models.py:1041` — `User.get_communication_email()` — returns newsletter alias for activated/notifying users, else `user.email`
 - `app/models.py:1182-1183` — `User.__repr__` → `f"<User {self.id} {self.name} {self.email}>"`
 - `app/models.py:1186` — `_expiration_1h = lambda: arrow.now().shift(hours=1)` — default for `ActivationCode.expired`
 - `app/models.py:1202` — `class ActivationCode`
 - `app/models.py:1212` — `expired = db.Column(ArrowType, default=_expiration_1h, ...)`
 - `app/models.py:1214-1215` — `def is_expired(self) -> bool: return self.expired < arrow.now()`
+- `app/models.py:3116` — `class SLDomain(Base, ModelMixin)` — the SQLAlchemy model class
+- `app/models.py:3119` — `__tablename__ = "public_domain"` — **the Python class is `SLDomain` but the underlying table name is `public_domain`**; every SQL example in this document uses the correct on-disk name
 - `app/models.py:3262` — `class DailyMetric`
 - `app/models.py:3280` — `DailyMetric.get_or_create_today_metric()` static method — upserts today's row
 
@@ -1281,15 +1305,17 @@ Every behavioural claim made in this document maps to a specific file and line i
 - `app/events/event_dispatcher.py:61-64` — `if not config.EVENT_WEBHOOK and skip_if_webhook_missing: LOG.i("Not sending events because webhook is not configured and allowed to be empty"); return`
 - `app/events/event_dispatcher.py:67-69` — `if partner_user is None: LOG.i(f"Not sending events because there's no partner user for user {user}"); return`
 - `app/events/auth_event.py` — top: `LoginEvent` and `RegisterEvent` classes with `ActionType` and `Source` enums
-- `app/events/auth_event.py:23` — `LoginEvent.send()` → `newrelic.agent.record_custom_event("LoginEvent", {"action": ..., "source": ...})`
-- `app/events/auth_event.py:46` — `RegisterEvent.send()` → `newrelic.agent.record_custom_event("RegisterEvent", {"action": ..., "source": ...})`
+- `app/events/auth_event.py:23-24` — `LoginEvent.send()` → `newrelic.agent.record_custom_event("LoginEvent", {"action": self.action.name, "source": self.source.name})` — emits the enum member **name** (human-readable string like `"success"` / `"catpcha_failed"` / `"web"`), **not** `.value`
+- `app/events/auth_event.py:45-46` — `RegisterEvent.send()` → `newrelic.agent.record_custom_event("RegisterEvent", {"action": self.action.name, "source": self.source.name})` — same `.name` convention
 
 ### Background Processes
 
 - `job_runner.py:27` — `def onboarding_send_from_alias(user)` — onboarding-1 handler body
-- `job_runner.py:48` — `def onboarding_mailbox(user)` — onboarding-2 handler body
-- `job_runner.py:65` — `def onboarding_pgp(user)` — onboarding-4 handler body
-- `job_runner.py:90` — additional onboarding / welcome helpers
+- `job_runner.py:48` — `def onboarding_pgp(user)` — onboarding-4 handler body (PGP-encryption promo)
+- `job_runner.py:65` — `def onboarding_browser_extension(user)` — browser-extension promo helper
+- `job_runner.py:90` — `def onboarding_mailbox(user)` — onboarding-2 handler body (multiple-mailbox promo)
+- `job_runner.py:107` — `def welcome_proton(user)` — welcome helper for Proton-partner users
+- `job_runner.py:130` — `def delete_mailbox_job(job)` — processor for mailbox-deletion jobs
 - `job_runner.py:188` — `def process_job(job)` — the dispatcher `if job.name == config.JOB_ONBOARDING_1: ...`
 - `job_runner.py:196` — `LOG.d("send onboarding send-from-alias email to user %s", user)`
 - `job_runner.py:307-327` — `def get_jobs_to_run()` — state/attempts/run_at filter query
@@ -1317,14 +1343,14 @@ Every behavioural claim made in this document maps to a specific file and line i
 - `cron.py:1245` — `def delete_old_data()`
 - `cron.py:1252` — `def clear_alias_audit_log()`
 - `cron.py:1257` — `def clear_user_audit_log()`
-- `crontab.yml` — yacron primary-host schedule: 8 jobs (stats, delete_old_monitoring, check_custom_domain, check_hibp, notify_hibp, delete_logs, delete_old_data, poll_apple_subscription)
-- `crontab-all-hosts.yml` — yacron multi-host schedule
+- `crontab.yml` — yacron primary-host schedule: **15** jobs (`stats`, `delete_old_monitoring`, `check_custom_domain`, `check_hibp`, `notify_hibp`, `delete_logs`, `delete_old_data`, `poll_apple_subscription`, `notify_trial_end`, `notify_manual_subscription_end`, `notify_premium_end`, `delete_scheduled_users`, `send_undelivered_mails`, `clear_alias_audit_log`, `clear_user_audit_log`)
+- `crontab-all-hosts.yml` — yacron multi-host schedule; in this repo it holds a single job (`send_undelivered_mails`, `*/5 * * * *`, `concurrencyPolicy: Forbid`) so every host re-tries its own local filesystem dead-letter queue
 - `monitoring.py:39` — `def log_postfix_metrics()` — queue depth + process counts
 - `monitoring.py:44` — `LOG.d("postfix queue sizes %s %s %s", ...)`
-- `monitoring.py:165-174` — `if __name__ == "__main__":` — the 60-second tick loop
-- `monitoring.py:174` — `sleep(60)`
-- `event_listener.py` — PostgreSQL LISTEN/NOTIFY consumer; `Mode` enum = {`listener`, `dead_letter`}
-- `email_handler.py` — aiosmtpd-based inbound mail handler (forward + reply phases)
+- `monitoring.py:157-171` — `if __name__ == "__main__":` — the 60-second tick loop
+- `monitoring.py:171` — `sleep(60)`
+- `event_listener.py` — PostgreSQL LISTEN/NOTIFY consumer; `argparse` sub-parsers expose four positional sub-commands: `listener`, `dead_letter`, `debug`, `run`. Invocation is `python event_listener.py listener` — there is **no** `--mode` flag.
+- `email_handler.py` — aiosmtpd-based inbound mail handler (forward + reply phases); default listening port is **20381** (the `default=20381` value on the `--port` argparse argument)
 
 ### Infrastructure & Entrypoints
 
@@ -1332,9 +1358,10 @@ Every behavioural claim made in this document maps to a specific file and line i
 - `Dockerfile` — two-stage build: `node:10.17.0-alpine` (Stage 1 — `npm ci` for `static/`) → `python:3.10` (Stage 2 — Poetry install). `EXPOSE 7777`. `CMD ["gunicorn","wsgi:app","-b","0.0.0.0:7777","-w","2","--timeout","15"]`.
 - `alembic.ini` — Alembic configuration pointing at `migrations/`
 - `migrations/versions/` — 256 migration revisions (as of `app_2cd6ee777f8c`)
-- `init_app.py:12` — `load_pgp_public_keys()` — loads keys into the GnuPG keyring
-- `init_app.py:39-55` — `add_sl_domains()` — seeds `sl_domain` table via `SLDomain.create(...)`; idempotent (logs `"%s is already a SL domain"` DEBUG or `"Add %s to SL domain"` INFO)
-- `init_app.py:73` — `if __name__ == "__main__":` — calls `add_sl_domains`, `load_pgp_public_keys`, `add_proton_partner`
+- `init_app.py:13` — `load_pgp_public_keys()` — loads keys into the GnuPG keyring
+- `init_app.py:39-56` — `add_sl_domains()` — seeds the `public_domain` table (Python class `SLDomain`, on-disk table name `public_domain`) via `SLDomain.create(...)`; idempotent (logs `"%s is already a SL domain"` DEBUG or `"Add %s to SL domain"` INFO)
+- `init_app.py:59` — `add_proton_partner()` — defined here, but **not** invoked from `init_app.py`'s `__main__`. It runs on normal app bootstrap from `server.py:497` (inside the `dummy-data` CLI command) and from `tests/conftest.py:39`.
+- `init_app.py:69-73` — `if __name__ == "__main__":` — calls, in order, `load_pgp_public_keys()` **first**, then `add_sl_domains()`. That is the complete set — `add_proton_partner()` is **not** called from this block.
 - `pyproject.toml` — Poetry manifest. Key pins: `python ^3.10`, `flask ^1.1.2`, `flask_login ^0.5.0`, `gunicorn ^20.0.4`, `SQLAlchemy 1.3.24`, `psycopg2-binary ^2.9.3`, `redis ^4.5.3`, `bcrypt ^3.2.0`, `python-dotenv ^0.14.0`, `sentry_sdk ^2.16.0`, `newrelic 8.8.0`, `aiosmtpd ^1.2`, `yacron ^0.11.1`, `flask-debugtoolbar ^0.11.0`, `flask_admin ^1.5.6`, `flask-cors ^3.0.9`.
 - `example.env:16` — `COLOR_LOG=true` (commented by default)
 - `example.env:19` — `NOT_SEND_EMAIL=true`
@@ -1358,7 +1385,7 @@ The following eight insights were surfaced during the investigation and are wort
 1. **`DISABLE_ONBOARDING=true` is the default in `example.env`.** With the shipped `example.env` copied verbatim to `.env`, the three onboarding jobs are **not** scheduled during registration. To observe them, delete or comment out the line at `example.env:150` (see `app/models.py:646`).
 2. **Mail-sender log format is verbose.** The actual format string at `app/mail_sender.py:131-135` is `send email with subject '%s', from '%s' to '%s'` — not the shortened "send email to X, subject 'Y'" some notes use.
 3. **EventDispatcher log message is verbose.** The full literal emitted at `app/events/event_dispatcher.py:63` is `"Not sending events because webhook is not configured and allowed to be empty"` — do not paraphrase.
-4. **`init_app.py` seeds `sl_domain`, not `public_domain`.** The Python class is `SLDomain`; the underlying table is `sl_domain`.
+4. **The SimpleLogin-managed-domain table is `public_domain`, not `sl_domain`.** The Python **class** is `SLDomain` (defined at `app/models.py:3116`), but its `__tablename__` is `"public_domain"` (`app/models.py:3119`) — so every `psql` query and every FK reference (e.g. `users.default_alias_public_domain_id` → `public_domain.id` at `app/models.py:383`) uses `public_domain`. `init_app.py:39-56`'s `add_sl_domains()` inserts into `public_domain`.
 5. **Gunicorn vs Flask dev server produce different startup logs.** Under `gunicorn wsgi:app` you see `[INFO] Starting gunicorn 20.1.0`, `[INFO] Listening at: http://0.0.0.0:7777`, and `[INFO] Booting worker with pid: ...`. Under `python server.py → local_main()` you see `* Serving Flask app "server" (lazy loading)` and `* Debug mode: on`. The `>>> URL:` and `>>> init logging <<<` banners appear in **both** cases because they fire at import time in `app/config.py:80` and `app/log.py:67`.
 6. **Welcome-email recipient is the newsletter alias, not the registration email.** `user.get_communication_email()` at `app/models.py:1041` returns `simplelogin-newsletter.<random>@sl.local` for an activated, opted-in user — so the welcome-email log line shows the alias as the recipient.
 7. **`oauth_bp` is double-registered** at `/oauth` and `/oauth2` (`server.py:240-241`). The blueprint count is 10 distinct blueprints but 11 `register_blueprint` calls.
