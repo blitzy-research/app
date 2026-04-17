@@ -184,7 +184,7 @@ def check_sudo_mode_is_active(api_key: ApiKey) -> bool:
         minutes=-SUDO_MODE_MINUTES_VALID
     )
 
-# app/api/base.py lines 63–71
+# app/api/base.py lines 63–73
 def require_api_sudo(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -300,7 +300,7 @@ These findings map directly onto `app/session.py`:
 
 - **Redis key prefix** is constant `SESSION_PREFIX = "session"` (line 18). `_get_key()` returns `f"{SESSION_PREFIX}:{session_Id}"` (lines 43–45), producing the observed `session:<uuid>` format.
 - **Pickle serialization** happens in `save_session()` at line 91: `val = pickle.dumps(dict(session))`. Python's default protocol for `pickle.dumps` on Python 3.8+ is protocol 4, which matches the observed `80 04` header bytes. Data is decoded in `open_session()` at line 76 via `pickle.loads(val)`.
-- **TTL logic** (`save_session()` lines 92–96) explicitly sets `ttl = 300` when `"_user_id" not in session` (unauthenticated) — matching the observed `295s` TTL — and otherwise falls back to `int(app.permanent_session_lifetime.total_seconds())` (7 days by Flask default) — matching the observed `604788s` TTL.
+- **TTL logic** (`save_session()` lines 92–96) explicitly sets `ttl = 300` when `"_user_id" not in session` (unauthenticated) — matching the observed `295s` TTL — and otherwise falls back to `int(app.permanent_session_lifetime.total_seconds())` (7 days — explicitly set by SimpleLogin at `server.py:207` via `app.permanent_session_lifetime = timedelta(days=7)`, overriding Flask's own 31-day default) — matching the observed `604788s` TTL.
 - **Cookie signing** (lines 102–104) uses `itsdangerous.Signer(app.secret_key, salt="session", key_derivation="hmac")` to sign the session UUID. The resulting cookie value is `<uuid>.<signature>`.
 - **Session keys:**
   - `_permanent` and `_fresh` are Flask-Login bookkeeping flags.
