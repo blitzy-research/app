@@ -519,6 +519,24 @@ BadTimeSignature: Signature b'JayFjy80p5Go3tsYLHhp-zXXXXX' does not match
 check_suffix_signature (tampered) result: None
 ```
 
+**Direct boundary tests.** To find the exact boundary where a token "stops working" (per the investigation requirement), we constructed tokens with back-dated timestamps by temporarily monkey-patching `signer.get_timestamp` to return `now - N` for specific values of `N`, then verified the behaviour of both `signer.unsign(token, max_age=600)` and the production `check_suffix_signature(token)`:
+
+```text
+--- Boundary Test 8: simulate 601-second-old token ---
+OLD (601s backdated) TOKEN: .test-suffix@sl.local.aeGvMA.PzaUo3YgM7n88lFhePqCEECNlsU
+SignatureExpired: Signature age 601 > 600 seconds
+
+--- Boundary Test 9: simulate 599-second-old token ---
+YOUNG (599s backdated) TOKEN: .test-suffix@sl.local.aeGvMg.1lB0uwSWsIWbotJcNyQf8m0uBFQ
+SUCCESS - result: .test-suffix@sl.local
+
+--- Boundary Test 10: check_suffix_signature on 601-second-old token ---
+check_suffix_signature (601s old) result: None  (should be None)
+
+--- Boundary Test 11: check_suffix_signature on 599-second-old token ---
+check_suffix_signature (599s old) result: '.test-suffix@sl.local'
+```
+
 ### Observed Result
 
 | Test | `max_age` | Elapsed time | Outcome |
@@ -530,8 +548,12 @@ check_suffix_signature (tampered) result: None
 | 5 | (hard-coded 600) | ~4 s | ✅ `check_suffix_signature()` returns `.test-suffix@sl.local` |
 | 6 | `600` (tampered) | ~4 s | ❌ `itsdangerous.BadTimeSignature: "Signature b'…XXXXX' does not match"` (a subclass of `BadSignature`) |
 | 7 | (hard-coded 600, tampered) | ~4 s | `check_suffix_signature()` returns `None` |
+| **8** | `600` | **601 s** | ❌ `itsdangerous.SignatureExpired: "Signature age 601 > 600 seconds"` |
+| **9** | `600` | **599 s** | ✅ VALID — returns `.test-suffix@sl.local` |
+| **10** | (hard-coded 600) | 601 s | `check_suffix_signature()` returns `None` |
+| **11** | (hard-coded 600) | 599 s | `check_suffix_signature()` returns `.test-suffix@sl.local` |
 
-**The expiration window is exactly 600 seconds (10 minutes).** The boundary tests at `max_age=0` and `max_age=1` produce `SignatureExpired` with messages of the form `"Signature age <elapsed> > <max_age> seconds"`, confirming that `itsdangerous` compares elapsed time against the supplied `max_age` and raises as soon as `elapsed > max_age`.
+**The expiration window is exactly 600 seconds (10 minutes).** The boundary tests at `max_age=0` and `max_age=1` (Tests 2–3) produce `SignatureExpired` with messages of the form `"Signature age <elapsed> > <max_age> seconds"`, confirming that `itsdangerous` compares elapsed time against the supplied `max_age` and raises as soon as `elapsed > max_age`. The direct boundary tests 8–11 pin the cutoff: a token that is **599 seconds old is accepted**, a token that is **601 seconds old is rejected**, and the production function `check_suffix_signature` exhibits the identical cut-off (returning the decoded suffix in one case, `None` in the other). The boundary is therefore exactly `elapsed ≤ 600` ⇒ accept, `elapsed > 600` ⇒ reject.
 
 ### Conclusion
 
@@ -563,29 +585,34 @@ Thus a user clicking the "Create alias" confirmation button must do so within **
 
 ### Method
 
-The `api_key` table row for the test API key (`id=46`) was queried before and after performing three successive API calls carrying the key in the `Authentication` header. The `Session.expire_all()` call in the post-query forces the ORM to re-read the row from the database so that values updated by the Flask worker's SQLAlchemy session are reflected.
+The `api_key` table row for the test API key was queried before and after performing three successive API calls carrying the key in the `Authentication` header. To obtain a clean baseline, the row was first reset to `times=0, last_used=None, sudo_mode_at=None` and committed, then the ORM `Session.expire_all()` was called so that subsequent reads hit the database (and reflect any writes made by the Flask worker's own SQLAlchemy session).
 
 ### Evidence
 
-**BEFORE — three API calls:**
+**BEFORE — three API calls (after reset to a clean baseline):**
 
 ```text
-BEFORE: id=46 user_id=408 times=3 last_used=2026-04-17T02:15:33.992414+00:00 sudo_mode_at=None
+BEFORE: id=<key_id> user_id=<user_id> code=<api_key_code> times=0 last_used=None sudo_mode_at=None
 ```
-
-(The row shows residual state from earlier testing: `times=3` and an older `last_used` timestamp.)
 
 **Three API calls with the key:**
 
 ```bash
 for i in 1 2 3; do
-  curl -s -H 'Authentication: hbijkhwsqyakgofduorvidjfhmmpffaqyxaagvycvvwruelntbhxfqtyszuj' \
+  curl -s -H 'Authentication: <api_key_code>' \
        http://localhost:7777/api/user_info -w '\nHTTP %{http_code}\n'
 done
 ```
 
+```text
+CALL 1: HTTP 200
+CALL 2: HTTP 200
+CALL 3: HTTP 200
+```
+
+All three calls returned the same JSON user-info body as in Section 1:
+
 ```json
---- CALL 1 ---
 {
   "can_create_reverse_alias": true,
   "connected_proton_address": null,
@@ -596,29 +623,20 @@ done
   "name": "Test User",
   "profile_picture_url": null
 }
-HTTP 200
---- CALL 2 ---
-{ ... same body ... }
-HTTP 200
---- CALL 3 ---
-{ ... same body ... }
-HTTP 200
 ```
 
 **AFTER — three API calls:**
 
 ```text
-AFTER: id=46 user_id=408 times=6 last_used=2026-04-17T02:22:02.704346+00:00 sudo_mode_at=None
+AFTER: times=3 last_used=<Arrow [2026-04-17T04:02:41.861677+00:00]> sudo_mode_at=None
 ```
 
 ### Observed Result
 
 | Column | Before | After | Delta |
 |--------|--------|-------|-------|
-| `id` | 46 | 46 | — |
-| `user_id` | 408 | 408 | — |
-| `times` | **3** | **6** | **+3** (exactly one increment per call) |
-| `last_used` | `2026-04-17T02:15:33.992414+00:00` | `2026-04-17T02:22:02.704346+00:00` | Overwritten each call — final value ≈ the timestamp of the third call |
+| `times` | **0** | **3** | **+3** (exactly one increment per call) |
+| `last_used` | `None` | `<Arrow [2026-04-17T04:02:41.861677+00:00]>` | Overwritten each call — final value ≈ the timestamp of the third call |
 | `sudo_mode_at` | `None` | `None` | **unchanged** — regular API calls do NOT modify `sudo_mode_at` |
 
 Two columns are updated: `times` (incremented by 1 per successful key-authenticated request) and `last_used` (replaced with the current `arrow.now()` on each call). `sudo_mode_at` is NOT touched by regular API usage.
@@ -748,7 +766,7 @@ The view function then falls through to `render_template("auth/login.html", ...)
 | 5 | `Reply-To` through forwarding | **STRIPPED** (may be re-added downstream as a reverse-alias address, but the original `Reply-To` is removed) |
 | 6 | Alias suffix token expiration window | **600 seconds (10 minutes)** — hard-coded `max_age=600` in `check_suffix_signature()` (`app/alias_suffix.py:40`) |
 | 7 | API-key fields updated per authenticated call | `times` += 1, `last_used` := `arrow.now()` (`sudo_mode_at` unchanged) |
-| 7 | Observed deltas for 3 calls | `times: 3 → 6`, `last_used: 2026-04-17T02:15:33 → 2026-04-17T02:22:02` |
+| 7 | Observed deltas for 3 calls (clean baseline) | `times: 0 → 3`, `last_used: None → 2026-04-17T04:02:41.861677+00:00` |
 | 8 | Failed login HTTP status | **HTTP 200** (login page is re-rendered) |
 | 8 | Failed login flash message | `toastr.error("Email or password incorrect")` |
 | 8 | Failed login server log | One standard DEBUG access-log line: `POST /auth/login ImmutableMultiDict([]) 200, takes 0.310...` (no explicit "login failed" log line; a silent `LoginEvent(failed)` New-Relic custom event is fired) |
