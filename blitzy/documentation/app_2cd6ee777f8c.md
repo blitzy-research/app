@@ -144,7 +144,7 @@ The log-level shortcuts `LOG.d` / `LOG.i` / `LOG.w` / `LOG.e` bind to `debug` / 
 
 **Rationale:**
 
-- `handle_forward()` begins with `alias = Alias.get_by(email=alias_address)` (`email_handler.py:538`). When it returns `None`, two log lines fire in sequence:
+- `handle_forward()` begins with `alias = Alias.get_by(email=alias_address)` (`email_handler.py:543`). When it returns `None`, two log lines fire in sequence:
   - `email_handler.py:545` — `LOG.d("alias %s not exist. Try to see if it can be created on the fly", alias_address)`
   - `email_handler.py:551` — `LOG.d("alias %s cannot be created on-the-fly, return 550", alias_address)` (emitted only if `try_auto_create()` also returns `None`).
 - `try_auto_create()` delegates to both `check_if_alias_can_be_auto_created_for_custom_domain()` and `check_if_alias_can_be_auto_created_for_a_directory()` in `app/alias_utils.py`. In this scenario neither succeeds — `sl.local` is not a custom domain in the `custom_domain` table, and `nonexistent_qm2z7xaa` contains no directory separator (`+` or `/`), which is why the two `INFO` lines from `alias_utils.py:104` and `:165` appear.
@@ -174,11 +174,13 @@ The assignment `EmailLog.create(… message_id=str(msg[headers.MESSAGE_ID]))` ha
 During the reply path, `replace_original_message_id()` at `email_handler.py:1296` deletes the inbound `Message-ID` from the outbound message and replaces it with a freshly generated SL Message-ID. The generator call is:
 
 ```python
-# email_handler.py:1311-1312 (unchanged)
-new_message_id = make_msgid(str(email_log.id), alias_domain)
+# email_handler.py:1311-1313 (unchanged)
+sl_message_id = make_msgid(
+    str(email_log.id), get_email_domain_part(alias.email)
+)
 ```
 
-`email.utils.make_msgid(idstring, domain)` produces RFC 5322-compliant Message-IDs of the form `<{time_ns}.{pid}.{random}.{idstring}@{domain}>`. After generation, the value is:
+`get_email_domain_part(alias.email)` extracts the apex domain of the alias (`sl.local` in this run — the captured `alias_domain` value referenced below). `email.utils.make_msgid(idstring, domain)` produces RFC 5322-compliant Message-IDs of the form `<{time_ns}.{pid}.{random}.{idstring}@{domain}>`. After generation, the value is:
 
 1. Written to the outbound `Message-ID` header (`email_handler.py:1338-1339`).
 2. Persisted to `EmailLog.sl_message_id`.
@@ -206,7 +208,7 @@ new_message_id = make_msgid(str(email_log.id), alias_domain)
  └──────────────────────────────────────────── monotonic timestamp component from make_msgid()
 ```
 
-**Log evidence:** `email_handler.py:1314` emits `LOG.d("create a new sl_message_id %s", new_message_id)` — in the captured trace this line reads `create a new sl_message_id <177637862949.6894.7827280164812125513.4@sl.local>`.
+**Log evidence:** `email_handler.py:1314` emits `LOG.d("create a new sl_message_id %s", sl_message_id)` — in the captured trace this line reads `create a new sl_message_id <177637862949.6894.7827280164812125513.4@sl.local>`.
 
 ### 4.3 Summary table
 
@@ -231,7 +233,7 @@ add_or_replace_header(msg, "From", new_from_header)
 LOG.d("From header, new:%s, old:%s", new_from_header, old_from_header)
 ```
 
-`contact.new_addr()` is defined at `app/models.py:2008-2058`. It reads the user's `SenderFormatEnum` preference — the default is `SenderFormatEnum.AT` — and builds the address via `app.email_utils.sl_formataddr()`:
+`contact.new_addr()` is defined at `app/models.py:2008-2046`. It reads the user's `SenderFormatEnum` preference — the default is `SenderFormatEnum.AT` — and builds the address via `app.email_utils.sl_formataddr()`:
 
 ```python
 # models.py (AT branch)
@@ -239,9 +241,9 @@ new_name = f"{contact_from_name} at {sender_from_domain}"
 return sl_formataddr((new_name, contact.reply_email))
 ```
 
-`sl_formataddr()` in `app/email_utils.py:1501-1510` delegates to Python's `email.utils.formataddr()` with a `utf-8` `Header` for the display name, producing an RFC 5322 display-name + angle-addressed email.
+`sl_formataddr()` in `app/email_utils.py:1501-1505` delegates to Python's `email.utils.formataddr()` with a `utf-8` `Header` for the display name, producing an RFC 5322 display-name + angle-addressed email.
 
-The `contact.reply_email` value was created when `create_contact()` (`app/contact_utils.py:92-115`) called `generate_reply_email(contact_email, alias)` (`app/email_utils.py:1103-1158`). For a user whose `include_sender_in_reverse_alias` flag is `True`, the reply email has the form `{sender_local}_at_{sender_domain}_{random_suffix}@{reply_domain}`.
+The `contact.reply_email` value was created when `create_contact()` (`app/contact_utils.py:92-115`) called `generate_reply_email(contact_email, alias)` (`app/email_utils.py:1103-1153`). For a user whose `include_sender_in_reverse_alias` flag is `True`, the reply email has the form `{sender_local}_at_{sender_domain}_{random_suffix}@{reply_domain}`.
 
 ### 5.1 Captured runtime values
 
@@ -371,7 +373,7 @@ A separate reply scenario (using the `tests/example_emls/replacement_on_reply_ph
 | `original_message_id` | `<d2386e98-b967-4e0e-bdd5-6672ee7267f8@user.mailbox.test>` |
 | `email_log_id` | `4` |
 
-Source: `MessageIDMatching.create(sl_message_id=new_message_id, original_message_id=original_message_id, email_log_id=email_log.id)` inside `replace_original_message_id()` at `email_handler.py:1316-1320`. Schema definition at `app/models.py:3365-3385`.
+Source: `MessageIDMatching.create(sl_message_id=sl_message_id, original_message_id=original_message_id, email_log_id=email_log.id, commit=True)` inside `replace_original_message_id()` at `email_handler.py:1316-1322`. Schema definition at `app/models.py:3365-3379`.
 
 ### 6.3 Consolidated "records per operation" matrix
 
@@ -389,7 +391,7 @@ Key file / line anchors referenced above (all unchanged; no source was modified 
 
 | Code site | Function / Symbol | Role in the pipeline |
 |---|---|---|
-| `email_handler.py:2334-2400` | `MailHandler._handle()` | Wall-clock timer, UUID `set_message_id()`, `create_light_app().app_context()`, `background_task()` decorator. |
+| `email_handler.py:2335-2378` | `MailHandler._handle()` | Wall-clock timer, UUID `set_message_id()`, `create_light_app().app_context()`, `background_task()` decorator. |
 | `email_handler.py:1945-2234` | `handle()` | Routing: `is_reverse_alias(rcpt_to)` → `handle_reply()` else `handle_forward()`. |
 | `email_handler.py:536-928` | `handle_forward()` + `forward_email_to_mailbox()` | Resolve alias, auto-create if possible, create contact, create email-log, rewrite headers, `sl_sendmail`. |
 | `email_handler.py:545-555` | `handle_forward()` alias-not-exist branch | The log lines `alias … not exist. Try to see if it can be created on the fly` and `alias … cannot be created on-the-fly, return 550`. |
@@ -398,13 +400,13 @@ Key file / line anchors referenced above (all unchanged; no source was modified 
 | `email_handler.py:966-1261` | `handle_reply()` | Lookup contact by `reply_email`, apply DMARC, create email-log, rewrite headers, replace Message-ID, `sl_sendmail`. |
 | `email_handler.py:1296-1320` | `replace_original_message_id()` | `make_msgid(str(email_log.id), domain)` → write to `sl_message_id` and `MessageIDMatching`. |
 | `app/contact_utils.py:42-120` | `create_contact()` | `Contact.create(…)` + `emit_user_audit_log(action=CreateContact)`. |
-| `app/email_utils.py:1103-1158` | `generate_reply_email()` | Reverse-alias generation: `{sender_local}_at_{sender_domain}_{random}@{reply_domain}` (or `{random}@{reply_domain}` when `include_sender_in_reverse_alias=False`). |
+| `app/email_utils.py:1103-1153` | `generate_reply_email()` | Reverse-alias generation: `{sender_local}_at_{sender_domain}_{random}@{reply_domain}` (or `{random}@{reply_domain}` when `include_sender_in_reverse_alias=False`). |
 | `app/email_utils.py:1438-1498` | `generate_verp_email()` / `get_verp_info_from_email()` | VERP envelope addresses. |
-| `app/email_utils.py:1501-1510` | `sl_formataddr()` | `formataddr((Header(name, 'utf-8'), address))`. |
+| `app/email_utils.py:1501-1505` | `sl_formataddr()` | `formataddr((Header(name, 'utf-8'), address))`. |
 | `app/models.py:62-130` | `ModelMixin` | `id`, `created_at` (Arrow UTC), `updated_at`, `get`, `get_by`, `filter_by`, `create`. |
-| `app/models.py:2008-2058` | `Contact.new_addr()` | Builds display-name + reply_email string under the chosen `SenderFormatEnum` (default `AT`). |
+| `app/models.py:2008-2046` | `Contact.new_addr()` | Builds display-name + reply_email string under the chosen `SenderFormatEnum` (default `AT`). |
 | `app/models.py:2153-2170` | `EmailLog.create()` override | Triggers `UPDATE alias SET last_email_log_id = :el_id` after the INSERT. |
-| `app/models.py:3365-3385` | `MessageIDMatching` | Unique indices on both `sl_message_id` and `original_message_id`; FK `email_log_id`. |
+| `app/models.py:3365-3379` | `MessageIDMatching` | Unique indices on both `sl_message_id` and `original_message_id`; FK `email_log_id`. |
 | `app/log.py:1-79` | `LOG` / `EmailHandlerFilter` / `set_message_id` | Logger setup, per-message correlation UUID injection, `LOG.d`/`LOG.i`/`LOG.w`/`LOG.e` shortcuts. |
 | `app/email/status.py` | `E200`, `E515`, … | SMTP status string constants (`"250 Message accepted for delivery"` and `"550 SL E515 Email not exist"`). |
 | `app/email/headers.py` | `FROM`, `TO`, `CC`, `MESSAGE_ID`, `SL_DIRECTION`, `SL_EMAIL_LOG_ID`, `SL_ENVELOPE_FROM`, `SL_ENVELOPE_TO`, `SL_ORIGINAL_FROM`, … | Header-name constants. |
@@ -424,7 +426,7 @@ The `SendRequest` captured from `mail_sender` during the forward-success run con
 | `Date` | `Thu, 16 Apr 2026 22:29:13 -0000` (auto-added because the inbound message was missing `Date`) |
 | `Message-ID` | `<af07e94a66ece6564ae30a2aaac7a34c@frontapp.com>` |
 | `X-SimpleLogin-Type` | `Forward` |
-| `X-SimpleLogin-Email-Log-ID` | `2` |
+| `X-SimpleLogin-EmailLog-ID` | `2` |
 | `X-SimpleLogin-Envelope-From` | `env.sender_ra3wlh@example.com` |
 | `X-SimpleLogin-Envelope-To` | `seeped_ftping948@sl.local` |
 | `X-SimpleLogin-Original-From` | `sender_ra3wlh@example.com` |
