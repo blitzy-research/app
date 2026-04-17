@@ -70,7 +70,7 @@ This section traces the complete inbound path from SMTP `DATA` command to delive
 - `email_handler.py:966` — `def handle_reply(envelope, msg: Message, rcpt_to: str) -> (bool, str):` is the reply-phase entry point.
 - `email_handler.py:972` — `reply_email = rcpt_to` — the local name `reply_email` is initially identical to the SMTP recipient.
 - `email_handler.py:974` — `reply_domain = get_email_domain_part(reply_email)` — extracts everything after the `@`.
-- `email_handler.py:977–981` — the reply domain must either equal `config.EMAIL_DOMAIN` or belong to an `SLDomain.get_by(domain=reply_domain)`. If neither, the function returns `(False, status.E501)` — the RCPT is not served by SimpleLogin at all.
+- `email_handler.py:977–981` — this is a **suffix** check, not a strict equality check: the guard is `if not reply_email.endswith(EMAIL_DOMAIN)`. If the address does not end with `EMAIL_DOMAIN`, the code falls back to `SLDomain.get_by(domain=reply_domain)` — a *plain lookup by domain only*, with no additional `use_as_reverse_alias` filter at this site (contrast with `generate_reply_email` in Section 7.1 which *does* inspect `sl_domain.use_as_reverse_alias`). If the `SLDomain` lookup returns `None`, the function logs via `LOG.w` and returns `(False, status.E501)` — the RCPT is not served by SimpleLogin at all.
 
 ### 2.4 Normalization
 
@@ -100,7 +100,16 @@ This section traces the complete inbound path from SMTP `DATA` command to delive
         return False, status.E502
     ```
 
-    `User.is_active` at `app/models.py:766–769` returns `True` unless `self.delete_on` is set in the past.
+    `User.is_active` at `app/models.py:766–769` has counter-intuitive semantics relative to its name. Reading the method body verbatim:
+
+    ```python
+    def is_active(self) -> bool:
+        if self.delete_on is None:
+            return True
+        return self.delete_on < arrow.now()
+    ```
+
+    It returns `True` in two cases: (a) when `delete_on is None` (no deletion is scheduled), and (b) when `delete_on` is **in the past** (i.e., the scheduled deletion moment has already elapsed). It returns `False` only when `delete_on` is set to a **future** moment — meaning the account is currently inside a pending-deletion grace window. In effect, the method reads "is the user either outside the delete-scheduled state or past its grace end", rather than the natural-language reading of "is the account active". Practically, inside `handle_reply` the check `if not contact.user.is_active(): return False, status.E502` triggers **only while the user's deletion grace window is still running**; users with no `delete_on` set and users whose grace window has already ended both pass the check.
 
 ### 2.6 Deriving the Routing Chain
 
@@ -120,14 +129,20 @@ This section traces the complete inbound path from SMTP `DATA` command to delive
 ### 2.7 Mailbox Authorization
 
 - `email_handler.py:1019` — `mailbox = get_mailbox_from_mail_from(mail_from, alias)`. This walks `alias.mailboxes` and each mailbox's `authorized_addresses` in `email_handler.py:1364–1387`.
-- `email_handler.py:1020–1034` — if no mailbox matched:
+- `email_handler.py:1020–1034` — if no mailbox matched, there are **two branches** depending on `alias.disable_email_spoofing_check`:
 
     ```python
-    handle_unknown_mailbox(envelope, msg, reply_email, user, alias)
-    return False, status.E214
+    if not mailbox:
+        if alias.disable_email_spoofing_check:
+            mailbox = alias.mailbox  # fallback: use default alias mailbox
+        else:
+            handle_unknown_mailbox(envelope, msg, reply_email, user, alias, contact)
+            return False, status.E214
     ```
 
-    `handle_unknown_mailbox` (`email_handler.py:1390–1430`) sends an alert email to the alias owner and returns `250 SL E214` to the MTA so it does not bounce — the reply is silently dropped.
+    The **fallback branch** (`alias.disable_email_spoofing_check == True`, lines 1021–1029) suppresses the anti-spoofing guard: the code logs a warning, then assigns `mailbox = alias.mailbox` (the alias's *default* mailbox) and falls through to continue processing the reply. This means for any alias that has the `disable_email_spoofing_check` flag set, **the `get_mailbox_from_mail_from` boundary is bypassed** and the reply proceeds as though the sender's `mail_from` had matched an authorized mailbox. Section 13.2 discusses the anti-spoofing implications of this fallback.
+
+    The **strict branch** (lines 1030–1034) calls `handle_unknown_mailbox(envelope, msg, reply_email, user, alias, contact)` — a **6-parameter** call that passes the resolved `contact` in addition to `envelope`, `msg`, `reply_email`, `user`, and `alias`. The helper (`email_handler.py:1390–1430`; signature at line 1390–1392 takes `envelope, msg, reply_email, user, alias, contact`) sends an alert email to the alias owner. After `handle_unknown_mailbox` returns, `handle_reply` returns `(False, status.E214)` — `False` to signal the MTA that the message was not handled by the reply path, paired with the `E214` status string `"250 SL E214 Unauthorized for using reverse alias"` (`app/email/status.py:22`) so the 2xx-prefixed status causes the sending MTA to treat the transaction as accepted (no backscatter), but the reply is silently dropped.
 
 ### 2.8 SPF, Logging, and Delivery
 
@@ -222,15 +237,13 @@ sequenceDiagram
 
 ```python
 def convert_to_id(s: str):
-    # remove space and remove multiple consecutive spaces
-    s = " ".join(s.split())
-    s = s.lower().strip()
-    # normalize 'ảnh' -> 'anh'
-    s = unidecode.unidecode(s)
+    s = s.lower()
+    s = unidecode(s)
+    s = s.replace(" ", "")
     return s[:256]
 ```
 
-So a non-ASCII input is first lowercased, space-normalized, and run through `unidecode` — which transliterates Unicode characters to their ASCII approximations — then truncated to 256 characters.
+(Docstring omitted for brevity; `unidecode` is imported at module top — the call is `unidecode(s)`, not `unidecode.unidecode(s)`.) So a non-ASCII input is first **lowercased**, then passed through `unidecode` — which transliterates Unicode characters to their ASCII approximations — then **all spaces are removed** (not merely collapsed), and finally the result is truncated to 256 characters.
 
 ### 3.3 Key Insight: Normalization Is Lossy
 
@@ -261,12 +274,17 @@ The two queries therefore use different keys for the *same* SMTP input. This asy
 
 ### 3.5 Idempotency for Generator Output
 
+Two separate `_ALLOWED_CHARS` constants exist in the codebase — they are **not** identical. The distinction matters here:
+
+- `app/email_validation.py:9` (used by `normalize_reply_email`): `"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.+@"` — the whitelist is `[a-zA-Z0-9_.\-+@]`, with the comment at line 8 documenting "allow also + and @ that are present in a reply address".
+- `app/utils.py:59` (used by `convert_to_alphanumeric`): `"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-."` — the whitelist is `[a-zA-Z0-9_.\-]`, **excluding** `+` and `@`.
+
 Although `normalize_reply_email` is lossy in general, it is idempotent for strings `generate_reply_email` produces today. Observe that:
 
 - `random_string` (`app/utils.py:41–47`) draws from `string.ascii_lowercase` only.
-- Sender-prefix path (`app/email_utils.py:1119–1127`) runs the prefix through `convert_to_alphanumeric` (`app/utils.py:62–71`), which replaces characters not in a whitelist of `[a-zA-Z0-9_]` with `_`, and then composes `f"{contact_email}_{random_string(...)}@{reply_domain}"`.
+- Sender-prefix path (`app/email_utils.py:1120–1127`) runs the prefix through `convert_to_alphanumeric` (`app/utils.py:62–71`), which replaces any character not in the narrower `[a-zA-Z0-9_.\-]` whitelist with `_`, and then composes `f"{contact_email}_{random_string(...)}@{reply_domain}"`. The `@` separating local-part from domain is valid in the email-validation whitelist but not in the `convert_to_alphanumeric` whitelist; since `@` is inserted by the f-string *after* `convert_to_alphanumeric` runs, this is fine.
 
-All code-produced strings already consist of characters inside `_ALLOWED_CHARS`, so feeding them through `normalize_reply_email` yields the same string. In a database that has only ever been populated by the current generator, normalization is a no-op. The concern is purely about **legacy rows** or **manually-created** data — a realistic concern given the docstring at `app/email_validation.py:26` literally names the purpose as rehabilitating "*strange* char that was wrongly generated in the past".
+All code-produced strings already consist of characters inside the `email_validation.py:9` `_ALLOWED_CHARS` (which is what `normalize_reply_email` actually consults), so feeding them through `normalize_reply_email` yields the same string. In a database that has only ever been populated by the current generator, normalization is a no-op. The concern is purely about **legacy rows** or **manually-created** data — a realistic concern given the docstring at `app/email_validation.py:26` literally names the purpose as rehabilitating "*strange* char that was wrongly generated in the past".
 
 ---
 
@@ -453,23 +471,14 @@ def upgrade():
 
 ### 6.4 Predecessor Table
 
-The ancestor of `contact` was the `forward_email` table, created in `migrations/versions/5fa68bafae72_.py:21–32`:
+The ancestor of `contact` was the `forward_email` table, created in `migrations/versions/5fa68bafae72_.py:21–32`. The salient columns and constraints are:
 
 ```python
-op.create_table('forward_email',
-    sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
-    sa.Column('created_at', sqlalchemy_utils.types.arrow.ArrowType(), nullable=False),
-    sa.Column('updated_at', sqlalchemy_utils.types.arrow.ArrowType(), nullable=True),
-    sa.Column('gen_email_id', sa.Integer(), nullable=False),
-    sa.Column('website_email', sa.String(length=128), nullable=False),
-    sa.Column('reply_email', sa.String(length=128), nullable=False),
-    sa.ForeignKeyConstraint(['gen_email_id'], ['gen_email.id'], ondelete='cascade'),
-    sa.PrimaryKeyConstraint('id'),
-    sa.UniqueConstraint('gen_email_id', 'website_email', name='uq_forward_email')
-)
+sa.Column('reply_email', sa.String(length=128), nullable=False),
+sa.UniqueConstraint('gen_email_id', 'website_email', name='uq_forward_email')
 ```
 
-Observe:
+(Other columns: `id` PK, `created_at`/`updated_at` as `ArrowType`, `gen_email_id` FK to `gen_email.id`, `website_email` `String(128)`. No `UniqueConstraint` names `reply_email`.) Observe:
 
 - Only unique constraint: `uq_forward_email(gen_email_id, website_email)` — the ancestor of `uq_contact`. No uniqueness on `reply_email` from day one.
 - `reply_email` is `sa.String(length=128)` here; the width was later widened to 512 in the current model.
@@ -494,50 +503,50 @@ Before analyzing race conditions, we must understand exactly how `reply_email` v
 
 ### 7.1 `generate_reply_email` — the 1000-Iteration Loop
 
-- `app/email_utils.py:1103–1153`:
+- `app/email_utils.py:1103–1153`. The function has four sub-steps: a tri-state opt-in read, optional sender-prefix sanitization, domain selection via an `SLDomain` database lookup, and a bounded random-candidate loop. Each is shown verbatim below.
 
-    Signature and header handling (lines 1103–1135):
-
-    ```python
-    def generate_reply_email(contact_email: str, alias: Alias) -> str:
-        include_sender_in_reverse_alias = False
-        if alias.user and alias.user.include_sender_in_reverse_alias and contact_email:
-            include_sender_in_reverse_alias = True
-        if include_sender_in_reverse_alias:
-            # remove special chars
-            contact_email = convert_to_alphanumeric(contact_email)
-            contact_email = contact_email[:45]
-            contact_email = contact_email.replace("@", "_at_")
-            contact_email = contact_email.replace(".", "_")
-
-        reply_domain = config.EMAIL_DOMAIN
-        if alias.sl_domain is not None and alias.sl_domain.use_as_reverse_alias:
-            reply_domain = alias.sl_domain.domain
-    ```
-
-    The retry loop (lines 1136–1150):
+    **Step 1 — opt-in read (lines 1112–1117):** The `include_sender_in_reverse_alias` user column is treated as a tri-state (`None` → default `False`, `True`/`False` → explicit):
 
     ```python
-        # not use while loop to avoid infinite loop
-        for _ in range(1000):
-            if include_sender_in_reverse_alias:
-                random_length = random.randint(5, 10)
-                reply_email = (
-                    f"{contact_email}_{random_string(random_length)}@{reply_domain}"
-                )
-            else:
-                random_length = random.randint(20, 50)
-                reply_email = f"{random_string(random_length)}@{reply_domain}"
-
-            if available_sl_email(reply_email):
-                return reply_email
+    include_sender_in_reverse_alias = False
+    user = alias.user
+    if user.include_sender_in_reverse_alias is not None:
+        include_sender_in_reverse_alias = user.include_sender_in_reverse_alias
     ```
 
-    Failure path (line 1152):
+    **Step 2 — sender-prefix sanitization (lines 1120–1127):** Only executed when `include_sender_in_reverse_alias and contact_email`. The order matters; `convert_to_id` runs **first** (to strip accents and spaces), `sanitize_email` **second** (to canonicalize the address shape), then truncation, `@`→`_at_` and `.`→`_` replacements, and finally `convert_to_alphanumeric` to replace any remaining disallowed characters:
 
     ```python
-        raise Exception("Cannot generate reply email")
+    contact_email = convert_to_id(contact_email)
+    contact_email = sanitize_email(contact_email)
+    contact_email = contact_email[:45]
+    contact_email = contact_email.replace("@", "_at_")
+    contact_email = contact_email.replace(".", "_")
+    contact_email = convert_to_alphanumeric(contact_email)
     ```
+
+    **Step 3 — domain selection (lines 1129–1133):** Note this is a **fresh database lookup** via `SLDomain.get_by(domain=alias_domain)` — *not* an attribute access on `alias.sl_domain`. The `use_as_reverse_alias` flag is then inspected on the looked-up row:
+
+    ```python
+    reply_domain = config.EMAIL_DOMAIN
+    alias_domain = get_email_domain_part(alias.email)
+    sl_domain = SLDomain.get_by(domain=alias_domain)
+    if sl_domain and sl_domain.use_as_reverse_alias:
+        reply_domain = alias_domain
+    ```
+
+    **Step 4 — the 1000-iteration candidate loop (lines 1136–1153):** The inner-branch condition is `if include_sender_in_reverse_alias and contact_email` (both flags must be truthy). The failure path raises after 1000 failed candidates:
+
+    ```python
+    for _ in range(1000):
+        # build candidate via sender-prefix or fully-random branch
+        reply_email = f"{random_string(random.randint(20,50))}@{reply_domain}"
+        if available_sl_email(reply_email):
+            return reply_email
+    raise Exception("Cannot generate reply email")
+    ```
+
+    (The excerpt shows only the default fully-random branch; the sender-prefix branch builds `f"{contact_email}_{random_string(random.randint(5,10))}@{reply_domain}"` under the inner guard. Both candidates are gated by `available_sl_email(reply_email)` before the function returns.)
 
 ### 7.2 `random_string` — Cryptographic Source
 
@@ -560,15 +569,17 @@ Before analyzing race conditions, we must understand exactly how `reply_email` v
 
 ### 7.4 The Domain Selection
 
-- `app/email_utils.py:1129–1133`:
+- `app/email_utils.py:1129–1133` (verbatim):
 
     ```python
     reply_domain = config.EMAIL_DOMAIN
-    if alias.sl_domain is not None and alias.sl_domain.use_as_reverse_alias:
-        reply_domain = alias.sl_domain.domain
+    alias_domain = get_email_domain_part(alias.email)
+    sl_domain = SLDomain.get_by(domain=alias_domain)
+    if sl_domain and sl_domain.use_as_reverse_alias:
+        reply_domain = alias_domain
     ```
 
-    `SLDomain.use_as_reverse_alias` is defined at `app/models.py:3146–3148`. When set, the reply domain becomes the alias's own SL domain rather than the default `EMAIL_DOMAIN`. This is relevant because it means that *not all* reply addresses share the same domain, which slightly reduces the total namespace pressure per-domain.
+    `SLDomain.use_as_reverse_alias` is defined at `app/models.py:3146–3148`. The code extracts the domain part of `alias.email`, performs a **fresh database lookup** (`SLDomain.get_by(domain=alias_domain)`), and only then inspects the resulting row's `use_as_reverse_alias` flag. When set, the reply domain becomes the alias's own SL domain (`alias_domain`) rather than the default `EMAIL_DOMAIN`. This is relevant because it means that *not all* reply addresses share the same domain, which slightly reduces the total namespace pressure per-domain.
 
 ### 7.5 `create_contact` — the Orchestrator
 
@@ -595,38 +606,17 @@ Before analyzing race conditions, we must understand exactly how `reply_email` v
 
 ### 7.6 `Contact.create` — the Inner INSERT
 
-`Contact.create` at `app/models.py:1937–1962` does two things of interest:
+`Contact.create` at `app/models.py:1937–1962` is an override of `ModelMixin.create`. Its salient defensive check (at `app/models.py:1950`) is:
 
 ```python
-@classmethod
-def create(cls, **kw):
-    commit = kw.pop("commit", False)
-    flush = kw.pop("flush", False)
-
-    new_contact = cls(**kw)
-
-    website_email = kw["website_email"]
-    # make sure email is lowercase and doesn't have any whitespace
-    website_email = sanitize_email(website_email)
-
-    # make sure contact.website_email isn't a reverse alias
-    if website_email != config.NOREPLY:
-        orig_contact = Contact.get_by(reply_email=website_email)
-        if orig_contact:
-            raise CannotCreateContactForReverseAlias(str(orig_contact))
-
-    Session.add(new_contact)
-
-    if commit:
-        Session.commit()
-
-    if flush:
-        Session.flush()
-
-    return new_contact
+if website_email != config.NOREPLY:
+    orig_contact = Contact.get_by(reply_email=website_email)
+    if orig_contact:
+        raise CannotCreateContactForReverseAlias(str(orig_contact))
+Session.add(new_contact)
 ```
 
-Note the defensive check at `app/models.py:1950`: a newly-created `Contact.website_email` must not collide with any existing `Contact.reply_email`. This catches an attempt to create an outbound-contact record whose outbound address is some *other* contact's reverse alias — which would be a reply-loop attack vector. (Raises `CannotCreateContactForReverseAlias` from `app/errors.py:29–33`.)
+(The surrounding method pops `commit` and `flush` kwargs, `sanitize_email`s `website_email`, then conditionally `Session.commit()` or `Session.flush()`.) This check protects against an attempt to create an outbound-contact record whose `website_email` is some *other* contact's reverse alias — which would be a reply-loop attack vector. (Raises `CannotCreateContactForReverseAlias` from `app/errors.py:29–33`.)
 
 This check is, however, **asymmetric**: it protects against `website_email == reply_email` for the *new* row against *existing* rows. It does **not** check for `reply_email == reply_email` duplicates — i.e., two contacts with the same `reply_email`.
 
@@ -675,38 +665,16 @@ Key properties:
 
 - `app/contact_utils.py:42–120` — the whole function.
 
-Key sequence (lines 85–119):
+Key sequence (lines 85–119), trimmed to the three salient calls:
 
 ```python
-contact = Contact.get_by(alias_id=alias.id, website_email=email)
-if contact is not None:
-    return __update_contact_if_needed(contact, name, mail_from)
-try:
-    ...
-    reply_email = generate_reply_email(email, alias)
-    contact = Contact.create(
-        user_id=alias.user_id,
-        alias_id=alias.id,
-        website_email=email,
-        name=name,
-        mail_from=mail_from,
-        reply_email=reply_email,
-        automatic_created=automatic_created,
-        flags=flags,
-        commit=True,
-    )
-    ...
-    return ContactCreateResult(contact, True, ContactCreateError.None_)
-except IntegrityError:
-    Session.rollback()
-    LOG.info(
-        f"Contact with email {email} for alias_id {alias.id} already existed, fetching from DB"
-    )
-    contact = Contact.get_by(alias_id=alias.id, website_email=email)
-    return __update_contact_if_needed(contact, name, mail_from)
+contact = Contact.get_by(alias_id=alias.id, website_email=email)          # L85 — idempotent re-use
+reply_email = generate_reply_email(email, alias)                          # L89 — random + available
+contact = Contact.create(..., reply_email=reply_email, commit=True)       # L92–103 — INSERT + COMMIT
+# except IntegrityError: Session.rollback(); re-fetch via Contact.get_by(alias_id=..., website_email=...)
 ```
 
-The key observation: `generate_reply_email` runs to completion, internally validating the candidate via `available_sl_email`. Then control returns to `create_contact`, which *passes* the `reply_email` to `Contact.create(commit=True)`. The commit is a separate database round-trip from the availability check. No lock was held across them.
+(Omitted kwargs in `Contact.create`: `user_id=alias.user_id, alias_id=alias.id, website_email=email, name=name, mail_from=mail_from, automatic_created=automatic_created, flags=flags`. The `IntegrityError` branch at lines 113–119 rolls back, logs, re-fetches the existing `Contact`, and returns via `__update_contact_if_needed`.) The key observation: `generate_reply_email` runs to completion, internally validating the candidate via `available_sl_email`. Then control returns to `create_contact`, which *passes* the `reply_email` to `Contact.create(commit=True)`. The commit is a separate database round-trip from the availability check. No lock was held across them.
 
 ### 9.2 What IntegrityError Actually Catches
 
@@ -717,27 +685,18 @@ The `except IntegrityError` at `app/contact_utils.py:113` catches a database-lev
 
 ### 9.3 The Analogous Pattern in `replace_header_when_forward`
 
-A second caller creates contacts directly, not through `contact_utils.create_contact`. At `email_handler.py:293–307`:
+A second caller creates contacts directly, not through `contact_utils.create_contact`. At `email_handler.py:293–307`, the salient subset is:
 
 ```python
-try:
-    contact = Contact.create(
-        user_id=alias.user_id,
-        alias_id=alias.id,
-        website_email=contact_email,
-        name=full_address.display_name,
-        reply_email=generate_reply_email(contact_email, alias),
-        is_cc=header.lower() == "cc",
-        automatic_created=True,
-    )
-    Session.commit()
-except IntegrityError:
-    LOG.w("Contact %s %s already exist", alias, contact_email)
-    Session.rollback()
-    contact = Contact.get_by(alias_id=alias.id, website_email=contact_email)
+contact = Contact.create(
+    user_id=alias.user_id, alias_id=alias.id,
+    website_email=contact_email, name=contact_name,
+    reply_email=generate_reply_email(contact_email, alias), ...
+)
+Session.commit()
 ```
 
-Same semantics: the `IntegrityError` handler only catches `uq_contact(alias_id, website_email)` — not any `reply_email` uniqueness (which does not exist as a constraint).
+(The surrounding `try/except IntegrityError` rolls back on uniqueness violation and re-fetches via `Contact.get_by(alias_id=alias.id, website_email=contact_email)`.) Note the `name=contact_name` keyword — `contact_name` is derived earlier from `full_address.display_name` plus sanitization; the `Contact.create` call site uses the already-computed `contact_name` variable. Same semantics as `create_contact`: the `IntegrityError` handler only catches `uq_contact(alias_id, website_email)` — not any `reply_email` uniqueness (which does not exist as a constraint).
 
 ### 9.4 The TOCTOU Window
 
@@ -777,26 +736,17 @@ A `UniqueConstraint` on `reply_email` would promote the silent-success path into
 
 ### 10.2 The Process-Level Session Layer
 
-- `app/db.py:1–18`:
+- `app/db.py:1–18` — the **entire file** is 18 lines: imports, engine creation, a single shared connection, and the scoped session factory. No `isolation_level` argument, no `@event.listens_for` hooks, no `text` import. Core lines:
 
     ```python
-    from sqlalchemy import create_engine, text
-    from sqlalchemy.orm import scoped_session, sessionmaker
-
-    from app import config
-
     engine = create_engine(
         config.DB_URI, connect_args={"application_name": config.DB_CONN_NAME}
     )
-
     connection = engine.connect()
-
     Session = scoped_session(sessionmaker(bind=connection))
-
-    @event.listens_for(Session, "after_flush")
-    def _after_flush_listener(session, flush_context):
-        ...
     ```
+
+    The imports (lines 1–4) are `sqlalchemy`, `create_engine`, `scoped_session`, `sessionmaker` only. Lines 16–18 are a comment plus a `Session: sqlalchemy.orm.Session` type annotation for IDE hinting. No after-flush listener is registered anywhere in this module.
 
 Several important consequences of this configuration:
 
@@ -1031,21 +981,25 @@ If `Contact.get_by(reply_email=normalized_rcpt_to)` at `email_handler.py:986` re
 - `EmailLog.create(..., alias_id=contact.alias_id, user_id=contact.user_id, ...)` → the email log is filed against the wrong account.
 - `sl_sendmail(..., contact.website_email, ...)` → the reply is delivered to the wrong `website_email`.
 
-### 13.2 First Safety Boundary: `get_mailbox_from_mail_from`
+### 13.2 First Safety Boundary: `get_mailbox_from_mail_from` (with conditional bypass)
 
 - `email_handler.py:1019` — `mailbox = get_mailbox_from_mail_from(mail_from, alias)`.
 - `email_handler.py:1020–1034`:
 
     ```python
     if not mailbox:
-        handle_unknown_mailbox(envelope, msg, reply_email, user, alias)
-        # NOTE: return 2xx code to suppress bounces from the sending MTA
-        return True, status.E214
+        if alias.disable_email_spoofing_check:
+            mailbox = alias.mailbox  # fallback; anti-spoofing bypassed
+        else:
+            handle_unknown_mailbox(envelope, msg, reply_email, user, alias, contact)
+            return False, status.E214
     ```
 
-`get_mailbox_from_mail_from` requires `mail_from` to match one of the *wrongly-selected alias*'s mailboxes or authorized addresses. If the real reply-sender's `mail_from` belongs to a mailbox on a *different* alias (the correct one for the true contact), the check fails and the reply is dropped with `E214`. This is a **fail-closed** semantic — bad for the user (their reply is silently lost) but protective against accidental leaks.
+`get_mailbox_from_mail_from` requires `mail_from` to match one of the *wrongly-selected alias*'s mailboxes or authorized addresses. If the real reply-sender's `mail_from` belongs to a mailbox on a *different* alias (the correct one for the true contact), the check fails and — **unless `alias.disable_email_spoofing_check` is set** — the reply is dropped with `E214`. This is a **fail-closed** semantic — bad for the user (their reply is silently lost) but protective against accidental leaks. Note that the `handle_unknown_mailbox` call takes **6 arguments** (`envelope, msg, reply_email, user, alias, contact`), matching the signature at `email_handler.py:1390–1392`; and that the return tuple is `(False, status.E214)` — `False` indicates the message was not delivered by the reply path, while the `E214` text begins with `250` so the sending MTA does not bounce.
 
-The boundary is defeated only if the *wrong* alias happens to have a mailbox or authorized address that matches the real sender's `mail_from`. That requires explicit user action (adding the same address as a mailbox or authorized address on the wrong alias), which is not something the resolution logic controls.
+**The `disable_email_spoofing_check` bypass weakens the boundary.** At `email_handler.py:1021–1029`, if `alias.disable_email_spoofing_check == True`, the unknown-`mail_from` branch is skipped entirely: the code logs a warning and assigns `mailbox = alias.mailbox` (the alias's default mailbox), then falls through to continue reply processing. This is an explicit user-opt-in feature — a user can disable anti-spoofing on a per-alias basis — but from a security analysis perspective it means the first safety boundary is **conditional**: an alias with `disable_email_spoofing_check=True` offers no `mail_from`-vs-mailbox verification. Under the hypothetical duplicate-`reply_email` regime of Section 12.2/12.3 + 12.5, if the *wrongly-selected* alias has this flag set, the mis-routed reply proceeds unchallenged through the first boundary and relies entirely on the conditional SPF check (Section 13.3) for any remaining protection.
+
+The strict boundary is defeated (in the absence of the flag) only if the *wrong* alias happens to have a mailbox or authorized address that matches the real sender's `mail_from`. That requires explicit user action (adding the same address as a mailbox or authorized address on the wrong alias), which is not something the resolution logic controls.
 
 ### 13.3 Second Safety Boundary: SPF
 
@@ -1102,14 +1056,15 @@ Even when the identity of a `reply_email`'s owning contact is stable, several st
 - Trigger: `email_handler.py:977–981`:
 
     ```python
-    if reply_domain != config.EMAIL_DOMAIN:
-        if not SLDomain.get_by(domain=reply_domain, use_as_reverse_alias=True):
-            LOG.e("Reply email with unknown reply domain: %s", reply_email)
+    if not reply_email.endswith(EMAIL_DOMAIN):
+        sl_domain: SLDomain = SLDomain.get_by(domain=reply_domain)
+        if sl_domain is None:
+            LOG.w(f"Reply email {reply_email} has wrong domain")
             return False, status.E501
     ```
 
 - Definition: `app/email/status.py:38` — `E501 = "550 SL E501"`.
-- Cause: the `@…` part of `rcpt_to` is neither `EMAIL_DOMAIN` nor a registered `SLDomain` with `use_as_reverse_alias=True`.
+- Cause: the `rcpt_to` address does not end with `EMAIL_DOMAIN`, and no `SLDomain` row exists for `reply_domain`. Note that this site performs a plain `SLDomain.get_by(domain=reply_domain)` — it does **not** filter on `use_as_reverse_alias`. A registered `SLDomain` with `use_as_reverse_alias=False` passes this check and proceeds to the `normalize_reply_email` step below. (The `use_as_reverse_alias` flag is inspected only during forward-phase generation; see Section 7.1.)
 - Transience: if the SL operator adds or re-enables a domain, subsequent replies succeed. Persistent if caused by a misrouted MX.
 
 ### 14.2 `status.E502` — Contact not found
@@ -1135,7 +1090,7 @@ Even when the identity of a `reply_email`'s owning contact is stable, several st
         return False, status.E502
     ```
 
-    Cause: `User.is_active` (`app/models.py:766–769`) returns `False` iff `self.delete_on is not None and self.delete_on < arrow.now()`. The user is scheduled for deletion.
+    Cause: `User.is_active` (`app/models.py:766–769`) returns `False` **iff** `self.delete_on is not None and self.delete_on > arrow.now()` — that is, when the user has a pending deletion scheduled for a **future** moment (currently inside the grace window). Users with `delete_on is None` and users whose grace window has already elapsed (i.e., `delete_on < arrow.now()`) both return `True` from `is_active`. So E502 via Trigger B fires *only* for aliases whose owning user is in an active pending-deletion grace state.
 
 - Definition: `app/email/status.py:39` — `E502 = "550 SL E502 Email not exist"`.
 - Transience: Trigger A is permanent for deleted contacts; Trigger B may clear if the user cancels their pending deletion.
@@ -1176,14 +1131,17 @@ Even when the identity of a `reply_email`'s owning contact is stable, several st
 
     ```python
     if not mailbox:
-        handle_unknown_mailbox(envelope, msg, reply_email, user, alias)
-        return True, status.E214
+        if alias.disable_email_spoofing_check:
+            mailbox = alias.mailbox  # bypass; not an E214
+        else:
+            handle_unknown_mailbox(envelope, msg, reply_email, user, alias, contact)
+            return False, status.E214
     ```
 
 - Definition: `app/email/status.py:22` — `E214 = "250 SL E214 Unauthorized for using reverse alias"`.
-- Cause: the `mail_from` does not match any mailbox or authorized address of `alias`. `handle_unknown_mailbox` (`email_handler.py:1390–1430`) sends an alert email to the alias owner.
-- Transience: resolves once the user adds the sender's address as an authorized address on the appropriate mailbox.
-- Note: this is returned as 250 so the MTA does not bounce; the message is silently dropped.
+- Cause: the `mail_from` does not match any mailbox or authorized address of `alias`, **and** `alias.disable_email_spoofing_check` is `False`. `handle_unknown_mailbox` (`email_handler.py:1390–1430`; takes 6 parameters: `envelope, msg, reply_email, user, alias, contact`) sends an alert email to the alias owner.
+- Transience: resolves once the user adds the sender's address as an authorized address on the appropriate mailbox, or once the alias owner sets `disable_email_spoofing_check=True` (which then uses `alias.mailbox` as a fallback default — see Section 13.2).
+- Note: the return tuple is `(False, status.E214)`. The `False` tells the caller (`handle` at `email_handler.py:2194–2200`) the message was not handled by the reply path; the `E214` text begins with `250` so the sending MTA does not bounce. The message is silently dropped.
 
 ### 14.6 Cross-Event Consistency Implication
 
@@ -1214,7 +1172,7 @@ The repository may not be modified, and therefore no live instrumentation was ad
 | `alias` | `email_handler.py:994` — `contact.alias` | `Alias` | The alias this reverse-alias belongs to |
 | `alias_address` | `email_handler.py:995–996` — `contact.alias.email` | `str` | e.g., `"fancy_alias@example.net"` |
 | `user` | `email_handler.py:1004` — `alias.user` | `User` | The alias owner |
-| `mail_from` (again) | `email_handler.py:1013` — `mail_from = envelope.mail_from` | `str` | Same as `envelope.mail_from`, possibly canonicalized later |
+| `mail_from` (again) | `email_handler.py:1005` — `mail_from = envelope.mail_from` | `str` | Same as `envelope.mail_from`, possibly canonicalized later |
 | `mailbox` | `email_handler.py:1019` via `get_mailbox_from_mail_from` | `Mailbox` or `None` | The mailbox whose email matches `mail_from`; `None` triggers E214 |
 | `email_log` | `email_handler.py:1042–1050` via `EmailLog.create` | `EmailLog` | Row capturing `contact_id`, `alias_id`, `user_id`, `mailbox_id`, `is_reply=True` |
 | `contact.website_email` | delivered to at `email_handler.py:1220–1231` | `str` | The external party's real email, e.g., `"bob@externalsite.example"` |
@@ -1388,8 +1346,8 @@ All code references used in this analysis.
 | `app/email_utils.py` | 557–566 | `is_valid_alias_address_domain` | SLDomain / CustomDomain check |
 | `app/email_utils.py` | 1103–1153 | `generate_reply_email` | Random candidate + availability loop |
 | `app/email_utils.py` | 1112–1117 | include-sender gating | `user.include_sender_in_reverse_alias` |
-| `app/email_utils.py` | 1119–1127 | sender-prefix sanitize | `convert_to_alphanumeric`, truncation, `@`→`_at_`, `.`→`_` |
-| `app/email_utils.py` | 1129–1133 | domain selection | `alias.sl_domain.use_as_reverse_alias` |
+| `app/email_utils.py` | 1120–1127 | sender-prefix sanitize | `convert_to_id` → `sanitize_email` → `[:45]` → `@`→`_at_` → `.`→`_` → `convert_to_alphanumeric` |
+| `app/email_utils.py` | 1129–1133 | domain selection | `sl_domain = SLDomain.get_by(domain=alias_domain)`; `if sl_domain and sl_domain.use_as_reverse_alias` |
 | `app/email_utils.py` | 1136–1150 | retry loop | `for _ in range(1000): ... available_sl_email(...)` |
 | `app/email_utils.py` | 1145 | default random length | `random.randint(20, 50)` |
 | `app/email_utils.py` | 1148 | default candidate | `f"{random_string(...)}@{reply_domain}"` |
