@@ -257,18 +257,7 @@ Because the function is lossy, it cannot be the sole guarantee of one-to-one ide
 
 ### 3.4 Normalization Is Asymmetric Across the Two Lookups
 
-Crucially, `normalize_reply_email` runs **only** inside `handle_reply` at line 984. The first lookup, `is_reverse_alias` (`app/email_utils.py:1156–1163`), queries the **raw** address:
-
-```python
-def is_reverse_alias(address: str) -> bool:
-    # to take into account the new reverse-alias that doesn't start with "ra+"
-    if Contact.get_by(reply_email=address):
-        return True
-
-    return address.endswith(f"@{config.EMAIL_DOMAIN}") and (
-        address.startswith("reply+") or address.startswith("ra+")
-    )
-```
+Crucially, `normalize_reply_email` runs **only** inside `handle_reply` at line 984. The first lookup, `is_reverse_alias` (`app/email_utils.py:1156–1163`), queries the **raw** address: its body invokes `Contact.get_by(reply_email=address)` against the argument **as received** — no `normalize_reply_email` wrapper is applied — and only falls back to a literal legacy-prefix test (`address.endswith(f"@{config.EMAIL_DOMAIN}")` conjoined with `address.startswith("reply+")` or `address.startswith("ra+")`) when that query returns `None`. The in-source comment at line 1157 annotates the fallback as covering "the new reverse-alias that doesn't start with `ra+`".
 
 The two queries therefore use different keys for the *same* SMTP input. This asymmetry is the mechanical basis for the TOCTOU discussion in Section 4 and the divergence analysis in Section 12.
 
@@ -294,17 +283,7 @@ For every inbound reply, the system performs **two** separate `Contact.get_by(re
 
 ### 4.1 Lookup 1 — `is_reverse_alias`
 
-Location: `app/email_utils.py:1156–1163`.
-
-```python
-def is_reverse_alias(address: str) -> bool:
-    # to take into account the new reverse-alias that doesn't start with "ra+"
-    if Contact.get_by(reply_email=address):
-        return True
-    return address.endswith(f"@{config.EMAIL_DOMAIN}") and (
-        address.startswith("reply+") or address.startswith("ra+")
-    )
-```
+Location: `app/email_utils.py:1156–1163`. The signature is `is_reverse_alias(address: str) -> bool`, and the body implements a two-branch predicate: branch one issues `Contact.get_by(reply_email=address)` and returns `True` immediately on any match (line 1158–1159); branch two — reached only when that query returns `None` — returns `address.endswith(f"@{config.EMAIL_DOMAIN}")` conjoined with `address.startswith("reply+") or address.startswith("ra+")` (lines 1161–1163). Only branch one hits the database; branch two decides purely from the string shape.
 
 Called from `email_handler.py:2195` inside the recipient loop with the **raw, non-normalized** `rcpt_to`.
 
