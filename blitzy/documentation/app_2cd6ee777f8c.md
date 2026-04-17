@@ -1330,7 +1330,7 @@ All code references used in this analysis.
 | `app/email_utils.py` | 1136–1150 | retry loop | `for _ in range(1000): ... available_sl_email(...)` |
 | `app/email_utils.py` | 1145 | default random length | `random.randint(20, 50)` |
 | `app/email_utils.py` | 1148 | default candidate | `f"{random_string(...)}@{reply_domain}"` |
-| `app/email_utils.py` | 1152 | give-up | `raise Exception("Cannot generate reply email")` |
+| `app/email_utils.py` | 1153 | give-up | `raise Exception("Cannot generate reply email")` |
 | `app/email_utils.py` | 1156–1163 | `is_reverse_alias` | First lookup + legacy prefix fallback |
 | `app/email_utils.py` | 1158 | DB hit | `Contact.get_by(reply_email=address)` |
 | `app/email_utils.py` | 1161–1163 | legacy prefix | `reply+` / `ra+` fallback |
