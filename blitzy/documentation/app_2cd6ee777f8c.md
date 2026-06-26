@@ -110,7 +110,7 @@ The `/api` prefix comes from
 @api_bp.route("/v2/alias/custom/new", methods=["POST"])   # routing
 @limiter.limit(ALIAS_LIMIT)                                # (1) Flask-Limiter HTTP limit
 @require_api_auth                                          # API key / session auth
-@parallel_limiter.lock(name="alias_creation")             # (3) per-user concurrency lock
+@parallel_limiter.lock(name="alias_creation")             # (3) concurrency lock (per current-user-or-IP)
 def new_custom_alias_v2():
     ...
 ```
@@ -128,7 +128,7 @@ API key from the **`Authentication` HTTP header** [`app/api/base.py:L17`].
 > [§4.2](#42-three-independent-limiting-mechanisms--do-not-conflate)):
 > 1. the Flask‑Limiter HTTP route limit (`@limiter.limit(ALIAS_LIMIT)`),
 > 2. the per‑user/per‑window **bucket quota** (`check_bucket_limit()` inside `Alias.create()`),
-> 3. the **per‑user concurrency lock** (`@parallel_limiter.lock(name="alias_creation")`).
+> 3. the **concurrency lock** (`@parallel_limiter.lock(name="alias_creation")`), keyed per current‑user‑or‑IP.
 
 On success, `Alias.create()` [`app/models.py:L1627+`] runs the bucket quota *before* persisting
 the row.
@@ -141,7 +141,7 @@ flowchart TD
     Post --> L1["@limiter.limit(ALIAS_LIMIT)<br/>Flask-Limiter HTTP limit"]
     L1 -->|breach| R429h["429 'Rate limit exceeded'"]
     L1 --> L2["@require_api_auth<br/>API key / session"]
-    L2 --> L3["@parallel_limiter.lock('alias_creation')<br/>Redis SET NX, 5s TTL"]
+    L2 --> L3["@parallel_limiter.lock('alias_creation')<br/>Redis SET NX, 5s TTL<br/>(keyed per current-user or IP)"]
     L3 -->|concurrent in-flight| R429c["429 'Rate limit exceeded'"]
     L3 --> Quota["user.can_create_new_alias()?"]
     Quota -->|False| R400a["400 'You have reached the limitation...'"]
@@ -453,15 +453,19 @@ different reasons.
   `werkzeug.exceptions.TooManyRequests` (429) when a bucket is exceeded
   [`app/rate_limiter.py:L31-40`].
 
-#### Mechanism ③ — Per-user concurrency lock
+#### Mechanism ③ — Concurrency lock (current-user-or-IP scoped)
 
 - Applied by `@parallel_limiter.lock(name="alias_creation")`.
 - `acquire_lock` does a Redis `SET ... nx=True, ex=timedelta(seconds=5)`
   [`app/parallel_limiter.py:L30-32`]; if the key already exists (a concurrent in‑flight create
-  for the same user), it raises `exceptions.TooManyRequests()` → 429
+  sharing the same lock key), it raises `exceptions.TooManyRequests()` → 429
   [`app/parallel_limiter.py:L34`].
-- Lock key = `cl:{current_user.id}:alias_creation` [`app/parallel_limiter.py:L56`] with a
-  **5‑second TTL** (`max_wait_secs=5` [`L23`, `L70`]).
+- Lock key is selected per caller [`app/parallel_limiter.py:L55-58`]: when `current_user`
+  exposes an `id` (Flask‑Login / session auth) the key is `cl:{current_user.id}:alias_creation`;
+  **otherwise it falls back to `cl:{request.remote_addr}:alias_creation`** (e.g. API‑key‑only
+  requests, where `current_user` is the anonymous user and has no `id` —
+  see [`app/api/base.py:L34`], which sets `g.user` but never calls `login_user()`). TTL is
+  **5 seconds** (`max_wait_secs=5` [`L23`, `L70`]).
 
 > **Diagnostic takeaway.** Because all three produce an identical `429
 > {"error":"Rate limit exceeded"}` body and identical (absent) headers, the *only* way to tell
@@ -547,7 +551,7 @@ def create(cls, **kw):
 ```
 
 ```python
-# app/rate_limiter.py:L19-43
+# app/rate_limiter.py:L19-42
 def check_bucket_limit(lock_name=None, max_hits=5, bucket_seconds=3600):
     int_time = int(datetime.utcnow().timestamp())               # L25
     bucket_id = int_time - (int_time % bucket_seconds)          # L26  (wall-clock window)
@@ -642,13 +646,18 @@ inside one window trips the limit. With Free `[(10,900),(50,3600)]` / Paid
 `[(50,900),(200,3600)]`, this yields intermittent 429s that correlate with the clock, not with
 the request payload.
 
-### 6.3 Per-user concurrency lock (5-second window)
+### 6.3 Concurrency lock — current-user-or-IP (5-second window)
 
-A second *simultaneous* create for the same user — while a prior create is still in flight —
-fails to acquire the Redis lock and is rejected with **429**
-[`app/parallel_limiter.py:L30-34`]. The lock has a **5‑second TTL**. This depends entirely on
-**request overlap/timing**: sequential requests are fine; two requests racing within ~5 s (e.g.
-a double‑click, a retrying client, or parallel automation) intermittently collide.
+A second *simultaneous* create sharing the same lock key — while a prior create is still in
+flight — fails to acquire the Redis lock and is rejected with **429**
+[`app/parallel_limiter.py:L30-34`]. The lock key is `cl:{current_user.id}:alias_creation` for
+Flask‑Login / session‑authenticated users (who expose an `id`), and **falls back to
+`cl:{request.remote_addr}:alias_creation`** otherwise — e.g. API‑key‑only requests, where
+`current_user` is anonymous [`app/parallel_limiter.py:L55-58`]. The lock has a **5‑second TTL**.
+This depends entirely on **request overlap/timing**: sequential requests are fine; two requests
+racing within ~5 s (e.g. a double‑click, a retrying client, or parallel automation) — and, under
+the IP‑keyed fallback, even *different* API‑key users behind the same IP/NAT — intermittently
+collide.
 
 ### 6.4 Redis availability / environment sensitivity
 
@@ -676,7 +685,7 @@ intermittency that tracks the *environment*, not the request.
 | `412 "…expired, please retry"` for a *fresh* suffix | Expired/tampered conflation ([§2.2](#22-key-finding--expired-and-tampered-suffixes-both-return-412)) | Verify the `signed_suffix` is byte‑exact and < 600 s old; a corrupted value also returns 412 |
 | `429 "Rate limit exceeded"`, sporadic, tracks the clock | Bucket quota ② ([§5.2](#52-bucket-quota-inside-aliascreate)) | INFO log `Rate limit hit for alias_create_…` names the bucket |
 | `429`, only under bursts of requests | Flask‑Limiter ① ([§4.2](#42-three-independent-limiting-mechanisms--do-not-conflate)) | Trips at 5/minute; disabled by `DISABLE_RATE_LIMIT` |
-| `429`, only on *simultaneous* requests | Concurrency lock ③ ([§4.2](#42-three-independent-limiting-mechanisms--do-not-conflate)) | Only on overlap within 5 s; no per‑request INFO log |
+| `429`, only on *simultaneous* requests | Concurrency lock ③ ([§4.2](#42-three-independent-limiting-mechanisms--do-not-conflate)) | Only on overlap within 5 s sharing the lock key (`cl:{user.id}`, or `cl:{remote_addr}` for API‑key‑only calls); no per‑request INFO log |
 | Behavior differs between environments | Redis absence / `DISABLE_RATE_LIMIT` ([§6.4](#64-redis-availability--environment-sensitivity)) | ② and ③ no‑op without Redis; ① off when `DISABLE_RATE_LIMIT` set |
 
 
@@ -768,9 +777,9 @@ Every claim in this document is backed by the following source locations (key li
 - `app/alias_utils.py` — L414‑425 (`check_alias_prefix`, `_ALIAS_PREFIX_PATTERN` at L415)
 - `app/extensions.py` — L14‑19 (`__key_func`), L23 (`Limiter` — no `headers_enabled`), L26‑28
   (`DISABLE_RATE_LIMIT` request filter)
-- `app/parallel_limiter.py` — L19‑74 (lock; `acquire_lock` L30‑34, no‑op L51‑52, key L56,
+- `app/parallel_limiter.py` — L19‑74 (lock; `acquire_lock` L30‑34, no‑op L51‑52, key‑selection L55‑58 (user‑id or IP fallback),
   5 s TTL L23/L70)
-- `app/rate_limiter.py` — L19‑43 (`check_bucket_limit`; `bucket_id` L25‑26, no‑op L28‑29,
+- `app/rate_limiter.py` — L19‑42 (`check_bucket_limit`; `bucket_id` L25‑26, no‑op L28‑29,
   `INCR` L31, `LOG.i` L33‑35, New Relic L36‑39, 429 L40, `LOG.e` L41‑42)
 - `app/models.py` — L341 (`FLAG_FREE_OLD_ALIAS_LIMIT`), L858‑865 (`max_alias_for_free_account`),
   L867‑884 (`can_create_new_alias`; stale docstring L870), L1627‑1641 (`Alias.create` bucket
@@ -789,7 +798,7 @@ Every claim in this document is backed by the following source locations (key li
 - `tests/api/test_new_custom_alias.py` — L4 (`signer` import), L13‑62 (v2/v3 create patterns),
   L255‑283 (429 reproduction; body assertion L283)
 - `tests/api/test_alias_options.py` — L9‑20 (`Authentication` header pattern)
-- `tests/dashboard/test_custom_alias.py` — signer usage / web‑path behavior reference
+- `tests/dashboard/test_custom_alias.py` — L6‑11 (shared verifier imports incl. `signer`), L28‑54 (`signer.sign` create pattern), L367‑395 (dashboard rate‑limit/429 behavior; 429 + body assertions L394‑395)
 
 ---
 
