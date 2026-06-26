@@ -274,7 +274,7 @@ The following are real behaviors observed in the source. They are reported here 
 
 ## Reference Files
 
-All ten files below were consulted **read-only** (traced and cited, never modified). `app/models.py` and `app/config.py` are shared across questions.
+The ten primary reference files below were consulted **read-only** (traced and cited, never modified). `app/models.py` and `app/config.py` are shared across questions. One further file — `app/user_audit_log_utils.py`, which defines the `emit_user_audit_log` audit-trail helper (`app/user_audit_log_utils.py:35`) — is cited once in *Environment & Methodology* as a supporting convention; it too was consulted read-only and never modified.
 
 - **Q1 (mailbox verification lockout):** `app/mailbox_utils.py`, `app/models.py`, `app/dashboard/views/mailbox.py`.
 - **Q2 (background task lifecycle and error/retry):** `job_runner.py`, `app/config.py`, `tasks/cleanup_old_jobs.py`, `app/models.py`.
