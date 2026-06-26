@@ -2,7 +2,7 @@
 
 **Repository:** SimpleLogin (self-hosted email aliasing) · **Source branch:** `app_2cd6ee777f8c`
 **Engagement type:** Code-as-truth investigation (diagnostic; no source code changed)
-**Runtime used for evidence:** Python 3.10.20 · PostgreSQL 13.23 · Redis 6 · SQLAlchemy 1.3.24 (project-locked)
+**Runtime used for evidence:** Python 3.10.18 · PostgreSQL 13.23 · Redis 6 · SQLAlchemy 1.3.24 (project-locked)
 **Scope note:** This document is analysis only. No fix is applied; candidate remediations appear at the end strictly as analysis.
 
 > All file/line citations below were verified by reading the source on branch `app_2cd6ee777f8c`. Root-level module is `email_handler.py`; application package is `app/`.
@@ -51,9 +51,9 @@ def is_reverse_alias(address: str) -> bool:
     if Contact.get_by(reply_email=address):
         return True
 
-    return (
+    return address.endswith(f"@{config.EMAIL_DOMAIN}") and (
         address.startswith("reply+") or address.startswith("ra+")
-    ) and address.endswith(EMAIL_DOMAIN)
+    )
 ```
 
 `Contact.get_by(reply_email=address)` appears at `app/email_utils.py` **L1158** — so the very gate that admits a message into the reply phase relies on the same non-unique `reply_email` lookup discussed in §3.
@@ -125,7 +125,7 @@ After normalization, the handler resolves a `Contact` (`email_handler.py` **L986
         return False, status.E502                            # L990-992
 ```
 
-`get_by` is the shared `ModelMixin` convenience used across all 76 models:
+`get_by` is the shared `ModelMixin` convenience inherited by 75 of the 76 ORM model classes (every `Base` subclass except `AdminAuditLog`, `app/models.py` **L3462**), including `Contact`:
 
 ```python
 # app/models.py L82-84
@@ -327,29 +327,30 @@ The index on `reply_email` is created with `unique=False` (**L22**) — explicit
     ...
     sa.UniqueConstraint('gen_email_id', 'website_email', name='uq_forward_email')        # L31
 ```
-From the very first migration that created the table, `reply_email` was a plain non-unique column (**L28**, originally 128 chars, later widened to 512), and the only unique constraint was on `(gen_email_id, website_email)` (**L31**) — which evolved into today's `uq_contact(alias_id, website_email)`. **At no point in the schema history was `reply_email` ever unique.**
+From the very first migration that created the table, `reply_email` was a plain non-unique column (**L28**, declared `String(128)`), and the only unique constraint was on `(gen_email_id, website_email)` (**L31**) — which evolved into today's `uq_contact(alias_id, website_email)`. (The current model declares `reply_email` as `String(512)` at `app/models.py` **L1899**, yet no migration widening the column from 128 to 512 exists under `migrations/versions/`; accordingly the live Alembic-migrated column remains `character varying(128)` — see §6.3.) **At no point in the schema history was `reply_email` ever unique.**
 
 ### 6.3 Live confirmation (PostgreSQL 13.23)
-Introspecting the actual `contact` table built from this schema:
+Introspecting the actual `contact` table on the Alembic-migrated runtime (`alembic upgrade head` → head revision `32f25cbf12f6`):
 
 ```
  index_name                  | is_unique | columns
 -----------------------------+-----------+------------------------
+ forward_email_pkey          | t         | id
  ix_contact_alias_id         | f         | alias_id
  ix_contact_pgp_finger_print | f         | pgp_finger_print
  ix_contact_reply_email      | f         | reply_email            <-- INDEXED, NOT UNIQUE
  ix_contact_user_id          | f         | user_id
- contact_pkey                | t         | id
  uq_contact                  | t         | alias_id,website_email
 
--- unique constraints on contact (ONLY these two):
- contact_pkey : PRIMARY KEY (id)
- uq_contact   : UNIQUE (alias_id, website_email)
+-- unique/primary constraints on contact (ONLY these two):
+ forward_email_pkey : PRIMARY KEY (id)
+ uq_contact         : UNIQUE (alias_id, website_email)
 
--- reply_email column: character varying(512), NOT NULL
+-- reply_email column: character varying(128), NOT NULL
+-- alembic_version : 32f25cbf12f6
 ```
 
-The database agrees with the model and migrations: the only unique objects on `contact` are the primary key and `uq_contact`. **Duplicate `reply_email` values are schema-permissible.**
+The live database reflects the **migration** history exactly: the only unique objects on `contact` are the primary key — named `forward_email_pkey`, a legacy of the table's original `forward_email` name (see §6.2) — and `uq_contact`; `ix_contact_reply_email` is **non-unique**. (The migrated `reply_email` column is `character varying(128)`; the current model declares `String(512)`, but as noted in §6.2 no widening migration exists, so the live column stays 128. This length divergence does not affect uniqueness.) On the load-bearing fact, model, migrations, and the live schema **agree**: **duplicate `reply_email` values are schema-permissible.**
 
 ---
 
@@ -383,12 +384,12 @@ flowchart TD
 
 ## 8. Runtime Evidence (R6) — actual values across repeated and concurrent reply events
 
-The system was built and run against an **ephemeral** stack faithful to the documented environment: Docker `python:3.10.20` with the project's locked dependencies (notably **SQLAlchemy 1.3.24**), `postgres:13.23`, and `redis:6`; `EMAIL_DOMAIN=sl.local`. The repository was mounted **read-only** and all instrumentation lived outside the source tree; the environment was torn down afterward, leaving the source byte-for-byte unchanged. The captures below are verbatim.
+The system was built and run against an **ephemeral** stack faithful to the documented environment: Python `3.10.18` with the project's locked dependencies (notably **SQLAlchemy 1.3.24**), `postgres:13.23` (schema applied via `alembic upgrade head` to head revision `32f25cbf12f6`), and `redis:6`; `EMAIL_DOMAIN=sl.local`. The repository source was treated as **read-only** (never modified) and all instrumentation lived outside the source tree in `/tmp`; the throwaway database and scripts were torn down afterward, leaving the source byte-for-byte unchanged. The captures below are verbatim.
 
 ### Setup — two distinct users, each owning their own alias
 ```
-userA.id=1 aliasA.id=1 (aliasA@sl.local) owner=ownerA@mailbox.test   <- sender INTENDS this user
-userB.id=2 aliasB.id=2 (aliasB@sl.local) owner=strangerB@mailbox.test <- a DIFFERENT user
+userA.id=1 aliasA.id=2 (bakery_strike075@sl.local) owner=ownera@mailbox.test   <- sender INTENDS this user
+userB.id=2 aliasB.id=4 (dosses_permit104@sl.local) owner=strangerb@mailbox.test <- a DIFFERENT user
 ```
 
 ### Evidence A — two Contacts (different users/aliases) can share an identical `reply_email`
@@ -404,17 +405,17 @@ This empirically confirms §6: the database accepts two `Contact` rows with the 
 ### Evidence B — `Contact.get_by(reply_email=...)` issues a query with NO `ORDER BY`
 The compiled lookup SQL (note the absence of any `ORDER BY` clause):
 ```
-SELECT contact.id AS contact_id, ..., contact.reply_email AS contact_reply_email, ...
+SELECT contact.id, contact.created_at, ..., contact.reply_email, ..., contact.flags
 FROM contact
-WHERE contact.reply_email = :v
+WHERE contact.reply_email = :reply_email_1
 ```
 Repeated calls in one physical state resolve consistently to the first heap row:
 ```
-[call#1] get_by -> contact.id=1 alias.id=1 -> user.id=1 userA(ownerA@mailbox.test)
-[call#2] get_by -> contact.id=1 alias.id=1 -> user.id=1 userA(ownerA@mailbox.test)
-[call#3] get_by -> contact.id=1 alias.id=1 -> user.id=1 userA(ownerA@mailbox.test)
-[call#4] get_by -> contact.id=1 alias.id=1 -> user.id=1 userA(ownerA@mailbox.test)
-[call#5] get_by -> contact.id=1 alias.id=1 -> user.id=1 userA(ownerA@mailbox.test)
+[call#1] get_by -> contact.id=1 alias.id=2 -> user.id=1 userA(ownera@mailbox.test)
+[call#2] get_by -> contact.id=1 alias.id=2 -> user.id=1 userA(ownera@mailbox.test)
+[call#3] get_by -> contact.id=1 alias.id=2 -> user.id=1 userA(ownera@mailbox.test)
+[call#4] get_by -> contact.id=1 alias.id=2 -> user.id=1 userA(ownera@mailbox.test)
+[call#5] get_by -> contact.id=1 alias.id=2 -> user.id=1 userA(ownera@mailbox.test)
 ```
 Determinism here is **incidental** (same heap order, same plan) — there is no `ORDER BY` guaranteeing it.
 
@@ -427,9 +428,9 @@ This is the smoking gun for silence: `.one()` proves multiplicity by raising, wh
 
 ### Evidence B3 — timing/state dependence: deleting the resolved row flips the destination USER
 ```
-resolved now: contact.id=1 -> user.id=1 (ownerA@mailbox.test)
+resolved now: contact.id=1 -> user.id=1 (ownera@mailbox.test)
 DELETE contact.id=1 (row churn / one reverse-alias removed) ...
-resolved now: contact.id=2 -> user.id=2 (strangerB@mailbox.test)
+resolved now: contact.id=2 -> user.id=2 (strangerb@mailbox.test)
 >>> SAME reply_email now routes to a DIFFERENT user — destination is state/timing dependent.
 ```
 With the same `reply_email`, ordinary row churn (a deletion) changes which Contact `.first()` returns — and therefore changes the destination from **userA (the intended owner)** to **userB (a different user)**. This directly demonstrates the user-facing symptom under investigation.
@@ -447,17 +448,17 @@ Both actors pass the lock-free check (`available_sl_email`, L1150) and both INSE
 
 ### Evidence D — helper behavior and the entropy nuance
 ```
-random_string(20): iavmmdnnosrtcesgzfzm        (alphabet = ascii_lowercase => 26 letters)
+random_string(20): lwxwdfxbpyneahokbewd        (alphabet = ascii_lowercase => 26 letters)
 
 include_sender=False (default branch, random.randint(20,50)):
-   fuzyrpfggvelfzfmdmpnyr@sl.local                         (local-part len=22)
-   hukvnkrkmqlajpfmpbzkkzjvoihlqrc@sl.local                (local-part len=31)
-   rtfayhqipxeebqstajqumybqrhyhtftlazbcwpalmrrir@sl.local  (local-part len=45)
+   ivblkddxuukbzusvozgsungmyjiemlhbqcikgywuexkpkg@sl.local  (local-part len=46)
+   sdadfevsrgmyglbslmyexaylicgccmzxybuvwllqfihqow@sl.local  (local-part len=46)
+   vwupnmqnuhrqkdabuxzobjnjmkbhvwruisp@sl.local             (local-part len=35)
 
 include_sender=True (branch, random.randint(5,10)) on SHARED prefix 'sender_at_example_org_':
-   sender_at_example_org_utabvcu@sl.local   (random suffix len=7)
-   sender_at_example_org_smalmm@sl.local    (random suffix len=6)
-   sender_at_example_org_dlfqlmr@sl.local   (random suffix len=7)
+   sender_at_example_org_cuyhzko@sl.local   (random suffix len=7)
+   sender_at_example_org_uvrpxdeb@sl.local  (random suffix len=8)
+   sender_at_example_org_enuijda@sl.local   (random suffix len=7)
 
 normalize_reply_email('ra+a b/c@sl.local') -> 'ra+a_b_c@sl.local'   (space and '/' mapped to '_')
 is_reverse_alias('ra+collision@sl.local') -> True
@@ -467,7 +468,7 @@ The default branch yields long, high-entropy local parts; the `include_sender` b
 
 ### Environment footer
 ```
-python: 3.10.20 | SQLAlchemy: 1.3.24 | PostgreSQL: 13.23 (Debian 13.23-1.pgdg13+1)
+python: 3.10.18 | SQLAlchemy: 1.3.24 | PostgreSQL 13.23 (Debian 13.23-1.pgdg13+1)
 ```
 
 ---
@@ -497,10 +498,10 @@ Each remediation independently addresses a different link in the chain of §7; t
 ---
 
 ## Appendix A — Evidence methodology (ephemeral; source untouched)
-- **Runtime:** Docker `python:3.10.20`, `postgres:13.23`, `redis:6`; project dependencies installed at locked versions (SQLAlchemy `1.3.24`, psycopg2-binary, flask `1.1.2`, flanker `0.9.11`, etc.). Repo mounted **read-only**.
-- **Schema:** built via SQLAlchemy `Base.metadata.create_all()` (76 tables) to obtain the real `contact` table for live constraint introspection (a historical migration-ordering quirk unrelated to this analysis made a full `alembic upgrade head` from scratch impractical in the throwaway environment; the resulting schema for `contact` matches the model and the cited migrations, as confirmed by the §6.3 introspection).
-- **Instrumentation:** temporary scripts in `/tmp` (outside the source tree) seeded duplicate-`reply_email` Contacts, exercised `Contact.get_by`, `.first()` vs `.one()`, post-deletion re-resolution, the `available_sl_email`→INSERT TOCTOU window, and the real helpers (`generate_reply_email`, `normalize_reply_email`, `random_string`, `is_reverse_alias`).
-- **Teardown:** all containers, networks, and scripts were removed; `git status --porcelain` confirmed the source tree unchanged.
+- **Runtime:** Python `3.10.18` with the project's locked dependencies (SQLAlchemy `1.3.24`, psycopg2-binary, flask `1.1.2`, flanker `0.9.11`, etc.), `postgres:13.23`, and `redis:6`. The repository source was treated as **read-only** (never modified; verified via `git status`).
+- **Schema:** an ephemeral throwaway PostgreSQL 13.23 database was created and migrated with `alembic upgrade head` to head revision `32f25cbf12f6` (the project's migration head); the `contact` table was then introspected directly from that **Alembic-migrated** schema for the §6.3 constraint evidence. The migrated schema reflects the *migration history* — primary key `forward_email_pkey` and `reply_email` of `character varying(128)` — rather than the current model's `String(512)` declaration; the two diverge only in column length (no widening migration exists — see §6.2) and **agree on the load-bearing fact** that `reply_email` carries no uniqueness (only the primary key and `uq_contact(alias_id, website_email)` are unique).
+- **Instrumentation:** temporary scripts in `/tmp` (outside the source tree) seeded duplicate-`reply_email` Contacts on the Alembic-migrated database, exercised `Contact.get_by`, `.first()` vs `.one()`, post-deletion re-resolution, the `available_sl_email`→INSERT TOCTOU window, and the real helpers (`generate_reply_email`, `normalize_reply_email`, `random_string`, `is_reverse_alias`).
+- **Teardown:** the throwaway database and all `/tmp` instrumentation scripts were removed; `git status --porcelain` confirmed the source tree unchanged.
 
 ## Appendix B — Verified code locators (quick index)
 | Concern | File:Line |
