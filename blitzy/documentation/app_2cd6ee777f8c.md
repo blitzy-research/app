@@ -166,7 +166,7 @@ The forwarding destination is derived **solely** from the resolved `Contact`:
 Every downstream decision flows from this one row:
 
 ```python
-# email_handler.py L1019 and L1042-1051
+# email_handler.py L1019 and L1042-1050
     mailbox = get_mailbox_from_mail_from(mail_from, alias)   # mailbox keyed on alias (from contact)
     ...
     email_log = EmailLog.create(
