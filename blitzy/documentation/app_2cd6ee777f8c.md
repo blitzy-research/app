@@ -639,55 +639,123 @@ rejected — which both the real‑time and the back‑dated experiments demonst
 > and the ACTUAL observed values after the calls."
 
 ### Method / commands
-Read the baseline `api_key` rows, make exactly **N = 5** keyed calls with the `Chrome`
-key (`code`), then re‑read the rows.
+Read the baseline `api_key` rows with a **full‑row `SELECT *`** (so no changing column can
+be missed — not a hand‑picked subset), make exactly **N = 5** keyed calls with the
+`Chrome` key (`code`), then re‑read the full rows and diff **every** column. A one‑call
+probe and an invalid‑key control were also run.
 
 ```bash
-psql … -c "SELECT code,name,times,last_used FROM api_key ORDER BY id;"   # baseline
+# full row (SELECT *): observe every column, not a hand-picked subset
+psql … -x -c "SELECT id,name,code,times,last_used,updated_at,created_at,sudo_mode_at,user_id \
+              FROM api_key ORDER BY id;"                                      # baseline
 for i in $(seq 1 5); do
-  curl -s -o /dev/null -H "Authentication: code" http://127.0.0.1:7777/api/user_info
+  curl -s -o /dev/null -w "%{http_code}\n" -H "Authentication: code" \
+       http://127.0.0.1:7777/api/user_info
 done
-psql … -c "SELECT code,name,times,last_used FROM api_key ORDER BY id;"   # after
+psql … -x -c "SELECT id,name,code,times,last_used,updated_at,created_at,sudo_mode_at,user_id \
+              FROM api_key ORDER BY id;"                                      # after
 ```
 
 ### Captured runtime evidence
+Full‑row baseline (`SELECT *`, `db_now = 2026-06-26 23:41:22.075053`):
+
 ```text
-BASELINE:
-  code   | Chrome  | times=9  | last_used=2026-06-26 21:40:59.476331
-  codeFF | Firefox | times=0  | last_used=(null)
+BASELINE (SELECT *):
+  Chrome  (code)   times=36  last_used=2026-06-26 23:39:43.772135  updated_at=2026-06-26 23:39:43.772634
+                   created_at=2026-06-26 20:41:33.346072  sudo_mode_at=2026-06-26 22:55:33.9263  id=1 user_id=1
+  Firefox (codeFF) times=4   last_used=2026-06-26 23:02:33.832832  updated_at=2026-06-26 23:02:33.833223
+                   created_at=2026-06-26 20:41:33.356727  sudo_mode_at=(null)                  id=2 user_id=1
 
-5 keyed calls to /api/user_info  ->  all HTTP 200
+5 keyed calls to /api/user_info  ->  call 1..5 all HTTP 200
 
-AFTER:
-  code   | Chrome  | times=14 | last_used=2026-06-26 21:46:41.101605
-  codeFF | Firefox | times=0  | last_used=(null)
-
-wall-clock at the last call: 2026-06-26 21:46:41 UTC
+AFTER 5 CALLS (SELECT *, db_now = 2026-06-26 23:41:22.252053):
+  Chrome  (code)   times=41  last_used=2026-06-26 23:41:22.204422  updated_at=2026-06-26 23:41:22.204825
+                   created_at=2026-06-26 20:41:33.346072  sudo_mode_at=2026-06-26 22:55:33.9263  id=1 user_id=1
+  Firefox (codeFF) times=4   last_used=2026-06-26 23:02:33.832832  updated_at=2026-06-26 23:02:33.833223  (UNCHANGED)
 ```
 
-`times` advanced by exactly **5** (9 → 14); `last_used` advanced to **21:46:41.101605**,
-matching the wall‑clock time of the final call. The unused `Firefox` key was unchanged
-(`times=0`, `last_used` still NULL).
+Per‑column diff of the `Chrome` row (the only key used), every column compared:
+
+```text
+CHANGED:    times         36 -> 41                                  (+5, == N)
+CHANGED:    last_used     2026-06-26 23:39:43.772135 -> 23:41:22.204422   (set to ~now)
+CHANGED:    updated_at    2026-06-26 23:39:43.772634 -> 23:41:22.204825   (THIRD field; ~0.4 ms after last_used)
+UNCHANGED:  created_at    2026-06-26 20:41:33.346072                      (frozen)
+UNCHANGED:  sudo_mode_at  2026-06-26 22:55:33.9263                        (frozen)
+UNCHANGED:  id, code, name, user_id
+```
+
+Single‑call probe (proves `updated_at` moves on **every** call, not merely cumulatively):
+
+```text
+before:  Chrome  times=41  last_used=23:41:22.204422  updated_at=23:41:22.204825
+1 keyed call -> HTTP 200
+after :  Chrome  times=42  last_used=23:41:41.370952  updated_at=23:41:41.371513
+         (times +1; last_used AND updated_at both advance, ~0.56 ms apart)
+```
+
+Invalid‑key control (a bad key writes nothing):
+
+```text
+wrong key             -> HTTP 401 {"error":"Wrong api key"};  Chrome row UNCHANGED
+no Authentication hdr -> HTTP 401 {"error":"Wrong api key"};  Chrome row UNCHANGED
+```
+
+So **three** columns advance on each keyed call — `times` (+1), `last_used`, and
+`updated_at` — while `created_at`, `sudo_mode_at`, `id`, `code`, `name`, and `user_id`
+stay fixed, and the unused `Firefox` key (`codeFF`) is wholly untouched.
 
 ### Code citation(s)
-- `app/api/base.py:L30-L32` — on each keyed call: `api_key.last_used = arrow.now()`,
-  `api_key.times += 1`, `Session.commit()`.
+- `app/api/base.py:L30-L32` — on each keyed call the **application logic** sets
+  `api_key.last_used = arrow.now()` (`L30`), `api_key.times += 1` (`L31`), then
+  `Session.commit()` (`L32`). These are the only two columns the code writes explicitly.
+- `app/models.py:L65` — `updated_at = sa.Column(ArrowType, default=None, onupdate=arrow.utcnow)`
+  on `ModelMixin`. `ApiKey(Base, ModelMixin)` (`app/models.py:L2350`) inherits it, so the
+  `UPDATE` flushed by the commit above auto‑stamps `updated_at` — the third changing column.
+- `app/api/base.py:L27` — the early `return jsonify(error="Wrong api key"), 401` taken when
+  the key is absent/invalid, *before* any assignment or commit (so a bad key writes nothing).
 - `app/models.py:L2353` — table `api_key`; `L2356-L2360` — columns `code`, `name`,
   `last_used` (ArrowType), `times` (Integer, default 0), `sudo_mode_at` (ArrowType).
 
 ### Definitive answer
-Exactly **two** DB fields are updated per keyed API call: **`times`** (incremented by 1)
-and **`last_used`** (set to the current time). After N = 5 calls, the observed values were
-`times = 14` (baseline 9 + 5) and `last_used = 2026-06-26 21:46:41.101605` (≈ the final
-call's timestamp). Keys not used in the calls are untouched.
+**Three** DB columns change on every keyed API call:
+
+1. **`times`** — incremented by 1 (observed `36 → 41` over N = 5 calls; `41 → 42` over a
+   single call), set explicitly by `authorize_request()` (`app/api/base.py:L31`).
+2. **`last_used`** — set to the current time (`2026-06-26 23:41:22.204422` after the 5th
+   call), set explicitly by `authorize_request()` (`app/api/base.py:L30`).
+3. **`updated_at`** — auto‑stamped to the current time (`2026-06-26 23:41:22.204825`,
+   ~0.4 ms after `last_used`) by `ModelMixin`'s `onupdate=arrow.utcnow` (`app/models.py:L65`)
+   because the keyed call flushes an `UPDATE` to the row.
+
+The first two are written by the application code itself; the third is a side effect of
+SQLAlchemy's `onupdate` hook firing on that same `UPDATE`. Every other column —
+`sudo_mode_at`, `created_at`, `id`, `code`, `name`, `user_id` — is **unchanged** by a plain
+keyed `GET`, and any API key not used in the calls (e.g. `Firefox`/`codeFF`) is wholly
+untouched. (An earlier scoped `SELECT code,name,times,last_used` probe could not observe
+`updated_at`; the full‑row `SELECT *` above corrects that and substantiates the complete
+changed‑field set `{times, last_used, updated_at}`.)
 
 ### Rationale
 The keyed branch of `authorize_request()` records usage statistics — `last_used = arrow.now()`
-and `times += 1` — and commits on **every** authenticated API request that presents a
-valid `Authentication` key. Because the commit happens inline on each request, the
-counter increases by exactly the number of keyed calls and `last_used` tracks the most
-recent one. (Session‑authenticated calls take the no‑key branch and therefore do not touch
-these columns.)
+and `times += 1` — and commits on **every** authenticated API request that presents a valid
+`Authentication` key (`app/api/base.py:L30-L32`). Because the commit happens inline on each
+request, the counter increases by exactly the number of keyed calls and `last_used` tracks
+the most recent one. That same inline `Session.commit()` flushes an `UPDATE` against the
+`api_key` row, which fires `ModelMixin`'s
+`updated_at = sa.Column(ArrowType, default=None, onupdate=arrow.utcnow)` (`app/models.py:L65`):
+`updated_at` is therefore bumped automatically on the same statement, landing a fraction of a
+millisecond after `last_used`. This is precisely why the changed‑field set is
+`{times, last_used, updated_at}` and not just `{times, last_used}` — and why a closed
+"exactly N fields" claim must be backed by a full‑row read rather than a scoped `SELECT`.
+
+A practical consequence worth flagging: because `updated_at` is driven by `onupdate`, on the
+`api_key` table it effectively records the **time of the last API call**, not the time the
+key was last administratively modified — so it should not be read as a "configuration
+last‑changed" signal. Invalid keys take the early `return jsonify(error="Wrong api key"), 401`
+(`app/api/base.py:L27`) before any assignment or commit, so a bad key writes nothing
+(confirmed by the control probe: HTTP 401, row unchanged). Session‑authenticated calls
+likewise take the no‑key branch and therefore do not touch these columns.
 
 ---
 
@@ -784,5 +852,5 @@ from the running system:
 | Q4 | Session id rotation | **Reused, not rotated** — `slapp` byte‑identical before/after login |
 | Q5 | Forwarded‑email headers | Custom `X-` **stripped**, `Received` **stripped**, `Reply-To` **not preserved** (rewritten to reverse‑alias) |
 | Q6 | Alias token expiry | **600 seconds** (valid ≤600 s, rejected ≥601 s) |
-| Q7 | API key usage stats | **`times` +1/call** and **`last_used` = now** per keyed call (9→14 over 5 calls) |
+| Q7 | API key usage stats | **Three** columns per keyed call: **`times`** +1 and **`last_used`** = now (set by code, `base.py:L30-31`) plus **`updated_at`** = now (auto via `onupdate`, `models.py:L65`); observed 36→41 over 5 calls; `sudo_mode_at`/`created_at` unchanged; unused key untouched |
 | Q8 | Failed login | **HTTP 200** re‑render + flashed "Email or password incorrect" + New Relic `LoginEvent.failed` (no error log line) |
