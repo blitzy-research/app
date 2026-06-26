@@ -18,6 +18,8 @@ When a mailbox replies to an email that was forwarded through an alias, the repl
 
 **Most likely point of incorrect routing:** `Contact.get_by(reply_email=reply_email)` at `email_handler.py:L986`, enabled by four compounding structural conditions in the data model and resolution path — an unordered `.first()` (`app/models.py:L83-L84`), no database uniqueness on `Contact.reply_email` (`app/models.py:L1899`), a racy application-layer uniqueness check (`app/email_utils.py:L1103`, `app/models.py:L1425-L1432`, `app/contact_utils.py:L42`), and a normalization/case divergence between the lookup key and the stored value (`app/email_validation.py:L25-L38`). These are demonstrated against a live database in §7 and §8.
 
+**Why this is a confidentiality/privacy risk, not just a delivery bug:** because both attribution (`EmailLog.create(... user_id=contact.user_id ...)` at `email_handler.py:L1042-L1050`) and delivery (`contact.website_email` at `email_handler.py:L1224-L1226`) are read off the mis-resolved `Contact`, a cross-user `reply_email` collision can record one user's reply under **another** user's account and/or relay its content to **another** user's external correspondent. The live trace in §8 even observed a collision leaking one user's mailbox address to an unrelated user on the rejection path. The full impact is detailed in §8 ("Confidentiality / privacy impact").
+
 A remediation is **recommended** in §9 but, per the task constraints, was **not** implemented.
 
 ---
@@ -49,13 +51,13 @@ The investigation answers six questions:
 
 **Environment used for the live trace.** The analysis was produced against an actually-running SimpleLogin development stack, not by static reading alone:
 
-- **Runtime:** Python **3.10.18** inside the provided container (the project declares `python = "^3.10"` in `pyproject.toml:L61`; the `Dockerfile` builds on `python:3.10` at `Dockerfile:L8`; CI uses Python 3.10 / `postgres:13` / redis 6 in `.github/workflows/main.yml`). The bare host interpreter (Python 3.13) is deliberately **not** used — `CONTRIBUTING.md` itself notes the project has not made newer Python work, and a mismatched interpreter would resolve incompatible dependency versions.
-- **Datastore:** PostgreSQL **13** with all Alembic migrations applied (`alembic current` → head `32f25cbf12f6`), plus Redis **6**, matching `scripts/run-test.sh` (which provisions `postgres:13` on port `15432`, runs `CONFIG=tests/test.env poetry run alembic upgrade head`, then the test suite).
-- **Configuration:** `CONFIG=tests/test.env`, where `NOT_SEND_EMAIL=true` makes the send path log/print rather than transmit, and `EMAIL_DOMAIN=sl.local` (`tests/test.env`). This lets an inbound reply be simulated and traced safely without sending outbound mail.
+- **Runtime:** Python **3.10.18** inside the provided container. The project declares `python = "^3.10"` at `pyproject.toml:L61`, the `Dockerfile` builds on `python:3.10` at `Dockerfile:L8`, and CI pins Python `3.10` at `.github/workflows/main.yml:L17` (lint job) and `.github/workflows/main.yml:L40` (test matrix). `CONTRIBUTING.md:L22-L25` states the project requires "Python 3.10 and poetry to manage dependencies" and "Postgres 13+", so the trace deliberately uses the container's Python 3.10 interpreter rather than the bare host interpreter.
+- **Datastore:** PostgreSQL **13** with all Alembic migrations applied (`alembic current` → head `32f25cbf12f6`), plus Redis **6**. This matches CI — `postgres:13` at `.github/workflows/main.yml:L47`, exposed on port `15432` at `.github/workflows/main.yml:L60`, and Redis `redis-version: 6` at `.github/workflows/main.yml:L92-L94` — and the `scripts/run-test.sh:L4-L16` harness, which provisions `postgres:13` on port `15432` at `scripts/run-test.sh:L7`, runs `alembic upgrade head` at `scripts/run-test.sh:L13`, then the test suite at `scripts/run-test.sh:L16`.
+- **Configuration:** `CONFIG=tests/test.env`, where `NOT_SEND_EMAIL=true` (`tests/test.env:L7`) makes the send path log/print rather than transmit, `EMAIL_DOMAIN=sl.local` (`tests/test.env:L8`), the database is `DB_URI=postgresql://test:test@localhost:15432/test` (`tests/test.env:L17`), and the cache is `MEM_STORE_URI=redis://localhost` (`tests/test.env:L78`). This lets an inbound reply be simulated and traced safely without sending outbound mail.
 
-**How the reply was simulated.** The trace mirrors the project's own canonical reply-simulation pattern in `tests/test_email_handler.py:L165-L188`: create a user, create a random alias, create a `Contact` with a `website_email` and a generated `reply_email`, build an `email.message.Message`, construct an `aiosmtpd` `Envelope` with `envelope.rcpt_tos = [contact.reply_email]`, and call `email_handler.handle(envelope, msg)`. The application context was bootstrapped exactly as `tests/conftest.py` does (`create_app()` at `tests/conftest.py:L23`, `add_sl_domains()` at `tests/conftest.py:L38`, `add_proton_partner()` at `tests/conftest.py:L39`). The full trace narrative and raw log output are in §7 and Appendix C.
+**How the reply was simulated.** The trace mirrors the project's own canonical reply-simulation pattern in `tests/test_email_handler.py:L165-L188`: create a user, create a random alias, create a `Contact` with a `website_email` and a generated `reply_email`, build an `email.message.Message`, construct an `aiosmtpd` `Envelope` with `envelope.rcpt_tos = [contact.reply_email]`, and call `email_handler.handle(envelope, msg)`. The application context was bootstrapped exactly as `tests/conftest.py` does (`create_app()` at `tests/conftest.py:L23`, `add_sl_domains()` at `tests/conftest.py:L38`, `add_proton_partner()` at `tests/conftest.py:L39`). Every seeded row was created inside a single `connection.begin()` transaction (`tests/conftest.py:L61`) that was rolled back at the end (`tests/conftest.py:L75-L77`) — the same external-transaction pattern the test fixtures use — so the source database was left byte-for-byte unchanged (the pre-trace baseline row counts equalled the post-rollback counts; see Appendix C and Appendix D). The full trace narrative and raw log output are in §7 and Appendix C.
 
-**One observed environment artifact (does not affect routing).** In this dev stack the DKIM signing key configured for `tests/test.env` is a placeholder that cannot be parsed, so `add_dkim_signature()` (`email_handler.py:L1221`) raises `Exception("Cannot create DKIM signature")`. Crucially this happens **after** the routing decision is already made and committed — after `EmailLog.create(...)` (`email_handler.py:L1042-L1050`) and after the "send email from … to …" decision is logged (`email_handler.py:L1212-L1215`) — and **before** the final physical `sl_sendmail(...)` (`email_handler.py:L1224`). The routing/attribution decision is therefore fully **OBSERVED**; only the final transport print is short-circuited, which is immaterial to the question of *which user* a reply is routed to.
+**Reaching the final print-mode send (DKIM note).** The default `tests/test.env` DKIM key (`DKIM_PRIVATE_KEY_PATH=local_data/dkim.key` at `tests/test.env:L15`) is, in this stack, in a PEM format the `dkimpy` library cannot parse. With default configuration the reply path calls `add_dkim_signature(msg, alias_domain)` at its call site `email_handler.py:L1220-L1221`; that function — defined at `app/email_utils.py:L457-L480` — logs a "DKIM fail" warning per header set at `app/email_utils.py:L468` and then **raises `Exception("Cannot create DKIM signature")` at `app/email_utils.py:L480`** (confirmed by direct probe — Appendix C). That failure occurs **after** the routing decision is already made and committed — after `EmailLog.create(...)` (`email_handler.py:L1042-L1050`) and after the "send email from … to …" decision is logged (`email_handler.py:L1212-L1215`) — and only just **before** the final physical `sl_sendmail(...)` (`email_handler.py:L1224-L1226`); it is therefore immaterial to *which user* a reply is routed to. To let the trace exercise the final transport and **observe** the `NOT_SEND_EMAIL=true` print branch, DKIM signing was delegated to rspamd via the standard `RSPAMD_SIGN_DKIM` configuration toggle (`app/config.py:L482`), which makes `add_dkim_signature()` return early at `app/email_utils.py:L458-L461`. With that toggle the reply reaches `sl_sendmail(...)` and the print-mode branch `if config.NOT_SEND_EMAIL:` at `app/mail_sender.py:L130-L137`, which **logs** the final "send email with subject …" line instead of transmitting (OBSERVED — §7 and Appendix C). No source file was modified; `RSPAMD_SIGN_DKIM` is a runtime/environment setting only.
 
 ---
 
@@ -68,8 +70,8 @@ Inbound SMTP is handled by an `aiosmtpd`-based server. The callback that receive
 **OBSERVED (executed).** In the trace, `handle()` received the simulated reply and logged the intake at `email_handler.py:L1980`:
 
 ```text
-"/app/email_handler.py:1980" - handle() - ==>> Handle mail_from:user_svyddscwob@mailbox.test,
-  rcpt_tos:['external-recipient_at_example_com_tgryatbrfz@sl.local'], header_from:..., message_id:<traceA@mailbox.test>, ...
+"/app/email_handler.py:1980" - handle() - ==>> Handle mail_from:user_a_tkcncjvw@mailbox.test,
+  rcpt_tos:['external-recipient_at_example_com_mnrotdcjq@sl.local'], header_from:..., message_id:<traceA@mailbox.test>, ...
 ```
 
 This confirms O1: the `aiosmtpd` `handle_DATA` callback (`email_handler.py:L2289`) is the component that receives the message, and it immediately delegates to the central `handle()` router (`email_handler.py:L1945`).
@@ -88,8 +90,8 @@ The recognizer itself is `def is_reverse_alias(address)` (`app/email_utils.py:L1
 **OBSERVED (executed).** The trace emitted the recognition log exactly as the user describes, immediately before any resolution:
 
 ```text
-"/app/email_handler.py:2196" - handle() - Reply phase user_svyddscwob@mailbox.test(user_svyddscwob@mailbox.test)
-  -> external-recipient_at_example_com_tgryatbrfz@sl.local
+"/app/email_handler.py:2196" - handle() - Reply phase user_a_tkcncjvw@mailbox.test(user_a_tkcncjvw@mailbox.test)
+  -> external-recipient_at_example_com_mnrotdcjq@sl.local
 ```
 
 So O2 is answered: classification is `is_reverse_alias(rcpt_to)` (`email_handler.py:L2195`), the "recognized" log is `email_handler.py:L2196-L2197`, and the message is then dispatched to `handle_reply()` (`email_handler.py:L2199`).
@@ -111,12 +113,12 @@ The critical observation for O6: **steps 4 and 5 read everything off the `Contac
 **OBSERVED (executed).** The trace resolved the reverse-alias to a specific contact/alias/user/mailbox, visible in the `EmailLog` creation log (`email_handler.py:L1051`):
 
 ```text
-"/app/email_handler.py:1051" - handle_reply() - Create <EmailLog 296> for
-  <Contact 176 external-recipient@example.com 836>, <User 477 Test User user_svyddscwob@mailbox.test>,
-  <Mailbox 559 user_svyddscwob@mailbox.test>
+"/app/email_handler.py:1051" - handle_reply() - Create <EmailLog 298> for
+  <Contact 178 external-recipient@example.com 840>, <User 479 Trace User A user_a_tkcncjvw@mailbox.test>,
+  <Mailbox 561 user_a_tkcncjvw@mailbox.test>
 ```
 
-Here `Contact 176` → `alias 836` → `User 477` → `Mailbox 559`, exactly the chain `email_handler.py:L986 → L994 → L1004 → L1019`.
+Here `Contact 178` → `alias 840` → `User 479` → `Mailbox 561`, exactly the chain `email_handler.py:L986 → L994 → L1004 → L1019`.
 
 ---
 
@@ -148,18 +150,26 @@ That block is `email_handler.py:L1042-L1050`, with the confirmation log `LOG.d("
 **OBSERVED (executed).** After the call returned, the persisted `EmailLog` row was inspected directly from the database:
 
 ```text
-[emaillog] id=296 is_reply=True user_id=477 alias_id=836 contact_id=176
-[verdict A] attributed user_id=477 (== contactA.user_id=477); delivered_to(website_email)=external-recipient@example.com
+[emaillog] id=298 is_reply=True user_id=479 alias_id=840 contact_id=178
+[verdict A] attributed user_id=479 (== contactA.user_id=479); delivered_to(website_email)=external-recipient@example.com
 ```
 
 and the delivery decision was logged as:
 
 ```text
-"/app/email_handler.py:1212" - handle_reply() - send email from list_test127@sl.local
+"/app/email_handler.py:1212" - handle_reply() - send email from word_word197@sl.local
   to external-recipient@example.com, mail_options:[],rcpt_options:[]
 ```
 
-i.e. delivered **from the alias** (`list_test127@sl.local`) **to the contact's website_email** (`external-recipient@example.com`), attributed to `user_id=477` — the matched contact's user.
+The physical send then reached the `NOT_SEND_EMAIL=true` **print branch** (`app/mail_sender.py:L130-L137`), which prints the message instead of transmitting it, after which `handle()` returned success:
+
+```text
+"/app/app/mail_sender.py:131" - send() - send email with subject 'Re: hello from external',
+  from 'word_word197@sl.local' to 'External A <external-recipient@example.com>'
+# handle() -> 250 Message accepted for delivery
+```
+
+i.e. delivered **from the alias** (`word_word197@sl.local`) **to the contact's website_email** (`external-recipient@example.com`), attributed to `user_id=479` — the matched contact's user. Because the run delegated DKIM signing to rspamd via `RSPAMD_SIGN_DKIM` (early-return at `app/email_utils.py:L458-L461`; config flag at `app/config.py:L482`), execution proceeded past the signing step into the actual `sl_sendmail(...)` call (`email_handler.py:L1224-L1226`) and the `NOT_SEND_EMAIL` print branch — confirming the full receive → attribute → relay path end-to-end, not merely the pre-send decision. *(O4 — delivery, OBSERVED through the `NOT_SEND_EMAIL` print branch.)*
 
 ---
 
@@ -170,22 +180,22 @@ This section narrates the **OBSERVED (executed)** run. A throwaway script (delet
 Seed values (from the database):
 
 ```text
-userA.id=477       userA.email=user_svyddscwob@mailbox.test
-aliasA.id=836      aliasA.email=list_test127@sl.local
-contactA.id=176    user_id=477  alias_id=836
+userA.id=479       userA.email=user_a_tkcncjvw@mailbox.test
+aliasA.id=840      aliasA.email=word_word197@sl.local
+contactA.id=178    user_id=479  alias_id=840
                    website_email=external-recipient@example.com
-                   reply_email =external-recipient_at_example_com_tgryatbrfz@sl.local
+                   reply_email =external-recipient_at_example_com_mnrotdcjq@sl.local
 ```
 
 Step-by-step, each step tied to the code that produced it:
 
-1. **Receive** — `handle()` intakes the envelope and logs `==>> Handle mail_from:user_svyddscwob@mailbox.test, rcpt_tos:['…tgryatbrfz@sl.local'], …` (`email_handler.py:L1980`, after sanitizing at `email_handler.py:L1949-L1950`). *(O1)*
-2. **Recognize** — `is_reverse_alias(rcpt_to)` (`email_handler.py:L2195`) returns true and the router logs `Reply phase user_svyddscwob@mailbox.test(…) -> external-recipient_at_example_com_tgryatbrfz@sl.local` (`email_handler.py:L2196`). *(O2 — the "alias recognized" log.)*
+1. **Receive** — `handle()` intakes the envelope and logs `==>> Handle mail_from:user_a_tkcncjvw@mailbox.test, rcpt_tos:['…mnrotdcjq@sl.local'], …` (`email_handler.py:L1980`, after sanitizing at `email_handler.py:L1949-L1950`). *(O1)*
+2. **Recognize** — `is_reverse_alias(rcpt_to)` (`email_handler.py:L2195`) returns true and the router logs `Reply phase user_a_tkcncjvw@mailbox.test(…) -> external-recipient_at_example_com_mnrotdcjq@sl.local` (`email_handler.py:L2196`). *(O2 — the "alias recognized" log.)*
 3. **Dispatch** — control passes to `handle_reply(envelope, copy_msg, rcpt_to)` (`email_handler.py:L2199`).
-4. **Normalize + resolve** — `normalize_reply_email(...)` (`email_handler.py:L984`) returns the key unchanged, then `Contact.get_by(reply_email=...)` (`email_handler.py:L986`) selects `Contact 176`. *(O3 — the decisive lookup.)*
+4. **Normalize + resolve** — `normalize_reply_email(...)` (`email_handler.py:L984`) returns the key unchanged, then `Contact.get_by(reply_email=...)` (`email_handler.py:L986`) selects `Contact 178`. *(O3 — the decisive lookup.)*
 5. **DMARC gate** — `apply_dmarc_policy_for_reply_phase(...)` returns "deliver" (`app/handler/dmarc.py:159` logged `DMARC check disabled` because the plain message carried no spam headers), so routing continues.
-6. **Attribute** — `EmailLog.create(...)` logs `Create <EmailLog 296> for <Contact 176 …>, <User 477 …>, <Mailbox 559 …>` (`email_handler.py:L1051`); the persisted row is `user_id=477, alias_id=836, contact_id=176`. *(O4 — attribution.)*
-7. **Relay** — the handler logs `send email from list_test127@sl.local to external-recipient@example.com` (`email_handler.py:L1212`) — FROM the alias, TO `contact.website_email`. The physical `sl_sendmail(...)` would follow at `email_handler.py:L1224-L1226`; in this stack it is preceded by the DKIM artifact noted in §2, which does not change the routing decision already made. *(O4 — delivery.)*
+6. **Attribute** — `EmailLog.create(...)` logs `Create <EmailLog 298> for <Contact 178 …>, <User 479 …>, <Mailbox 561 …>` (`email_handler.py:L1051`); the persisted row is `user_id=479, alias_id=840, contact_id=178`. *(O4 — attribution.)*
+7. **Relay** — the handler logs `send email from word_word197@sl.local to external-recipient@example.com` (`email_handler.py:L1212`) — FROM the alias, TO `contact.website_email`. With DKIM signing delegated to rspamd (`RSPAMD_SIGN_DKIM`; early-return at `app/email_utils.py:L458-L461`), execution proceeded into the physical `sl_sendmail(...)` at `email_handler.py:L1224-L1226` and reached the `NOT_SEND_EMAIL=true` **print branch**, which logged `send email with subject 'Re: hello from external', from 'word_word197@sl.local' to 'External A <external-recipient@example.com>'` (`app/mail_sender.py:L131`; branch `app/mail_sender.py:L130-L137`); `handle()` then returned `250 Message accepted for delivery`. *(O4 — delivery, OBSERVED through the print branch.)*
 
 The sequence below summarizes the observed flow and marks the single decision point (step 4) where a wrong-user outcome originates:
 
@@ -196,7 +206,7 @@ sequenceDiagram
     participant RevAlias as is_reverse_alias()<br/>app/email_utils.py:L1156-L1158
     participant Reply as handle_reply()<br/>email_handler.py:L966
     participant Norm as normalize_reply_email()<br/>app/email_validation.py:L25-L38
-    participant DB as Contact.get_by(reply_email)<br/>email_handler.py:L986 (models.py:L83-L84)
+    participant DB as Contact.get_by(reply_email)<br/>email_handler.py:L986 (app/models.py:L83-L84)
     participant Log as EmailLog.create()<br/>email_handler.py:L1042-L1050
     participant Out as deliver to contact.website_email<br/>email_handler.py:L1212-L1226
 
@@ -271,27 +281,45 @@ Against the live database, a second contact for a **different** user/alias was c
 
 ```text
 [check]  available_sl_email(dup) -> False        # the app-layer guard says "taken"...
-[result] Contact.create with DUPLICATE reply_email SUCCEEDED, contactB.id=177 contactB.user_id=478
+[result] Contact.create with DUPLICATE reply_email SUCCEEDED, contactB.id=179 contactB.user_id=480
          -> NO IntegrityError raised             # ...but the DB has no constraint to enforce it
-[state]  contacts sharing reply_email='external-recipient_at_example_com_tgryatbrfz@sl.local':
-           contact.id=176 user_id=477 alias_id=836 website_email=external-recipient@example.com
-           contact.id=177 user_id=478 alias_id=838 website_email=external-recipient-B@example.com
-[resolve] Contact.get_by(reply_email).first() -> contact.id=176 user_id=477
-[verdict] reply_email maps to 2 contacts across users [477, 478];
-          resolver collapses to a SINGLE user_id=477. The other user is shadowed.
+[state]  contacts sharing reply_email='external-recipient_at_example_com_mnrotdcjq@sl.local':
+           contact.id=178 user_id=479 alias_id=840 website_email=external-recipient@example.com
+           contact.id=179 user_id=480 alias_id=842 website_email=external-recipient-B@example.com
+[resolve] Contact.get_by(reply_email).first() -> contact.id=178 user_id=479
+[verdict] reply_email maps to 2 contacts across users [479, 480];
+          resolver collapses to a SINGLE user_id=479. The other user (480) is shadowed.
 ```
 
-This directly confirms Conditions 1–3: the duplicate inserted with **no `IntegrityError`** (no DB uniqueness), and `Contact.get_by(reply_email=...)` returned exactly **one** of the two rows via an unordered `.first()`. A second run then drove a reply through `handle_reply()` for that duplicated address and observed the attribution following the resolved contact only:
+This directly confirms Conditions 1–3: the duplicate inserted with **no `IntegrityError`** (no DB uniqueness), and `Contact.get_by(reply_email=...)` returned exactly **one** of the two rows via an unordered `.first()`. The *intended* recipient of the shadowed user's correspondence was `Contact 179` (user 480, `website_email=external-recipient-B@example.com`), but the resolver selected `Contact 178` (user 479) instead:
 
 ```text
-"/app/email_handler.py:1051" - handle_reply() - Create <EmailLog 297> for <Contact 176 …>, <User 477 …>, …
-"/app/email_handler.py:1212" - handle_reply() - send email from list_test127@sl.local to external-recipient@example.com
-[emaillog] id=297 is_reply=True user_id=477 alias_id=836 contact_id=176
-[verdict] EmailLog.user_id=477 == resolved.user_id=477. Routing/attribution is decided solely
-          by the reply_email lookup, not by the sender or the intended user.
+[intended] shadowed user_id=480, intended contact.id=179, website=external-recipient-B@example.com
+[resolved] Contact.get_by(reply_email).first() -> contact.id=178 user_id=479   # WRONG user / contact
 ```
 
-**INFERRED (static) corollary.** With two cross-user contacts sharing one `reply_email`, a reply legitimately originating from the *shadowed* user (id 478) would still resolve to `Contact 176`/user 477 at `email_handler.py:L986`. If that sender's address is not an authorized mailbox of the resolved alias 836, the anti-spoofing check `get_mailbox_from_mail_from(mail_from, alias)` (`email_handler.py:L1019`) returns `None` and the reply is rejected/diverted with `status.E214` (`email_handler.py:L1019-L1035`) — i.e. the shadowed user's legitimate reply fails *under the other user's alias*. This is the static failure-mode corollary of the observed collapse; it was not separately executed.
+**OBSERVED (executed) shadowed-user route.** A reply was then driven from the *shadowed* user's own mailbox (`user_b_tbaspabw@mailbox.test`, user 480) to the duplicated `reply_email`. The alias was **recognized** (the user's "alias recognized" log fired exactly as in the user's report), yet the decisive lookup resolved to the **other** user's contact/alias, so the anti-spoofing guard rejected the reply *under the wrong user's alias*:
+
+```text
+"/app/email_handler.py:2196" - handle()                 - Reply phase user_b_tbaspabw@mailbox.test(...) ->
+    external-recipient_at_example_com_mnrotdcjq@sl.local            # RECOGNIZED — "alias recognized" log fires
+"/app/email_handler.py:1393" - handle_unknown_mailbox() - Reply email can only be used by mailbox.
+    Actual mail_from: user_b_tbaspabw@mailbox.test. ... reverse-alias ...mnrotdcjq@sl.local,
+    <Alias 840 word_word197@sl.local> <User 479 Trace User A ...> <Contact 178 ...>   # processed under WRONG user 479
+# handle() -> 250 SL E214 Unauthorized for using reverse alias        (no EmailLog created for this reply)
+```
+
+This is the wrong-user mechanism executed end-to-end: the shadowed user 480's legitimate reply was recognized, but `Contact.get_by(reply_email=...)` (`email_handler.py:L986`) returned `Contact 178` / alias 840 / user 479 (note the log lists the *other* user's `<Alias 840>`, `<User 479>`, `<Contact 178>`); because user 480's mailbox is not an authorized mailbox of the resolved alias 840, `get_mailbox_from_mail_from(mail_from, alias)` (`email_handler.py:L1019`) returned `None`, control fell into the `else` branch that calls `handle_unknown_mailbox` (`email_handler.py:L1032`; def at `email_handler.py:L1390`, log at `email_handler.py:L1393`), and the caller returned `status.E214` (`email_handler.py:L1034`, surfaced to the SMTP client as `250 SL E214 Unauthorized for using reverse alias`). The shadowed user's reply thus failed **under the other user's alias** — this is the wrong-user outcome **observed in execution**, not merely inferred.
+
+### Confidentiality / privacy impact
+
+This wrong-user resolution is not merely a delivery nuisance — it is a **confidentiality/privacy risk**, because both the *attribution* and the *delivery target* of a reply are derived from the mis-resolved `Contact`:
+
+- **Mis-attribution.** The reply is logged against the wrong account: `EmailLog.create(... user_id=contact.user_id ...)` (`email_handler.py:L1042-L1050`) records `user_id` from the resolved contact, so one user's reply activity can be persisted under **another user's** identity.
+- **Mis-delivery.** When resolution reaches the send step, the message is relayed to `contact.website_email` of the *resolved* contact (`email_handler.py:L1224-L1226`) — i.e. potentially to **another user's** external correspondent rather than the intended one. The content of a private reply could therefore be disclosed to a third party who happens to share the duplicated `reply_email`.
+- **Observed information disclosure.** In the executed shadowed-user run above, the rejection did not stay private: `handle_unknown_mailbox` alerts the *resolved* alias's owner via `send_email_with_rate_control(user, ALERT_REVERSE_ALIAS_UNKNOWN_MAILBOX, user.email, f"Attempt to use your alias {alias.email} from {envelope.mail_from}", ...)` (`email_handler.py:L1408-L1412`) — the recipient is `user.email` (the resolved user, A) and the subject embeds `envelope.mail_from` (the shadowed sender, B). The trace observed `app/mail_sender.py:L131` emit `send email with subject 'Attempt to use your alias word_word197@sl.local from user_b_tbaspabw@mailbox.test' ... to user_a_tkcncjvw@mailbox.test` — i.e. the shadowed user **B's mailbox address was disclosed to user A**, who has no legitimate relationship to user B. Even on the *rejection* path, the collision leaked one user's identifier to another.
+
+In short, a cross-user `reply_email` collision can attribute and/or deliver a reply under the wrong user/contact, and can leak one user's address to another — a genuine confidentiality concern, not just a routing inconvenience.
 
 ### Tying it back to the user's report
 
@@ -313,7 +341,7 @@ Because recognition fires first and the two unordered `.first()` lookups are ind
 - uniqueness is enforced only by a **racy, unbacked application check** (`app/email_utils.py:L1103`, `app/models.py:L1425-L1432`), and the one `IntegrityError` recovery path keys on `uq_contact`, never on `reply_email` (`app/contact_utils.py:L113-L118`);
 - the lookup key normalization is **case- and form-divergent** from storage (`app/email_validation.py:L25-L38` vs `app/utils.py:L78`/`L97`).
 
-The live trace in §8 demonstrated that a duplicate `reply_email` across two users **inserts without any `IntegrityError`** and that the resolver then **collapses both users onto one**, with attribution and delivery following whichever row `.first()` happens to return.
+The live trace in §8 demonstrated that a duplicate `reply_email` across two users **inserts without any `IntegrityError`** and that the resolver then **collapses both users onto one**, with attribution and delivery following whichever row `.first()` happens to return. Because attribution (`email_handler.py:L1042-L1050`) and delivery (`email_handler.py:L1224-L1226`) both follow that resolved contact, the defect carries a **confidentiality/privacy** dimension — a reply can be recorded under, or delivered on behalf of, the wrong user, and (as observed) a collision can disclose one user's mailbox address to another. That raises the severity of the defect from a delivery error to a cross-user data-exposure risk.
 
 **Recommendation (for the maintainers to consider — deliberately NOT implemented here):**
 
@@ -332,66 +360,90 @@ These two changes together would remove the ambiguity at its source — the sing
 |-------|--------|----------|
 | `handle_DATA` → `handle()` receives the message | OBSERVED | `==>> Handle …` at `email_handler.py:L1980` |
 | `is_reverse_alias` true → "Reply phase" log (the "recognized" log) | OBSERVED | `Reply phase …` at `email_handler.py:L2196` |
-| `Contact.get_by(reply_email)` resolves contact→alias→user | OBSERVED | `Create <EmailLog 296> for <Contact 176 …>, <User 477 …>` at `email_handler.py:L1051` |
-| `EmailLog.user_id == contact.user_id`; delivery to `contact.website_email` | OBSERVED | `EmailLog 296 user_id=477`; `send email … to external-recipient@example.com` at `email_handler.py:L1212` |
-| Duplicate `reply_email` (different users) persists with no `IntegrityError` | OBSERVED | `contactB.id=177 … NO IntegrityError raised` |
-| `get_by(reply_email).first()` returns one arbitrary row, collapsing two users | OBSERVED | `resolve … contact.id=176 user_id=477`; 2 contacts across users `[477, 478]` |
-| Shadowed user's reply fails anti-spoofing under the other user's alias | INFERRED | `get_mailbox_from_mail_from` → `None` → `status.E214` at `email_handler.py:L1019-L1035` |
-| DKIM signing failure is an env artifact after the routing decision | OBSERVED | `Cannot create DKIM signature` raised at `email_handler.py:L1221`, after `L1042-L1050` and `L1212` |
+| `Contact.get_by(reply_email)` resolves contact→alias→user | OBSERVED | `Create <EmailLog 298> for <Contact 178 …>, <User 479 …>` at `email_handler.py:L1051` |
+| `EmailLog.user_id == contact.user_id`; delivery to `contact.website_email` | OBSERVED | `EmailLog 298 user_id=479`; `send email … to external-recipient@example.com` at `email_handler.py:L1212` |
+| Duplicate `reply_email` (different users) persists with no `IntegrityError` | OBSERVED | `contactB.id=179 … NO IntegrityError raised` |
+| `get_by(reply_email).first()` returns one arbitrary row, collapsing two users | OBSERVED | `resolve … contact.id=178 user_id=479`; 2 contacts across users `[479, 480]` |
+| Shadowed user's reply is recognized, then fails anti-spoofing under the **other** user's alias (`E214`) | OBSERVED | shadowed user 480 → `Reply phase` at `email_handler.py:L2196`, then `handle_unknown_mailbox` log at `email_handler.py:L1393` lists `<Alias 840> <User 479> <Contact 178>`; caller returns `status.E214` at `email_handler.py:L1034` → `250 SL E214 …` (def `email_handler.py:L1390`) |
+| Cross-user collision leaks one user's mailbox address to another (confidentiality) | OBSERVED | unauthorized-use alert `'Attempt to use your alias word_word197@sl.local from user_b_tbaspabw@mailbox.test' … to user_a_tkcncjvw@mailbox.test` at `app/mail_sender.py:L131` |
+| DKIM signing (default key) raises *after* the routing decision; bypassed via `RSPAMD_SIGN_DKIM` to reach print-mode | OBSERVED | `Exception("Cannot create DKIM signature")` raised at `app/email_utils.py:L480` (function `app/email_utils.py:L457-L480`; called from `email_handler.py:L1220-L1221`), after `email_handler.py:L1042-L1050` and `L1212` |
+| Final transport reaches the `NOT_SEND_EMAIL=true` print branch | OBSERVED | `send email with subject 'Re: hello from external' … to 'External A <external-recipient@example.com>'` at `app/mail_sender.py:L131` (branch `app/mail_sender.py:L130-L137`); `handle()` returned `250 Message accepted for delivery` |
 
 ### B. Environment and commands
 
 ```bash
-# Runtime: Python 3.10.18, PostgreSQL 13, Redis 6 (per pyproject.toml:L61, Dockerfile:L8, .github/workflows/main.yml)
-# Config: CONFIG=tests/test.env  (NOT_SEND_EMAIL=true, EMAIL_DOMAIN=sl.local)  -> tests/test.env
+# Runtime: Python 3.10.18, PostgreSQL 13, Redis 6
+#   per pyproject.toml:L61 (python = "^3.10"), Dockerfile:L8 (FROM python:3.10),
+#   .github/workflows/main.yml:L17,L40 (Python 3.10), :L47 (postgres:13), :L60 (15432:5432), :L92-L94 (redis 6)
+# Config: CONFIG=tests/test.env -> NOT_SEND_EMAIL=true (tests/test.env:L7), EMAIL_DOMAIN=sl.local (tests/test.env:L8),
+#   DB_URI=postgresql://test:test@localhost:15432/test (tests/test.env:L17), MEM_STORE_URI=redis://localhost (tests/test.env:L78)
 
-# Migrations already at head (matches scripts/run-test.sh):
+# Migrations already at head (provisioning matches scripts/run-test.sh:L7,L13,L16):
 CONFIG=tests/test.env alembic current        # -> 32f25cbf12f6 (head)
 
-# Run the (temporary) trace inside the Python 3.10 dev container:
-CONFIG=tests/test.env PYTHONPATH=<repo> python <temporary_trace_script>.py
+# Run the (temporary) trace inside the Python 3.10 dev container, delegating DKIM signing to rspamd
+# (RSPAMD_SIGN_DKIM; app/config.py:L482) so the final NOT_SEND_EMAIL print-mode send (app/mail_sender.py:L130-L137) is reached:
+CONFIG=tests/test.env PYTHONPATH=<repo> RSPAMD_SIGN_DKIM=1 python <temporary_trace_script>.py
 ```
 
 ### C. Raw observed log lines (key markers, verbatim)
 
 ```text
-"/app/email_handler.py:1980" - handle()      - ==>> Handle mail_from:user_svyddscwob@mailbox.test,
-    rcpt_tos:['external-recipient_at_example_com_tgryatbrfz@sl.local'], ... message_id:<traceA@mailbox.test> ...
-"/app/email_handler.py:2196" - handle()      - Reply phase user_svyddscwob@mailbox.test(...) ->
-    external-recipient_at_example_com_tgryatbrfz@sl.local
+# Part 1 — primary reply (user A's mailbox -> contact A's reply_email), DKIM delegated to rspamd:
+"/app/email_handler.py:1980" - handle()      - ==>> Handle mail_from:user_a_tkcncjvw@mailbox.test,
+    rcpt_tos:['external-recipient_at_example_com_mnrotdcjq@sl.local'], ... message_id:<traceA@mailbox.test> ...
+"/app/email_handler.py:2196" - handle()      - Reply phase user_a_tkcncjvw@mailbox.test(...) ->
+    external-recipient_at_example_com_mnrotdcjq@sl.local
 "/app/app/handler/dmarc.py:159" - apply_dmarc_policy_for_reply_phase() - DMARC check disabled
-"/app/email_handler.py:1051" - handle_reply() - Create <EmailLog 296> for
-    <Contact 176 external-recipient@example.com 836>, <User 477 Test User user_svyddscwob@mailbox.test>,
-    <Mailbox 559 user_svyddscwob@mailbox.test>
-"/app/email_handler.py:1212" - handle_reply() - send email from list_test127@sl.local to
+"/app/email_handler.py:1051" - handle_reply() - Create <EmailLog 298> for
+    <Contact 178 external-recipient@example.com 840>, <User 479 Trace User A user_a_tkcncjvw@mailbox.test>,
+    <Mailbox 561 user_a_tkcncjvw@mailbox.test>
+"/app/email_handler.py:1212" - handle_reply() - send email from word_word197@sl.local to
     external-recipient@example.com, mail_options:[],rcpt_options:[]
+"/app/app/email_utils.py:459" - add_dkim_signature() - DKIM signature will be added by rspamd
+"/app/app/mail_sender.py:131" - send()        - send email with subject 'Re: hello from external',
+    from 'word_word197@sl.local' to 'External A <external-recipient@example.com>'
+# handle() -> 250 Message accepted for delivery ;  EmailLog 298 is_reply=True user_id=479 alias_id=840 contact_id=178
 
-# Wrong-user demonstration (duplicate reply_email across users 477 and 478):
+# Part 2 — wrong-user demonstration (duplicate reply_email across users 479 and 480):
 available_sl_email(dup) -> False
-Contact.create with DUPLICATE reply_email SUCCEEDED, contactB.id=177 contactB.user_id=478 -> NO IntegrityError raised
+Contact.create with DUPLICATE reply_email SUCCEEDED, contactB.id=179 contactB.user_id=480 -> NO IntegrityError raised
 contacts sharing reply_email:
-    contact.id=176 user_id=477 alias_id=836 website_email=external-recipient@example.com
-    contact.id=177 user_id=478 alias_id=838 website_email=external-recipient-B@example.com
-Contact.get_by(reply_email).first() -> contact.id=176 user_id=477
-EmailLog 297 user_id=477 alias_id=836 contact_id=176   # attribution follows the resolved contact only
+    contact.id=178 user_id=479 alias_id=840 website_email=external-recipient@example.com
+    contact.id=179 user_id=480 alias_id=842 website_email=external-recipient-B@example.com
+Contact.get_by(reply_email).first() -> contact.id=178 user_id=479   # collapses users [479, 480] to one
+[intended] shadowed user_id=480, intended contact.id=179, website=external-recipient-B@example.com
+
+# Driving the reply from the SHADOWED user 480's mailbox -> recognized, then rejected under user 479's alias:
+"/app/email_handler.py:2196" - handle()                 - Reply phase user_b_tbaspabw@mailbox.test(...) ->
+    external-recipient_at_example_com_mnrotdcjq@sl.local
+"/app/email_handler.py:1393" - handle_unknown_mailbox() - Reply email can only be used by mailbox.
+    Actual mail_from: user_b_tbaspabw@mailbox.test. ... reverse-alias ...mnrotdcjq@sl.local,
+    <Alias 840 word_word197@sl.local> <User 479 Trace User A ...> <Contact 178 ...>
+# handle() -> 250 SL E214 Unauthorized for using reverse alias   (NO EmailLog created for the shadowed reply)
+"/app/app/mail_sender.py:131" - send()        - send email with subject
+    'Attempt to use your alias word_word197@sl.local from user_b_tbaspabw@mailbox.test'
+    ... to user_a_tkcncjvw@mailbox.test     # confidentiality leak: user B's address disclosed to user A
 ```
 
 ### D. Temporary artifacts and source-tree cleanliness
 
-The investigation used one temporary trace script and seeded rows in the disposable test database; both were removed after the trace. The seeded `EmailLog`/`Contact` rows were deleted by the script's own cleanup step (`[cleanup] removed seeded EmailLogs and Contacts …`), and the trace script was deleted from disk. No file in the SimpleLogin source tree was created, modified, or deleted at any point.
+The investigation used one temporary trace script and seeded rows in a disposable test database. Both were removed: the trace script ran **inside a separate, ephemeral Python 3.10 container**, living under `/tmp` (never inside the repository tree) and deleted afterwards; the seeded `User`/`Alias`/`Contact`/`EmailLog`/`Mailbox` rows were created inside a single `connection.begin()` transaction and undone with `transaction.rollback()` (the same wrapper the project's own `tests/conftest.py:L61,L75-L77` uses), so the database was left byte-for-byte unchanged. Row counts confirmed equality across the rollback (`baseline == after_rollback -> True`). No file in the SimpleLogin source tree was created, modified, or deleted at any point.
 
-Source-tree status after cleanup (`git status --porcelain` on the source working tree):
+The only change this task makes to the repository is the addition of this one document. Comparing the deliverable commit against the upstream SimpleLogin `HEAD` (`2cd6ee77`) shows exactly one added file and zero source changes:
 
 ```text
-$ git status --porcelain -uall
-?? blitzy/documentation/app_2cd6ee777f8c.md
+$ git diff --name-status 2cd6ee77 HEAD
+A       blitzy/documentation/app_2cd6ee777f8c.md
 
-# Interpretation: the ONLY entry is this deliverable document. ZERO SimpleLogin source
-# files were created, modified, or deleted (tracked-source changes = 0). The live trace
-# executed in a separate, ephemeral Python 3.10 container; its temporary script lived
-# outside the source tree (under /tmp) and was deleted, seeded database rows were removed,
-# and Python bytecode caches (__pycache__) are git-ignored.
+$ git status --porcelain          # after commit: clean working tree (no pending changes)
+                                  # (empty output)
+
+$ git ls-files | grep -E '__pycache__|\.pytest_cache'
+                                  # (empty: bytecode/pytest caches are git-ignored and never tracked)
 ```
+
+Interpretation: the single tracked change introduced is this deliverable document; **zero** SimpleLogin source files were created, modified, or deleted (tracked-source changes = 0). Python bytecode caches (`__pycache__/`, `.pytest_cache/`) are listed in `.gitignore`, so they never appear as tracked or untracked changes and do not pollute `git status`; they are build artifacts of the interpreter, not part of the deliverable. The live trace's temporary script and seeded data left no residue (script deleted; DB transaction rolled back).
 
 The sole artifact produced by this task is **this document**, `blitzy/documentation/app_2cd6ee777f8c.md`, whose filename matches the source branch name `app_2cd6ee777f8c`.
 
@@ -433,8 +485,16 @@ The sole artifact produced by this task is **this document**, `blitzy/documentat
 | `canonicalize_email` / `sanitize_email` (lowercase) | `app/utils.py:L78, L97` |
 | reply-simulation harness | `tests/test_email_handler.py:L165-L188` |
 | app-context bootstrap (`create_app`, `add_sl_domains`) | `tests/conftest.py:L23, L38-L39` |
-| print-mode config (`NOT_SEND_EMAIL`, `EMAIL_DOMAIN`) | `tests/test.env` |
-| postgres + migrations + tests harness | `scripts/run-test.sh` |
+| print-mode config (`NOT_SEND_EMAIL`, `EMAIL_DOMAIN`, `DB_URI`, `MEM_STORE_URI`) | `tests/test.env:L7-L8, L17, L78` |
+| DKIM key path (`DKIM_PRIVATE_KEY_PATH`) | `tests/test.env:L15` |
+| postgres + migrations + tests harness | `scripts/run-test.sh:L4-L16` (provision `:L7`, migrate `:L13`, test `:L16`) |
+| CI runtime/service versions (Python 3.10, `postgres:13`, redis 6) | `.github/workflows/main.yml:L17, L40, L47, L60, L92-L94` |
+| project requirements (Python 3.10, Postgres 13+) | `CONTRIBUTING.md:L22-L25` |
+| `add_dkim_signature` (def + raise) / rspamd early-return | `app/email_utils.py:L457-L480` (raise `:L480`; rspamd `:L458-L461`); call site `email_handler.py:L1220-L1221` |
+| `RSPAMD_SIGN_DKIM` config flag | `app/config.py:L482` |
+| `NOT_SEND_EMAIL` print-mode send branch | `app/mail_sender.py:L130-L137` (log line `:L131`) |
+| DMARC reply-phase check (disabled under test) | `app/handler/dmarc.py:L158-L160` |
+| external-transaction rollback pattern (clean DB) | `tests/conftest.py:L61, L75-L77` |
 | forward path (contrast) | `email_handler.py:L536` |
 | bounce path (contrast) | `email_handler.py:L1851` |
 | SMTP process entry point | `email_handler.py:L2381` |
