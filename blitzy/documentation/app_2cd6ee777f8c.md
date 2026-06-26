@@ -68,8 +68,8 @@ flowchart TD
     end
 
     subgraph Flow["Q2: Basic User Actions"]
-        A1["Register /register<br/>register.py:31"] --> A2["Activate /activate<br/>activate.py:13"]
-        A2 --> A3["Create alias<br/>create_new_random()<br/>index.py:104"]
+        A1["Register /register<br/>app/auth/views/register.py:31"] --> A2["Activate /activate<br/>app/auth/views/activate.py:13"]
+        A2 --> A3["Create alias<br/>create_new_random()<br/>app/dashboard/views/index.py:104"]
         A3 --> A4["Inbound mail to alias :20381"]
         A4 --> A5["handle_forward() writes EmailLog<br/>email_handler.py:536"]
     end
@@ -306,9 +306,9 @@ The end‑to‑end flow and its signals are summarized here, then detailed below
 
 | Step | Route / mechanism | Code | Proof signal observed |
 |---|---|---|---|
-| Register | `POST /auth/register` | `register.py:31,86,95` | 200 → "waiting activation" page; `User(activated=False)` + `ActivationCode` rows |
-| Activate | `GET /auth/activate?code=…` | `activate.py:13,49,53,56` | 302 redirect; `users.activated=true`; single‑use code deleted |
-| Create alias | dashboard `POST` (`form-name=create-random-email`) | `index.py:97,104,110,111` | flash "Alias … has been created"; new `Alias` row; self‑cited log line |
+| Register | `POST /auth/register` | `app/auth/views/register.py:31,86,95` | 200 → "waiting activation" page; `User(activated=False)` + `ActivationCode` rows |
+| Activate | `GET /auth/activate?code=…` | `app/auth/views/activate.py:13,49,53,56` | 302 redirect; `users.activated=true`; single‑use code deleted |
+| Create alias | dashboard `POST` (`form-name=create-random-email`) | `app/dashboard/views/index.py:97,104,110,111` | flash "Alias … has been created"; new `Alias` row; self‑cited log line |
 | Receive email | inbound SMTP to `:20381` | `email_handler.py:1945,536,679,732` | "New message"/"Finish mail_from" log pair; new `EmailLog` row; `+1` forward |
 
 ### Q2.1 Create an account (register → activate)
@@ -385,7 +385,7 @@ GET /auth/activate?code=<single-use code>  -> 302 FOUND
  activation_code rows for that user   : 0             <-- single-use code deleted
 ```
 
-**Rationale (why this proves it).** The transition `activated: f → t` together with the activation‑code row disappearing maps **exactly** to the code: `user.activated = True` ([`activate.py:49`](#citations-appendix)) and `ActivationCode.delete(...)` ([`activate.py:53`](#citations-appendix)). The `302` is the post‑login redirect that follows `login_user(user)` ([`activate.py:50`](#citations-appendix)). The `200 → "waiting activation"` page maps to `render_template("auth/register_waiting_activation.html")` ([`register.py:104`](#citations-appendix)), and the un‑activated `User` plus the `ActivationCode` row map to `User.create(...)` ([`register.py:86`](#citations-appendix)) followed by `send_activation_email(...)` ([`register.py:95`](#citations-appendix)). Every observed signal has a one‑to‑one source counterpart.
+**Rationale (why this proves it).** The transition `activated: f → t` together with the activation‑code row disappearing maps **exactly** to the code: `user.activated = True` ([`app/auth/views/activate.py:49`](#citations-appendix)) and `ActivationCode.delete(...)` ([`app/auth/views/activate.py:53`](#citations-appendix)). The `302` is the post‑login redirect that follows `login_user(user)` ([`app/auth/views/activate.py:50`](#citations-appendix)). The `200 → "waiting activation"` page maps to `render_template("auth/register_waiting_activation.html")` ([`app/auth/views/register.py:104`](#citations-appendix)), and the un‑activated `User` plus the `ActivationCode` row map to `User.create(...)` ([`app/auth/views/register.py:86`](#citations-appendix)) followed by `send_activation_email(...)` ([`app/auth/views/register.py:95`](#citations-appendix)). Every observed signal has a one‑to‑one source counterpart.
 
 ### Q2.2 Create an alias
 
@@ -409,7 +409,7 @@ elif request.form.get("form-name") == "create-random-email":   # :97
 
 The dashboard template renders the alias list and controls, and surfaces per‑account activity statistics — **"New Custom Alias"** ([`templates/dashboard/index.html:46`](#citations-appendix)) and **"Random Alias"** ([`templates/dashboard/index.html:56`](#citations-appendix)) controls, plus the stats `nb_alias` ([line 131](#citations-appendix)), `nb_forward` ([line 145](#citations-appendix)), `nb_reply` ([line 159](#citations-appendix)), and `nb_block` ([line 173](#citations-appendix)). A custom‑alias path also exists (`app/dashboard/views/custom_alias.py`), with shared logic in `app/alias_utils.py`.
 
-**Observed runtime signal (reproducible).** Clicking **"Random Alias"** in the dashboard (logged in as `john@wick.com`) navigated to `/dashboard/?highlight_alias_id=13&…` and rendered a new, highlighted card **`word_list342@sl.local`** labeled *"Created just now."* The alias is on the `@sl.local` domain (matching `EMAIL_DOMAIN`, see [Q2.4](#q24-the-critical-local-mode-nuance-not_send_email)). The server log self‑cites `dashboard/views/index.py:110`:
+**Observed runtime signal (reproducible).** Clicking **"Random Alias"** in the dashboard (logged in as `john@wick.com`) navigated to `/dashboard/?highlight_alias_id=13&…` and rendered a new, highlighted card **`word_list342@sl.local`** labeled *"Created just now."* The alias is on the `@sl.local` domain (matching `EMAIL_DOMAIN`, see [Q2.4](#q24-the-critical-local-mode-nuance-not_send_email)). The server log self‑cites `app/dashboard/views/index.py:110`:
 
 ```text
 2026-06-26 18:47:44,834 - SL - DEBUG - 78 - "/app/app/dashboard/views/index.py:110" - index() -  - create new random alias <Alias 13 word_list342@sl.local> for user <User 1 John Wick john@wick.com>
@@ -417,7 +417,7 @@ The dashboard template renders the alias list and controls, and surfaces per‑a
 
 …and the database held the corresponding row: `alias.id=13`, `email=word_list342@sl.local`, `user_id=1` (John), `enabled=true`.
 
-**Rationale (why this proves it).** The new `Alias` row plus the self‑citing `index.py:110` log line are the direct outputs of `Alias.create_new_random(...)` ([`index.py:104`](#citations-appendix)) and its `LOG.d(...)` ([`index.py:110`](#citations-appendix)); the `highlight_alias_id=13` query parameter on the redirect and the "Created just now" card are the user‑visible confirmation that the flash ([`index.py:111`](#citations-appendix)) describes. The route is `@login_required` ([`index.py:56`](#citations-appendix)), so reaching it at all confirms the authenticated session from Q1.
+**Rationale (why this proves it).** The new `Alias` row plus the self‑citing `app/dashboard/views/index.py:110` log line are the direct outputs of `Alias.create_new_random(...)` ([`app/dashboard/views/index.py:104`](#citations-appendix)) and its `LOG.d(...)` ([`app/dashboard/views/index.py:110`](#citations-appendix)); the `highlight_alias_id=13` query parameter on the redirect and the "Created just now" card are the user‑visible confirmation that the flash ([`app/dashboard/views/index.py:111`](#citations-appendix)) describes. The route is `@login_required` ([`app/dashboard/views/index.py:56`](#citations-appendix)), so reaching it at all confirms the authenticated session from Q1.
 
 ### Q2.3 Have the alias receive an email
 
