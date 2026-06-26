@@ -143,7 +143,7 @@ DEV (Werkzeug):
 HTTP/1.0 200 OK
 Content-Type: text/html; charset=utf-8
 Content-Length: 7
-Server: Werkzeug/1.0.1 Python/3.10.20
+Server: Werkzeug/1.0.1 Python/3.10.18
 
 success
 ```
@@ -179,7 +179,7 @@ Authentication uses the **`Authentication`** request header — **not** `Authori
 
 ### Seed prerequisites
 
-`flask dummy-data` (the CLI command at [server.py:L490-L495] → `fake_data()` in [app/fake_data.py:L40]) creates the user `john@wick.com` (password `password`) [CONTRIBUTING.md:L109], an `ApiKey` with `code="code"` [app/fake_data.py:L121-L122], and a verified default `Mailbox` whose id becomes `user.default_mailbox_id`. This matters because `alias.mailbox_id` is a **non-null** foreign key [app/models.py:L1506-L1508], sourced from `user.default_mailbox_id` in `Alias.create_new_random` [app/models.py:L1721]. Seeding also pre-creates several aliases, so the `alias` table already held **11 rows (ids 1–11)** before the API call in this capture; the newly created alias is therefore **`id=12`** (autoincrement).
+`flask dummy-data` (the CLI command at [server.py:L490-L495] → `fake_data()` in [app/fake_data.py:L40]) creates the user `john@wick.com` (password `password`) [CONTRIBUTING.md:L109], an `ApiKey` with `code="code"` [app/fake_data.py:L121-L122], and a verified default `Mailbox` whose id becomes `user.default_mailbox_id`. This matters because `alias.mailbox_id` is a **non-null** foreign key [app/models.py:L1506-L1508], sourced from `user.default_mailbox_id` in `Alias.create_new_random` [app/models.py:L1750-L1755]. Seeding also pre-creates several aliases, so the `alias` table already held **11 rows (ids 1–11)** before the API call in this capture; the newly created alias is therefore **`id=12`** (autoincrement).
 
 ### (a) Commands executed (three cases, to demonstrate the auth behavior)
 
@@ -280,7 +280,7 @@ flags                        | 0
 
 ### (e) Rationale & citations
 
-**Endpoint & status.** `POST /api/alias/random/new` returns `201` on success [app/api/views/new_random_alias.py:L21-L25]; the analogous custom-alias endpoints are `POST /api/v2/alias/custom/new` [app/api/views/new_custom_alias.py:L28-L32] and `POST /api/v3/alias/custom/new` [app/api/views/new_custom_alias.py:L115-L119]. Each stacks `@limiter.limit(ALIAS_LIMIT)` + `@require_api_auth` + `@parallel_limiter.lock(name="alias_creation")`.
+**Endpoint & status.** `POST /api/alias/random/new` [app/api/views/new_random_alias.py:L21-L25] returns `201` on success [app/api/views/new_random_alias.py:L114-L117]; the analogous custom-alias endpoints are `POST /api/v2/alias/custom/new` [app/api/views/new_custom_alias.py:L28-L32] and `POST /api/v3/alias/custom/new` [app/api/views/new_custom_alias.py:L115-L119]. Each stacks `@limiter.limit(ALIAS_LIMIT)` + `@require_api_auth` + `@parallel_limiter.lock(name="alias_creation")`.
 
 **Why the JSON has an extra top-level `alias` key.** The view returns `jsonify(alias=alias.email, **serialize_alias_info_v2(get_alias_info_v2(alias))), 201` [app/api/views/new_random_alias.py:L114-L117]. So the response is the `serialize_alias_info_v2` object [app/api/serializer.py:L55-L93] (keys: `id, email, creation_date, creation_timestamp, enabled, note, name, nb_forward, nb_block, nb_reply, mailbox{id,email}, mailboxes[{id,email}], support_pgp, disable_pgp, latest_activity, pinned`) **plus** an extra `alias` key equal to the alias email. That is why `alias` and `email` carry the same value (`gavels_rushes985@sl.local`). This duplication is easy to miss from the serializer alone — it is only visible by inspecting the view's return statement and/or the live response.
 
@@ -295,9 +295,9 @@ flags                        | 0
 - `email = gavels_rushes985@sl.local` — unique, non-null [app/models.py:L1477]; the local-part is randomly generated (word-based scheme), hence run-specific.
 - `enabled = t` — default `True` [app/models.py:L1482].
 - `flags = 0` — default `0` [app/models.py:L1483-L1485].
-- `custom_domain_id = NULL` and `directory_id = NULL` — a *random* alias has neither [app/models.py:L1487, app/models.py:L1499].
+- `custom_domain_id = NULL` [app/models.py:L1487-L1489] and `directory_id = NULL` [app/models.py:L1499-L1501] — a *random* alias has neither.
 - `automatic_creation = f` [app/models.py:L1494]; `disable_pgp = f` [app/models.py:L1516]; `cannot_be_disabled = f` [app/models.py:L1521]; `disable_email_spoofing_check = f` [app/models.py:L1528]; `pinned = f` [app/models.py:L1545]; `name = NULL` [app/models.py:L1480]; and `batch_import_id`, `original_owner_id`, `transfer_token`, `hibp_last_check`, `last_email_log_id` are all `NULL`.
-- `mailbox_id = 1` — set to `user.default_mailbox_id` in `create_new_random` [app/models.py:L1721]; this is a non-null foreign key [app/models.py:L1506-L1508].
+- `mailbox_id = 1` — set to `user.default_mailbox_id` in `create_new_random` [app/models.py:L1750-L1755]; this is a non-null foreign key [app/models.py:L1506-L1508].
 - `transfer_token_expiration = 2026-06-26 19:53:35.352939` — this column carries `default=arrow.utcnow` [app/models.py:L1549-L1551], so it is stamped at insert time even though `transfer_token` itself is `NULL`.
 - `ts_vector = 'api':3 'creat':1 'q3':5 'via':2` — a **generated/persisted** PostgreSQL column, `to_tsvector('english', note)` [app/models.py:L1559-L1561]. The note `created via API for Q3` becomes the lexemes `creat`(1) `via`(2) `api`(3) `q3`(5): `created` is stemmed to `creat`, and the English stopword `for` (position 4) is dropped. This is visible proof that the column is **computed by PostgreSQL**, not stored as the raw note text.
 
@@ -381,7 +381,7 @@ sqlalchemy.exc.OperationalError: (psycopg2.OperationalError) connection to serve
 - **Run paths and binds.** Development: `python3 server.py` → `app.run(debug=True, port=7777)` [server.py:L588] binds `127.0.0.1:7777`. Production: `gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15` [Dockerfile:L47] binds `0.0.0.0:7777` with two `sync` workers. Both paths use **port 7777**.
 - **Canonical local recipe.** `alembic upgrade head && flask dummy-data && python3 server.py` [CONTRIBUTING.md:L106]; afterwards one can log in as `john@wick.com / password` [CONTRIBUTING.md:L109].
 - **Working directory.** The Docker image sets `WORKDIR /code` [Dockerfile:L3], so captured console paths read `/code/...`. Running the same code from a different working directory changes only that path prefix, not the behavior.
-- **Run-specific values.** Alias local-part, autoincrement `id`, all timestamps, pids, and `GNUPGHOME` temp-directory names are specific to a single run and will differ on re-execution. The *structure, tables, columns, status codes, and error types* are stable and were confirmed reproducible across runs.
-- **Optional accelerators (no behavioral effect).** The investigation environment substituted a faithful `re`-backed shim for the optional `pyre2` regex accelerator and used a newer `cbor2`; both are transitively optional and have **zero** effect on port binding, the health check, alias creation, or the database-failure path documented here.
+- **Run-specific values.** Alias local-part, autoincrement `id`, all timestamps, pids, `GNUPGHOME` temp-directory names, and the Python patch version reported in the dev `Server` header (e.g. `Python/3.10.18`) are specific to a single run/environment and will differ on re-execution. The *structure, tables, columns, status codes, and error types* are stable and were confirmed reproducible across runs.
+- **Optional accelerators (no behavioral effect).** The investigation environment provided `google-re2` (`1.1.20250805`) for the `re2` module in place of the manifest's `pyre2` [pyproject.toml:L110]; this `re2` is a drop-in `re`-compatible API implemented on top of Google's RE2 engine (not a pure-`re` shim). `cbor2` (`5.2.0`) matches the locked version [poetry.lock:L411-L412]. Both are transitively optional and have **zero** effect on port binding, the health check, alias creation, or the database-failure path documented here.
 - **No repository changes.** This document is the only artifact. No existing source file was modified, and every temporary investigation script lived outside the repository tree and was removed afterward; the source tree remains byte-for-byte unmodified (clean `git status`).
 
