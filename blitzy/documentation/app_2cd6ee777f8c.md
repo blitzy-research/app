@@ -12,7 +12,7 @@ This document answers three questions a newcomer typically asks after bringing t
 
 Each section gives **the answer**, **the code evidence**, **the observed runtime signal**, and **the rationale** ("why this proves it").
 
-> **A note on how the logs cite themselves.** SimpleLogin's logger format embeds the call site `"%(pathname)s:%(lineno)d"` in every line ([`app/log.py:12‑14`](#citations)). That means the runtime log output literally prints the source file and line that emitted it. Throughout this document you will see observed log lines such as `"/app/email_handler.py:2386"` — these are not annotations added by hand; they are emitted by the running program, so the runtime evidence and the code citation are one and the same.
+> **A note on how the logs cite themselves.** SimpleLogin's logger format embeds the call site `"%(pathname)s:%(lineno)d"` in every line ([`app/log.py:12‑14`](#citations-appendix)). That means the runtime log output literally prints the source file and line that emitted it. Throughout this document you will see observed log lines such as `"/app/email_handler.py:2386"` — these are not annotations added by hand; they are emitted by the running program, so the runtime evidence and the code citation are one and the same.
 
 ---
 
@@ -54,8 +54,8 @@ This is not an assumption — it is visible directly in the code. There are sepa
 | Process | Entry point | What it does | Loop |
 |---|---|---|---|
 | **Web server** | `server.py` (local) / `wsgi.py` (gunicorn) | Serves the Flask app, dashboard, API | Gunicorn worker request loop / `app.run()` |
-| **Email handler** | `email_handler.py` | aiosmtpd SMTP listener on `0.0.0.0:20381` | `while True: time.sleep(2)` ([`email_handler.py:2392‑2393`](#citations)) |
-| **Job runner** | `job_runner.py` | Polls the `job` table and processes jobs | `while True: ... time.sleep(10)` ([`job_runner.py:330,347`](#citations)) |
+| **Email handler** | `email_handler.py` | aiosmtpd SMTP listener on `0.0.0.0:20381` | `while True: time.sleep(2)` ([`email_handler.py:2392‑2393`](#citations-appendix)) |
+| **Job runner** | `job_runner.py` | Polls the `job` table and processes jobs | `while True: ... time.sleep(10)` ([`job_runner.py:330,347`](#citations-appendix)) |
 
 The web entry point only registers blueprints and runs the Flask/WSGI app — it contains **no code that launches** `email_handler.py` or `job_runner.py`. We verify this precisely in [Q3](#q3--background-components).
 
@@ -106,9 +106,9 @@ python email_handler.py      # binds 0.0.0.0:20381   (CONTRIBUTING.md:212)
 python job_runner.py         # 10s poll loop         (CONTRIBUTING.md:228)
 ```
 
-Then open `http://localhost:7777` and sign in with the seeded account **`john@wick.com` / `password`** ([`CONTRIBUTING.md:109`](#citations)). That account is created by `flask dummy-data` already **activated** and as an **admin** ([`app/fake_data.py:44‑49`](#citations)), so you can exercise alias/email flows immediately without going through registration first.
+Then open `http://localhost:7777` and sign in with the seeded account **`john@wick.com` / `password`** ([`CONTRIBUTING.md:109`](#citations-appendix)). That account is created by `flask dummy-data` already **activated** and as an **admin** ([`app/fake_data.py:44‑49`](#citations-appendix)), so you can exercise alias/email flows immediately without going through registration first.
 
-> In the Docker‑based environment used to capture the observations in this document, the three processes were launched inside the application container and each writes to its own log file (`/app/web.log`, `/app/email_handler.log`, `/app/job_runner.log`); in a self‑host deployment the same lines are read with `docker logs <container>` per `docs/troubleshooting.md`. SimpleLogin's logger writes to **stdout** ([`app/log.py:41`](#citations)), so whichever way the process is supervised, the container runtime captures the lines.
+> In the Docker‑based environment used to capture the observations in this document, the three processes were launched inside the application container and each writes to its own log file (`/app/web.log`, `/app/email_handler.log`, `/app/job_runner.log`); in a self‑host deployment the same lines are read with `docker logs <container>` per `docs/troubleshooting.md`. SimpleLogin's logger writes to **stdout** ([`app/log.py:41`](#citations-appendix)), so whichever way the process is supervised, the container runtime captures the lines.
 
 ### 0.3 The `DB_URI` port nuance (resolved by observation)
 
@@ -120,7 +120,7 @@ A newcomer following the docs literally will hit a genuine **inconsistency in th
 | `CONTRIBUTING.md:94` (instruction text: "edit `DB_URI` to") | `…@localhost:35432/…` | **35432** |
 | `CONTRIBUTING.md:100` (the `docker run` command) | `docker run … -p 15432:5432 postgres:13` | host **15432** → container 5432 |
 
-**What actually worked (observed):** In the running deployment, the application's *effective* `DB_URI` was **`postgresql://myuser:<password>@sl-db:5432/simplelogin`** — i.e., it connects to the PostgreSQL **container by its service name `sl-db` on the standard internal port `5432`**. This is because `app/config.py` loads the `.env` with `load_dotenv(override=False)`, so an environment variable injected by the container runtime (`-e DB_URI=…@sl-db:5432/…`) **wins over** the value copied from `example.env`. The host‑port numbers in the docs (5432 / 35432 / 15432) only matter when PostgreSQL is reached over a host port mapping; in a Docker‑network topology the app reaches the database container directly on `5432`.
+**What actually worked (observed):** In the running deployment, the application's *effective* `DB_URI` was **`postgresql://myuser:<password>@sl-db:5432/simplelogin`** — i.e., it connects to the PostgreSQL **container by its service name `sl-db` on the standard internal port `5432`**. This is because `app/config.py` calls `load_dotenv()` **without** an `override` argument ([`app/config.py:69‑71`](#citations-appendix)); python‑dotenv's default `override=False` behavior means an environment variable injected by the container runtime (`-e DB_URI=…@sl-db:5432/…`) **wins over** the value copied from `example.env`. The host‑port numbers in the docs (5432 / 35432 / 15432) only matter when PostgreSQL is reached over a host port mapping; in a Docker‑network topology the app reaches the database container directly on `5432`.
 
 > **Takeaway for a newcomer:** don't blindly copy one of the three port numbers. Confirm which host/port your PostgreSQL is actually reachable on and set `DB_URI` to match. If you run the app and the database in the same Docker network, address the DB container by name on `5432`.
 
@@ -128,15 +128,15 @@ A newcomer following the docs literally will hit a genuine **inconsistency in th
 
 In production the web app is served by Gunicorn rather than the Flask dev server:
 
-- **Gunicorn command:** `gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15` ([`Dockerfile:47`](#citations)). `wsgi.py` exposes `app = create_app()`.
-- **Base image:** `python:3.10` ([`Dockerfile:8`](#citations)); a front‑end asset build stage uses `node:10.17.0-alpine` ([`Dockerfile:2`](#citations)).
-- **Exposed port:** `EXPOSE 7777` ([`Dockerfile:44`](#citations)).
+- **Gunicorn command:** `gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15` ([`Dockerfile:47`](#citations-appendix)). `wsgi.py` exposes `app = create_app()`.
+- **Base image:** `python:3.10` ([`Dockerfile:8`](#citations-appendix)); a front‑end asset build stage uses `node:10.17.0-alpine` ([`Dockerfile:2`](#citations-appendix)).
+- **Exposed port:** `EXPOSE 7777` ([`Dockerfile:44`](#citations-appendix)).
 
 Beyond the three core processes, SimpleLogin's documented architecture includes additional **background daemons**, each also launched explicitly or on a schedule (again, *not* spawned by the web app):
 
 - **`cron.py`** — scheduled maintenance, invoked per‑job by `yacron` according to `crontab.yml` / `crontab-all-hosts.yml` (e.g. entries of the form `python /code/cron.py -j <job>`).
-- **`event_listener.py`** — a PostgreSQL `LISTEN`/`NOTIFY` consumer with a `Mode` enum of `DEAD_LETTER` and `LISTENER` ([`event_listener.py:15‑26`](#citations)).
-- **`monitoring.py`** — an infrastructure‑metrics daemon on a 60‑second loop (`sleep(60)`, [`monitoring.py:171`](#citations)).
+- **`event_listener.py`** — a PostgreSQL `LISTEN`/`NOTIFY` consumer with a `Mode` enum of `DEAD_LETTER` and `LISTENER` ([`event_listener.py:15‑26`](#citations-appendix)).
+- **`monitoring.py`** — an infrastructure‑metrics daemon on a 60‑second loop (`sleep(60)`, [`monitoring.py:171`](#citations-appendix)).
 
 Together these correspond to the project's documented six‑process model: Web App, SMTP Handler, Job Runner, Cron Scheduler, Event Listener, and a Monitoring Daemon.
 
@@ -144,10 +144,10 @@ Together these correspond to the project's documented six‑process model: Web A
 
 All processes use a single centralized logger, `LOG`, defined in `app/log.py`. Understanding its format is what lets a newcomer *read* the health signals:
 
-- **Writes to stdout** via `logging.StreamHandler(sys.stdout)` ([`app/log.py:41`](#citations)), with UTC timestamps (`converter = time.gmtime`).
-- **Format** ([`app/log.py:12‑14`](#citations)) includes: timestamp, logger name (`SL`), level, process id, the **call site** `"pathname:lineno"`, the function name, a **message‑id** correlation token, and the message.
-- **Message‑id correlation** via `set_message_id` ([`app/log.py:22`](#citations)) — every log line emitted while processing one email shares the same id, so you can follow a single message end‑to‑end (demonstrated in [Q2.3](#q23-have-the-alias-receive-an-email)).
-- **Colorized output** via `coloredlogs` when `COLOR_LOG` is set ([`app/log.py:61‑62`](#citations)). Note that `COLOR_LOG` is **commented out** in `example.env` (`# COLOR_LOG=true`, [`example.env:16`](#citations)), but the local dev entry point `local_main()` forces `config.COLOR_LOG = True` ([`server.py:573`](#citations)) — so running `python3 server.py` locally yields colored logs even though the env var is unset.
+- **Writes to stdout** via `logging.StreamHandler(sys.stdout)` ([`app/log.py:41`](#citations-appendix)), with UTC timestamps (`converter = time.gmtime`).
+- **Format** ([`app/log.py:12‑14`](#citations-appendix)) includes: timestamp, logger name (`SL`), level, process id, the **call site** `"pathname:lineno"`, the function name, a **message‑id** correlation token, and the message.
+- **Message‑id correlation** via `set_message_id` ([`app/log.py:22`](#citations-appendix)) — every log line emitted while processing one email shares the same id, so you can follow a single message end‑to‑end (demonstrated in [Q2.3](#q23-have-the-alias-receive-an-email)).
+- **Colorized output** via `coloredlogs` when `COLOR_LOG` is set ([`app/log.py:61‑62`](#citations-appendix)). Note that `COLOR_LOG` is **commented out** in `example.env` (`# COLOR_LOG=true`, [`example.env:16`](#citations-appendix)), but the local dev entry point `local_main()` forces `config.COLOR_LOG = True` ([`server.py:573`](#citations-appendix)) — so running `python3 server.py` locally yields colored logs even though the env var is unset.
 
 A real captured line looks like this (note the embedded `server.py:284` call site and empty message‑id for a normal web request):
 
@@ -174,7 +174,7 @@ A real captured line looks like this (note the embedded `server.py:284` call sit
   def healthcheck():
       return "success", 200
   ```
-- The index route redirects based on authentication — authenticated users to the dashboard, anonymous users to the login page ([`server.py:250‑255`](#citations)):
+- The index route redirects based on authentication — authenticated users to the dashboard, anonymous users to the login page ([`server.py:250‑255`](#citations-appendix)):
   ```python
   @app.route("/", methods=["GET", "POST"])
   def index():
@@ -183,9 +183,9 @@ A real captured line looks like this (note the embedded `server.py:284` call sit
       else:
           return redirect(url_for("auth.login"))
   ```
-- Per‑request logging is emitted by the `after_request` hook via `LOG.d("%s %s %s %s %s, takes %s", …)` ([`server.py:284‑292`](#citations)).
-- Supplementary monitor endpoints are mounted by the monitor blueprint at `url_prefix="/"` ([`app/monitor/base.py:3`](#citations)): `/git` → build SHA1 ([`app/monitor/views.py:5‑7`](#citations)), `/live` → `"live"` ([`app/monitor/views.py:10‑12`](#citations)), and `/exception` → deliberately raises to test Sentry ([`app/monitor/views.py:15‑18`](#citations)).
-- The full blueprint set registered on the app is `auth`, `monitor`, `dashboard`, `developer`, `phone`, `oauth` (mounted at **both** `/oauth` and `/oauth2`), `onboarding`, `discover`, `internal`, and `api` ([`server.py:233‑246`](#citations)) — so a `200` from the app means this entire routing surface is mounted.
+- Per‑request logging is emitted by the `after_request` hook via `LOG.d("%s %s %s %s %s, takes %s", …)` ([`server.py:284‑292`](#citations-appendix)).
+- Supplementary monitor endpoints are mounted by the monitor blueprint at `url_prefix="/"` ([`app/monitor/base.py:3`](#citations-appendix)): `/git` → build SHA1 ([`app/monitor/views.py:5‑7`](#citations-appendix)), `/live` → `"live"` ([`app/monitor/views.py:10‑12`](#citations-appendix)), and `/exception` → deliberately raises to test Sentry ([`app/monitor/views.py:15‑18`](#citations-appendix)).
+- The full blueprint set registered on the app is `auth`, `monitor`, `dashboard`, `developer`, `phone`, `oauth` (mounted at **both** `/oauth` and `/oauth2`), `onboarding`, `discover`, `internal`, and `api` ([`server.py:233‑246`](#citations-appendix)) — so a `200` from the app means this entire routing surface is mounted.
 
 **Observed runtime signal (reproducible).**
 
@@ -206,7 +206,7 @@ $ curl http://localhost:7777/git  ;  # -> dev   (the build SHA1; "dev" in this b
 
 Loading `http://localhost:7777/` in a browser redirected to `/auth/login` (page title *"Login | SimpleLogin"*) and, after signing in as `john@wick.com`, landed on `/dashboard/` showing the alias‑management UI (the **"+ New Custom Alias"** and **"Random Alias"** controls — see [Q2.2](#q22-create-an-alias)). That round trip is itself proof that the sign‑in and alias‑management surfaces are reachable.
 
-**⚠ Accuracy refinement (a) — `/health` produces NO request‑log line.** `/health` is **deliberately excluded** from the `after_request` logging block (`not request.path.startswith("/health")`, [`server.py:281`](#citations)) and from the profiler's ignore list ([`server.py:195`](#citations)). So a health probe returns `200` but emits **no** per‑request log line. This was verified directly: after probing `/health` several times and `/auth/login` once, the web log contained **0** lines mentioning `GET /health` and **4** mentioning `GET /auth/login`:
+**⚠ Accuracy refinement (a) — `/health` produces NO request‑log line.** `/health` is **deliberately excluded** from the `after_request` logging block (`not request.path.startswith("/health")`, [`server.py:281`](#citations-appendix)) and from the profiler's ignore list ([`server.py:195`](#citations-appendix)). So a health probe returns `200` but emits **no** per‑request log line. This was verified directly: after probing `/health` several times and `/auth/login` once, the web log contained **0** lines mentioning `GET /health` and **4** mentioning `GET /auth/login`:
 
 ```text
 # /app/web.log — a real route IS logged (note the self-cited server.py:284):
@@ -236,7 +236,7 @@ Loading `http://localhost:7777/` in a browser redirected to `/auth/login` (page 
       while True:
           time.sleep(2)                                                        # :2392-2393
   ```
-- The `__main__` block defaults the port to `20381` ([`email_handler.py:2399`](#citations)) and logs the "Listen for port" line just before calling `main()`:
+- The `__main__` block defaults the port to `20381` ([`email_handler.py:2399`](#citations-appendix)) and logs the "Listen for port" line just before calling `main()`:
   ```python
   # email_handler.py:2403-2404
   LOG.i("Listen for port %s", args.port)
@@ -259,7 +259,7 @@ $ (probe 127.0.0.1:20381)
 220 <hostname> Python SMTP 1.4.2
 ```
 
-**Rationale (why this proves it).** `controller.start()` ([`email_handler.py:2385`](#citations)) binds and begins serving *before* the "Start mail controller" line is logged, so seeing that line means the bind succeeded. The `220 … Python SMTP 1.4.2` banner is the protocol‑level proof that the socket is open and the aiosmtpd server (version 1.4.2) is responding — independent of the application logs. (A definitive end‑to‑end proof — actually accepting and forwarding a message — is shown in [Q2.3](#q23-have-the-alias-receive-an-email).)
+**Rationale (why this proves it).** `controller.start()` ([`email_handler.py:2385`](#citations-appendix)) binds and begins serving *before* the "Start mail controller" line is logged, so seeing that line means the bind succeeded. The `220 … Python SMTP 1.4.2` banner is the protocol‑level proof that the socket is open and the aiosmtpd server (version 1.4.2) is responding — independent of the application logs. (A definitive end‑to‑end proof — actually accepting and forwarding a message — is shown in [Q2.3](#q23-have-the-alias-receive-an-email).)
 
 ### Q1.3 Job runner
 
@@ -281,9 +281,9 @@ if __name__ == "__main__":
             time.sleep(10)                                   # :347
 ```
 
-A crucial nuance lives in `get_jobs_to_run()` ([`job_runner.py:307`](#citations)): it selects **only** jobs that are `ready` (or `taken` but stale) **and** whose `run_at` is null or due. So an idle job runner legitimately logs nothing between polls.
+A crucial nuance lives in `get_jobs_to_run()` ([`job_runner.py:307‑326`](#citations-appendix)): it selects jobs that are `ready` **or** `taken`‑but‑stale (state `taken` with `taken_at` older than `JOB_TAKEN_RETRY_WAIT_MINS` and `attempts < JOB_MAX_ATTEMPTS`), **and** whose `run_at` is **null or within the next 10 minutes** — the filter is `or_(Job.run_at.is_(None), Job.run_at <= arrow.now().shift(minutes=+10))` ([`job_runner.py:312,323`](#citations-appendix)). That 10‑minute look‑ahead is why a near‑future job can be consumed slightly before its scheduled time; an idle job runner with no eligible jobs legitimately logs nothing between polls.
 
-**Observed runtime signal (reproducible).** To prove the loop is alive, enqueue a job and watch it get consumed within ~10 s. A deliberately unknown job name is used so there are **no side effects** — `process_job` simply logs `Unknown job name …` via its `else` branch ([`job_runner.py:303‑304`](#citations)):
+**Observed runtime signal (reproducible).** To prove the loop is alive, enqueue a job and watch it get consumed within ~10 s. A deliberately unknown job name is used so there are **no side effects** — `process_job` simply logs `Unknown job name …` via its `else` branch ([`job_runner.py:303‑304`](#citations-appendix)):
 
 ```text
 # after inserting a Job(name="blitzy-verification-noop", state=ready):
@@ -291,7 +291,7 @@ A crucial nuance lives in `get_jobs_to_run()` ([`job_runner.py:307`](#citations)
 2026-06-26 18:50:19,507 - SL - ERROR - 2993 - "/app/job_runner.py:304" - process_job() -  - Unknown job name blitzy-verification-noop
 ```
 
-The job's row then transitioned to `state = 2` (`done`, per the `JobState` enum at [`app/models.py:253‑256`](#citations)).
+The job's row then transitioned to `state = 2` (`done`, per the `JobState` enum at [`app/models.py:253‑256`](#citations-appendix)).
 
 **Rationale (why this proves it).** The pair of lines proves the *entire* loop body executed: the runner **selected** a due job (`get_jobs_to_run`), **logged taking it** (`job_runner.py:334`), **invoked `process_job`** (`job_runner.py:304` is inside it), and **marked it done** (`state=2`). Seeing this happen within ~10 s of enqueueing — and a quiet loop otherwise — is exactly what a healthy poll‑based worker looks like.
 
@@ -315,7 +315,7 @@ The end‑to‑end flow and its signals are summarized here, then detailed below
 
 **Answer.** A new account is created through `POST /auth/register`, which creates a `User` with `activated=False` and sends an activation email; clicking the activation link (`GET /auth/activate?code=…`) flips `activated` to `True`, logs the user in, and consumes the single‑use code.
 
-**Code evidence — registration** ([`app/auth/views/register.py`](#citations)):
+**Code evidence — registration** ([`app/auth/views/register.py`](#citations-appendix)):
 
 ```python
 @auth_bp.route("/register", methods=["GET", "POST"])     # :31
@@ -333,7 +333,7 @@ def register():
     return render_template("auth/register_waiting_activation.html")   # :104
 ```
 
-**Code evidence — activation** ([`app/auth/views/activate.py`](#citations)):
+**Code evidence — activation** ([`app/auth/views/activate.py`](#citations-appendix)):
 
 ```python
 @auth_bp.route("/activate", methods=["GET", "POST"])     # :13
@@ -349,7 +349,7 @@ def activate():
     flash("Your account has been activated", "success")  # :56
 ```
 
-**Verification shortcut.** Because the seeded `john@wick.com` account is created **already activated** and as an **admin** ([`app/fake_data.py:44‑49`](#citations)), you can demonstrate registration/activation as a *separate* exercise from alias/email testing.
+**Verification shortcut.** Because the seeded `john@wick.com` account is created **already activated** and as an **admin** ([`app/fake_data.py:44‑49`](#citations-appendix)), you can demonstrate registration/activation as a *separate* exercise from alias/email testing.
 
 **Observed runtime signal (reproducible).** Driving the real HTTP routes with a fresh session (anonymous, so registration is allowed):
 
@@ -385,13 +385,13 @@ GET /auth/activate?code=<single-use code>  -> 302 FOUND
  activation_code rows for that user   : 0             <-- single-use code deleted
 ```
 
-**Rationale (why this proves it).** The transition `activated: f → t` together with the activation‑code row disappearing maps **exactly** to the code: `user.activated = True` ([`activate.py:49`](#citations)) and `ActivationCode.delete(...)` ([`activate.py:53`](#citations)). The `302` is the post‑login redirect that follows `login_user(user)` ([`activate.py:50`](#citations)). The `200 → "waiting activation"` page maps to `render_template("auth/register_waiting_activation.html")` ([`register.py:104`](#citations)), and the un‑activated `User` plus the `ActivationCode` row map to `User.create(...)` ([`register.py:86`](#citations)) followed by `send_activation_email(...)` ([`register.py:95`](#citations)). Every observed signal has a one‑to‑one source counterpart.
+**Rationale (why this proves it).** The transition `activated: f → t` together with the activation‑code row disappearing maps **exactly** to the code: `user.activated = True` ([`activate.py:49`](#citations-appendix)) and `ActivationCode.delete(...)` ([`activate.py:53`](#citations-appendix)). The `302` is the post‑login redirect that follows `login_user(user)` ([`activate.py:50`](#citations-appendix)). The `200 → "waiting activation"` page maps to `render_template("auth/register_waiting_activation.html")` ([`register.py:104`](#citations-appendix)), and the un‑activated `User` plus the `ActivationCode` row map to `User.create(...)` ([`register.py:86`](#citations-appendix)) followed by `send_activation_email(...)` ([`register.py:95`](#citations-appendix)). Every observed signal has a one‑to‑one source counterpart.
 
 ### Q2.2 Create an alias
 
 **Answer.** From the dashboard, the **"Random Alias"** button issues a `POST` with `form-name=create-random-email`, which calls `Alias.create_new_random(...)`, commits a new `Alias` row, logs the creation, and flashes a confirmation.
 
-**Code evidence** ([`app/dashboard/views/index.py`](#citations)):
+**Code evidence** ([`app/dashboard/views/index.py`](#citations-appendix)):
 
 ```python
 @dashboard_bp.route("/", methods=["GET", "POST"])        # :55
@@ -407,7 +407,7 @@ elif request.form.get("form-name") == "create-random-email":   # :97
         flash(f"Alias {alias.email} has been created", "success")             # :111
 ```
 
-The dashboard template renders the alias list and controls, and surfaces per‑account activity statistics — **"New Custom Alias"** ([`templates/dashboard/index.html:46`](#citations)) and **"Random Alias"** ([`templates/dashboard/index.html:56`](#citations)) controls, plus the stats `nb_alias` ([line 131](#citations)), `nb_forward` ([line 145](#citations)), `nb_reply` ([line 159](#citations)), and `nb_block` ([line 173](#citations)). A custom‑alias path also exists (`app/dashboard/views/custom_alias.py`), with shared logic in `app/alias_utils.py`.
+The dashboard template renders the alias list and controls, and surfaces per‑account activity statistics — **"New Custom Alias"** ([`templates/dashboard/index.html:46`](#citations-appendix)) and **"Random Alias"** ([`templates/dashboard/index.html:56`](#citations-appendix)) controls, plus the stats `nb_alias` ([line 131](#citations-appendix)), `nb_forward` ([line 145](#citations-appendix)), `nb_reply` ([line 159](#citations-appendix)), and `nb_block` ([line 173](#citations-appendix)). A custom‑alias path also exists (`app/dashboard/views/custom_alias.py`), with shared logic in `app/alias_utils.py`.
 
 **Observed runtime signal (reproducible).** Clicking **"Random Alias"** in the dashboard (logged in as `john@wick.com`) navigated to `/dashboard/?highlight_alias_id=13&…` and rendered a new, highlighted card **`word_list342@sl.local`** labeled *"Created just now."* The alias is on the `@sl.local` domain (matching `EMAIL_DOMAIN`, see [Q2.4](#q24-the-critical-local-mode-nuance-not_send_email)). The server log self‑cites `dashboard/views/index.py:110`:
 
@@ -417,7 +417,7 @@ The dashboard template renders the alias list and controls, and surfaces per‑a
 
 …and the database held the corresponding row: `alias.id=13`, `email=word_list342@sl.local`, `user_id=1` (John), `enabled=true`.
 
-**Rationale (why this proves it).** The new `Alias` row plus the self‑citing `index.py:110` log line are the direct outputs of `Alias.create_new_random(...)` ([`index.py:104`](#citations)) and its `LOG.d(...)` ([`index.py:110`](#citations)); the `highlight_alias_id=13` query parameter on the redirect and the "Created just now" card are the user‑visible confirmation that the flash ([`index.py:111`](#citations)) describes. The route is `@login_required` ([`index.py:56`](#citations)), so reaching it at all confirms the authenticated session from Q1.
+**Rationale (why this proves it).** The new `Alias` row plus the self‑citing `index.py:110` log line are the direct outputs of `Alias.create_new_random(...)` ([`index.py:104`](#citations-appendix)) and its `LOG.d(...)` ([`index.py:110`](#citations-appendix)); the `highlight_alias_id=13` query parameter on the redirect and the "Created just now" card are the user‑visible confirmation that the flash ([`index.py:111`](#citations-appendix)) describes. The route is `@login_required` ([`index.py:56`](#citations-appendix)), so reaching it at all confirms the authenticated session from Q1.
 
 ### Q2.3 Have the alias receive an email
 
@@ -425,15 +425,15 @@ The dashboard template renders the alias list and controls, and surfaces per‑a
 
 **Code evidence.**
 
-- Routing hub: `def handle(envelope, msg) -> str` ([`email_handler.py:1945`](#citations)) classifies the message and dispatches.
-- Forward phase: `def handle_forward(...)` ([`email_handler.py:536`](#citations)) → `def forward_email_to_mailbox(...)` ([`email_handler.py:679`](#citations)).
-- Contact resolution: `get_or_create_contact(...)` ([`email_handler.py:581`](#citations)).
-- `EmailLog` creation: `EmailLog.create(...)` spans [`email_handler.py:732‑739`](#citations), immediately followed by `LOG.d("Create %s for %s, %s, %s", email_log, …)` at [`email_handler.py:740`](#citations). (A separate blocked‑path `EmailLog.create(...)` with the alias disabled lives at [`email_handler.py:598`](#citations).)
-- Per‑message brackets: the entry `LOG.i("New message, mail from %s, rctp tos %s ", …)` — **the source contains the typo `rctp` (for "rcpt"), preserved verbatim here** — is the statement spanning [`email_handler.py:2343‑2347`](#citations) (the format string is on line 2344; the `LOG.i(` call begins on line 2343). The exit `LOG.i("Finish mail_from %s, rcpt_tos %s, takes %s seconds with return code '%s'<<===", …)` is the statement spanning [`email_handler.py:2367‑2373`](#citations) (format string on line 2368; `LOG.i(` call begins on line 2367).
+- Routing hub: `def handle(envelope, msg) -> str` ([`email_handler.py:1945`](#citations-appendix)) classifies the message and dispatches.
+- Forward phase: `def handle_forward(...)` ([`email_handler.py:536`](#citations-appendix)) → `def forward_email_to_mailbox(...)` ([`email_handler.py:679`](#citations-appendix)).
+- Contact resolution: `get_or_create_contact(...)` ([`email_handler.py:581`](#citations-appendix)).
+- `EmailLog` creation: `EmailLog.create(...)` spans [`email_handler.py:732‑739`](#citations-appendix), immediately followed by `LOG.d("Create %s for %s, %s, %s", email_log, …)` at [`email_handler.py:740`](#citations-appendix). (A separate blocked‑path `EmailLog.create(...)` with the alias disabled lives at [`email_handler.py:598`](#citations-appendix).)
+- Per‑message brackets: the entry `LOG.i("New message, mail from %s, rctp tos %s ", …)` — **the source contains the typo `rctp` (for "rcpt"), preserved verbatim here** — is the statement spanning [`email_handler.py:2343‑2347`](#citations-appendix) (the format string is on line 2344; the `LOG.i(` call begins on line 2343). The exit `LOG.i("Finish mail_from %s, rcpt_tos %s, takes %s seconds with return code '%s'<<===", …)` is the statement spanning [`email_handler.py:2367‑2373`](#citations-appendix) (format string on line 2368; `LOG.i(` call begins on line 2367).
 
 > **Why the cited line and the runtime line can differ by one.** Python's logging records the line where the `LOG.x(` *call* begins. For these two multi‑line calls that is `2343` and `2367`, whereas the human‑readable message *string literal* is on the next line (`2344` and `2368`). Both are reported here so the citation is exact either way. The same applies to the `EmailLog` `LOG.d` whose call is on `740` while the `EmailLog.create(...)` it describes spans `732‑739`.
 
-**Observed runtime signal (reproducible).** A test message was sent with Python's `smtplib` to `word_list342@sl.local` via `127.0.0.1:20381` (the project's documented tool is `swaks --to <alias>@sl.local --from hey@google.com --server 127.0.0.1:20381`, [`CONTRIBUTING.md:218`](#citations); `swaks` is not present in this image, so `smtplib` was used to the same effect, and the SMTP server returned `250`). The handler produced a complete, single‑message trace in which **every line shares the same message‑id** (`f5101992‑…`), demonstrating the `set_message_id` correlation from [§0.5](#05-the-centralized-logger). The lines self‑cite their source:
+**Observed runtime signal (reproducible).** A test message was sent with Python's `smtplib` to `word_list342@sl.local` via `127.0.0.1:20381` (the project's documented tool is `swaks --to <alias>@sl.local --from hey@google.com --server 127.0.0.1:20381`, [`CONTRIBUTING.md:218`](#citations-appendix); `swaks` is not present in this image, so `smtplib` was used to the same effect, and the SMTP server returned `250`). The handler produced a complete, single‑message trace in which **every line shares the same message‑id** (`f5101992‑…`), demonstrating the `set_message_id` correlation from [§0.5](#05-the-centralized-logger). The lines self‑cite their source:
 
 ```text
 "/app/email_handler.py:2343" _handle()                New message, mail from hey@google.com, rctp tos ['word_list342@sl.local']
@@ -447,25 +447,25 @@ The dashboard template renders the alias list and controls, and surfaces per‑a
 "/app/email_handler.py:2367" _handle()                Finish mail_from hey@google.com, rcpt_tos ['word_list342@sl.local'], takes 0.0516 seconds with return code '250 Message accepted for delivery'<<===
 ```
 
-Database deltas confirmed a **new `Contact`** (`hey@google.com`, for alias 13) and a **new `EmailLog`** row (the `email_log` and `contact` counts each incremented by one). The `EmailLog`/`Contact`/`Alias` models live at [`app/models.py:2060 / 1863 / 1469`](#citations).
+Database deltas confirmed a **new `Contact`** (`hey@google.com`, for alias 13) and a **new `EmailLog`** row (the `email_log` and `contact` counts each incremented by one). The `EmailLog`/`Contact`/`Alias` models live at [`app/models.py:2060 / 1863 / 1469`](#citations-appendix).
 
-**Rationale (why this proves it).** The "New message" entry line ([`email_handler.py:2343‑2347`](#citations)) proves the SMTP server *accepted* the envelope; the "Finish mail_from … return code '250 …'" exit line ([`email_handler.py:2367‑2373`](#citations)) proves it *finished successfully*. Between them, the self‑citing trace shows the exact code path the question is about — `handle()` → forward phase → `forward_email_to_mailbox()` resolving `Contact → Alias → Mailbox` and writing `EmailLog 2` ([`email_handler.py:740`](#citations)). The persistent `EmailLog` row is the durable proof that the alias *received and accounted for* the message; it is also what increments the dashboard's `nb_forward` statistic. The shared message‑id ties every line to this one message, so the evidence is unambiguous.
+**Rationale (why this proves it).** The "New message" entry line ([`email_handler.py:2343‑2347`](#citations-appendix)) proves the SMTP server *accepted* the envelope; the "Finish mail_from … return code '250 …'" exit line ([`email_handler.py:2367‑2373`](#citations-appendix)) proves it *finished successfully*. Between them, the self‑citing trace shows the exact code path the question is about — `handle()` → forward phase → `forward_email_to_mailbox()` resolving `Contact → Alias → Mailbox` and writing `EmailLog 2` ([`email_handler.py:740`](#citations-appendix)). The persistent `EmailLog` row is the durable proof that the alias *received and accounted for* the message; it is also what increments the dashboard's `nb_forward` statistic. The shared message‑id ties every line to this one message, so the evidence is unambiguous.
 
 ### Q2.4 The critical local‑mode nuance: `NOT_SEND_EMAIL`
 
 **This is the single most important thing to understand so you do not misread "no delivery" as a failure.**
 
-**Answer.** In local configuration, SimpleLogin **logs forwarded email content instead of transmitting it**. So after a successful inbound test you will see the message *logged*, and the alias's `EmailLog` row created — but no mail leaves the machine. That is correct, expected behavior.
+**Answer.** In local configuration, SimpleLogin **skips outbound SMTP entirely and logs the send metadata instead of transmitting the message**. Concretely, the `MailSender.send()` `NOT_SEND_EMAIL` branch logs the message's `subject`, `from`, and `to` headers — **not** the full MIME body — and returns success ([`app/mail_sender.py:130‑137`](#citations-appendix)). So after a successful inbound test you will see that send‑metadata line *logged*, and the alias's `EmailLog` row created — but no mail leaves the machine. That is correct, expected behavior.
 
 **Code evidence.**
 
-- `example.env` sets `NOT_SEND_EMAIL=true` ([`example.env:19`](#citations), with the comment *"Only print email content, not sending it, for local development"* on line 18) and `EMAIL_DOMAIN=sl.local` ([`example.env:22`](#citations)).
-- The flag is read in `app/config.py` as **membership**, not value: `NOT_SEND_EMAIL = "NOT_SEND_EMAIL" in os.environ` ([`app/config.py:91`](#citations)). **Subtlety:** the flag is enabled whenever the variable is *present at all* — even `NOT_SEND_EMAIL=false` would still enable log‑only mode, because only the *presence* of the key is checked.
-- The decisive branch is in `MailSender.send()` ([`app/mail_sender.py:130‑137`](#citations)): when `config.NOT_SEND_EMAIL` is truthy it logs `LOG.d("send email with subject '%s', from '%s' to '%s'", …)` and `return True` **without** calling `_send_to_smtp`.
+- `example.env` sets `NOT_SEND_EMAIL=true` ([`example.env:19`](#citations-appendix), with the comment *"Only print email content, not sending it, for local development"* on line 18) and `EMAIL_DOMAIN=sl.local` ([`example.env:22`](#citations-appendix)).
+- The flag is read in `app/config.py` as **membership**, not value: `NOT_SEND_EMAIL = "NOT_SEND_EMAIL" in os.environ` ([`app/config.py:91`](#citations-appendix)). **Subtlety:** the flag is enabled whenever the variable is *present at all* — even `NOT_SEND_EMAIL=false` would still enable log‑only mode, because only the *presence* of the key is checked.
+- The decisive branch is in `MailSender.send()` ([`app/mail_sender.py:130‑137`](#citations-appendix)): when `config.NOT_SEND_EMAIL` is truthy it logs `LOG.d("send email with subject '%s', from '%s' to '%s'", …)` and `return True` **without** calling `_send_to_smtp`.
 
 **Observed runtime signal.** Both the activation email ([Q2.1](#q21-create-an-account-register--activate)) and the forwarded test message ([Q2.3](#q23-have-the-alias-receive-an-email)) appeared as `send()` log lines self‑citing `app/mail_sender.py:131` — and no external delivery occurred. `EMAIL_DOMAIN=sl.local` is also why the test alias had to be `…@sl.local` for the inbound message to be routed to it.
 
-**Rationale (why this proves it).** The `return True` after logging ([`app/mail_sender.py:137`](#citations)) means the application treats the send as successful while skipping the actual SMTP transmission. Therefore the *correct* success signal in local mode is the `send email with subject …` log line plus the persisted `EmailLog` row — **not** an outbound message. A newcomer who looks for delivered mail and finds none has not found a bug; they have found `NOT_SEND_EMAIL=true` working as designed.
+**Rationale (why this proves it).** The `return True` after logging ([`app/mail_sender.py:137`](#citations-appendix)) means the application treats the send as successful while skipping the actual SMTP transmission. Therefore the *correct* success signal in local mode is the `send email with subject …` log line plus the persisted `EmailLog` row — **not** an outbound message. A newcomer who looks for delivered mail and finds none has not found a bug; they have found `NOT_SEND_EMAIL=true` working as designed.
 
 
 ---
@@ -480,9 +480,9 @@ Database deltas confirmed a **new `Contact`** (`hey@google.com`, for alias 13) a
 
 **Code evidence — each is its own program with its own loop.**
 
-- **Email handler:** has its own `main()` and `__main__` block, and an infinite loop: `Controller(...).start()` then `while True: time.sleep(2)` ([`email_handler.py:2381‑2393`](#citations)), driven from the `__main__` entry at [`email_handler.py:2403‑2404`](#citations).
-- **Job runner:** has its own `__main__` block with `while True: … time.sleep(10)` ([`job_runner.py:329‑347`](#citations)).
-- **Web server:** `create_app()` only calls `register_blueprints(app)` ([`server.py:233‑246`](#citations)) and the local entry point `local_main()` only configures and calls `app.run(debug=True, port=7777)` ([`server.py:572‑587`](#citations)). **There is no `subprocess`, `Popen`, `os.fork`, thread, or import‑side launch of `email_handler.py` or `job_runner.py` anywhere in the web startup path.** The web app and the two workers share only the **PostgreSQL database** (and Redis) — that is the coupling, not process parenting.
+- **Email handler:** has its own `main()` and `__main__` block, and an infinite loop: `Controller(...).start()` then `while True: time.sleep(2)` ([`email_handler.py:2381‑2393`](#citations-appendix)), driven from the `__main__` entry at [`email_handler.py:2403‑2404`](#citations-appendix).
+- **Job runner:** has its own `__main__` block with `while True: … time.sleep(10)` ([`job_runner.py:329‑347`](#citations-appendix)).
+- **Web server:** `create_app()` only calls `register_blueprints(app)` ([`server.py:233‑246`](#citations-appendix)) and the local entry point `local_main()` only configures and calls `app.run(debug=True, port=7777)` ([`server.py:572‑587`](#citations-appendix)). **There is no `subprocess`, `Popen`, `os.fork`, thread, or import‑side launch of `email_handler.py` or `job_runner.py` anywhere in the web startup path.** The web app and the two workers share only the **PostgreSQL database** (and Redis) — that is the coupling, not process parenting.
 
 **Observed runtime signal — process independence (the decisive proof).** Inspecting the process table with parent‑PID shows the relationships unambiguously:
 
@@ -500,17 +500,17 @@ The web master (PID 55) has exactly two children — its own Gunicorn workers (7
 **Observed runtime signal — they function while the app is active.**
 
 - *Email handler functioning:* the complete inbound‑mail trace in [Q2.3](#q23-have-the-alias-receive-an-email) (entry "New message", `EmailLog 2` written, exit "Finish mail_from … 250") shows the handler accepting and forwarding live traffic on `:20381` while the web app served the dashboard.
-- *Job runner functioning:* the [Q1.3](#q13-job-runner) demonstration — enqueue a `Job`, observe `Take job …` ([`job_runner.py:334`](#citations)) and the `process_job` dispatch ([`job_runner.py:304`](#citations)) within ~10 s, and the row reaching `state=done` — proves the runner is consuming enqueued `Job` rows on its poll cycle.
+- *Job runner functioning:* the [Q1.3](#q13-job-runner) demonstration — enqueue a `Job`, observe `Take job …` ([`job_runner.py:334`](#citations-appendix)) and the `process_job` dispatch ([`job_runner.py:304`](#citations-appendix)) within ~10 s, and the row reaching `state=done` — proves the runner is consuming enqueued `Job` rows on its poll cycle.
 
 **Supporting background daemons (corroborating the documented six‑process model).** Three more processes exist, and — importantly — they are **also launched explicitly or on a schedule, not spawned by the web app**:
 
 - `cron.py` — scheduled maintenance run by `yacron` per `crontab.yml` / `crontab-all-hosts.yml` (entries like `python /code/cron.py -j <job>`).
-- `event_listener.py` — a PostgreSQL `LISTEN`/`NOTIFY` consumer with a `Mode` enum (`DEAD_LETTER`, `LISTENER`) ([`event_listener.py:15‑26`](#citations)).
-- `monitoring.py` — a metrics daemon on a 60‑second loop ([`monitoring.py:171`](#citations)).
+- `event_listener.py` — a PostgreSQL `LISTEN`/`NOTIFY` consumer with a `Mode` enum (`DEAD_LETTER`, `LISTENER`) ([`event_listener.py:15‑26`](#citations-appendix)).
+- `monitoring.py` — a metrics daemon on a 60‑second loop ([`monitoring.py:171`](#citations-appendix)).
 
-Together with the web app, SMTP handler, and job runner, these make up the documented architecture of six persistent processes plus a monitoring daemon.
+Together with the web app, SMTP handler, and job runner, these make up the documented six‑process model, which already includes the monitoring daemon.
 
-**Models backing all of these observations** ([`app/models.py`](#citations)): `User` (line 336), `ActivationCode` (line 1202), `Alias` (line 1469), `Contact` (line 1863), `EmailLog` (line 2060), `Job` (line 2683).
+**Models backing all of these observations** ([`app/models.py`](#citations-appendix)): `User` (line 336), `ActivationCode` (line 1202), `Alias` (line 1469), `Contact` (line 1863), `EmailLog` (line 2060), `Job` (line 2683).
 
 **Rationale (why this proves it).** The question "do they come online in the background?" has a precise, code‑grounded answer: yes, they run as background processes — but they are **independent**, evidenced by (1) each having its own `__main__` and infinite loop, (2) the web startup path containing no spawn of them, and (3) the process table showing they are not children of the web master. "Functioning as intended" is then proved by *behavioral* evidence under two different situations: an inbound email produces a forward + `EmailLog` (handler), and an enqueued job is taken and completed within one poll interval (runner). The shared coupling is the database, which is exactly why all three can cooperate without any one launching another.
 
@@ -521,7 +521,7 @@ Together with the web app, SMTP handler, and job runner, these make up the docum
 
 The verification strategy throughout this document follows one discipline: **isolate the smallest signal that can only be produced if the component is actually working, and tie it to the exact code that produces it.**
 
-- **Q1 — Health.** A liveness check should have *no side effects* so a positive result cannot be a false positive caused by some other working subsystem. `/health` is perfect for this: it returns a constant `("success", 200)` with no DB access ([`server.py:213‑215`](#citations)), so a `200` isolates "the WSGI app is routing and a worker is alive." The email handler and job runner have no HTTP surface, so their honest liveness signals are their **startup log lines** (`email_handler.py:2386/2403`) and their **loop behavior** (`job_runner.py:334`). The one subtlety a newcomer must know is that `/health` is intentionally *silent* in the request log ([`server.py:281`, `195`](#citations)) — silence there is health, not failure.
+- **Q1 — Health.** A liveness check should have *no side effects* so a positive result cannot be a false positive caused by some other working subsystem. `/health` is perfect for this: it returns a constant `("success", 200)` with no DB access ([`server.py:213‑215`](#citations-appendix)), so a `200` isolates "the WSGI app is routing and a worker is alive." The email handler and job runner have no HTTP surface, so their honest liveness signals are their **startup log lines** (`email_handler.py:2386/2403`) and their **loop behavior** (`job_runner.py:334`). The one subtlety a newcomer must know is that `/health` is intentionally *silent* in the request log ([`server.py:281`, `195`](#citations-appendix)) — silence there is health, not failure.
 - **Q2 — Actions.** Each user action was driven through its **real route or real SMTP port**, and verified against a **durable artifact** (a database row) rather than a transient UI message alone — because rows are unambiguous and reproducible. Register → an un‑activated `User` + `ActivationCode`; activate → `activated=true` + code deleted; create alias → a new `Alias` row + self‑citing log; receive email → a new `EmailLog` + `Contact` and the "New message"/"Finish mail_from" bracket. The `NOT_SEND_EMAIL` nuance is called out explicitly because it is the most common way a correct local deployment is *mistaken* for a broken one.
 - **Q3 — Background components.** The answer is deliberately phrased to avoid over‑claiming "automatic" startup. The proof is layered: a **code** reading (each has its own loop; the web app spawns nothing), a **structural** runtime observation (process table parentage), and **behavioral** runtime observations (a forwarded email; a consumed job). Three independent angles converging on the same conclusion is what makes the answer trustworthy.
 
@@ -533,8 +533,8 @@ In every case the runtime evidence and the code citation reinforce each other �
 
 All verification data created while capturing the observations above were **ephemeral runtime database rows**, not repository files, and **every one was deleted** on completion using the application's own deletion logic:
 
-- The test alias created for the seeded user was removed with `delete_alias(alias, user)` ([`app/alias_utils.py:336`](#citations)) — the project's required path, since `Alias.delete` deliberately raises ([`app/models.py:1717`](#citations)). This cascaded its `Contact` and `EmailLog` rows.
-- The disposable test account was removed with `User.delete(id)` ([`app/models.py:671`](#citations)), which internally deletes the user's aliases and then the user.
+- The test alias created for the seeded user was removed with `delete_alias(alias, user)` ([`app/alias_utils.py:336`](#citations-appendix)) — the project's required path, since `Alias.delete` deliberately raises ([`app/models.py:1717`](#citations-appendix)). This cascaded its `Contact` and `EmailLog` rows.
+- The disposable test account was removed with `User.delete(id)` ([`app/models.py:671`](#citations-appendix)), which internally deletes the user's aliases and then the user.
 - The no‑op verification `Job` row was deleted.
 - The alias‑"trash" rows that `delete_alias` writes (`DeletedAlias`) for the two test aliases were also removed, leaving no residue.
 
@@ -588,7 +588,7 @@ Every claim above maps to one of the following `path:line` references (verified 
 | 25 | Exit "Finish mail_from … return code …" | `email_handler.py:2367-2373` (string at `2368`) |
 | 26 | Job runner poll loop & `Take job` & `time.sleep(10)` | `job_runner.py:329-347` (`Take job` at `334`, sleep at `347`) |
 | 27 | `process_job` dispatch + "Unknown job name" else‑branch | `job_runner.py:188, 303-304` |
-| 28 | `get_jobs_to_run()` selects only ready/due jobs | `job_runner.py:307` |
+| 28 | `get_jobs_to_run()` selects `ready` or stale‑`taken` jobs whose `run_at` is null or within the next 10 min (`run_at <= arrow.now().shift(minutes=+10)`) | `job_runner.py:307-326` (look‑ahead at `312`, comparison at `323`) |
 | 29 | Register route, `User.create`, `send_activation_email`, waiting page | `app/auth/views/register.py:31, 86, 95, 104` |
 | 30 | Activate route, `activated=True`, `login_user`, code delete, success flash | `app/auth/views/activate.py:13, 49, 50, 53, 56` |
 | 31 | Seeded `john@wick.com` created activated + admin | `app/fake_data.py:44-49` |
@@ -623,7 +623,7 @@ curl    http://localhost:7777/live       # -> live
 swaks --to <alias>@sl.local --from hey@google.com --server 127.0.0.1:20381
 #   -> "New message ... rctp tos ['<alias>@sl.local']"  and
 #   -> "Finish mail_from ... return code '250 Message accepted for delivery'"
-#   -> a new EmailLog row; with NOT_SEND_EMAIL the content is LOGGED, not sent.
+#   -> a new EmailLog row; with NOT_SEND_EMAIL the send metadata (subject/from/to) is LOGGED and outbound SMTP is skipped.
 
 # Q3 process independence:
 ps -eo pid,ppid,args | grep -E "gunicorn wsgi:app|email_handler.py|job_runner.py"
