@@ -22,7 +22,7 @@ that persists.
 All evidence was gathered inside the prescribed container image
 `andrewparkscaleai/coding-agent:simple-login__app__2cd6ee777f8c2d3531559588bcfb18627ffb5d2c`
 (from `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_simple-login_app_1.0`). It bundles
-**Python 3.10**, the Poetry‑managed dependencies, **Postgres**, and **Redis**. The app
+**Python 3.10**, the Poetry‑managed dependencies, **Postgres**, and **Redis**. The checkpoint/AAP prescribes the runtime as *Python 3.10 + Postgres 13 + Redis*; the provisioned container actually runs **Postgres 15.13** (verified at runtime: `SHOW server_version` returned `15.13 (Debian 15.13-0+deb12u1)`) alongside **Redis 7.0.15**. That Postgres major-version difference is immaterial to this investigation — none of the session, authentication, or email behaviors examined here depend on the database version. The app
 targets Python 3.10 with pinned legacy dependencies (Flask 1.1.2, itsdangerous 1.1.0,
 redis 4.6.0, SQLAlchemy 1.3.24, Werkzeug 1.0.1, flask‑login 0.5.0); the project notes
 that Python 3.12 does not work (`CONTRIBUTING.md:L236`), so the container's provisioned
@@ -64,7 +64,7 @@ with HTTP 200, and the SMTP handler announced `220 … Python SMTP 1.4.2` on por
 - API keys: **`Chrome`** with code **`code`** (`app/fake_data.py:L121-L122`) and
   **`Firefox`** with code **`codeFF`** (`app/fake_data.py:L124-L125`). These are sent in
   the `Authentication` request header.
-- Forwarding alias **`e1@sl.local`** → mailbox `john@wick.com` (used for Q5).
+- Forwarding alias **`e1@sl.local`** → mailbox `john@wick.com` (used for Q5). Seeded by `app/fake_data.py:L140,L146-L149` — odd-index aliases `e{i}@{FIRST_ALIAS_DOMAIN}` are created with `mailbox_id=user.default_mailbox_id` (the user's default mailbox, `john@wick.com`), and `FIRST_ALIAS_DOMAIN` resolves to `EMAIL_DOMAIN`=`sl.local` via `app/config.py:L168` and `example.env:L22`.
 
 ### Cleanup
 All probe scripts and capture files (`curl` cookie jars, a `redis-cli`/pickle reader, an
@@ -418,63 +418,111 @@ the identifier.)
 > stripped. Send an actual test email and examine the result."
 
 ### Method / commands
-With `NOT_SEND_EMAIL=true`, the live SMTP path does not emit the full forwarded message
-(it only logs a one‑line summary at `app/mail_sender.py:L130-L135`). To capture the
-**complete** forwarded headers while still exercising the **real** forward code, the
-running app's `mail_sender` was switched into its built‑in store mode
-(`store_emails_instead_of_sending`, `app/mail_sender.py:L102`) — the captured
-`SendRequest` is appended **before** the `NOT_SEND_EMAIL` early‑return
-(`app/mail_sender.py:L128-L135`). A crafted inbound message carrying all three headers was
-then pushed through the actual `email_handler.handle_forward(...)` to the seeded alias
-`e1@sl.local`, and the resulting forwarded message's headers were read back from the store.
+Per the question, an **actual inbound email was sent over SMTP** to the running handler
+(not an in-process function call). The inbound SMTP handler was started with
+`python3 email_handler.py` (aiosmtpd controller bound to `0.0.0.0:20381`,
+`email_handler.py:L2381-L2386,L2403`). A disposable `smtplib` client then opened a real
+SMTP transaction to `127.0.0.1:20381` and sent a crafted message — from an external
+sender to the seeded forwarding alias `e1@sl.local` (which maps to mailbox `john@wick.com`;
+`app/fake_data.py:L140,L146-L149`, `app/config.py:L168`, `example.env:L22`) — carrying all
+**three** probe headers: a custom `X-Custom-Probe-Header`, a `Received` header, and a
+`Reply-To` header.
 
 ```python
-# disposable in-process driver (deleted afterward)
-from app.mail_sender import mail_sender
-import email, email_handler
-msg = email.message_from_string(
-    "From: Outside Sender <outsider@gmail.com>\n"
-    "To: e1@sl.local\nSubject: Q5 Header Survival Probe\n"
-    "Reply-To: secret-replyto@external-example.com\n"
-    "Received: from probe.example.org (... [203.0.113.55]) by mx.sl.local ...\n"
-    "X-Custom-Probe-Header: CUSTOM_VALUE_SHOULD_BE_STRIPPED\n"
-    "Message-ID: <q5probe-unique@external-example.com>\n"
-    "Content-Type: text/plain; charset=utf-8\n\nbody\n")
-class Env: mail_from="outsider@gmail.com"; rcpt_tos=["e1@sl.local"]; mail_options=[]; rcpt_options=[]
-mail_sender.purge_stored_emails(); mail_sender.store_emails_instead_of_sending(True)
-email_handler.handle_forward(Env(), msg, "e1@sl.local")
-for sr in mail_sender.get_stored_emails(): print(dict(sr.msg.items()))
+# disposable SMTP client probe (deleted afterward) — sends a REAL inbound email to :20381
+import smtplib
+msg = (
+  "From: Outside Sender <outsider@gmail.com>\r\n"
+  "To: e1@sl.local\r\nSubject: Q5 SMTP Header Survival Probe\r\n"
+  "Reply-To: secret-replyto@external-example.com\r\n"
+  "Received: from probe.example.org (probe.example.org [203.0.113.55]) by mx.sl.local ...\r\n"
+  "X-Custom-Probe-Header: CUSTOM_VALUE_SHOULD_BE_STRIPPED\r\n"
+  "Message-ID: <q5probe-unique@external-example.com>\r\n"
+  "Content-Type: text/plain; charset=utf-8\r\n\r\nbody\r\n")
+s = smtplib.SMTP("127.0.0.1", 20381, timeout=30); s.ehlo("probe.example.org")
+s.sendmail("outsider@gmail.com", ["e1@sl.local"], msg); s.quit()
 ```
 
+Because the runtime keeps `NOT_SEND_EMAIL=true` (`example.env:L19`), the SMTP forward path
+does **not** print the full forwarded message — it writes a one-line summary and returns
+success (`app/mail_sender.py:L130-L137`; note the flag is *presence-based*:
+`NOT_SEND_EMAIL = "NOT_SEND_EMAIL" in os.environ`, `app/config.py:L91`). That observed fact
+is reported as **Capture A** below. To also obtain the **complete** forwarded headers
+*through the same real SMTP ingress*, a second run (**Capture B**) started a disposable
+local SMTP sink on `127.0.0.1:2525` and launched a second `email_handler.py` whose outbound
+relay was pointed at that sink (`POSTFIX_SERVER=127.0.0.1`, `POSTFIX_PORT=2525`,
+`app/mail_sender.py:L144-L177`) with `NOT_SEND_EMAIL` disabled via a **temporary copy** of
+the env file (`CONFIG=/tmp/q5.env`), so the repository's `.env` was never modified. The same
+crafted email was re-sent to `:20381` and the fully built forwarded message was read at the
+sink. The client, the sink, the temp env file, and all handler logs were deleted afterward.
+
 ### Captured runtime evidence
-`handle_forward(...)` returned `[(True, '250 Message accepted for delivery')]`. The
-**forwarded** message (envelope_to = `john@wick.com`) had exactly these headers:
+**Capture A — real SMTP send to `127.0.0.1:20381` (`NOT_SEND_EMAIL=true`).** The live SMTP
+transaction returned `250 Message accepted for delivery`, and the handler's own log shows
+the message traversing the real ingress -> forward pipeline:
 
 ```text
-Subject: Q5 Header Survival Probe
+# SMTP transaction (disposable client -> 127.0.0.1:20381)
+mail FROM:<outsider@gmail.com>            -> 250 OK
+rcpt TO:<e1@sl.local>                     -> 250 OK
+data ... <CR><LF>.<CR><LF>                -> 250 Message accepted for delivery
+
+# email_handler.py log lines (timestamps trimmed)
+New message, mail from outsider@gmail.com, rctp tos ['e1@sl.local']           (email_handler.py:L2343)
+==>> Handle mail_from:outsider@gmail.com ... headers:[('From','Outside Sender <outsider@gmail.com>'),
+     ('To','e1@sl.local'),('Subject','Q5 SMTP Header Survival Probe'),
+     ('Reply-To','secret-replyto@external-example.com'),
+     ('Received','from probe.example.org (probe.example.org [203.0.113.55]) by mx.sl.local ...'),
+     ('X-Custom-Probe-Header','CUSTOM_VALUE_SHOULD_BE_STRIPPED'), ...]               (email_handler.py:L1980)
+Forward phase outsider@gmail.com(Outside Sender <outsider@gmail.com>) -> e1@sl.local (email_handler.py:L2202)
+send email with subject 'Q5 SMTP Header Survival Probe',
+     from '"Outside Sender - outsider at gmail.com" <outsider_at_gmail_com_vdjdqgz@sl.local>'
+     to 'e1@sl.local'                                                                (app/mail_sender.py:L131)
+Finish mail_from outsider@gmail.com ... return code '250 Message accepted for delivery' (email_handler.py:L2367)
+```
+
+The inbound message (logged at `email_handler.py:L1980`) carried all three probe headers;
+under `NOT_SEND_EMAIL=true` the outbound is the single summary line above, which already
+shows the `From` rewritten to a reverse-alias.
+
+**Capture B — full forwarded message via the same SMTP ingress (outbound relayed to a local
+sink).** The complete forwarded message received at the sink (SMTP envelope
+`rcpt_to = john@wick.com`, the alias's mailbox):
+
+```text
+=== ENVELOPE mail_from: sl.lmycyibwfqqdemzvha3dgmc5.t2hwfwsmc2yfq@sl.local rcpt_tos: ['john@wick.com'] ===
+Subject: Q5 SMTP Header Survival Probe
 Message-ID: <q5probe-unique@external-example.com>
 Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
 X-SimpleLogin-Type: Forward
-X-SimpleLogin-EmailLog-ID: 3
+X-SimpleLogin-EmailLog-ID: 6
 X-SimpleLogin-Envelope-From: outsider@gmail.com
 X-SimpleLogin-Original-From: Outside Sender <outsider@gmail.com>
 X-SimpleLogin-Envelope-To: e1@sl.local
-Date: Fri, 26 Jun 2026 21:46:04 -0000
+Date: Fri, 26 Jun 2026 22:30:26 -0000
 From: "Outside Sender - outsider at gmail.com" <outsider_at_gmail_com_vdjdqgz@sl.local>
 Reply-To: "secret-replyto at external-example.com" <secret-replyto_at_external-example_com_gckjqozq@sl.local>
 To: e1@sl.local
 
---- survival check on the forwarded message ---
-X-Custom-Probe-Header present? : None        (STRIPPED)
-Received present?              : None        (STRIPPED)
-Reply-To present?              : <secret-replyto_at_external-example_com_gckjqozq@sl.local>   (REWRITTEN, not the original)
-From (rewritten?)              : <outsider_at_gmail_com_vdjdqgz@sl.local>                     (REWRITTEN reverse-alias)
-envelope_from / to             : sl.<reverse-path>@sl.local / john@wick.com
+This is the Q5 inbound test email body.
 ```
 
-The inbound original carried `X-Custom-Probe-Header: CUSTOM_VALUE_SHOULD_BE_STRIPPED`,
-`Received: from probe.example.org …`, and `Reply-To: secret-replyto@external-example.com`
-— none of those original values appear in the forwarded message.
+Survival check on the three probe headers in the forwarded message:
+
+```text
+X-Custom-Probe-Header : ABSENT   (STRIPPED)
+Received              : ABSENT   (STRIPPED)
+Reply-To              : present but REWRITTEN -> <secret-replyto_at_external-example_com_gckjqozq@sl.local>
+                        (the original "secret-replyto@external-example.com" does NOT survive)
+From                  : REWRITTEN -> reverse-alias <outsider_at_gmail_com_vdjdqgz@sl.local>
+To                    : "e1@sl.local" kept (To is on the whitelist); envelope recipient is john@wick.com
+```
+
+Neither the custom `X-` header nor the `Received` header appears in the forwarded message,
+and the original `Reply-To` value is gone — replaced by a SimpleLogin reverse-alias. (The
+`From` is likewise rewritten, and SimpleLogin adds its own `X-SimpleLogin-*` and `Date`
+headers.)
 
 ### Code citation(s)
 - `email_handler.py:L793-L807` — the forward phase builds a header **whitelist**
