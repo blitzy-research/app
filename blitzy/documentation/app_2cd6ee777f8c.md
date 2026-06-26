@@ -136,7 +136,7 @@ There are **two** custom-alias API endpoints — `v2` and `v3` — and their req
 
 ### Suffix options are fetched *before* creation
 
-For the custom flows, the chosen domain/suffix is not free text — it is a **server-signed token**. The dashboard pre-loads the available suffixes via `get_alias_suffixes(current_user)` (`app/alias_suffix.py:94`, called from `app/dashboard/views/custom_alias.py:45`), and the API exposes them via `app/api/views/alias_options.py` (`GET /v4/alias/options` at `:13`, `GET /v5/alias/options` at `:79`). The selected suffix is signed; the create endpoints later verify the signature with `check_suffix_signature()` (`app/alias_suffix.py:37`).
+For the custom flows, the chosen domain/suffix is not free text — it is a **server-signed token**. The dashboard pre-loads the available suffixes via `get_alias_suffixes(current_user)` (`app/alias_suffix.py:94`, called from `app/dashboard/views/custom_alias.py:45`), and the API exposes them via `app/api/views/alias_options.py` (`GET /v4/alias/options` at `:13`, `GET /v5/alias/options` at `:77`). The selected suffix is signed; the create endpoints later verify the signature with `check_suffix_signature()` (`app/alias_suffix.py:37`).
 
 ### Why / Reasoning
 
@@ -183,11 +183,11 @@ The remaining keys are produced by `serialize_alias_info_v2()` (`app/api/seriali
 | `latest_activity` | `app/api/serializer.py:77` | **`null` for a newly created alias** |
 | `pinned` | `app/api/serializer.py:78` | |
 
-`latest_activity` is initialized to `None` at `app/api/serializer.py:77` and is only replaced with a real object inside `if alias_info.latest_email_log:` (`app/api/serializer.py:79-91`). A brand-new alias has no `EmailLog` rows yet, so that branch is skipped and the key stays `null`.
+`latest_activity` is initialized to `None` at `app/api/serializer.py:77` and is only replaced with a real object inside `if alias_info.latest_email_log:` (`app/api/serializer.py:80-92`). A brand-new alias has no `EmailLog` rows yet, so that branch is skipped and the key stays `null`.
 
 ### Why / Reasoning
 
-The two response shapes follow from the two audiences. The dashboard targets a **browser**, so it uses the PRG pattern — a `302` to a GET URL (`app/dashboard/views/custom_alias.py:161`) plus a one-shot flash (`:159`) — which prevents duplicate submissions on refresh and lets the index page highlight the freshly created alias. The API targets **programmatic clients**, so it returns a machine-readable `201 Created` with a full JSON resource representation (`app/api/views/new_custom_alias.py:110-111`). The `latest_activity: null` value is not a special case in the response code — it falls out naturally because the serializer only populates activity when `latest_email_log` exists (`app/api/serializer.py:79`), and a just-created alias has none.
+The two response shapes follow from the two audiences. The dashboard targets a **browser**, so it uses the PRG pattern — a `302` to a GET URL (`app/dashboard/views/custom_alias.py:161`) plus a one-shot flash (`:159`) — which prevents duplicate submissions on refresh and lets the index page highlight the freshly created alias. The API targets **programmatic clients**, so it returns a machine-readable `201 Created` with a full JSON resource representation (`app/api/views/new_custom_alias.py:110-111`). The `latest_activity: null` value is not a special case in the response code — it falls out naturally because the serializer only populates activity when `latest_email_log` exists (`app/api/serializer.py:80`), and a just-created alias has none.
 
 
 ---
@@ -269,7 +269,7 @@ The question here is whether alias creation triggers background tasks, emits fol
 
 ### The in-process event dispatcher is triple-gated
 
-`Alias.create()` calls `EventDispatcher.send_event(...)` at `app/models.py:1687`. That method lives in `app/events/event_dispatcher.py`, where the notification channel name is `NOTIFICATION_CHANNEL = "simplelogin_sync_events"` (`app/events/event_dispatcher.py:14`). `EventDispatcher.send_event(...)` (`app/events/event_dispatcher.py:48-95`) returns early — **logging only, writing nothing** — if **any** of three gates is hit:
+`Alias.create()` calls `EventDispatcher.send_event(...)` at `app/models.py:1687`. That method lives in `app/events/event_dispatcher.py`, where the notification channel name is `NOTIFICATION_CHANNEL = "simplelogin_sync_events"` (`app/events/event_dispatcher.py:14`). `EventDispatcher.send_event(...)` (`app/events/event_dispatcher.py:48-84`) returns early — **logging only, writing nothing** — if **any** of three gates is hit:
 
 1. **Webhook explicitly disabled.** `if config.EVENT_WEBHOOK_DISABLE:` → `LOG.i("Not sending events because webhook is disabled")` then `return` (`app/events/event_dispatcher.py:57-59`).
 2. **Webhook not configured.** `if not config.EVENT_WEBHOOK and skip_if_webhook_missing:` → `LOG.i("Not sending events because webhook is not configured ...")` then `return` (`app/events/event_dispatcher.py:61-65`). `EVENT_WEBHOOK` defaults to `None` (`app/config.py:612`, `os.environ.get("EVENT_WEBHOOK", None)`) and is **absent from `example.env`**, so this gate is active by default in dev.
@@ -330,7 +330,7 @@ The API returns explicit JSON errors with the appropriate status. Representative
 - **`201`** success — `:111` / `:234`.
 - **`409`** duplicate (`"alias ... already exists"`) — `:88` / `:203`.
 - **`412`** expired suffix (`"Alias creation time is expired, please retry"`) — `:73` / `:188`.
-- **`400`** for the remaining validation failures: quota (`:55`), empty body (`:62` / `:151`), wrong body format (`:154`), bad prefix (`:76` / `:168`), bad `mailbox_ids`/mailbox (`:79` / `:172` / `:177` / `:181`), tampered suffix (`:76` / `:191`), wrong prefix/suffix (`:79` / `:194`), consecutive dots (`:92-93` / `:207-208`), and the v3 quota/format branch (`:144`).
+- **`400`** for the remaining validation failures: quota (`:55`), empty body (`:62` / `:151`), wrong body format (`:154`), bad prefix (`:168`), bad `mailbox_ids`/mailbox (`:172` / `:177` / `:181`), tampered suffix (`:76` / `:191`), wrong prefix/suffix (`:79` / `:194`), consecutive dots (`:92-93` / `:207-208`), and the v3 quota/format branch (`:144`).
 
 As with the dashboard, all of these return before the alias is committed, so a rejected API request leaves the database unchanged.
 
