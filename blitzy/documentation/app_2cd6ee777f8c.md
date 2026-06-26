@@ -57,7 +57,7 @@ alembic upgrade head && flask dummy-data && python3 server.py   # CONTRIBUTING.m
 
 `flask dummy-data` is a Flask CLI command registered in the webapp — `@app.cli.command("dummy-data")` [server.py:490] — that seeds fake data, SL domains, the Proton partner, and the **pre‑activated** login `john@wick.com / password`.
 
-> **⚠️ DB_URI port nuance (call this out — it is the most common first‑run trip‑up).** Three places disagree on the Postgres port: `CONTRIBUTING.md` shows `DB_URI=...localhost:35432/...` [CONTRIBUTING.md:94], its own `docker run` maps `-p 15432:5432` [CONTRIBUTING.md:100], and `example.env` ships `DB_URI=...localhost:5432/simplelogin` [example.env:75]. Nothing auto‑detects the port — the app simply connects to whatever `DB_URI` says — so you must reconcile the `.env` `DB_URI` port to the host port you actually publish, or startup fails with a connection‑refused error. `scripts/reset_local_db.sh` uses `15432`, making `15432` the most consistent choice.
+> **⚠️ DB_URI port nuance (call this out — it is the most common first‑run trip‑up).** Three places disagree on the Postgres port: `CONTRIBUTING.md` shows `DB_URI=...localhost:35432/...` [CONTRIBUTING.md:94], its own `docker run` maps `-p 15432:5432` [CONTRIBUTING.md:100], and `example.env` ships `DB_URI=...localhost:5432/simplelogin` [example.env:75]. Nothing auto‑detects the port — the app simply connects to whatever `DB_URI` says — so you must reconcile the `.env` `DB_URI` port to the host port you actually publish, or startup fails with a connection‑refused error. `scripts/reset_local_db.sh` hard‑codes `15432` (`export DB_URI=postgresql://myuser:mypassword@localhost:15432/simplelogin`) [scripts/reset_local_db.sh:3], making `15432` the most consistent choice.
 
 For **Q3** you also run the mail handler and the job worker as separate processes:
 
@@ -94,7 +94,7 @@ PY
 
 `NOT_SEND_EMAIL` is derived as a simple presence check — `NOT_SEND_EMAIL = "NOT_SEND_EMAIL" in os.environ` [app/config.py:91] — and is the single most important first‑run nuance: locally there is no SMTP delivery, so an "email sent" success is a **log line**, not an inbox message. (See Q2 for how to obtain the activation code without an inbox.)
 
-> For a full reset, `scripts/reset_local_db.sh` drops and recreates the `public` schema, then re‑runs `alembic upgrade head` + `flask dummy-data`.
+> For a full reset, `scripts/reset_local_db.sh` drops and recreates the `public` schema (`drop schema public cascade; create schema public;`), then re‑runs `alembic upgrade head` + `flask dummy-data` [scripts/reset_local_db.sh:3-7].
 
 ---
 
@@ -163,11 +163,11 @@ This walks the full path with a **temporary** account, and also demonstrates a d
 
 ### Step 1 — Register (`POST /auth/register`)
 
-`RegisterForm` collects an email and a password (length 8–100) [app/auth/views/register.py:23-28] and is submitted from `templates/auth/register.html`. On a valid submit the handler logs `LOG.d("create user %s", email)` [register.py:85], creates the user with a bcrypt‑hashed password via `User.create(...)` [register.py:86], and calls `send_activation_email(user, next_url)` [register.py:95].
+`RegisterForm` collects an email and a password (length 8–100) [app/auth/views/register.py:23-28] and is submitted from `templates/auth/register.html`. On a valid submit the handler logs `LOG.d("create user %s", email)` [register.py:85], creates the user with a bcrypt‑hashed password via `User.create(...)` [register.py:86], and calls `send_activation_email(user, next_url)` [register.py:95]. (The bcrypt hashing is not in `register.py` itself: `User` inherits `PasswordOracle` [app/models.py:336], `User.create()` invokes `set_password()` when a password is supplied [app/models.py:606-607], and `set_password()` does the actual hashing — `salt = bcrypt.gensalt()` then `self.password = bcrypt.hashpw(password.encode(), salt).decode()` [app/pw_models.py:11-14].)
 
 **Visible confirmation:** the page renders `templates/auth/register_waiting_activation.html` — `return render_template("auth/register_waiting_activation.html")` [register.py:104] — whose title is *“Activation Email Sent”* and whose body reads *“An email to validate your email is on its way.”* This is the "check your email to activate" screen.
 
-`send_activation_email()` deletes any prior codes for the user, creates a 30‑char `ActivationCode` (`random_string(30)`) [register.py:120], and builds the link `{URL}/auth/activate?code=<code>` [register.py:124]. *Rationale:* identity verification is a one‑time, time‑boxed code bound to the user — exactly what you want for proving control of an address.
+`send_activation_email()` deletes any prior codes for the user, creates a 30‑char `ActivationCode` (`random_string(30)`) [register.py:120], and builds the link `{URL}/auth/activate?code=<code>` [register.py:124]. **The activation code is valid for 1 hour:** the inline comment says it is "valid for 1h" [app/auth/views/register.py:118], and the model enforces it — the `ActivationCode.expired` column defaults to `_expiration_1h`, i.e. `arrow.now().shift(hours=1)` [app/models.py:1186-1187,1212], and `ActivationCode.is_expired()` returns `True` once that timestamp has passed [app/models.py:1214-1215]. *Rationale:* identity verification is a one‑time, time‑boxed (1‑hour) code bound to the user — exactly what you want for proving control of an address.
 
 **Observed:**
 
@@ -238,7 +238,7 @@ GET  /dashboard/                            => HTTP 200  (alias dashboard)
 
 ### Step 4 — Dashboard (the terminal state)
 
-The dashboard blueprint is mounted at `/dashboard` — `Blueprint(name="dashboard", ... url_prefix="/dashboard", ...)` [app/dashboard/base.py:3-8] — and its index route is `@dashboard_bp.route("/", ...)` + `@login_required` + `def index()` [app/dashboard/views/index.py:55-67], rendering `templates/dashboard/index.html` (title *“Alias”*, with the *“Create a custom alias”* / *“Create a totally random alias”* actions). *Rationale:* reaching `/dashboard/` with the rendered alias‑management page — confirmed above for both the activated temporary user **and** the seed account, each accompanied by a `GET /dashboard/ … 200` access‑log line — is the end‑to‑end success signal the question asks about.
+The dashboard blueprint is mounted at `/dashboard` — `Blueprint(name="dashboard", ... url_prefix="/dashboard", ...)` [app/dashboard/base.py:3-8] — and its index route is `@dashboard_bp.route("/", ...)` + `@login_required` + `def index()` [app/dashboard/views/index.py:55-67]; on completion `index()` returns `render_template("dashboard/index.html", …)` [app/dashboard/views/index.py:215-229], rendering `templates/dashboard/index.html` (title *“Alias”*, with the *“Create a custom alias”* / *“Create a totally random alias”* actions [templates/dashboard/index.html:31 (the `{% block title %}Alias{% endblock %}`), :43-56 (the two alias‑creation buttons)]). *Rationale:* reaching `/dashboard/` with the rendered alias‑management page — confirmed above for both the activated temporary user **and** the seed account, each accompanied by a `GET /dashboard/ … 200` access‑log line — is the end‑to‑end success signal the question asks about.
 
 
 ---
@@ -265,7 +265,7 @@ while True:                                              # job_runner.py:330
         time.sleep(10)                                   # job_runner.py:347
 ```
 
-`get_jobs_to_run()` selects jobs whose state is `ready` (or `taken` jobs that have timed out) [job_runner.py:307], and `process_job()` dispatches by `job.name`, logging `LOG.e("Unknown job name %s", job.name)` for unrecognized names [job_runner.py:304]. *Rationale:* the webapp and mail handler **enqueue `Job` rows in PostgreSQL**, and this worker dequeues them every 10 seconds — so a recurring `Take job <Job …>` line is the indicator that the worker is alive and consuming the queue.
+`get_jobs_to_run()` selects jobs whose state is `ready` (or `taken` jobs that have timed out) [job_runner.py:307], and `process_job()` dispatches by `job.name`, logging `LOG.e("Unknown job name %s", job.name)` for unrecognized names [job_runner.py:304]. *Rationale:* `Job` rows are enqueued by the **webapp / model / dashboard / API flows** — e.g. `User.create()` schedules the onboarding‑email jobs [app/models.py:625-665] (so a normal Q2 registration itself enqueues jobs), the dashboard batch‑alias import enqueues one [app/dashboard/views/batch_import.py:66], and account deletion enqueues one [app/dashboard/views/delete_account.py:42]. The **mail handler does _not_ enqueue `Job` rows** — `email_handler.py` contains no `Job` import or `Job.create()` call; it coordinates through PostgreSQL instead by reading/writing alias, contact, and email‑log state while forwarding. This worker dequeues those rows every 10 seconds — so a recurring `Take job <Job …>` line is the indicator that the worker is alive and consuming the queue.
 
 **Observed (a probe `Job` was enqueued, then dequeued within one loop iteration):**
 
@@ -337,14 +337,58 @@ graph LR
 
 ## (e) Cleanup — temporary test data removed, baseline restored
 
-Per the testing constraint, every temporary artifact created for the Q2/Q3 walkthrough was deleted at the end, returning the database to its seeded baseline. Concretely, the following **runtime database rows** were removed (read‑only ORM deletes — no source files touched):
+Per the testing constraint, every temporary artifact created for the Q2/Q3 walkthrough was deleted at the end, returning the database to its seeded baseline. Concretely, the following **runtime database rows** were removed (runtime DB deletes against throwaway test rows only; **no repository files were touched**):
 
 - The temporary registered user (`blitzytmpqa…@gmail.com`, user id 3) and its cascaded rows (its auto‑created alias `simplelogin-newsletter.word769@sl.local` and its mailbox). Its one‑time `ActivationCode` was already gone — it is deleted on activation by design [app/auth/views/activate.py:53].
 - The `Contact` row (`hey@google.com`) created on `e1@sl.local` by the Q3 inbound‑forwarding test, together with its email‑log rows.
 - The probe `Job` (`__blitzy_probe__`) enqueued to demonstrate the `job_runner` loop.
-- The aggregate `DailyMetric.nb_new_web_non_proton_user` counter incremented by the registration [app/auth/views/register.py] was decremented back by 1.
+- The aggregate `DailyMetric.nb_new_web_non_proton_user` counter incremented by the registration [app/auth/views/register.py:97] (the column is defined at [app/models.py:3273-3276]) was decremented back by 1.
 
-**Verification after cleanup:** the temporary user, alias, mailbox, contact, and probe job were all confirmed gone; `e1@sl.local` again has zero contacts; the seeded `john@wick.com` account remains intact (activated, with its original alias set unchanged); and the total user count returned to its seeded value. The `flask dummy-data` seed data was left untouched.
+**Exact cleanup method (the commands actually used).** The teardown used the project's own ORM from a `flask shell` (which loads `DB_URI` from `.env`; no source files were edited). Every statement is a runtime DB delete against throwaway test rows only:
+
+```python
+# flask shell   (run inside the app venv; DB_URI is read from .env)
+from app.db import Session
+from app.models import User, Alias, Contact, Job, DailyMetric
+
+# 1) Temporary registered user. User.delete() first removes the user's aliases via
+#    delete_alias(), then the DB cascades its mailbox / activation_code rows
+#    (FK ondelete="cascade").                                  [app/models.py:670-689]
+u = User.get_by(email="blitzytmpqa...@gmail.com")
+if u:
+    User.delete(u.id, commit=True)
+
+# 2) The Q3 forwarding-test Contact sits on the SEED alias e1@sl.local (owned by
+#    john@wick.com), so step 1 does not touch it. Deleting the Contact cascades its
+#    email_log rows at the DB level (EmailLog.contact_id ondelete="cascade").
+#                                                              [app/models.py:2067-2069]
+e1 = Alias.get_by(email="e1@sl.local")
+Contact.filter_by(alias_id=e1.id, website_email="hey@google.com").delete()
+Session.commit()
+
+# 3) Probe Job enqueued only to demonstrate the job_runner loop.
+Job.filter_by(name="__blitzy_probe__").delete()
+Session.commit()
+
+# 4) Reverse the DailyMetric increment that registration applied.
+#    [app/auth/views/register.py:97 ; column app/models.py:3273-3276]
+DailyMetric.get_or_create_today_metric().nb_new_web_non_proton_user -= 1
+Session.commit()
+```
+
+(`User.get_by` / `Contact.filter_by` / `*.delete(...)` are the project's `ModelMixin` helpers [app/models.py:83-84,87-88,136-141]; `User.delete` is the overridden cascade-aware variant [app/models.py:670-689].)
+
+**Verification after cleanup:** the temporary user, alias, mailbox, contact, and probe job were all confirmed gone; `e1@sl.local` again has zero contacts; the seeded `john@wick.com` account remains intact (activated, with its original alias set unchanged); and the total user count returned to its seeded value. The `flask dummy-data` seed data was left untouched. The post-cleanup state was confirmed with read-only `psql` queries against the `simplelogin` DB (`DB_URI` from `.env`):
+
+```text
+select count(*) from users;                                          -> 2    (back to the seeded count)
+select id,email,activated from users where email='john@wick.com';    -> 1|john@wick.com|t   (seed intact, still activated)
+select count(*) from users where email like 'blitzytmp%';            -> 0    (temporary user gone)
+select a.id, (select count(*) from contact c where c.alias_id=a.id)
+  from alias a where a.email='e1@sl.local';                          -> 5|0  (e1 alias kept; 0 contacts)
+select count(*) from job;                                            -> 0    (probe job gone)
+select count(*) from activation_code;                                -> 0    (one-time code consumed on activation)
+```
 
 **No repository files were created, modified, or deleted — only runtime DB rows — besides this single documentation file.** The SimpleLogin source tree is byte‑for‑byte unchanged (`git status --porcelain` on the source checkout reports no changes).
 
@@ -359,6 +403,7 @@ Per the testing constraint, every temporary artifact created for the Q2/Q3 walkt
 - `example.env:6` (`URL`), `:19` (`NOT_SEND_EMAIL`), `:22` (`EMAIL_DOMAIN`), `:58` (`DISABLE_REGISTRATION` commented), `:75` (`DB_URI` `5432`), `:77` (`FLASK_SECRET`)
 - `app/config.py:91` (`NOT_SEND_EMAIL`), `:568` (`MEM_STORE_URI` default `None`)
 - `server.py:490` (`flask dummy-data` CLI)
+- `scripts/reset_local_db.sh:3` (`DB_URI` on `15432`), `:4` (`drop schema public cascade; create schema public;`), `:6-7` (`alembic upgrade head` + `flask dummy-data`)
 
 **Q1 — Readiness (b)**
 
@@ -368,17 +413,19 @@ Per the testing constraint, every temporary artifact created for the Q2/Q3 walkt
 
 **Q2 — New‑user journey (c)**
 
-- `app/auth/views/register.py:23-28` (`RegisterForm`), `:85` (`create user`), `:86` (`User.create`), `:95` (`send_activation_email`), `:104` (renders `register_waiting_activation.html`), `:120` (`ActivationCode … random_string(30)`), `:124` (activation link)
+- `app/auth/views/register.py:23-28` (`RegisterForm`), `:85` (`create user`), `:86` (`User.create`), `:95` (`send_activation_email`), `:104` (renders `register_waiting_activation.html`), `:118` (activation code valid for 1h), `:120` (`ActivationCode … random_string(30)`), `:124` (activation link)
 - `app/auth/views/activate.py:24` (read `code`), `:26` (`ActivationCode.get_by`), `:28-36` (invalid code), `:38-46` (expired code), `:49` (`activated = True`), `:50` (`login_user`), `:53` (delete one‑time code), `:56` (`flash` "activated"), `:66` (`redirect user to dashboard`), `:67` (`redirect(... dashboard.index)`)
 - `app/auth/views/login.py:16-18` (`LoginForm`), `:21-24` (`10/minute` limit), `:45-50` (wrong creds), `:63-69` (not activated), `:71-72` (success → `after_login`)
 - `app/auth/views/login_utils.py:12-45` (`after_login` tree), `:35` (`log user … in`), `:36` (`login_user`), `:37` (`sudo_time`), `:44-45` (`redirect … dashboard.index`)
-- `app/dashboard/base.py:3-8` (dashboard blueprint, `url_prefix="/dashboard"`), `app/dashboard/views/index.py:55-67` (index route, `@login_required`)
+- `app/dashboard/base.py:3-8` (dashboard blueprint, `url_prefix="/dashboard"`), `app/dashboard/views/index.py:55-67` (index route, `@login_required`), `:215-229` (`render_template("dashboard/index.html", …)`); `templates/dashboard/index.html:31` (title `Alias`), `:43-56` (custom / random alias actions)
 - `app/mail_sender.py:126-137` (`NOT_SEND_EMAIL` log‑only send), `app/config.py:91` (`NOT_SEND_EMAIL`)
 - `app/fake_data.py:45,47,48` (seed `john@wick.com / password`, `activated=True`)
+- Password hashing & code expiry (model layer): `app/models.py:336` (`User(Base, ModelMixin, UserMixin, PasswordOracle)`), `:606-607` (`User.create()` → `set_password()`), `app/pw_models.py:11-14` (`set_password` → `bcrypt.hashpw(...)`); `app/models.py:1186-1187` (`_expiration_1h`), `:1212` (`ActivationCode.expired` default), `:1214-1215` (`ActivationCode.is_expired`)
 
 **Q3 — Behind the scenes (d)**
 
 - `job_runner.py:304` (`Unknown job name`), `:307` (`get_jobs_to_run`), `:330` (`while True`), `:332` (`app_context`), `:333` (`for job`), `:334` (`Take job`), `:337-341` (mark taken), `:342` (`process_job`), `:344` (`state = done`), `:347` (`sleep(10)`)
+- `Job` enqueue sites (web / model / dashboard / API — **not** the mail handler): `app/models.py:625-665` (`User.create()` onboarding jobs), `app/dashboard/views/batch_import.py:66` (batch import), `app/dashboard/views/delete_account.py:42` (account deletion)
 - `email_handler.py:2343` (`New message …`, INFO), `:688` (`Forward … -> … -> …`); `app/log.py:14` (`%(message_id)s`); `app/mail_sender.py:131` (log‑only send)
 - `crontab.yml:77-82` (`send_undelivered_mails`, `*/5 * * * *`)
 - `app/events/event_dispatcher.py:14` (`NOTIFICATION_CHANNEL`), `:23-26` (`SyncEvent.create` + `NOTIFY simplelogin_sync_events`), `:57-69` (`Not sending events …` guards, incl. `:62`)
@@ -388,5 +435,6 @@ Per the testing constraint, every temporary artifact created for the Q2/Q3 walkt
 
 **Cleanup (e)**
 
-- `app/auth/views/activate.py:53` (one‑time code deleted on activation), `app/auth/views/register.py` (DailyMetric increment on registration)
+- `app/auth/views/activate.py:53` (one‑time code deleted on activation), `app/auth/views/register.py:97` (DailyMetric increment on registration), `app/models.py:3273-3276` (`nb_new_web_non_proton_user` column)
+- Cleanup ORM mechanics: `app/models.py:670-689` (`User.delete` removes aliases via `delete_alias`, then DB cascade), `:2067-2069` (`EmailLog.contact_id` `ondelete="cascade"`), `:83-84` (`get_by`), `:87-88` (`filter_by`), `:136-141` (`ModelMixin.delete`)
 
