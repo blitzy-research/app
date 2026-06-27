@@ -329,11 +329,17 @@ The logger is monkey‑patched with one‑letter shortcuts [`app/log.py:L74-77`]
 | `LOG.d` | `logging.Logger.debug` | DEBUG | |
 | `LOG.i` | `logging.Logger.info` | INFO | |
 | `LOG.w` | `logging.Logger.warning` | WARNING | |
-| `LOG.e` | `logging.Logger.exception` | **ERROR** | **logs at ERROR level *with a stack traceback*** |
+| `LOG.e` | `logging.Logger.exception` | **ERROR** | logs at ERROR with `exc_info=True`; prints a real stack traceback **only when called inside an `except` block**, otherwise it appends the literal line `NoneType: None` |
 
-> ⚠️ **`LOG.e` is `logging.Logger.exception`, not `error`.** Every `LOG.e(...)` call prints an
-> **ERROR line followed by a traceback** — even when no exception was actually raised. This is a
-> notable log artifact on the suffix path (see the `verify_prefix_suffix` entries below).
+> ⚠️ **`LOG.e` is `logging.Logger.exception`, not `error`.** It logs at ERROR level and requests
+> exception info (`exc_info=True`). When called **inside an `except` block** (e.g. the Redis guard
+> `LOG.e("Cannot connect to redis")` at `app/rate_limiter.py:L41-42`) it prints a real
+> `Traceback (most recent call last):` stack trace. When called **outside** any active exception —
+> exactly the case for the `verify_prefix_suffix` calls below, whose function contains no
+> `try`/`except` [`app/alias_suffix.py:L45-91`] — `sys.exc_info()` is `(None, None, None)`, so the
+> handler has no exception to format and instead appends the **literal line `NoneType: None`** after
+> the ERROR message (not a stack trace). This is a notable log artifact on the suffix path (see the
+> `verify_prefix_suffix` entries below).
 
 ### 3.3 Validation-relevant log entries on the creation path
 
@@ -349,16 +355,20 @@ validation, with their level and source line:
   `LOG.w("Alias suffix is tampered, user %s", user)`
   [`new_custom_alias.py:L75` (v2), `L190` (v3)]. In practice this line will seldom appear, since
   ordinary tampering is caught earlier and reported as the 412 above.
-- **ERROR *with traceback* — inside `verify_prefix_suffix()`** (accompanies the 400
-  "wrong alias prefix or suffix" response):
+- **ERROR (followed by the literal `NoneType: None`, *not* a real traceback) — inside
+  `verify_prefix_suffix()`** (accompanies the 400 "wrong alias prefix or suffix" response):
   - `LOG.e("wrong alias suffix %s, user %s", alias_suffix, user)`
     [`app/alias_suffix.py:L61, L84, L88`]
   - `LOG.e("User %s submits a wrong alias suffix %s", user, alias_suffix)`
     [`app/alias_suffix.py:L78`]
 
-  These print a **traceback even though no real exception occurred** (a direct consequence of
-  `LOG.e == logging.Logger.exception`) — a potentially confusing artifact when grepping logs
-  during a diagnosis.
+  Because `verify_prefix_suffix()` has **no `try`/`except`** [`app/alias_suffix.py:L45-91`], these
+  `LOG.e` calls run with no active exception. `LOG.e == logging.Logger.exception` still requests
+  `exc_info`, so the console shows the ERROR message immediately followed by the **literal line
+  `NoneType: None`** — **not** a `Traceback (most recent call last):` stack trace. (A genuine
+  traceback appears only when `LOG.e` runs inside an `except` block, e.g.
+  `app/rate_limiter.py:L41-42`.) When diagnosing, grep for the ERROR message followed by
+  `NoneType: None`, not for a stack trace.
 - **DEBUG — quota‑gate 400 path:**
   `LOG.d("user %s cannot create any custom alias", user)`
   [`new_custom_alias.py:L49` (v2), `L138` (v3)].
