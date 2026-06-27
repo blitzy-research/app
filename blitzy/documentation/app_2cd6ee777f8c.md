@@ -777,7 +777,7 @@ Every claim in this document is backed by the following source locations (key li
 - `app/alias_utils.py` — L414‑425 (`check_alias_prefix`, `_ALIAS_PREFIX_PATTERN` at L415)
 - `app/extensions.py` — L14‑19 (`__key_func`), L23 (`Limiter` — no `headers_enabled`), L26‑28
   (`DISABLE_RATE_LIMIT` request filter)
-- `app/parallel_limiter.py` — L19‑74 (lock; `acquire_lock` L30‑34, no‑op L51‑52, key‑selection L55‑58 (user‑id or IP fallback),
+- `app/parallel_limiter.py` — L19‑73 (lock; `acquire_lock` L30‑34, no‑op L51‑52, key‑selection L55‑58 (user‑id or IP fallback),
   5 s TTL L23/L70)
 - `app/rate_limiter.py` — L19‑42 (`check_bucket_limit`; `bucket_id` L25‑26, no‑op L28‑29,
   `INCR` L31, `LOG.i` L33‑35, New Relic L36‑39, 429 L40, `LOG.e` L41‑42)
