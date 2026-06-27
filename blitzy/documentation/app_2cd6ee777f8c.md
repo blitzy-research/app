@@ -695,11 +695,11 @@ flowchart TD
     C -->|No| D["Forward branch -> handle_forward()  (email_handler.py:2202,2208)"]
     D --> E{"Alias.get_by(email) exists?  (email_handler.py:543)"}
     E -->|No| F["LOG.d: alias not exist, try auto-create  (email_handler.py:545)"]
-    F --> G["try_auto_create()  (email_handler.py:549, alias_utils.py:202)"]
+    F --> G["try_auto_create()  (email_handler.py:549, app/alias_utils.py:202)"]
     G --> H{"catch-all CustomDomain OR directory?"}
-    H -->|"no public_domain entry, no CustomDomain, no directory"| I["returns None  (alias_utils.py:220-224)"]
+    H -->|"no public_domain entry, no CustomDomain, no directory"| I["returns None  (app/alias_utils.py:220-224)"]
     I --> J["LOG.d: cannot be created on-the-fly, return 550  (email_handler.py:551)"]
-    J --> K["return status.E515 = '550 SL E515 Email not exist'  (email_handler.py:555, status.py:51)"]
+    J --> K["return status.E515 = '550 SL E515 Email not exist'  (email_handler.py:555, app/email/status.py:51)"]
     K --> L{"SpamdResult present AND SPF fail/softfail?  (email_handler.py:2356-2361)"}
     L -->|"No (no X-Spamd-Result header)"| M["Final SMTP reply: 550 SL E515 Email not exist"]
     L -->|"Yes"| N["Replaced with E216 = '250 SL E216 Handled spf policy'  (email_handler.py:2365)"]
