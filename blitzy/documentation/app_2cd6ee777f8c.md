@@ -852,5 +852,5 @@ from the running system:
 | Q4 | Session id rotation | **Reused, not rotated** — `slapp` byte‑identical before/after login |
 | Q5 | Forwarded‑email headers | Custom `X-` **stripped**, `Received` **stripped**, `Reply-To` **not preserved** (rewritten to reverse‑alias) |
 | Q6 | Alias token expiry | **600 seconds** (valid ≤600 s, rejected ≥601 s) |
-| Q7 | API key usage stats | **Three** columns per keyed call: **`times`** +1 and **`last_used`** = now (set by code, `base.py:L30-31`) plus **`updated_at`** = now (auto via `onupdate`, `models.py:L65`); observed 36→41 over 5 calls; `sudo_mode_at`/`created_at` unchanged; unused key untouched |
+| Q7 | API key usage stats | **Three** columns per keyed call: **`times`** +1 and **`last_used`** = now (set by code, `app/api/base.py:L30-L31`) plus **`updated_at`** = now (auto via `onupdate`, `app/models.py:L65`); observed 36→41 over 5 calls; `sudo_mode_at`/`created_at` unchanged; unused key untouched |
 | Q8 | Failed login | **HTTP 200** re‑render + flashed "Email or password incorrect" + New Relic `LoginEvent.failed` (no error log line) |
