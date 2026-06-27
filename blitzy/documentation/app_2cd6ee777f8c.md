@@ -545,14 +545,14 @@ O5    is_bounce('<>','multipart/report') -> True
       is_bounce('a@b.c','multipart/report') -> False
 ```
 
-> **Honesty note on the time- and secret-dependent VERP value (O1-C / O2-O3).** The VERP address has two variable segments. (1) The **payload** encodes `[verp_type, object_id, minutes]`, where `minutes` is a *live wall-clock value* (minutes since `VERP_TIME_START=1640995200`, 2022-01-01 [app/email_utils.py:L68]); only the `minutes` field changes between runs. The canonical `lmycyibrgiztinjmeazdgnjygq2tqxi` base32-decodes to exactly `[0, 12345, 2358458]` (`verp_type=bounce_forward=0`, `object_id=12345`, `minutes=2358458` ≈ 2026-06-26T19:38Z); the live container captures below decode to `[0, 12345, 2358610]` (≈ 2026-06-26T22:10Z) — **identical `verp_type` and `object_id`, differing only in `minutes`**, which is itself proof the timestamp is computed live rather than hardcoded. (2) The **signature** is `HMAC(VERP_EMAIL_SECRET, payload)` truncated to 8 bytes, so it changes whenever the payload changes *and* whenever the secret changes. The placeholder-secret re-run here (`"blitzy-verification-secret-0123456789ABCDEF"`) produced signature `diqtbmuefcvek`; the live container (using its real, **redacted** secret) produced different signatures again (see A.2). In **every** run the round-trip succeeds and any single-character signature flip yields `None` — which is exactly the HMAC integrity property under test (§(a)).
+> **Honesty note on the time- and secret-dependent VERP value (O1-C / O2-O3).** The VERP address has two variable segments. (1) The **payload** encodes `[verp_type, object_id, minutes]`, where `minutes` is a *live wall-clock value* (minutes since `VERP_TIME_START=1640995200`, 2022-01-01 [app/email_utils.py:L68]); only the `minutes` field changes between runs. The canonical `lmycyibrgiztinjmeazdgnjygq2tqxi` base32-decodes to exactly `[0, 12345, 2358458]` (`verp_type=bounce_forward=0`, `object_id=12345`, `minutes=2358458` ≈ 2026-06-26T19:38Z); the live container captures below decode to `[0, 12345, 2358749]` (≈ 2026-06-27T00:29Z) — **identical `verp_type` and `object_id`, differing only in `minutes`**, which is itself proof the timestamp is computed live rather than hardcoded. (2) The **signature** is `HMAC(VERP_EMAIL_SECRET, payload)` truncated to 8 bytes, so it changes whenever the payload changes *and* whenever the secret changes. The placeholder-secret re-run here (`"blitzy-verification-secret-0123456789ABCDEF"`) produced signature `diqtbmuefcvek`; the live container (using its real, **redacted** secret) produced different signatures again (see A.2). In **every** run the round-trip succeeds and any single-character signature flip yields `None` — which is exactly the HMAC integrity property under test (§(a)).
 
 ### A.2 — Tier 2: live container run (Python 3.10.18 + PostgreSQL + Redis)
 
 The block below is the **verbatim** captured output of the live probe run inside the provided Docker image `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_simple-login_app_1.0` (SimpleLogin at commit `2cd6ee777f8c2d3531559588bcfb18627ffb5d2c`), after `/build.sh` (Postgres+Redis up, schema migrated) and the documented DKIM PKCS#1 fix. The transient probe (`/app/tests/blitzy_live_probe.py`, deleted afterward; the source tree was never modified) seeded rows via the committed fixtures and invoked the **real** routing — `email_handler.handle(...)` for rows 1–6 (with the `handle_DATA` exception→status mapping reproduced verbatim, capturing the actual exception), and `MailHandler()._handle(...)` with the project's `5xx_overwrite_spf.eml` fixture for row 7. The probe test reported `1 passed`.
 
 ```text
-@@@VERP_GEN sl.lmycyibrgiztinjmeazdgnjygyytaxi.mvsglmie5ykcg@sl.local
+@@@VERP_GEN sl.lmycyibrgiztinjmeazdgnjyg42dsxi.77ywcj5miivse@sl.local
 @@@VERP_RT (<VerpType.bounce_forward: 0>, 12345)
 @@@PARSE 12345
 @@@R1 (None, '550 SL E512 No such email log')
@@ -563,7 +563,7 @@ The block below is the **verbatim** captured output of the live probe run inside
 @@@R6 (None, '550 SL E515 Email not exist')
 @@@R4 (None, '550 SL E510 so such user')
 @@@R7 250 SL E216 Handled spf policy
-@@@CONST E512='550 SL E512 No such email log' E211='250 SL E211 Bounce Forward phase handled' E212='250 SL E212 Bounce Reply phase handled' E213='250 SL E213 Unknown email ignored' E510='550 SL E510 so such user' E216='250 SL E216 Handled spf policy' E404='421 SL E404 Unexpected error - Retry later'
+@@@CONST E512='550 SL E512 No such email log' E211='250 SL E211 Bounce Forward phase handled' E212='250 SL E212 Bounce Reply phase handled' E213='250 SL E213 Unknown email ignored' E510='550 SL E510 so such user' E515='550 SL E515 Email not exist' E216='250 SL E216 Handled spf policy'
 ```
 
 Reading the capture against the §(d) table:
@@ -574,17 +574,17 @@ Reading the capture against the §(d) table:
 - `@@@R7` is the SPF-gate rewrite to **`250 SL E216 Handled spf policy`**, captured through `_handle()` with `R_SPF_FAIL` (the engine also logged *"Replacing 5XX to 216 status because the return-path failed the spf check"* at email_handler.py:L2362).
 - `@@@CONST` echoes the live `app/email/status.py` constants, confirming the wire strings are byte-identical to the source.
 
-> **Provenance of the canonical A.1 value vs. the A.2 capture.** A.1's O1-C line shows `…gnjygq2tqxi.e7bm3xshjgxji` (payload `minutes=2358458`); A.2's `@@@VERP_GEN` shows `…gnjygyytaxi.mvsglmie5ykcg` (payload `minutes=2358610`). Both use the container's real secret; they differ **only** because A.2 ran ~2.5 hours later (different `minutes`, hence a different payload and therefore a different HMAC). This is the time-dependence documented in the honesty note above — not an inconsistency.
+> **Provenance of the canonical A.1 value vs. the A.2 capture.** A.1's O1-C line shows `…gnjygq2tqxi.e7bm3xshjgxji` (payload `minutes=2358458`); A.2's `@@@VERP_GEN` shows `…gnjyg42dsxi.77ywcj5miivse` (payload `minutes=2358749`). Both use the container's real secret; they differ **only** because A.2 ran ~4.85 hours later (different `minutes`, hence a different payload and therefore a different HMAC). This is the time-dependence documented in the honesty note above — not an inconsistency.
 
 ---
 
 ## Appendix B — Ready-to-run DB-backed probe (for the Docker container)
 
-The script below is the **exact probe used to capture the A.2 output above** — it is reproduced verbatim so any reader can re-derive every §(d) wire string inside the provided SimpleLogin container (Python 3.10 + Postgres + Redis, `NOT_SEND_EMAIL=true` [example.env:L19]). It is modeled on the committed harness [tests/test_email_handler.py:L82-156] and seeds rows exactly as the suite's own fixtures do (`create_new_user`, `Alias.create_new_random`, `Contact.create`, `EmailLog.create`). It is a **transient** artifact: it lives only inside the ephemeral container and is deleted after use — it is **never** added to the source tree.
+The script below is the **exact probe used to capture the A.2 output above** — it is reproduced verbatim so any reader can re-derive every §(d) wire string inside the provided SimpleLogin container (Python 3.10 + Postgres + Redis, `NOT_SEND_EMAIL=true` [example.env:L19]). Re-running it reproduces every `@@@R*` wire string and the `@@@CONST` constants summary **byte-for-byte** (those values are deterministic and time-invariant); the **sole** run-to-run variation is the `@@@VERP_GEN` line, whose `minutes` and signature segments change on every run (this is the format-demonstration value behind §(a), *not* a §(d) wire string — see the A.2 honesty note above). It is modeled on the committed harness [tests/test_email_handler.py:L82-156] and seeds rows exactly as the suite's own fixtures do (`create_new_user`, `Alias.create_new_random`, `Contact.create`, `EmailLog.create`). It is a **transient** artifact: it lives only inside the ephemeral container and is deleted after use — it is **never** added to the source tree.
 
 Two construction details matter for reproducibility:
 
-1. **Build the DSN from raw RFC822 bytes and parse with `email.message_from_bytes(...)`** — mirroring production's `handle_DATA` (`msg = email.message_from_bytes(envelope.original_content)` [email_handler.py:L2291]). Constructing a `message/delivery-status` part by hand with `EmailMessage().set_payload("…")` does **not** round-trip through the email generator (its sub-blocks must be `Message` objects, not strings) and raises `AttributeError: 'str' object has no attribute 'policy'` during serialization. The raw-bytes form avoids that entirely.
+1. **Build the DSN from raw RFC822 bytes and parse with `email.message_from_bytes(...)`** — mirroring production's `handle_DATA` (`msg = email.message_from_bytes(envelope.original_content)` [email_handler.py:L2290]). Constructing a `message/delivery-status` part by hand with `EmailMessage().set_payload("…")` does **not** round-trip through the email generator (its sub-blocks must be `Message` objects, not strings) and raises `AttributeError: 'str' object has no attribute 'policy'` during serialization. The raw-bytes form avoids that entirely.
 2. **Route rows 1–6 through `email_handler.handle(...)` directly** (as the committed bounce tests do) and replicate `handle_DATA`'s `except (VERPReply, VERPForward, VERPTransactional): return status.E213` mapping in the probe — capturing the *real* exception. Do **not** route the seeded-row scenarios through `_handle()`, because `_handle` opens a nested `create_light_app().app_context()` that swaps the SQLAlchemy session and detaches the rows you just seeded (`DetachedInstanceError`). Row 7 uses `_handle()` deliberately, with a non-existent id (no seeded row to detach), exactly like `test_prevent_5xx_from_spf`.
 
 > **How to run it.** Inside the container, after `/build.sh` and the DKIM PKCS#1 fix, source the build env (which sets `DB_URI=postgresql://test:test@localhost:5432/test`, `NOT_SEND_EMAIL=true`, `EMAIL_DOMAIN=sl.local`, and the secret-bearing values such as `FLASK_SECRET`/`VERP_EMAIL_SECRET` — **redacted** here), then run the probe under pytest so the `flask_client` fixture (hence the DB session) is active:
@@ -735,7 +735,7 @@ def test_probe(flask_client):
         status.E510, status.E515, status.E216))
 ```
 
-> Running this probe is what produced the verbatim A.2 transcript above (`1 passed`). The seeding mirrors the fixtures used by the committed tests, so the printed strings are the live equivalents of the §(d) constants — and the row-6 result (`E515`, not `E213`) is the empirically observed truth, not a prediction.
+> Running this probe is what produced the A.2 transcript above (`1 passed`); every `@@@R*` row and the `@@@CONST` summary reproduce verbatim on re-run (deterministic), the only run-to-run variation being the time-dependent `@@@VERP_GEN` minute/signature (per the A.2 honesty note). The seeding mirrors the fixtures used by the committed tests, so the printed strings are the live equivalents of the §(d) constants — and the row-6 result (`E515`, not `E213`) is the empirically observed truth, not a prediction.
 
 
 ---
