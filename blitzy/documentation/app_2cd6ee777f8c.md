@@ -43,7 +43,7 @@ Each section gives **the answer**, **the code evidence**, **the observed runtime
 
 ## Section 0 — Overview & How It Is Run Locally
 
-### 0.1 The multi‑process model
+### 0.1 The multi-process model
 
 SimpleLogin is a **Python/Flask monolith** with a **multi‑process runtime**. The single most important thing for a newcomer to internalize is this:
 
@@ -206,7 +206,7 @@ $ curl http://localhost:7777/git  ;  # -> dev   (the build SHA1; "dev" in this b
 
 Loading `http://localhost:7777/` in a browser redirected to `/auth/login` (page title *"Login | SimpleLogin"*) and, after signing in as `john@wick.com`, landed on `/dashboard/` showing the alias‑management UI (the **"+ New Custom Alias"** and **"Random Alias"** controls — see [Q2.2](#q22-create-an-alias)). That round trip is itself proof that the sign‑in and alias‑management surfaces are reachable.
 
-**⚠ Accuracy refinement (a) — `/health` produces NO request‑log line.** `/health` is **deliberately excluded** from the `after_request` logging block (`not request.path.startswith("/health")`, [`server.py:281`](#citations-appendix)) and from the profiler's ignore list ([`server.py:195`](#citations-appendix)). So a health probe returns `200` but emits **no** per‑request log line. This was verified directly: after probing `/health` several times and `/auth/login` once, the web log contained **0** lines mentioning `GET /health` and **4** mentioning `GET /auth/login`:
+**⚠ Accuracy refinement (a) — `/health` produces NO request‑log line.** `/health` is **deliberately excluded** from the `after_request` logging block (`not request.path.startswith("/health")`, [`server.py:281`](#citations-appendix)) and from the profiler's ignore list ([`server.py:195`](#citations-appendix)). So a health probe returns `200` but emits **no** per‑request log line. This was verified directly: after probing `/health` several times and issuing real requests to `/auth/login`, the web log contained **0** lines mentioning `GET /health`, while **each** `GET /auth/login` request produced **exactly one** self‑citing line (e.g., three `/health` probes plus one `/auth/login` request yields 0 health lines and 1 login line):
 
 ```text
 # /app/web.log — a real route IS logged (note the self-cited server.py:284):
@@ -451,7 +451,7 @@ Database deltas confirmed a **new `Contact`** (`hey@google.com`, for alias 13) a
 
 **Rationale (why this proves it).** The "New message" entry line ([`email_handler.py:2343‑2347`](#citations-appendix)) proves the SMTP server *accepted* the envelope; the "Finish mail_from … return code '250 …'" exit line ([`email_handler.py:2367‑2373`](#citations-appendix)) proves it *finished successfully*. Between them, the self‑citing trace shows the exact code path the question is about — `handle()` → forward phase → `forward_email_to_mailbox()` resolving `Contact → Alias → Mailbox` and writing `EmailLog 2` ([`email_handler.py:740`](#citations-appendix)). The persistent `EmailLog` row is the durable proof that the alias *received and accounted for* the message; it is also what increments the dashboard's `nb_forward` statistic. The shared message‑id ties every line to this one message, so the evidence is unambiguous.
 
-### Q2.4 The critical local‑mode nuance: `NOT_SEND_EMAIL`
+### Q2.4 The critical local-mode nuance: `NOT_SEND_EMAIL`
 
 **This is the single most important thing to understand so you do not misread "no delivery" as a failure.**
 
@@ -482,7 +482,7 @@ Database deltas confirmed a **new `Contact`** (`hey@google.com`, for alias 13) a
 
 - **Email handler:** has its own `main()` and `__main__` block, and an infinite loop: `Controller(...).start()` then `while True: time.sleep(2)` ([`email_handler.py:2381‑2393`](#citations-appendix)), driven from the `__main__` entry at [`email_handler.py:2403‑2404`](#citations-appendix).
 - **Job runner:** has its own `__main__` block with `while True: … time.sleep(10)` ([`job_runner.py:329‑347`](#citations-appendix)).
-- **Web server:** `create_app()` only calls `register_blueprints(app)` ([`server.py:233‑246`](#citations-appendix)) and the local entry point `local_main()` only configures and calls `app.run(debug=True, port=7777)` ([`server.py:572‑587`](#citations-appendix)). **There is no `subprocess`, `Popen`, `os.fork`, thread, or import‑side launch of `email_handler.py` or `job_runner.py` anywhere in the web startup path.** The web app and the two workers share only the **PostgreSQL database** (and Redis) — that is the coupling, not process parenting.
+- **Web server:** `create_app()` only calls `register_blueprints(app)` ([`server.py:233‑246`](#citations-appendix)) and the local entry point `local_main()` only configures and calls `app.run(debug=True, port=7777)` ([`server.py:572‑588`](#citations-appendix)). **There is no `subprocess`, `Popen`, `os.fork`, thread, or import‑side launch of `email_handler.py` or `job_runner.py` anywhere in the web startup path.** The web app and the two workers share only the **PostgreSQL database** (and Redis) — that is the coupling, not process parenting.
 
 **Observed runtime signal — process independence (the decisive proof).** Inspecting the process table with parent‑PID shows the relationships unambiguously:
 
@@ -529,7 +529,7 @@ In every case the runtime evidence and the code citation reinforce each other �
 
 ---
 
-## Test Data Cleanup & Non‑Persistence
+## Test Data Cleanup & Non-Persistence
 
 All verification data created while capturing the observations above were **ephemeral runtime database rows**, not repository files, and **every one was deleted** on completion using the application's own deletion logic:
 
@@ -567,7 +567,7 @@ Every claim above maps to one of the following `path:line` references (verified 
 | 4 | Per‑request activity logged by `after_request` hook | `server.py:284-292` |
 | 5 | Index `/` redirects (auth → dashboard, anon → login) | `server.py:250-255` |
 | 6 | Blueprints registered (auth, monitor, dashboard, …, oauth at `/oauth` & `/oauth2`, …, api) | `server.py:233-246` |
-| 7 | Local entry `local_main()`; forces `COLOR_LOG=True`; `app.run(port=7777)` | `server.py:572-587` (COLOR_LOG at `573`) |
+| 7 | Local entry `local_main()`; forces `COLOR_LOG=True`; `app.run(port=7777)` | `server.py:572-588` (COLOR_LOG at `573`) |
 | 8 | Gunicorn WSGI entry `app = create_app()` | `wsgi.py` |
 | 9 | Monitor blueprint mounted at `url_prefix="/"` | `app/monitor/base.py:3` |
 | 10 | `/git` → SHA1, `/live` → `"live"`, `/exception` → raises | `app/monitor/views.py:5-7, 10-12, 15-18` |
