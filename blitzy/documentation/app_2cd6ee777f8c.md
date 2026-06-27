@@ -13,6 +13,7 @@ This document explains what the SimpleLogin backend **actually does — and actu
 - **Identity is dual-path.** Browser sessions resolve `current_user` through the Flask-Login `user_loader` keyed on the UUID `alternative_id` (`server.py:L220-230` + `app/models.py:L595-599`), **not** the numeric primary key. API calls resolve `g.user` from the `Authentication` request header (`app/api/base.py:L16-43`).
 - **No background jobs run in the web process.** The dev server serves HTTP only. Every periodic / asynchronous / SMTP task is a **separate top-level `__main__` script** (`job_runner.py`, `cron.py`, `event_listener.py`, `email_handler.py`). Most of these wrap their work in a minimal Flask app context built by `create_light_app()` (`job_runner.py`, `cron.py`, `init_app.py`, and — per processed message — `email_handler.py`), **but `event_listener.py` does *not*** — it runs its own Postgres event-source → `Runner` loop with no Flask app or app context (`event_listener.py:L5`, `L46-47`).
 - **Other import-time activity.** An **eager database connection** is opened at import (`app/db.py:L9-14`) — but *not* before the import-time prints. Configuration is imported and printed first (`>>> URL:`, `app/config.py:L80`), then `>>> init logging <<<` (`app/log.py:L67`), and only *afterwards* does `app.db`'s `engine.connect()` (`app/db.py:L12`) run; so an unreachable Postgres aborts startup *after* those two lines have already printed, but *before* app creation, the Flask banner, and readiness. Also at import: optional Sentry init only if `SENTRY_DSN` is set (`server.py:L111-121`); a Flask-Limiter rate limiter is wired up (`app/extensions.py:L14-23`); and `OAUTHLIB_INSECURE_TRANSPORT=1` is set (`server.py:L124`).
+- **⚠️ Dev-only secret exposure in HTTP responses (Flask-DebugToolbar).** Because `local_main()` attaches the Flask-DebugToolbar (`server.py:L577-582`), **every ordinary HTML response served by the dev server** (e.g. `/auth/login`, `/dashboard/`) has a debug toolbar injected into its body, and the toolbar's **Config** panel dumps the entire Flask `app.config`. That config includes `SECRET_KEY` (set from `FLASK_SECRET`, `server.py:L151`; `app/config.py:L196-199`) and `SQLALCHEMY_DATABASE_URI` (set from `DB_URI`, **including the database password**, `server.py:L146`; `app/config.py:L192`) — so these secrets are emitted **in clear text inside the HTML response body**. This was confirmed empirically: `GET /auth/login` and (after login) `GET /dashboard/` both returned the values `SECRET_KEY = 'secret'` and `SQLALCHEMY_DATABASE_URI = 'postgresql://myuser:mypassword@localhost:5432/simplelogin'` (literal excerpt in [Appendix A.6](#a6--dev-only-flask-debugtoolbar-config-panel-secret-exposure)). It affects only HTML responses that contain a `</body>` tag; redirects (e.g. the `302` after login) and JSON/`/api/*` responses are **not** modified — they instead trigger the harmless `Could not insert debug toolbar. </body> tag not found in response.` warning. This is a **development-only** exposure that is **absent from the production `gunicorn wsgi:app` path**, which never attaches the toolbar. Full detail in [O7](#o7--other-runtime-activity-at-startupduring-requests).
 
 ---
 
@@ -178,7 +179,7 @@ The child (pid 23) is the process that actually serves requests, which is why ev
   ```
   The comment right above it (`app/log.py:L69`) states the intent: silence Flask's default `127.0.0.1 - - [...] "GET ..." 200` access lines. A side effect is that the dev-server "Running on" / debugger lines are silenced too — so the code *would* announce its address, but at runtime it does not.
 - **Per-request lines come from `after_request`.** The structured request line is emitted by `LOG.d("%s %s %s %s %s, takes %s", request.remote_addr, request.method, request.path, request.args, res.status_code, time.time() - start_time)` at `server.py:L284-292`. Because `after_request` skips `/health` (`server.py:L281`), the health probe used to confirm readiness does not itself produce a log line — consistent with the silent readiness.
-- **The Flask-DebugToolbar `UserWarning` is dev-only.** The capture's `UserWarning: Could not insert debug toolbar. </body> tag not found in response.` originates from the toolbar attached in `local_main()` (`server.py:L577-582`); it is harmless and appears only because of the dev toolbar.
+- **The Flask-DebugToolbar `UserWarning` is the *negative* half of a two-sided behavior — not a blanket "harmless" no-op.** The capture's `UserWarning: Could not insert debug toolbar. </body> tag not found in response.` originates from the toolbar attached in `local_main()` (`server.py:L577-582`). The toolbar registers an `after_request` hook that looks for a `</body>` tag in the response (`flask_debugtoolbar/__init__.py:L201-214`): for responses **without** one — redirects (`302`), the plain-text `/health`, and JSON `/api/*` bodies — it cannot insert and emits exactly this warning (this *is* harmless). But for responses that **do** contain `</body>` — every full HTML page such as `/auth/login` and `/dashboard/` — it silently injects the toolbar, and its Config panel then leaks `SECRET_KEY` and `SQLALCHEMY_DATABASE_URI` into the response body. That security-relevant *positive* half is documented in [O7](#o7--other-runtime-activity-at-startupduring-requests) with a literal capture in [Appendix A.6](#a6--dev-only-flask-debugtoolbar-config-panel-secret-exposure).
 - **Color/timestamp variation.** With `COLOR_LOG` unset (the `example.env` default), `SL` timestamps include milliseconds (`19:47:35,485`). With `COLOR_LOG=true` present at import, `coloredlogs.install()` runs (`app/log.py:L61-62`) and reformats timestamps without milliseconds (`19:49:38`), applying ANSI colors only on a TTY. Note that `local_main()` sets `config.COLOR_LOG = True` (`server.py:L573`) *after* `LOG` was already constructed at import (`app/log.py:L79`), so that assignment is inert for the `SL` logger — coloring is governed by whether `COLOR_LOG` was in the environment at import time. Both variants are shown in [Appendix A](#appendix-a--verbatim-captured-output).
 
 ---
@@ -375,6 +376,18 @@ The development web process (`python3 server.py`) starts **no** schedulers, thre
 
 Beyond serving HTTP, the most consequential startup activity is **establishing a database connection at import time**. This is invisible in stdout when it succeeds, and it is a hard prerequisite for reaching readiness — but it is *not* the very first side effect of startup. The import-time **config prints come first** (`>>> URL:` and the four others), then **`>>> init logging <<<`**, and only *after* those does `app.db` open its connection (`app/db.py:L12`). So if Postgres is unreachable, the process fails during import **after** `>>> URL:` and `>>> init logging <<<` have already printed, but **before** app creation, the Flask banner, and readiness (the exact import order is traced in (b) below). In the successful canonical capture, the database connect happened silently and startup proceeded to readiness. No Sentry/profiler lines appear because those features are not enabled in the dev `.env`.
 
+The most consequential *request-time* dev-only activity — and a genuine security caveat — is that **the Flask-DebugToolbar rewrites HTML responses to embed application secrets.** During the captured run, requesting an ordinary HTML page returned a response **bloated by an injected debug toolbar** (`GET /auth/login` → `200`, **349,169 bytes**; the authenticated `GET /dashboard/` → `200`, **779,562 bytes** — both far larger than the few-KB un-instrumented pages; the exact byte size varies run-to-run because the toolbar embeds per-request profiler/timer data and a fresh CSRF token, but the leaked secret values do not), and that injected toolbar's **Config** panel contained, in clear text inside the HTML body, the application's `SECRET_KEY` and full database URI (with password):
+
+```
+<td>SECRET_KEY</td>
+<td><code>&#39;secret&#39;</code></td>
+...
+<td>SQLALCHEMY_DATABASE_URI</td>
+<td><code>&#39;postgresql://myuser:mypassword@localhost:5432/simplelogin&#39;</code></td>
+```
+
+This appears only for responses that carry a `</body>` tag (full HTML pages, anonymous or authenticated); the `302` redirect emitted by a successful login and the JSON `/api/*` and plain-text `/health` responses are **not** rewritten — they instead produce the `Could not insert debug toolbar. </body> tag not found in response.` warning seen in [Appendix A.1](#a1--canonical-dev-startup-python3-serverpy-real-env-color_log-unset). The complete literal capture is in [Appendix A.6](#a6--dev-only-flask-debugtoolbar-config-panel-secret-exposure). **This exposure is specific to the development server and does not occur on the production `gunicorn wsgi:app` path** (the toolbar is attached only in `local_main()`).
+
 ### (b) Why — code rationale
 
 - **Eager, import-time database connection.** `app/db.py` builds the engine and **opens a connection immediately at import**:
@@ -392,6 +405,12 @@ Beyond serving HTTP, the most consequential startup activity is **establishing a
 - **Rate limiter.** A Flask-Limiter `Limiter(key_func=__key_func)` is constructed (`app/extensions.py:L23`) with the per-user/per-IP key function (`app/extensions.py:L14-19`) and attached to the app via `limiter.init_app(app)` (`server.py:L167`); it is disabled when `config.DISABLE_RATE_LIMIT` is set (`app/extensions.py:L26-28`).
 - **`OAUTHLIB_INSECURE_TRANSPORT=1` is set at import.** `os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"` (`server.py:L124`) lets the OAuth flows work over plain HTTP locally (the app is normally fronted by NGINX terminating TLS). This is a development convenience and is **not** appropriate for a direct production deployment.
 - **Optional profiler and per-response NewRelic event.** `flask_profiler` is initialized only if `FLASK_PROFILER_PATH` is set (`server.py:L185-197`); on every non-skipped response, `after_request` records a NewRelic custom event `HttpResponseStatus` (`server.py:L293-295`).
+- **Flask-DebugToolbar injects application secrets into HTML responses (dev only).** This is the one request-time behavior that materially changes what the dev server *sends back*, so it is documented here in full:
+  - **Where it is attached.** Only the dev entry point wires it up. `local_main()` does `from flask_debugtoolbar import DebugToolbarExtension` (`server.py:L577`), enables the profiler panel and disables redirect interception (`app.config["DEBUG_TB_PROFILER_ENABLED"] = True`, `DEBUG_TB_INTERCEPT_REDIRECTS = False`, `server.py:L579-580`), sets `app.debug = True` (`server.py:L581`), and calls `DebugToolbarExtension(app)` (`server.py:L582`) — all **before** `app.run(debug=True, port=7777)` (`server.py:L588`). Production (`gunicorn wsgi:app`) builds the app via the same `create_app()` but never runs `local_main()`, so the toolbar is never attached there.
+  - **How it rewrites responses.** Attaching the extension registers an `after_request` hook (`app.after_request(self.process_response)`, `flask_debugtoolbar/__init__.py:L75`). On each response, `process_response` (`flask_debugtoolbar/__init__.py:L173`) decodes the body (`response.data`, `:L201`) and searches for the last `</body>` tag (`response_html.lower().rfind('</body>')`, `:L204`). If found (`:L206`), it inserts the rendered toolbar immediately before `</body>` (`:L207-208`); if **not** found, it emits `warnings.warn('Could not insert debug toolbar. </body> tag not found in response.')` (`:L213-214`). This is exactly why full HTML pages are rewritten while redirects, JSON, and plain-text bodies are not.
+  - **Why secrets end up in the page.** The toolbar's **Config** panel (`ConfigVarsDebugPanel`, `flask_debugtoolbar/panels/config_vars.py`) renders the **entire** `current_app.config` dict into an HTML table. SimpleLogin's `create_app()` populates that config with the sensitive values: `app.config["SQLALCHEMY_DATABASE_URI"] = DB_URI` (`server.py:L146`) and `app.secret_key = FLASK_SECRET` (`server.py:L151`, which Flask exposes as `app.config["SECRET_KEY"]`). Those originate from the environment at import time — `DB_URI = os.environ["DB_URI"]` (`app/config.py:L192`) and `FLASK_SECRET = os.environ["FLASK_SECRET"]` (`app/config.py:L196-199`, the same block that also fixes `SESSION_COOKIE_NAME = "slapp"`). Consequently the Config panel renders `SECRET_KEY` → `'secret'` and `SQLALCHEMY_DATABASE_URI` → `'postgresql://myuser:mypassword@localhost:5432/simplelogin'` (the DB password in clear text) into every HTML page, as captured verbatim in [Appendix A.6](#a6--dev-only-flask-debugtoolbar-config-panel-secret-exposure). Other config keys are dumped too (e.g. `SESSION_COOKIE_NAME` → `'slapp'`), but `SECRET_KEY` and the DB URI are the security-relevant ones.
+
+> **⚠️ Security caveat (development server only).** Running `python3 server.py` serves application **secrets in the response body of every HTML page**: the Flask `SECRET_KEY` (which signs the `slapp` session cookie) and the full `SQLALCHEMY_DATABASE_URI` including the database password. Anyone who can load a dev page — or capture its HTML — can read both. This is a property of the **development** server only, because the Flask-DebugToolbar is attached exclusively in `local_main()` (`server.py:L577-582`); it is **not** present under the production `gunicorn wsgi:app` launch (`Dockerfile:L47`), which never calls `local_main()`. The takeaway for "what actually happens at runtime": the local dev server is **not** safe to expose beyond `localhost`, and a leaked dev `SECRET_KEY` would let an attacker forge session cookies. No source change is made here (this document is read-only against the codebase); the behavior is reported as observed.
 
 
 ---
@@ -528,6 +547,40 @@ In production, **gunicorn's own logger** prints the readiness signal `Listening 
 
 An earlier startup-only capture used `CONFIG=/work/run.env` and therefore *also* printed a leading line `load config file /work/run.env` (`app/config.py:L68`). The documented `.env` flow — the `else` branch `load_dotenv()` at `app/config.py:L71` — does **not** print that line. The canonical `.env`-based capture in A.1 (no `CONFIG`) is authoritative; this artifact is noted only to explain the conditional print at `app/config.py:L68`.
 
+### A.6 — Dev-only Flask-DebugToolbar config-panel secret exposure
+
+This capture documents the request-time secret exposure described in [O7](#o7--other-runtime-activity-at-startupduring-requests). It was produced by running the dev server inside the provided container image, against the throwaway `.env` built from `example.env` (so `SECRET_KEY` is the literal `example.env` placeholder `secret` and the DB URI carries the throwaway `example.env` credentials — *not* real production secrets). The exposure reproduced identically on repeated runs.
+
+**Reproduction (curl, from inside the container):**
+
+```
+# anonymous HTML page
+curl -s -D login.headers -o login.html http://127.0.0.1:7777/auth/login
+#   -> HTTP/1.0 200 OK ; Content-Type: text/html; charset=utf-8 ; 349169 bytes
+grep -n -C1 "<td>SECRET_KEY</td>"              login.html
+grep -n -C1 "<td>SQLALCHEMY_DATABASE_URI</td>" login.html
+
+# authenticated HTML page (after POST /auth/login john@wick.com/password -> 302, slapp cookie)
+curl -s -b cookies.txt -o dashboard.html http://127.0.0.1:7777/dashboard/
+#   -> HTTP/1.0 200 OK ; 779562 bytes  (same two rows present)
+```
+
+**Verbatim rows from the `/auth/login` response body** (the `&#39;` entities are the HTML-escaped single quotes exactly as served; identical rows appear in the `/dashboard/` body):
+
+```
+            <tr class="flDebugOdd">
+                <td>SECRET_KEY</td>
+                <td><code>&#39;secret&#39;</code></td>
+...
+            <tr class="flDebugOdd">
+                <td>SQLALCHEMY_DATABASE_URI</td>
+                <td><code>&#39;postgresql://myuser:mypassword@localhost:5432/simplelogin&#39;</code></td>
+```
+
+The injected block is the toolbar's **Config** panel (`ConfigVarsDebugPanel`), which dumps the whole `app.config`; for context, adjacent rows in the same table include non-secret entries such as `SESSION_COOKIE_NAME` → `'slapp'` and `SQLALCHEMY_TRACK_MODIFICATIONS` → `False`. **Negative controls** (no `</body>` ⇒ no injection ⇒ no leak): `GET /api/user_info` returned a 284-byte `application/json` body with **zero** occurrences of `SECRET_KEY`/`flDebugToolbar`, and `GET /health` returned the plain-text `success`; both instead caused the `Could not insert debug toolbar. </body> tag not found in response.` warning in the server log (also visible at lines 20–21 of [Appendix A.1](#a1--canonical-dev-startup-python3-serverpy-real-env-color_log-unset)).
+
+> The `alternative_id`/timestamps/`GNUPGHOME` paths and the **total response byte size** differ run-to-run (the toolbar embeds per-request profiler data and a fresh CSRF token); the **values that matter here** — `SECRET_KEY = 'secret'` and the `SQLALCHEMY_DATABASE_URI` with `myuser:mypassword` — are deterministic functions of the `.env` built from `example.env` (`example.env:L75`, `L77`) and reproduced identically across repeated requests.
+
 ---
 
 ## Appendix B — Evidence index
@@ -575,6 +628,11 @@ Every factual claim in this document maps to a source location below (and, where
 | Dev run command / login creds | `CONTRIBUTING.md:L106`, `L109` |
 | Worker entry points | `job_runner.py:L24`, `L329-347`; `cron.py:L65`, `L1262-1273`; `event_listener.py:L5`, `L8-9`, `L29-47`, `L94-113`; `email_handler.py:L48`, `L177`, `L2352`, `L2383-2396`; `init_app.py:L10`, `L69-71` |
 | `dummy-data` lazy `init_app` import | `server.py:L490-497` (import at `L492`) |
+| Flask-DebugToolbar attached (dev only) | `server.py:L577-582`; not on prod path (`Dockerfile:L47`, `wsgi.py:L1-3`) |
+| Toolbar `after_request` insert-on-`</body>` / else warn | `flask_debugtoolbar/__init__.py:L75`, `L173`, `L201`, `L204`, `L206-208`, `L213-214` |
+| Config panel dumps entire `app.config` | `flask_debugtoolbar/panels/config_vars.py` (`ConfigVarsDebugPanel.content()`) |
+| Secret values placed into `app.config` | `SQLALCHEMY_DATABASE_URI = DB_URI` (`server.py:L146`; `app/config.py:L192`); `SECRET_KEY` from `FLASK_SECRET` (`server.py:L151`; `app/config.py:L196-199`) |
+| DebugToolbar secret/DB-credential exposure (observed) | [Appendix A.6](#a6--dev-only-flask-debugtoolbar-config-panel-secret-exposure) — `SECRET_KEY = 'secret'`, `SQLALCHEMY_DATABASE_URI` incl. password in `/auth/login` & `/dashboard/` HTML |
 | Version pins | `pyproject.toml:L61-117`; `poetry.lock` (werkzeug 1.0.1, flask 1.1.2, click 8.0.3) |
 
 ---
