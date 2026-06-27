@@ -47,12 +47,17 @@ inbound email is delivered to an alias:
 
 The values below were captured by **building and running** SimpleLogin, not by static reasoning:
 
-- A **`postgres:13`** database container, standing up the exact pattern used by the project's own
-  test runner `scripts/run-test.sh`: container named **`sl-test-db`**, host port **`15432`** mapped to
-  container port `5432`, with `POSTGRES_USER=test` / `POSTGRES_PASSWORD=test` / `POSTGRES_DB=test`.
-- **Python 3.10** (the version pinned by `Dockerfile` `FROM python:3.10` `[Dockerfile:L8]` and by CI),
-  with dependencies pinned from `poetry.lock` — notably **`SQLAlchemy 1.3.24`**, **`Flask 1.1.2`**,
-  **`aiosmtpd 1.4.2`**, **`flanker 0.9.11`**, and **`arrow 0.16.0`**.
+- The committed Docker image **`simplelogin-app-ready`** (built from
+  `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_simple-login_app_1.0`), which bakes in the full pinned
+  stack at HEAD `2cd6ee77`. Inside it, **PostgreSQL 15.13** listens on **`localhost:15432`**
+  (`POSTGRES_USER=test` / `POSTGRES_PASSWORD=test` / `POSTGRES_DB=test`) and **Redis 7** on `6379` —
+  the same host / port / credentials the project's own test runner `scripts/run-test.sh` uses (its
+  portable form spins a `postgres:13` container named `sl-test-db`; the PostgreSQL **major** version
+  is immaterial here because the schema is fixed entirely by the Alembic migrations).
+- **Python 3.10.18** (the version pinned by `Dockerfile` `FROM python:3.10` `[Dockerfile:L8]` and by
+  CI), with **every dependency installed verbatim from `poetry.lock` — no substitutions** — notably
+  **`SQLAlchemy 1.3.24`**, **`Flask 1.1.2`**, **`aiosmtpd 1.4.2`**, **`flanker 0.9.11`**,
+  **`arrow 0.16.0`**, and the genuine compiled **`pyre2 0.3.6`** (the Google RE2 binding).
 - Schema materialized via `CONFIG=tests/test.env poetry run alembic upgrade head` (Alembic head
   `32f25cbf12f6`).
 - Runtime configuration loaded from **`tests/test.env`**:
@@ -80,15 +85,18 @@ Three scenarios were exercised against this single coherent snapshot:
 - **(C)** a single **reply** to a contact's reverse-alias — included **only** to contrast the
   `Message-ID` behavior for Q2.
 
-### Transparency note (environment substitutions that do not affect any reported value)
+### Provenance note (fully faithful pinned stack; values confirmed across repeated runs)
 
-In full honesty: two dependencies were substituted **in the throwaway test environment only**, and
-neither affects any value reported in this document. `pyre2` (a libre2 binding) was replaced by a
-thin standard-library `re` shim — the regular-expression *engine* is irrelevant to email routing and
-header transformation logic — and `cbor2` resolved to `5.6.4` (used solely by the FIDO2/WebAuthn code
-paths, which are unrelated to email forwarding). **No source file was modified.** The probe code ran
-from a writable working copy with the repository source treated strictly read-only, and any probe
-code lived **outside** the repository tree. `git status --porcelain` confirmed the source tree was
+Every dependency was installed **verbatim from `poetry.lock`, with no substitutions** — in particular
+the genuine compiled **`pyre2 0.3.6`** (the Google RE2 binding) and **`cbor2 5.2.0`** are present, so
+the regular-expression engine and the FIDO2/WebAuthn codec are exactly those pinned at HEAD `2cd6ee77`.
+The three scenarios were driven **twice**, each against a freshly-migrated (pristine) database: the
+**structure and behaviour were identical** across runs, and only the non-deterministic elements
+changed — the random reverse-alias suffix, the `make_msgid()` timestamp/pid/random components, the
+per-message UUID `Message-ID`s, and the `created_at` timestamps. The values reported below are
+**one coherent live-run snapshot**, captured at ~`2026-06-27T00:57:51Z`. **No source file was
+modified:** the probe that drove `handle()` lived **outside** the repository tree and treated the
+repository source as strictly read-only; `git status --porcelain` confirmed the source tree was
 byte-for-byte unchanged after the run.
 
 ### Disambiguation: the per-email trace UUID is NOT the email `Message-ID`
@@ -107,9 +115,9 @@ the reply path (Q2). This document never conflates the two.
 
 ### 1.1 Success path — forward accepted (`250`)
 
-**Scenario:** a forward to a **valid** alias `rotary_carafe092@sl.local` from a **new** sender
-`bob_skaliz@external-example.com` (display name `Bob Sender`), owned by user *Alice Owner* whose
-mailbox is `owner_gyhgrvmq@mailbox.test`.
+**Scenario:** a forward to a **valid** alias `faring_earwig711@sl.local` from a **new** sender
+`bob@external-example.com` (display name `Bob Sender`), owned by user *Alice Owner* whose
+mailbox is `owner_probe@mailbox.test`.
 
 **Final SMTP return code (captured):**
 
@@ -126,48 +134,48 @@ This is `status.E200`, defined exactly as `E200 = "250 Message accepted for deli
 level). Each line is reproduced verbatim:
 
 ```text
-==>> Handle mail_from:bob_skaliz@external-example.com, rcpt_tos:['rotary_carafe092@sl.local'], header_from:Bob Sender <bob_skaliz@external-example.com>, header_to:rotary_carafe092@sl.local, cc:None, reply-to:None, message_id:<orig.8e0ff55d69e242e795d10f30b9bc4f8a@external-example.com>, ...
+==>> Handle mail_from:bob@external-example.com, rcpt_tos:['faring_earwig711@sl.local'], header_from:Bob Sender <bob@external-example.com>, header_to:faring_earwig711@sl.local, cc:None, reply-to:None, message_id:<orig.681afbf4b62b4ce5bb9d649934c3b2a2@external-example.com>, ...
 ```
 ↳ emitted by `handle()` `[email_handler.py:L1980]` (the `==>> Handle ...` format string sits on the
 following line, `[email_handler.py:L1981]`).
 
 ```text
-Forward phase bob_skaliz@external-example.com(Bob Sender <bob_skaliz@external-example.com>) -> rotary_carafe092@sl.local
+Forward phase bob@external-example.com(Bob Sender <bob@external-example.com>) -> faring_earwig711@sl.local
 ```
 ↳ `handle()` `[email_handler.py:L2202]`.
 
 ```text
-Create or get contact for from_header:Bob Sender <bob_skaliz@external-example.com>
+Create or get contact for from_header:Bob Sender <bob@external-example.com>
 ```
 ↳ `handle_forward()` `[email_handler.py:L580]`.
 
 ```text
-Created contact <Contact 1 bob_skaliz@external-example.com 2> for alias <Alias 2 rotary_carafe092@sl.local> with email bob_skaliz@external-example.com invalid_email=False
+Created contact <Contact 1 bob@external-example.com 2> for alias <Alias 2 faring_earwig711@sl.local> with email bob@external-example.com invalid_email=False
 ```
 ↳ `create_contact()` `[app/contact_utils.py:L110]`.
 
 ```text
-Forward <Contact 1 bob_skaliz@external-example.com 2> -> <Alias 2 rotary_carafe092@sl.local> -> <Mailbox 1 owner_gyhgrvmq@mailbox.test>
+Forward <Contact 1 bob@external-example.com 2> -> <Alias 2 faring_earwig711@sl.local> -> <Mailbox 1 owner_probe@mailbox.test>
 ```
 ↳ `forward_email_to_mailbox()` `[email_handler.py:L688]`.
 
 ```text
-Create <EmailLog 1> for <Contact 1 bob_skaliz@external-example.com 2>, <User 1 Alice Owner owner_gyhgrvmq@mailbox.test>, <Mailbox 1 owner_gyhgrvmq@mailbox.test>
+Create <EmailLog 1> for <Contact 1 bob@external-example.com 2>, <User 1 Alice Owner owner_probe@mailbox.test>, <Mailbox 1 owner_probe@mailbox.test>
 ```
 ↳ `forward_email_to_mailbox()` `[email_handler.py:L740]`.
 
 ```text
-From header, new:"Bob Sender - bob_skaliz at external-example.com" <bob_skaliz_at_external-example_com_vukwpsmrkk@sl.local>, old:Bob Sender <bob_skaliz@external-example.com>
+From header, new:"Bob Sender - bob at external-example.com" <bob_at_external-example_com_tmnpnrtiyy@sl.local>, old:Bob Sender <bob@external-example.com>
 ```
 ↳ `forward_email_to_mailbox()` `[email_handler.py:L867]`.
 
 ```text
-Forward mail from bob_skaliz@external-example.com to owner_gyhgrvmq@mailbox.test, mail_options:[], rcpt_options:[]
+Forward mail from bob@external-example.com to owner_probe@mailbox.test, mail_options:[], rcpt_options:[]
 ```
 ↳ `forward_email_to_mailbox()` `[email_handler.py:L893]`.
 
 ```text
-send email with subject 'Hello through my alias', from '"Bob Sender - bob_skaliz at external-example.com" <bob_skaliz_at_external-example_com_vukwpsmrkk@sl.local>' to 'rotary_carafe092@sl.local'
+send email with subject 'Hello through my alias', from '"Bob Sender - bob at external-example.com" <bob_at_external-example_com_tmnpnrtiyy@sl.local>' to 'faring_earwig711@sl.local'
 ```
 ↳ `mail_sender.send()` `[app/mail_sender.py:L131]`.
 
@@ -181,7 +189,7 @@ send email with subject 'Hello through my alias', from '"Bob Sender - bob_skaliz
 
 ### 1.2 Failure path — alias does not exist (`550`)
 
-**Scenario:** a forward to a **non-existent** alias `nope_xqlqxkko@sl.local`.
+**Scenario:** a forward to a **non-existent** alias `nope_80ed3227@sl.local`.
 
 **Final SMTP return code (captured):**
 
@@ -195,22 +203,22 @@ This is `status.E515`, defined exactly as `E515 = "550 SL E515 Email not exist"`
 **Captured log lines, in the exact order emitted** (verbatim):
 
 ```text
-alias nope_xqlqxkko@sl.local not exist. Try to see if it can be created on the fly
+alias nope_80ed3227@sl.local not exist. Try to see if it can be created on the fly
 ```
 ↳ `handle_forward()` `[email_handler.py:L545]`.
 
 ```text
-Cannot auto-create custom domain alias for nope_xqlqxkko@sl.local because there's no custom domain for sl.local
+Cannot auto-create custom domain alias for nope_80ed3227@sl.local because there's no custom domain for sl.local
 ```
 ↳ `check_if_alias_can_be_auto_created_for_custom_domain()` `[app/alias_utils.py:L104]`.
 
 ```text
-Cannot auto-create nope_xqlqxkko@sl.local since it has no directory separator
+Cannot auto-create nope_80ed3227@sl.local since it has no directory separator
 ```
 ↳ `check_if_alias_can_be_auto_created_for_a_directory()` `[app/alias_utils.py:L165]`.
 
 ```text
-alias nope_xqlqxkko@sl.local cannot be created on-the-fly, return 550
+alias nope_80ed3227@sl.local cannot be created on-the-fly, return 550
 ```
 ↳ `handle_forward()` `[email_handler.py:L551]`.
 
@@ -258,7 +266,7 @@ The headline result corrects a common misconception:
 For the forward scenario, the inbound original `Message-ID`:
 
 ```text
-<orig.8e0ff55d69e242e795d10f30b9bc4f8a@external-example.com>
+<orig.681afbf4b62b4ce5bb9d649934c3b2a2@external-example.com>
 ```
 
 appeared **identically** on the outbound forwarded message, and `EmailLog #1.message_id` stored that
@@ -274,14 +282,14 @@ Driving a reply (from the mailbox back to the contact's reverse-alias) produced 
 `Message-ID`:
 
 ```text
-inbound original Message-ID : <reply.orig.7e1a27db3d354ee1a2e667e8e5c08211@mailbox.test>
-minted SL Message-ID        : <178250299191.8674.9648925825288615843.2@sl.local>
+inbound original Message-ID : <reply.orig.6563e3323b9a429b9f5cbd026c43ac44@mailbox.test>
+minted SL Message-ID        : <178252187190.518.10434143251263511269.2@sl.local>
 ```
 
 The minting was visible in the log:
 
 ```text
-create a new sl_message_id <178250299191.8674.9648925825288615843.2@sl.local>
+create a new sl_message_id <178252187190.518.10434143251263511269.2@sl.local>
 ```
 ↳ `replace_original_message_id()` `[email_handler.py:L1314]`.
 
@@ -290,10 +298,10 @@ create a new sl_message_id <178250299191.8674.9648925825288615843.2@sl.local>
 ```text
 MessageIDMatching:
   id                  = 1
-  sl_message_id       = <178250299191.8674.9648925825288615843.2@sl.local>
-  original_message_id = <reply.orig.7e1a27db3d354ee1a2e667e8e5c08211@mailbox.test>
+  sl_message_id       = <178252187190.518.10434143251263511269.2@sl.local>
+  original_message_id = <reply.orig.6563e3323b9a429b9f5cbd026c43ac44@mailbox.test>
   email_log_id        = 2
-  created_at          = 2026-06-26T19:43:11.917109+00:00
+  created_at          = 2026-06-27T00:57:51.905546+00:00
 ```
 
 ### 2.3 Rationale / How we know — how it differs (Q2)
@@ -303,7 +311,7 @@ MessageIDMatching:
   `make_msgid(str(email_log.id), get_email_domain_part(alias.email))` `[email_handler.py:L1311-L1313]`.
   Python's `email.utils.make_msgid(idstring, domain)` produces a value of the shape
   `<{timestamp}.{pid}.{random}.{idstring}@{domain}>`. Decoding the captured
-  `<178250299191.8674.9648925825288615843.2@sl.local>` against that template gives
+  `<178252187190.518.10434143251263511269.2@sl.local>` against that template gives
   `idstring = "2"` — i.e. `str(email_log.id)`, the reply's `EmailLog` id — and `domain = sl.local`,
   the alias's domain.
 - **How it differs from the original.** The SL Message-ID therefore (a) **embeds the `EmailLog` id**
@@ -340,13 +348,13 @@ include_sender_in_reverse_alias = True   # Python model default   [app/models.py
 **Transformed `From` header on the stored outbound forwarded message:**
 
 ```text
-"Bob Sender - bob_skaliz at external-example.com" <bob_skaliz_at_external-example_com_vukwpsmrkk@sl.local>
+"Bob Sender - bob at external-example.com" <bob_at_external-example_com_tmnpnrtiyy@sl.local>
 ```
 
 **Reverse-alias / reply address (`Contact.reply_email`):**
 
 ```text
-bob_skaliz_at_external-example_com_vukwpsmrkk@sl.local
+bob_at_external-example_com_tmnpnrtiyy@sl.local
 ```
 
 ### 3.2 Rationale / How we know — format explanation (Q3)
@@ -359,8 +367,8 @@ bob_skaliz_at_external-example_com_vukwpsmrkk@sl.local
   `new_name = "{name} - {formatted_email}"`, then returns `sl_formataddr((new_name, reply_email))`
   `[app/models.py:L2045]`. Concretely:
   - display name → `Bob Sender`
-  - `bob_skaliz@external-example.com` → `bob_skaliz at external-example.com` (the `@` becomes ` at `)
-  - phrase → `Bob Sender - bob_skaliz at external-example.com`
+  - `bob@external-example.com` → `bob at external-example.com` (the `@` becomes ` at `)
+  - phrase → `Bob Sender - bob at external-example.com`
   - addressed at the reverse-alias → the captured `From` header above.
 
 - **How the reverse-alias is generated.** The reverse-alias is produced by `generate_reply_email()`
@@ -372,12 +380,12 @@ bob_skaliz_at_external-example_com_vukwpsmrkk@sl.local
   `random_length = random.randint(5, 10)`. For our sender this composes as:
 
   ```text
-  bob_skaliz  +  _at_  +  external-example_com  +  _vukwpsmrkk  +  @sl.local
-  └ local part ─────────────────────────────┘  └ random(5..10) ┘  └ EMAIL_DOMAIN ┘
-  = bob_skaliz_at_external-example_com_vukwpsmrkk@sl.local
+  bob  +  _at_  +  external-example_com  +  _tmnpnrtiyy  +  @sl.local
+  └ local part ───────────────────────┘  └ random(5..10) ┘  └ EMAIL_DOMAIN ┘
+  = bob_at_external-example_com_tmnpnrtiyy@sl.local
   ```
 
-  The random suffix `vukwpsmrkk` is 10 characters — within the `random.randint(5, 10)` range. There is
+  The random suffix `tmnpnrtiyy` is 10 characters — within the `random.randint(5, 10)` range. There is
   **no `ra+` / `reply+` prefix on the generated reverse-alias**: in `generate_reply_email()` the legacy
   prefixed-generation is commented out — the include-sender branch at `[app/email_utils.py:L1140-L1141]`
   and the bare-random branch at `[app/email_utils.py:L1146-L1147]`, **both referencing only `ra+`** — so
@@ -415,27 +423,27 @@ creation order (by `created_at`):
 ```text
 1) Contact
    id              = 1
-   website_email   = bob_skaliz@external-example.com
-   reply_email     = bob_skaliz_at_external-example_com_vukwpsmrkk@sl.local
+   website_email   = bob@external-example.com
+   reply_email     = bob_at_external-example_com_tmnpnrtiyy@sl.local
    automatic_created = True
-   created_at      = 2026-06-26T19:43:11.844665+00:00
+   created_at      = 2026-06-27T00:57:51.835158+00:00
    origin: create_contact() -> Contact.create(...)   [app/contact_utils.py:L92-L103]
 
 2) UserAuditLog
    id          = 1
    action      = create_contact
-   message     = "Created contact 1 (bob_skaliz@external-example.com)"
-   created_at  = 2026-06-26T19:43:11.850017+00:00
+   message     = "Created contact 1 (bob@external-example.com)"
+   created_at  = 2026-06-27T00:57:51.839808+00:00
    origin: emit_user_audit_log(action=UserAuditLogAction.CreateContact,
                                message=f"Created contact {contact.id} ({contact.email})")
            [app/contact_utils.py:L104-L109]
 
 3) EmailLog
    id          = 1
-   message_id  = <orig.8e0ff55d69e242e795d10f30b9bc4f8a@external-example.com>
+   message_id  = <orig.681afbf4b62b4ce5bb9d649934c3b2a2@external-example.com>
    is_reply    = False
    contact_id  = 1
-   created_at  = 2026-06-26T19:43:11.861468+00:00
+   created_at  = 2026-06-27T00:57:51.850783+00:00
    origin: EmailLog.create(..., message_id=str(msg[headers.MESSAGE_ID]), commit=True)
            [email_handler.py:L732-L739]
 ```
@@ -446,14 +454,14 @@ creation order (by `created_at`):
   inserts the `Contact` row with `automatic_created=True` `[app/contact_utils.py:L92-L103]` and an
   accompanying `UserAuditLog` of action `CreateContact` `[app/contact_utils.py:L104-L109]`; the forward
   then inserts one `EmailLog` `[email_handler.py:L732-L739]`. The `message` of the audit row,
-  `"Created contact 1 (bob_skaliz@external-example.com)"`, is produced verbatim by the f-string
+  `"Created contact 1 (bob@external-example.com)"`, is produced verbatim by the f-string
   `f"Created contact {contact.id} ({contact.email})"` at `[app/contact_utils.py:L107]`.
 - **Why the ids and timestamps look the way they do.** All three models inherit `ModelMixin`, which
   defines an autoincrement integer primary key
   `id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)` `[app/models.py:L63]` and
   `created_at = sa.Column(ArrowType, default=arrow.utcnow, nullable=False)` `[app/models.py:L64]`.
   Because `arrow.utcnow()` is evaluated at insert time, the timestamps are strictly increasing in
-  insert order — Contact (`…844665`) → UserAuditLog (`…850017`) → EmailLog (`…861468`) — which is
+  insert order — Contact (`…835158`) → UserAuditLog (`…839808`) → EmailLog (`…850783`) — which is
   exactly what was observed.
 - **Contrast — a forward from an *existing* contact creates only ONE row.** When the sender's contact
   already exists, `create_contact()` short-circuits to the existing contact (no new `Contact`, no new
@@ -461,13 +469,16 @@ creation order (by `created_at`):
   scenario corroborates this: it added `EmailLog id=2` plus `MessageIDMatching id=1` (see Q2) and
   created **no** new `Contact` and **no** new `UserAuditLog`, precisely because the contact already
   existed. So the per-forward record count is **3 for a new sender, 1 for a known sender.**
-- **Authoring caveat — how the live ids/timestamps were read.** The `flask_client` fixture in
-  `tests/conftest.py` wraps each test in `connection.begin()` `[tests/conftest.py:L61]` and **rolls
-  back** at teardown (`transaction.rollback()` `[tests/conftest.py:L75]` / `Session.rollback()`
-  `[tests/conftest.py:L76]`), so probe rows do not persist after the test. The ids and `created_at`
-  values above were therefore read **during** the probe (before rollback). They are genuine live-DB
-  autoincrement values: on a freshly migrated, empty database the first forward yields `Contact id=1`
-  / `UserAuditLog id=1` / `EmailLog id=1`, consistent with the snapshot above.
+- **Authoring note — how the live ids/timestamps were read.** The database was first reset to a
+  **pristine** schema (drop/recreate `public` + `alembic upgrade head`, Alembic head `32f25cbf12f6`),
+  so every autoincrement sequence started fresh. The probe then ran inside a Flask `app_context` and
+  let the forward's own `Session.commit()` `[email_handler.py:L927]` persist the rows, reading them
+  straight back from the live PostgreSQL instance. Because the database was empty, the first forward
+  yields `Contact id=1` / `UserAuditLog id=1` / `EmailLog id=1` — exactly the snapshot above. (The
+  project's own `flask_client` fixture instead wraps each test in `connection.begin()`
+  `[tests/conftest.py:L61]` and **rolls back** at teardown `[tests/conftest.py:L75-L76]`; the probe
+  deliberately did **not** rely on that fixture — it committed to, and re-read from, a pristine DB so
+  the reported ids/timestamps are stable, genuine, persisted values.)
 
 
 ---
@@ -534,7 +545,7 @@ by this investigation is **this document**, `blitzy/documentation/app_2cd6ee777f
 | Build/run + teardown pattern | `scripts/run-test.sh` |
 
 *All values reported above are genuine values captured from a single coherent live-run snapshot
-(timestamps ~`2026-06-26T19:43:11Z`). Re-running the harness yields different non-deterministic
+(timestamps ~`2026-06-27T00:57:51Z`). Re-running the harness yields different non-deterministic
 random suffixes and timestamps; the code-level structure and behavior, however, are invariant and are
 what the citations point to.*
 
