@@ -39,7 +39,7 @@ aiosmtpd 1.4.2
 gunicorn 20.0.4
 ```
 
-These match the pins declared in the project manifest: `pyproject.toml:L2` `target-version = ['py310']`, `pyproject.toml:L61` `python = "^3.10"`, `pyproject.toml:L66` `gunicorn = "^20.0.4"`, `pyproject.toml:L71` `psycopg2-binary = "^2.9.3"`, `pyproject.toml:L77` `Flask-Migrate = "^2.5.3"`, `pyproject.toml:L87` `aiosmtpd = "^1.2"` (resolved to `1.4.2`), and `pyproject.toml:L116` `SQLAlchemy = "1.3.24"`. The container image base is `Dockerfile:L8` `FROM python:3.10` (an earlier stage builds frontend assets with `Dockerfile:L2` `FROM node:10.17.0-alpine as npm`).
+These match the pins declared in the project manifest: `pyproject.toml:L2` `target-version = ['py310']`, `pyproject.toml:L61` `python = "^3.10"`, `pyproject.toml:L62` `flask = "^1.1.2"`, `pyproject.toml:L66` `gunicorn = "^20.0.4"`, `pyproject.toml:L71` `psycopg2-binary = "^2.9.3"`, `pyproject.toml:L77` `Flask-Migrate = "^2.5.3"`, `pyproject.toml:L87` `aiosmtpd = "^1.2"` (resolved to `1.4.2`), and `pyproject.toml:L116` `SQLAlchemy = "1.3.24"`. The container image base is `Dockerfile:L8` `FROM python:3.10` (an earlier stage builds frontend assets with `Dockerfile:L2` `FROM node:10.17.0-alpine as npm`).
 
 The three behaviors below depend on:
 
@@ -90,7 +90,19 @@ LISTEN 0      244        127.0.0.1:15432      0.0.0.0:*
 LISTEN 0      244        127.0.0.1:5432       0.0.0.0:*
 ```
 
-**Decision: this investigation uses port `5432`** — the `simplelogin` database that the application reads from `.env`/`example.env` (`myuser`/`mypassword`/`simplelogin`). Port `15432` is a separate `test`/`test`/`test` instance used by the developer reset script and the test suite. This discrepancy is **described, not fixed** (the task is read‑only).
+**Decision: this investigation uses port `5432`** — the `simplelogin` database that the application reads from `.env`/`example.env` (`myuser`/`mypassword`/`simplelogin`). Port `15432`, by contrast, is — in this environment — the **test** PostgreSQL instance, and the two source files that reference it do not agree: `scripts/reset_local_db.sh:L3` points at `myuser:mypassword@localhost:15432/simplelogin` (quoted above), whereas the test config `tests/test.env:L17` uses `test:test@localhost:15432/test`. Probing port `15432` confirms it accepts `test`/`test`/`test` but rejects the reset script's `myuser`/`mypassword`/`simplelogin`:
+
+```bash
+PGPASSWORD=test psql -h localhost -p 15432 -U test -d test -tAc "select 1;"
+PGPASSWORD=mypassword psql -h localhost -p 15432 -U myuser -d simplelogin -tAc "select 1;"
+```
+
+```text
+1
+psql: error: connection to server at "localhost" (::1), port 15432 failed: FATAL:  password authentication failed for user "myuser"
+```
+
+The `scripts/reset_local_db.sh:L3` URI is therefore stale relative to this environment — its `myuser`/`mypassword`/`simplelogin` credentials live only on port `5432` — which is a further reason this investigation used the application's `.env`/`example.env` port `5432`. This discrepancy is **described, not fixed** (the task is read‑only).
 
 ### Migration set
 
@@ -166,7 +178,7 @@ curl -s -o /dev/null -w "HTTP %{http_code} -> %header{location}\n" -c /tmp/cj.tx
 curl -s -o /tmp/login_get.html -w "HTTP %{http_code}, bytes=%{size_download}\n" -b /tmp/cj.txt -c /tmp/cj.txt "http://localhost:7777/auth/login"
 CSRF=$(grep -oE 'name="csrf_token"[^>]*value="[^"]*"' /tmp/login_get.html | head -1 | sed -E 's/.*value="([^"]*)".*/\1/')
 
-# POST credentials with the valid csrf_token -> triggers User.get_by(email=...)
+# POST credentials with the valid csrf_token -> triggers User.get_by(email=email)
 curl -s -o /tmp/login_post.html \
   -w "HTTP %{http_code}, bytes=%{size_download}, content-type=%header{content-type}\n" \
   -b /tmp/cj.txt -c /tmp/cj.txt \
@@ -182,10 +194,10 @@ curl -s -o /tmp/login_post.html \
 >>> URL: http://localhost:7777
 MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value
 Paddle param not set
-WARNING: Use a temp directory for GNUPGHOME /tmp/tfmmgvsbhgyjlwzjmnxv
+WARNING: Use a temp directory for GNUPGHOME /tmp/eqxbhrennyhbpukkmtge
 Upload files to local dir
 >>> init logging <<<
-2026-07-01 04:25:23,941 - SL - DEBUG - 193 - "/code/app/utils.py:17" - <module>() -  - load words file: /code/local_data/test_words.txt
+2026-07-01 05:05:05,071 - SL - DEBUG - 1200 - "/code/app/utils.py:17" - <module>() -  - load words file: /code/local_data/test_words.txt
  * Serving Flask app "server" (lazy loading)
  * Environment: production
    WARNING: This is a development server. Do not use it in a production deployment.
@@ -193,7 +205,7 @@ Upload files to local dir
  * Debug mode: on
 ```
 
-`* Debug mode: on` confirms `app.run(debug=True, …)`. (The startup block prints twice because `debug=True` enables the Werkzeug reloader, which spawns a child process — parent PID 193, child PID 200.) Note there is **no** Werkzeug `Running on http://…` banner: SimpleLogin silences the `werkzeug` logger, so readiness is signalled by `* Serving Flask app "server"` plus the listening socket on `7777`.
+`* Debug mode: on` confirms `app.run(debug=True, …)`. (The startup block prints twice because `debug=True` enables the Werkzeug reloader, which spawns a child process — parent PID 1200, child PID 1214.) Note there is **no** Werkzeug `Running on http://…` banner: SimpleLogin silences the `werkzeug` logger, so readiness is signalled by `* Serving Flask app "server"` plus the listening socket on `7777`.
 
 ### Verbatim output — GET vs POST (sub‑part d)
 
@@ -202,7 +214,7 @@ Upload files to local dir
 HTTP 302 -> Location: http://localhost:7777/auth/login
 
 ===GET /auth/login — HTTP 200, NO DB query on anonymous GET===
-HTTP 200, bytes=335570
+HTTP 200, bytes=335022
 
 ===POST /auth/login with credentials (triggers first DB query)===
 HTTP 500, bytes=5749, content-type=text/html; charset=utf-8
@@ -211,12 +223,12 @@ HTTP 500, bytes=5749, content-type=text/html; charset=utf-8
 The server's own request log confirms the GET succeeded with no error and only the POST failed:
 
 ```text
-2026-07-01 04:26:01,637 - SL - DEBUG - 200 - "/code/server.py:284" - after_request() -  - 127.0.0.1 GET / ImmutableMultiDict([]) 302, takes 0.0010535717010498047
-2026-07-01 04:26:01,789 - SL - DEBUG - 200 - "/code/server.py:284" - after_request() -  - 127.0.0.1 GET /auth/login ImmutableMultiDict([]) 200, takes 0.13643741607666016
-2026-07-01 04:26:19,334 - SL - DEBUG - 200 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /auth/login ImmutableMultiDict([]) 500, takes 0.014991044998168945
+2026-07-01 05:05:07,845 - SL - DEBUG - 1214 - "/code/server.py:284" - after_request() -  - 127.0.0.1 GET / ImmutableMultiDict([]) 302, takes 0.0009739398956298828
+2026-07-01 05:05:07,996 - SL - DEBUG - 1214 - "/code/server.py:284" - after_request() -  - 127.0.0.1 GET /auth/login ImmutableMultiDict([]) 200, takes 0.12711119651794434
+2026-07-01 05:05:08,024 - SL - DEBUG - 1214 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /auth/login ImmutableMultiDict([]) 500, takes 0.013110160827636719
 ```
 
-This is direct evidence for the GET‑vs‑POST distinction: the anonymous **GET** of `/auth/login` returns **HTTP 200** (335,570 bytes) with no exception because it renders the form without touching the database; the **POST** returns **HTTP 500** because it is the first request to execute `User.get_by(email=…)`.
+This is direct evidence for the GET‑vs‑POST distinction: the anonymous **GET** of `/auth/login` returns **HTTP 200** (335,022 bytes) with no exception because it renders the form without touching the database; the **POST** returns **HTTP 500** because it is the first request to execute `User.get_by(email=…)`.
 
 ### Verbatim output — which surface shows the error (sub‑part e)
 
@@ -234,11 +246,11 @@ The body is the branded SimpleLogin 500 page (its `<title>` is `| SimpleLogin` a
 Captured from the server log; the record is emitted at `"/code/server.py:390" - error_handler()` at level `ERROR` (i.e. `LOG.e(e)` → `logging.Logger.exception`, which appends the full traceback):
 
 ```text
-2026-07-01 04:26:19,327 - SL - ERROR - 200 - "/code/server.py:390" - error_handler() -  - (psycopg2.errors.UndefinedTable) relation "users" does not exist
+2026-07-01 05:05:08,018 - SL - ERROR - 1214 - "/code/server.py:390" - error_handler() -  - (psycopg2.errors.UndefinedTable) relation "users" does not exist
 LINE 2: FROM users
              ^
 
-[SQL: SELECT users.directory_quota AS users_directory_quota, users.subdomain_quota AS users_subdomain_quota, users.password AS users_password, users.id AS users_id, ... users.delete_on AS users_delete_on
+[SQL: SELECT users.directory_quota AS users_directory_quota, users.subdomain_quota AS users_subdomain_quota, users.password AS users_password, users.id AS users_id, users.created_at AS users_created_at, users.updated_at AS users_updated_at, users.email AS users_email, users.name AS users_name, users.is_admin AS users_is_admin, users.alias_generator AS users_alias_generator, users.notification AS users_notification, users.activated AS users_activated, users.disabled AS users_disabled, users.profile_picture_id AS users_profile_picture_id, users.otp_secret AS users_otp_secret, users.enable_otp AS users_enable_otp, users.last_otp AS users_last_otp, users.fido_uuid AS users_fido_uuid, users.default_alias_custom_domain_id AS users_default_alias_custom_domain_id, users.default_alias_public_domain_id AS users_default_alias_public_domain_id, users.lifetime AS users_lifetime, users.paid_lifetime AS users_paid_lifetime, users.lifetime_coupon_id AS users_lifetime_coupon_id, users.trial_end AS users_trial_end, users.default_mailbox_id AS users_default_mailbox_id, users.sender_format AS users_sender_format, users.sender_format_updated_at AS users_sender_format_updated_at, users.replace_reverse_alias AS users_replace_reverse_alias, users.referral_id AS users_referral_id, users.intro_shown AS users_intro_shown, users.max_spam_score AS users_max_spam_score, users.newsletter_alias_id AS users_newsletter_alias_id, users.include_sender_in_reverse_alias AS users_include_sender_in_reverse_alias, users.random_alias_suffix AS users_random_alias_suffix, users.expand_alias_info AS users_expand_alias_info, users.ignore_loop_email AS users_ignore_loop_email, users.alternative_id AS users_alternative_id, users.disable_automatic_alias_note AS users_disable_automatic_alias_note, users.one_click_unsubscribe_block_sender AS users_one_click_unsubscribe_block_sender, users.include_website_in_one_click_alias AS users_include_website_in_one_click_alias, users.disable_import AS users_disable_import, users.can_use_phone AS users_can_use_phone, users.phone_quota AS users_phone_quota, users.block_behaviour AS users_block_behaviour, users.include_header_email_header AS users_include_header_email_header, users.enable_data_breach_check AS users_enable_data_breach_check, users.flags AS users_flags, users.unsub_behaviour AS users_unsub_behaviour, users.delete_on AS users_delete_on
 FROM users
 WHERE users.email = %(email_1)s
  LIMIT %(param_1)s]
@@ -269,18 +281,43 @@ Traceback (most recent call last):
     user = User.get_by(email=email) or User.get_by(email=canonical_email)
   File "/code/app/models.py", line 84, in get_by
     return Session.query(cls).filter_by(**kw).first()
-  ...
+  File "/usr/local/lib/python3.10/site-packages/sqlalchemy/orm/query.py", line 3429, in first
+    ret = list(self[0:1])
+  File "/usr/local/lib/python3.10/site-packages/sqlalchemy/orm/query.py", line 3203, in __getitem__
+    return list(res)
+  File "/usr/local/lib/python3.10/site-packages/sqlalchemy/orm/query.py", line 3535, in __iter__
+    return self._execute_and_instances(context)
+  File "/usr/local/lib/python3.10/site-packages/sqlalchemy/orm/query.py", line 3560, in _execute_and_instances
+    result = conn.execute(querycontext.statement, self._params)
+  File "/usr/local/lib/python3.10/site-packages/sqlalchemy/engine/base.py", line 1011, in execute
+    return meth(self, multiparams, params)
+  File "/usr/local/lib/python3.10/site-packages/sqlalchemy/sql/elements.py", line 298, in _execute_on_connection
+    return connection._execute_clauseelement(self, multiparams, params)
+  File "/usr/local/lib/python3.10/site-packages/sqlalchemy/engine/base.py", line 1124, in _execute_clauseelement
+    ret = self._execute_context(
+  File "/usr/local/lib/python3.10/site-packages/sqlalchemy/engine/base.py", line 1316, in _execute_context
+    self._handle_dbapi_exception(
+  File "/usr/local/lib/python3.10/site-packages/sqlalchemy/engine/base.py", line 1510, in _handle_dbapi_exception
+    util.raise_(
+  File "/usr/local/lib/python3.10/site-packages/sqlalchemy/util/compat.py", line 182, in raise_
+    raise exception
+  File "/usr/local/lib/python3.10/site-packages/sqlalchemy/engine/base.py", line 1276, in _execute_context
+    self.dialect.do_execute(
   File "/usr/local/lib/python3.10/site-packages/sqlalchemy/engine/default.py", line 608, in do_execute
     cursor.execute(statement, parameters)
 sqlalchemy.exc.ProgrammingError: (psycopg2.errors.UndefinedTable) relation "users" does not exist
 LINE 2: FROM users
              ^
-...
+
+[SQL: SELECT users.directory_quota AS users_directory_quota, users.subdomain_quota AS users_subdomain_quota, users.password AS users_password, users.id AS users_id, users.created_at AS users_created_at, users.updated_at AS users_updated_at, users.email AS users_email, users.name AS users_name, users.is_admin AS users_is_admin, users.alias_generator AS users_alias_generator, users.notification AS users_notification, users.activated AS users_activated, users.disabled AS users_disabled, users.profile_picture_id AS users_profile_picture_id, users.otp_secret AS users_otp_secret, users.enable_otp AS users_enable_otp, users.last_otp AS users_last_otp, users.fido_uuid AS users_fido_uuid, users.default_alias_custom_domain_id AS users_default_alias_custom_domain_id, users.default_alias_public_domain_id AS users_default_alias_public_domain_id, users.lifetime AS users_lifetime, users.paid_lifetime AS users_paid_lifetime, users.lifetime_coupon_id AS users_lifetime_coupon_id, users.trial_end AS users_trial_end, users.default_mailbox_id AS users_default_mailbox_id, users.sender_format AS users_sender_format, users.sender_format_updated_at AS users_sender_format_updated_at, users.replace_reverse_alias AS users_replace_reverse_alias, users.referral_id AS users_referral_id, users.intro_shown AS users_intro_shown, users.max_spam_score AS users_max_spam_score, users.newsletter_alias_id AS users_newsletter_alias_id, users.include_sender_in_reverse_alias AS users_include_sender_in_reverse_alias, users.random_alias_suffix AS users_random_alias_suffix, users.expand_alias_info AS users_expand_alias_info, users.ignore_loop_email AS users_ignore_loop_email, users.alternative_id AS users_alternative_id, users.disable_automatic_alias_note AS users_disable_automatic_alias_note, users.one_click_unsubscribe_block_sender AS users_one_click_unsubscribe_block_sender, users.include_website_in_one_click_alias AS users_include_website_in_one_click_alias, users.disable_import AS users_disable_import, users.can_use_phone AS users_can_use_phone, users.phone_quota AS users_phone_quota, users.block_behaviour AS users_block_behaviour, users.include_header_email_header AS users_include_header_email_header, users.enable_data_breach_check AS users_enable_data_breach_check, users.flags AS users_flags, users.unsub_behaviour AS users_unsub_behaviour, users.delete_on AS users_delete_on
+FROM users
+WHERE users.email = %(email_1)s
+ LIMIT %(param_1)s]
 [parameters: {'email_1': 'test@example.com', 'param_1': 1}]
 (Background on this error at: http://sqlalche.me/e/13/f405)
 ```
 
-(The SQL `SELECT` column list was elided for brevity where marked `...`; the full `users.*` column list appears in the raw log. The `[parameters: …]` line shows the submitted email `test@example.com`.)
+(The block above is the **complete, unabridged** `ERROR` record exactly as written to the server log by `LOG.e(e)` — no output is elided or truncated. It includes the full `users.*` column list (all 49 columns, in both the psycopg2 detail and the wrapped SQLAlchemy detail), and the complete chained psycopg2 → SQLAlchemy traceback. The parameters line `[parameters: {'email_1': 'test@example.com', 'param_1': 1}]` shows the submitted email `test@example.com`.)
 
 ### Rationale and explicit sub‑part coverage
 
@@ -531,15 +568,18 @@ E515 = "550 SL E515 Email not exist"
 The handler's log for this transaction, in order:
 
 ```text
-2026-07-01 04:31:15,143 - SL - DEBUG - 510 - "/code/email_handler.py:2342" - _handle() - 5db14a5d-... - ====>=====>====>====>====>====>====>====>
-2026-07-01 04:31:15,143 - SL - INFO - 510 - "/code/email_handler.py:2343" - _handle() - 5db14a5d-... - New message, mail from sender@example.com, rctp tos ['anything@sl.local']
-2026-07-01 04:31:15,282 - SL - DEBUG - 510 - "/code/email_handler.py:1980" - handle() - 5db14a5d-... - ==>> Handle mail_from:sender@example.com, rcpt_tos:['anything@sl.local'], header_from:sender@example.com, header_to:anything@sl.local, ... message_id:<q3-test@example.com>, client_ip:None, ...
-2026-07-01 04:31:15,287 - SL - DEBUG - 510 - "/code/email_handler.py:2202" - handle() - 5db14a5d-... - Forward phase sender@example.com(sender@example.com) -> anything@sl.local
-2026-07-01 04:31:15,298 - SL - DEBUG - 510 - "/code/email_handler.py:545" - handle_forward() - 5db14a5d-... - alias anything@sl.local not exist. Try to see if it can be created on the fly
-2026-07-01 04:31:15,307 - SL - INFO - 510 - "/code/app/alias_utils.py:104" - check_if_alias_can_be_auto_created_for_custom_domain() - 5db14a5d-... - Cannot auto-create custom domain alias for anything@sl.local because there's no custom domain for sl.local
-2026-07-01 04:31:15,308 - SL - INFO - 510 - "/code/app/alias_utils.py:165" - check_if_alias_can_be_auto_created_for_a_directory() - 5db14a5d-... - Cannot auto-create anything@sl.local since it has no directory separator
-2026-07-01 04:31:15,308 - SL - DEBUG - 510 - "/code/email_handler.py:551" - handle_forward() - 5db14a5d-... - alias anything@sl.local cannot be created on-the-fly, return 550
-2026-07-01 04:31:15,309 - SL - INFO - 510 - "/code/email_handler.py:2367" - _handle() - 5db14a5d-... - Finish mail_from sender@example.com, rcpt_tos ['anything@sl.local'], takes 0.1656792163848877 seconds with return code '550 SL E515 Email not exist'<<===
+2026-07-01 05:16:47,244 - SL - DEBUG - 1404 - "/code/app/log.py:24" - set_message_id() -  - set message_id 5e00dbec-14af-475c-b0f2-2c9150d0277b
+2026-07-01 05:16:47,244 - SL - DEBUG - 1404 - "/code/email_handler.py:2342" - _handle() - 5e00dbec-14af-475c-b0f2-2c9150d0277b - ====>=====>====>====>====>====>====>====>
+2026-07-01 05:16:47,244 - SL - INFO - 1404 - "/code/email_handler.py:2343" - _handle() - 5e00dbec-14af-475c-b0f2-2c9150d0277b - New message, mail from sender@example.com, rctp tos ['anything@sl.local']
+2026-07-01 05:16:47,245 - SL - INFO - 1404 - "/code/email_handler.py:1956" - handle() - 5e00dbec-14af-475c-b0f2-2c9150d0277b - Set CONTENT_TRANSFER_ENCODING
+2026-07-01 05:16:47,246 - SL - DEBUG - 1404 - "/code/email_handler.py:1963" - handle() - 5e00dbec-14af-475c-b0f2-2c9150d0277b - Cannot parse Postfix queue ID from None None
+2026-07-01 05:16:47,387 - SL - DEBUG - 1404 - "/code/email_handler.py:1980" - handle() - 5e00dbec-14af-475c-b0f2-2c9150d0277b - ==>> Handle mail_from:sender@example.com, rcpt_tos:['anything@sl.local'], header_from:sender@example.com, header_to:anything@sl.local, cc:None, reply-to:None, message_id:<q3-test@example.com>, client_ip:None, headers:[('From', 'sender@example.com'), ('To', 'anything@sl.local'), ('Subject', 'Q3 plain injection test'), ('Message-ID', '<q3-test@example.com>'), ('Content-Transfer-Encoding', '7bit')], mail_options:[], rcpt_options:[]
+2026-07-01 05:16:47,392 - SL - DEBUG - 1404 - "/code/email_handler.py:2202" - handle() - 5e00dbec-14af-475c-b0f2-2c9150d0277b - Forward phase sender@example.com(sender@example.com) -> anything@sl.local
+2026-07-01 05:16:47,402 - SL - DEBUG - 1404 - "/code/email_handler.py:545" - handle_forward() - 5e00dbec-14af-475c-b0f2-2c9150d0277b - alias anything@sl.local not exist. Try to see if it can be created on the fly
+2026-07-01 05:16:47,416 - SL - INFO - 1404 - "/code/app/alias_utils.py:104" - check_if_alias_can_be_auto_created_for_custom_domain() - 5e00dbec-14af-475c-b0f2-2c9150d0277b - Cannot auto-create custom domain alias for anything@sl.local because there's no custom domain for sl.local
+2026-07-01 05:16:47,416 - SL - INFO - 1404 - "/code/app/alias_utils.py:165" - check_if_alias_can_be_auto_created_for_a_directory() - 5e00dbec-14af-475c-b0f2-2c9150d0277b - Cannot auto-create anything@sl.local since it has no directory separator
+2026-07-01 05:16:47,416 - SL - DEBUG - 1404 - "/code/email_handler.py:551" - handle_forward() - 5e00dbec-14af-475c-b0f2-2c9150d0277b - alias anything@sl.local cannot be created on-the-fly, return 550
+2026-07-01 05:16:47,417 - SL - INFO - 1404 - "/code/email_handler.py:2367" - _handle() - 5e00dbec-14af-475c-b0f2-2c9150d0277b - Finish mail_from sender@example.com, rcpt_tos ['anything@sl.local'], takes 0.17296862602233887 seconds with return code '550 SL E515 Email not exist'<<===
 ```
 
 These lines make the **true causal chain** explicit, and it is **not** "empty `SLDomain` → reject". The chain is:
