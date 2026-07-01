@@ -48,8 +48,13 @@ cd /app
 . /app/venv/bin/activate
 export CONFIG=tests/test.env  # drives app/config.py -> prints "load config file ..."
 
-# Schema was already applied with Alembic (creates users, api_key, mailbox, alias, ...):
-#   CONFIG=tests/test.env FLASK_APP=server.py flask db upgrade
+# Schema was already applied with Alembic (creates users, api_key, mailbox, alias, ...).
+# NOTE: `flask db upgrade` does NOT work in this app (it raises KeyError: 'migrate' because
+# Flask-Migrate is never registered on the Flask app — see the migration-provenance note
+# below). The reproducible schema command is the Alembic CLI invoked directly:
+CONFIG=tests/test.env alembic upgrade head    # -> exits 0 (schema already at head; no-op)
+CONFIG=tests/test.env alembic current         # -> 32f25cbf12f6 (head)
+CONFIG=tests/test.env alembic heads           # -> 32f25cbf12f6 (head)
 # Verified: alembic head = 32f25cbf12f6, 77 tables, incl. alias / api_key / mailbox / users.
 
 # Provenance of the exact checkout used for capture (verbatim observed output):
@@ -68,6 +73,19 @@ git describe --all                 # -> tags/v4.53.2-6-g2cd6ee77
 > prints the commit SHA `2cd6ee777f8c…`. The commit SHA is therefore the reliable provenance
 > anchor; the branch label is only an informational naming input and can differ from one
 > checkout to another.
+
+> **Migration-provenance note (why `alembic` directly, not `flask db upgrade`).** Although
+> `Flask-Migrate` is a declared dependency (`Flask-Migrate = "^2.5.3"` at `pyproject.toml:L77`)
+> and installs the `flask db` command group, this application never calls `Migrate(app, db)`,
+> so the `migrate` extension is not registered on the Flask app. Running
+> `CONFIG=tests/test.env FLASK_APP=server.py flask db upgrade` therefore fails with
+> `KeyError: 'migrate'`, raised inside the **installed Flask-Migrate package — a virtualenv
+> file, not a repo file** — at `/app/venv/lib/python3.10/site-packages/flask_migrate/__init__.py`,
+> line 269, where it reads `current_app.extensions['migrate']`. The schema is therefore applied
+> and verified with the Alembic CLI directly: `CONFIG=tests/test.env alembic upgrade head`
+> (exit 0), and both `alembic current` and `alembic heads` report `32f25cbf12f6 (head)`. Alembic
+> is configured by `alembic.ini` and the `migrations/` environment in this repo, which is what
+> actually drives schema creation.
 
 Key config literals used, all from `tests/test.env` (verified):
 `URL=http://localhost` (`L2`), `EMAIL_DOMAIN=sl.local` (`L8`),
@@ -430,12 +448,34 @@ Set-Cookie: slapp=c898064f-af4a-4d7f-afc0-15b8de0c4906.z78zj-f8qiu_aWXS1Akp7Fom9
 #### Observed output (verbatim — raw response body exactly as returned by the server, `cat /tmp/q4_body.json`)
 
 The server returns **compact** JSON with no whitespace between tokens, because Flask's `jsonify`
-uses `separators=(",", ":")` when not pretty-printing and then appends a single trailing newline —
-`dumps(data, indent=indent, separators=separators) + "\n"` (`flask/json/__init__.py:L356,L370` in the
-pinned Flask 1.1.2). The visible JSON text on the single line below is **447 bytes**; the server appends
-one trailing `\n`, giving the **448-byte** body measured by `Content-Length: 448` above. Keys are
-alphabetically ordered because Flask sorts keys by default (`JSON_SORT_KEYS = True` in Flask 1.1.2). The
-447-vs-448 relationship was confirmed directly on the saved body file:
+serializes with `separators=(",", ":")` when not pretty-printing and then appends a single trailing
+newline (`... + "\n"`). This compact-output behavior lives inside **Flask itself — a third-party
+package installed in the container virtualenv, not a file in this repository** — so it is grounded
+below by capturing the installed library's absolute path and quoting its exact source lines as
+observed runtime output, rather than by a repository `file:line` citation. (Flask is declared
+`flask = "^1.1.2"` at `pyproject.toml:L62`; the version actually installed and observed in the image
+is `1.1.2`, shown by the capture below.)
+
+```bash
+# Third-party (venv) library, NOT a repo file: prove its absolute path and quote the exact
+# lines that drive compact serialization + the trailing newline.
+python -c "import flask, flask.json, inspect; print(flask.__version__); print(inspect.getsourcefile(flask.json))"
+awk 'NR==356 || NR==370 {printf "%d: %s\n", NR, $0}' \
+  /app/venv/lib/python3.10/site-packages/flask/json/__init__.py
+```
+
+```text
+1.1.2
+/app/venv/lib/python3.10/site-packages/flask/json/__init__.py
+356:     separators = (",", ":")
+370:         dumps(data, indent=indent, separators=separators) + "\n",
+```
+
+The visible JSON text on the single line below is **447 bytes**; the server appends one trailing
+`\n`, giving the **448-byte** body measured by `Content-Length: 448` above. Keys are alphabetically
+ordered because Flask sorts keys by default (`JSON_SORT_KEYS` defaults to `True` in Flask 1.1.2,
+confirmed at runtime: `Flask(__name__).config["JSON_SORT_KEYS"]` → `True`). The 447-vs-448 relationship
+was confirmed directly on the saved body file:
 
 ```bash
 wc -c /tmp/q4_body.json                    # total bytes returned by the server
