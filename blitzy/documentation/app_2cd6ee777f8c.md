@@ -55,10 +55,32 @@ CONFIG=/root/sl.env /app/venv/bin/python email_handler.py   # inbound SMTP on :2
 CONFIG=/root/sl.env /app/venv/bin/python job_runner.py      # 10s poll loop
 ```
 
-**Dependency transparency and required scratch‑environment disclosure.** The runtime is a throwaway scratch environment that lives entirely outside the repository and installs the locked dependency set; the versions actually exercised by the flows in this document match `poetry.lock` exactly — for example `Flask 1.1.2` (the `create_app()` framework at `server.py:139`), `SQLAlchemy 1.3.24`, `aiosmtpd 1.4.2`, `redis 4.6.0`, `bcrypt 3.2.0`. Two substitutions were made **in the scratch environment only** so the stack would build and boot. Both are disclosed here in full, and **neither is a change to the repository's dependencies — `pyproject.toml` and `poetry.lock` are untouched** — and neither touches the register/verify/login/e‑mail flows documented below:
+**Dependency transparency.** The runtime is a throwaway scratch environment that lives entirely outside the repository and installs the locked dependency set; the versions actually exercised by the flows in this document match `poetry.lock` exactly — for example `Flask 1.1.2` (the `create_app()` framework at `server.py:139`), `SQLAlchemy 1.3.24`, `aiosmtpd 1.4.2`, `redis 4.6.0`, `bcrypt 3.2.0`. The two packages most sensitive to the sandbox build — `cbor2` and `pyre2` — were checked directly against the installed distribution metadata in the live `/app/venv`, and both match the lock (`cbor2 5.2.0` at `poetry.lock:412`, `pyre2 0.3.6` at `poetry.lock:2474`): no version substitution and no stdlib `re` shim were in effect. The producing command and its **verbatim** output:
 
-1. **`cbor2 5.2.0 → 5.6.5`** — the locked `cbor2 5.2.0` source distribution fails to build in the sandbox, so the `5.6.5` wheel was substituted. `cbor2` is a WebAuthn/FIDO2 (de)serialization dependency; it is not imported by any of the register/verify/login/e‑mail code paths exercised here.
-2. **`pyre2` → a `re2` shim onto Python's stdlib `re`** — `pyre2` (which supplies the compiled `re2` module) is awkward to build in the sandbox, so in the scratch environment the single source line that imports it was shimmed to stdlib `re`. To be exact about the difference between the *repository source* and the *scratch environment*: the **committed repository source** imports the compiled binding — `import re2 as re` at `app/spamassassin_utils.py:8`, used as `re.DOTALL` at `app/spamassassin_utils.py:13` — whereas the scratch environment ran that one module with `import re` instead. `spamassassin_utils.py` participates only in inbound spam scanning and in none of the flows below.
+```bash
+# run inside the running container, against the same /app/venv used for every observation below
+/app/venv/bin/python - <<'PY'
+import importlib.metadata as md
+for pkg in ["cbor2", "pyre2", "google-re2"]:
+    try:
+        print(f"{pkg}=={md.version(pkg)}")
+    except Exception:
+        print(f"{pkg}=NOT_INSTALLED")
+import re2
+print("re2_file=", getattr(re2, "__file__", None))
+print("re2_DOTALL=", getattr(re2, "DOTALL", None))
+PY
+```
+
+```text
+cbor2==5.2.0
+pyre2==0.3.6
+google-re2=NOT_INSTALLED
+re2_file= /app/venv/lib/python3.10/site-packages/re2.cpython-310-x86_64-linux-gnu.so
+re2_DOTALL= re.DOTALL
+```
+
+So the regular‑expression engine used at runtime is the **compiled `pyre2` binding**, not Python’s stdlib `re`: `import re2` resolves to the C‑extension `re2.cpython-310-x86_64-linux-gnu.so`, and `re2.DOTALL` is present. That is the module the source imports as `import re2 as re` at `app/spamassassin_utils.py:8` and relies on as `re.DOTALL` at `app/spamassassin_utils.py:13`; the locked `pyre2 0.3.6` supplies exactly that compiled module, so the code path runs as written with no shim (`google-re2` is not installed). **Neither `pyproject.toml` nor `poetry.lock` was modified** — the locked set was installed only into the throwaway `/app/venv`.
 
 Crucially, the **deliverable repository** (the one this document is committed to) is left byte‑for‑byte unchanged: this Markdown file is the only addition in the baseline‑to‑HEAD diff, and the final working tree `git status --porcelain` is empty.
 
