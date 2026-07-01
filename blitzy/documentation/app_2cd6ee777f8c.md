@@ -20,7 +20,7 @@ generalized beyond it.
 
 | Component | Version / value (observed) |
 |-----------|----------------------------|
-| Python | 3.10.18 (venv at `/app/venv`) — project targets `FROM python:3.10` (`Dockerfile:8`), `python = "^3.10"` (`pyproject.toml`) |
+| Python | 3.10.18 (venv at `/app/venv`) — project targets `FROM python:3.10` (`Dockerfile:8`), `python = "^3.10"` (`pyproject.toml:61`) |
 | PostgreSQL | 15.13, listening on host port `15432` |
 | Redis | 7.0.15, listening on `6379` |
 | Flask / Werkzeug / Gunicorn | 1.1.2 / 1.0.1 / 20.0.4 (observed `Starting gunicorn 20.0.4`) |
@@ -38,7 +38,10 @@ and a throwaway `after.env` with `MAX_NB_EMAIL_FREE_PLAN=10`. No committed file 
 throwaway files were deleted afterward (per the read‑only‑source rule).
 
 **Read‑only scope:** no existing repository file was modified. The only committed change is this
-document. All temporary scripts / `.env` files used for observation were removed afterward.
+document. All temporary scripts / `.env` files used for observation were removed afterward. The
+verbatim `git status --porcelain`, `git diff --stat`, baseline `git diff --name-status`, and
+artifact‑scan output proving this are provided in the **"Cleanup and read‑only‑compliance
+evidence"** section at the end of this document.
 
 ---
 
@@ -56,12 +59,15 @@ which inserts rows, not tables):
 
 ```bash
 # 1) Provision an EMPTY database (drop + recreate the public schema)
+#    (PGPASSWORD=test supplies the throwaway test-DB password from tests/test.env:17
+#     DB_URI=postgresql://test:test@localhost:15432/test; pg_hba here is scram-sha-256, so
+#     the password is required for a non-interactive psql)
 echo 'drop schema public cascade; create schema public;' \
-  | psql -h localhost -p 15432 -U test -d test        # scripts/reset_local_db.sh:4
+  | PGPASSWORD=test psql -h localhost -p 15432 -U test -d test    # scripts/reset_local_db.sh:4
 
 # verify empty
-psql ... -tAc "SELECT count(*) FROM information_schema.tables
-               WHERE table_schema NOT IN ('pg_catalog','information_schema');"
+PGPASSWORD=test psql -h localhost -p 15432 -U test -d test -tAc \
+  "SELECT count(*) FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema');"
 # -> 0
 
 # 2) Run all migrations to head with SQL echo so CREATE TABLE order is visible.
@@ -78,7 +84,7 @@ script location resolves to `migrations/` (`alembic.ini:5`), and the schema is b
 ### (a) Total number of tables — from the live schema (authoritative)
 
 ```bash
-psql -h localhost -p 15432 -U test -d test -tAc \
+PGPASSWORD=test psql -h localhost -p 15432 -U test -d test -tAc \
  "SELECT count(*) FROM information_schema.tables
   WHERE table_schema NOT IN ('pg_catalog','information_schema');"
 ```
@@ -91,7 +97,8 @@ Adding `AND table_type='BASE TABLE'` returns the same number:
 ```
 The `alembic_version` bookkeeping table **is** present and **is** included in this count:
 ```bash
-psql ... -tAc "SELECT table_name FROM information_schema.tables WHERE table_name='alembic_version';"
+PGPASSWORD=test psql -h localhost -p 15432 -U test -d test -tAc \
+  "SELECT table_name FROM information_schema.tables WHERE table_name='alembic_version';"
 ```
 ```
 alembic_version
@@ -151,7 +158,7 @@ chain ends at head revision `32f25cbf12f6` (confirmed by `alembic current` → `
 > (`CREATE TABLE user_audit_log`, log line 2819; created by revision `91ed7f46dc81 -> 7d7b84779837`).
 
 ### Grounding
-- Empty‑DB pattern + `alembic upgrade head`: `scripts/reset_local_db.sh:4,6`; `flask dummy-data` skipped: `scripts/reset_local_db.sh:7`; test invocation pattern `CONFIG=tests/test.env ... alembic upgrade head`: `scripts/run-test.sh:13`.
+- Empty‑DB pattern + `alembic upgrade head`: `scripts/reset_local_db.sh:4,6`; `flask dummy-data` skipped: `scripts/reset_local_db.sh:7`; reference test‑invocation pattern (verbatim `scripts/run-test.sh:13`) is `CONFIG=tests/test.env poetry run alembic upgrade head` — this investigation ran the equivalent `CONFIG=tests/test.env /app/venv/bin/alembic upgrade head` because the runtime image bakes dependencies into `/app/venv` and has no Poetry.
 - Migration wiring: `target_metadata = Base.metadata` (`migrations/env.py:28`); `script_location = migrations` (`alembic.ini:5`); table models on the shared `Base.metadata` (`app/models.py`).
 - Count technique: `information_schema.tables` filtered to exclude `pg_catalog`/`information_schema`; `alembic_version` is a real `public` table and is counted — stated explicitly above.
 
@@ -215,49 +222,137 @@ Verbatim captured startup (each line prefixed `[UTC wallclock | +offset from fir
 
 ### Path 2 — Development server (`app.run(debug=True, port=7777)`)
 
+**Sub‑path 2a — real path (exactly `server.py:588`, werkzeug logger disabled as shipped):**
 ```bash
 CONFIG=tests/test.env /app/venv/bin/python server.py
 ```
-Verbatim captured startup:
+Verbatim captured startup (each line prefixed `[UTC wallclock | +offset from first line]`):
 ```
-[2026-07-01 04:26:27.957Z | +     0.000 ms] load config file /app/tests/test.env
-[2026-07-01 04:26:27.958Z | +     1.269 ms] >>> URL: http://localhost
-[2026-07-01 04:26:28.243Z | +   286.256 ms] >>> init logging <<<
-[2026-07-01 04:26:28.310Z | +   353.467 ms] 2026-07-01 04:26:28 - SL - DEBUG - 2638 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
-[2026-07-01 04:26:29.475Z | +  1517.914 ms]  * Serving Flask app "server" (lazy loading)
-[2026-07-01 04:26:29.475Z | +  1517.980 ms]  * Environment: production
-[2026-07-01 04:26:29.475Z | +  1517.993 ms]    WARNING: This is a development server. Do not use it in a production deployment.
-[2026-07-01 04:26:29.475Z | +  1518.003 ms]    Use a production WSGI server instead.
-[2026-07-01 04:26:29.475Z | +  1518.020 ms]  * Debug mode: on
-[2026-07-01 04:26:29.924Z | +  1967.657 ms] load config file /app/tests/test.env      <- reloader restarts child
+[2026-07-01 05:07:32.093Z | +     0.000 ms] load config file /app/tests/test.env
+[2026-07-01 05:07:32.095Z | +     1.266 ms] >>> URL: http://localhost
+[2026-07-01 05:07:32.095Z | +     1.540 ms] WARNING: Use a temp directory for GNUPGHOME /tmp/ksewvdexrehtxhefhexr
+[2026-07-01 05:07:32.095Z | +     1.556 ms] Upload files to local dir
+[2026-07-01 05:07:32.382Z | +   288.937 ms] >>> init logging <<<
+[2026-07-01 05:07:32.439Z | +   345.253 ms] 2026-07-01 05:07:32,438 - SL - DEBUG - 178 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+[2026-07-01 05:07:34.750Z | +  2656.261 ms]  * Serving Flask app "server" (lazy loading)
+[2026-07-01 05:07:34.750Z | +  2656.329 ms]  * Environment: production
+[2026-07-01 05:07:34.750Z | +  2656.345 ms]    WARNING: This is a development server. Do not use it in a production deployment.
+[2026-07-01 05:07:34.750Z | +  2656.353 ms]    Use a production WSGI server instead.
+[2026-07-01 05:07:34.750Z | +  2656.360 ms]  * Debug mode: on
+[2026-07-01 05:07:35.188Z | +  3094.646 ms] load config file /app/tests/test.env
 ### RESULT first_line_offset=0.000 ms
-### RESULT ready_line: NOT observed in output
-### RESULT port_connectable_offset=1520.573 ms   (empirical ready-to-accept-connections)
+### RESULT ready_line: NOT observed in output (substr='Running on')
+### RESULT port_connectable_offset=2666.082 ms   (empirical ready-to-accept-connections)
+```
+On the real path the Werkzeug readiness banner is **not printed** (root cause below).
+
+**Sub‑path 2b — instrumented, to capture the exact readiness message + delta.** The *same*
+`app.run(debug=True, port=7777)` entrypoint was run again through a **throwaway** harness that
+**re‑enables** the `werkzeug` logger that `app/log.py:70-71` disables. **No source file is
+modified**; the harness (`/tmp/inv/dev_instrumented.py`, removed afterward) is:
+```python
+import logging, sys
+from server import create_app                    # server.py
+app = create_app()
+wl = logging.getLogger("werkzeug")               # app/log.py:70-71 had set wl.disabled = True
+wl.disabled = False; wl.setLevel(logging.INFO)
+wl.addHandler(logging.StreamHandler(sys.stdout)); wl.propagate = False
+app.run(debug=True, port=7777)                   # server.py:588 — the operative dev entrypoint
+```
+```bash
+CONFIG=tests/test.env PYTHONPATH=/app /app/venv/bin/python /tmp/inv/dev_instrumented.py
+```
+Verbatim captured startup (instrumented — werkzeug logger re‑enabled):
+```
+[2026-07-01 05:07:57.921Z | +     0.000 ms] load config file /app/tests/test.env
+[2026-07-01 05:07:57.922Z | +     1.277 ms] >>> URL: http://localhost
+[2026-07-01 05:07:57.922Z | +     1.596 ms] WARNING: Use a temp directory for GNUPGHOME /tmp/dmcrsfxtyrcwqgwlyxsk
+[2026-07-01 05:07:57.922Z | +     1.615 ms] Upload files to local dir
+[2026-07-01 05:07:58.179Z | +   258.038 ms] >>> init logging <<<
+[2026-07-01 05:07:58.233Z | +   312.564 ms] 2026-07-01 05:07:58,233 - SL - DEBUG - 233 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+[2026-07-01 05:07:59.292Z | +  1371.063 ms]  * Serving Flask app "server" (lazy loading)
+[2026-07-01 05:07:59.292Z | +  1371.140 ms]  * Environment: production
+[2026-07-01 05:07:59.292Z | +  1371.157 ms]    WARNING: This is a development server. Do not use it in a production deployment.
+[2026-07-01 05:07:59.292Z | +  1371.166 ms]    Use a production WSGI server instead.
+[2026-07-01 05:07:59.292Z | +  1371.173 ms]  * Debug mode: on
+[2026-07-01 05:07:59.294Z | +  1373.249 ms]  * Running on http://127.0.0.1:7777/ (Press CTRL+C to quit)
+### RESULT first_line_offset=0.000 ms
+### RESULT ready_line_offset=1373.249 ms   (DELTA first->ready-line, substr='Running on')
+### RESULT port_connectable_offset=1374.522 ms   (empirical ready-to-accept-connections)
 ```
 
-> **Answer R2(a) — dev server:** the expected Werkzeug readiness banner
-> **`* Running on http://127.0.0.1:7777/ (Press CTRL+C to quit)` is NOT emitted** on this path.
-> This was confirmed across two runs (`ready_line: NOT observed`). **Root cause (verified):**
-> Werkzeug 1.0.1 emits that banner through the **`werkzeug` logger** via its internal `_log()`
-> helper (`werkzeug/_internal.py:94`, called from `werkzeug/serving.py`'s `log_startup`), and
-> `app/log.py:70-71` sets that logger `disabled = True` (`log = logging.getLogger("werkzeug");
-> log.disabled = True`), which suppresses it. The lines that **do** appear are Flask's CLI banner,
-> printed via `click.echo` (not the logger): `* Serving Flask app "server" (lazy loading)`,
-> `* Environment: production`, the development‑server `WARNING`, and `* Debug mode: on`. None of
-> these literally states "ready to accept connections."
+> **Answer R2(a) — dev server.** The exact readiness message is
+> **`* Running on http://127.0.0.1:7777/ (Press CTRL+C to quit)`** (captured verbatim above, at
+> `+1373.249 ms`, from the instrumented run). **Explicit limitation:** on the *real*, unmodified
+> `python server.py` path this line is **suppressed and never printed** — the project as shipped
+> emits **no** readiness log line for the dev server (`ready_line: NOT observed`, confirmed on the
+> real‑path capture). **Root cause (verified by capture):** Werkzeug 1.0.1 prints the banner from
+> `log_startup()` via `_log("info", " * Running on …")`
+> (`/app/venv/lib/python3.10/site-packages/werkzeug/serving.py:984`), and `_log` routes it through
+> the **`werkzeug` logger** (`…/werkzeug/_internal.py:113` → `getattr(_logger, type)(…)` on
+> `logging.getLogger("werkzeug")`); `app/log.py:70-71` sets that logger `disabled = True`, which
+> silences it. The lines that **do** appear on the real path are Flask's CLI banner printed via
+> `click.echo` (not the logger) — `* Serving Flask app "server" (lazy loading)`,
+> `* Environment: production`, the dev‑server `WARNING`, and `* Debug mode: on` — none of which
+> literally states "ready to accept connections." The message above is therefore the exact text
+> Werkzeug emits **once its logger is not disabled**.
 >
-> **Answer R2(b) — dev server:** because no readiness **log line** is emitted, readiness was
-> measured empirically: TCP port 7777 first accepted a connection at **`+1520.573 ms`** after the
-> first log entry (`load config file …`); a second run measured **1446.200 ms**. The last banner
-> line (`* Debug mode: on`) appeared at `+1518.020 ms` / `+1897.581 ms`. This path is slower than
-> Gunicorn because `debug=True` enables the Werkzeug **reloader**, which double‑initializes the app
-> (the parent binds the socket via fd‑inheritance ~1520 ms, then execs a child that re‑imports and
-> serves). This is faithful to `server.py:588`.
+> **Answer R2(b) — dev server.** Measured on the instrumented run (where the readiness line is
+> observable): the first log entry `load config file …` is at `+0.000 ms` and `* Running on …`
+> follows at **`+1373.249 ms`** → **delta ≈ 1373 ms** (a second run measured **1340.633 ms**). The
+> port became connectable at `+1374.522 ms` — essentially coincident with the readiness line,
+> confirming it is a faithful "ready to accept connections" signal. On the *real* `python server.py`
+> path **no readiness log line exists**, so a log‑line delta **cannot** be reported there; the
+> empirical port‑connectable moment on that path was `+2666.082 ms`. This path is slower than
+> Gunicorn because `debug=True` enables the Werkzeug **reloader**, which double‑initializes the app.
+> This is faithful to `server.py:588`.
+>
+> **Coverage note (honesty).** Because the shipped dev path suppresses the readiness line, the R2
+> dev‑server "exact ready message" is obtained **only** under the instrumentation shown; it is
+> **not** claimed to be emitted by the unmodified `python server.py` path. The coverage table marks
+> this subpart accordingly rather than overclaiming it.
+
+**Werkzeug provenance (installed package — not a repository file).** Captured from the runtime venv,
+Werkzeug **1.0.1** at `/app/venv/lib/python3.10/site-packages/werkzeug/`:
+```
+$ WZ=/app/venv/lib/python3.10/site-packages/werkzeug
+$ /app/venv/bin/python -c "import werkzeug; print(werkzeug.__version__)"
+1.0.1
+$ grep -n "Running on" "$WZ/serving.py"
+977:            _log("info", " * Running on %s %s", display_hostname, quit_msg)
+984:                " * Running on %s://%s:%d/ %s",
+$ grep -n '' "$WZ/_internal.py" | sed -n '94,113p'
+94:def _log(type, message, *args, **kwargs):
+95:    """Log a message to the 'werkzeug' logger.
+96:
+97:    The logger is created the first time it is needed. If there is no
+98:    level set, it is set to :data:`logging.INFO`. If there is no handler
+99:    for the logger's effective level, a :class:`logging.StreamHandler`
+100:    is added.
+101:    """
+102:    global _logger
+103:
+104:    if _logger is None:
+105:        _logger = logging.getLogger("werkzeug")
+106:
+107:        if _logger.level == logging.NOTSET:
+108:            _logger.setLevel(logging.INFO)
+109:
+110:        if not _has_level_handler(_logger):
+111:            _logger.addHandler(logging.StreamHandler())
+112:
+113:    getattr(_logger, type)(message.rstrip(), *args, **kwargs)
+```
+`serving.py:984` builds the `" * Running on …"` string and hands it to `_log`, whose body obtains
+the module‑level logger via `logging.getLogger("werkzeug")` (`_internal.py:105`) and emits the
+message at `_internal.py:113` (`getattr(_logger, type)(message.rstrip(), *args, **kwargs)` with
+`type="info"`); `app/log.py:70-71` disables exactly that `werkzeug` logger, which is why the line is
+suppressed on the real `python server.py` path.
 
 ### Grounding
 - Launch paths: `server.py:572` (`local_main`), `server.py:588` (`app.run(debug=True, port=7777)`), `server.py:598-599` (`__main__` → `local_main()`); `Dockerfile:47` (Gunicorn command); `wsgi.py:1-3` (`app = create_app()`).
 - Logging facts: UTC timestamps via `time.gmtime` (`app/log.py:43`); fixed format string (`app/log.py:12-15`); first `print(">>> init logging <<<")` (`app/log.py:67`); `werkzeug` logger disabled (`app/log.py:70-71`).
-- Werkzeug banner mechanism (installed 1.0.1): emitted via the `werkzeug` logger in `werkzeug/_internal.py:94` (`_log`) — hence suppressed by the disabled logger.
+- Werkzeug banner mechanism — **installed package, not a repository file** (Werkzeug **1.0.1** at `/app/venv/lib/python3.10/site-packages/werkzeug/`, captured verbatim in the "Werkzeug provenance" block above): `serving.py:984` builds `" * Running on …"` inside `log_startup()`, and `_internal.py:94`'s `_log` obtains `logging.getLogger("werkzeug")` (`_internal.py:105`) and emits it (`_internal.py:113`). Because `app/log.py:70-71` disables that logger, the banner is suppressed on the real `python server.py` path; it is observable only when the logger is re‑enabled (sub‑path 2b).
 
 ---
 
@@ -331,12 +426,12 @@ curl -sS -i -X POST http://localhost:7777/api/auth/register \
 ```
 HTTP/1.1 200 OK
 Server: gunicorn/20.0.4
-Date: Wed, 01 Jul 2026 04:30:10 GMT
+Date: Wed, 01 Jul 2026 05:08:42 GMT
 Connection: close
 Content-Type: application/json
 Content-Length: 46
 Access-Control-Allow-Origin: *
-Set-Cookie: slapp=e582d7e4-100e-4fe5-b18a-0741fbe9fef8...; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=e4a51a36-eb6b-4918-8279-a09b55d892b0.Sn7qWxIuTWkf4iL0gcYt1xaTaNI; Expires=Wed, 08-Jul-2026 05:08:42 GMT; HttpOnly; Path=/; SameSite=Lax
 
 {"msg":"User needs to confirm their account"}
 ```
@@ -355,12 +450,12 @@ curl -sS -i -X POST http://localhost:7777/api/auth/login \
 ```
 HTTP/1.1 422 UNPROCESSABLE ENTITY
 Server: gunicorn/20.0.4
-Date: Wed, 01 Jul 2026 04:30:21 GMT
+Date: Wed, 01 Jul 2026 05:08:42 GMT
 Connection: close
 Content-Type: application/json
 Content-Length: 34
 Access-Control-Allow-Origin: *
-Set-Cookie: slapp=563beeb2-c0e1-4f5c-a16e-f1b75dd187d1...; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=93c28471-3c87-4113-8516-f0f39d3e5608.Iu0rfHCfOjnLv4ntwgZHQ1J8waQ; Expires=Wed, 08-Jul-2026 05:08:42 GMT; HttpOnly; Path=/; SameSite=Lax
 
 {"error":"Account not activated"}
 ```
@@ -379,13 +474,16 @@ HTTP_STATUS=422
 > **Answer R4(b):** the HTTP status code is **`422`** (`422 UNPROCESSABLE ENTITY`) — demonstrated
 > in both the `-i` headers and the `-w "%{http_code}"` probe (not assumed).
 >
-> **Answer R4(c):** the full curl commands and their complete output (request, response headers,
-> status line, and body) are shown verbatim above.
+> **Answer R4(c):** the full curl commands and their **complete, untruncated** output (status
+> line, every response header, and body) are shown verbatim above — nothing is elided. The
+> `Set-Cookie: slapp=…` header is Flask's signed **session cookie** (Werkzeug/`itsdangerous`);
+> it is an ephemeral per‑request session identifier from the **disposable** test environment (not a
+> persistent credential or API key), so it is reproduced in full rather than redacted.
 
 ### (d) Direct database query
 
 ```bash
-psql -h localhost -p 15432 -U test -d test \
+PGPASSWORD=test psql -h localhost -p 15432 -U test -d test \
   -c "SELECT email, activated, notification FROM users WHERE email='testuser@example.com';"
 ```
 ```
@@ -430,25 +528,72 @@ created after the change?
 `max_alias_for_free_account()` returns `config.MAX_NB_EMAIL_FREE_PLAN` (`app/models.py:858,865`),
 which is read from the environment with default `5` (`app/config.py:120-124`). The API key is
 supplied in the **`Authentication`** header (`app/api/base.py:17-18`). Users were created
-(activated, with an API key) using a throwaway helper mirroring `tests/utils.py`'s
-`create_new_user` (`User.create(..., activated=True, flush=True)` + `ApiKey.create`).
+(activated, each with an API key) using a **throwaway** helper that mirrors `tests/utils.py`'s
+`create_new_user` (`User.create(..., activated=True, flush=True)`, `tests/utils.py:23-29`) plus
+`ApiKey.create(user_id, ...)` (`app/models.py:2365`). The helper and its **exact** output are shown
+next.
+
+> **API‑key redaction note (safety).** The 60‑character API keys generated by the helper below were
+> **real** and were used **verbatim** in the `curl` calls that produced every response quoted in
+> this section. In this document each key is shown as **`[REDACTED API KEY — USER-A]`** /
+> **`[REDACTED API KEY — USER-B]`**; the redaction is **intentional** (an API key is a bearer
+> credential) and does not affect any quoted response. Everything else — commands, headers, status
+> lines, and bodies — is reproduced verbatim.
+
+### User creation — throwaway helper (exact invocation + output)
+
+Helper `/tmp/inv/r5_make_user.py` (throwaway; removed afterward — no source file modified):
+```python
+import sys
+from app.db import Session
+from app.models import User, ApiKey
+email = sys.argv[1]; name = sys.argv[2] if len(sys.argv) > 2 else email.split("@")[0]
+user = User.create(email=email, password="password", name=name, activated=True, flush=True)
+Session.commit()
+key = ApiKey.create(user_id=user.id, name="r5-helper")
+Session.commit()
+print("CREATED user_id=%s email=%s api_key=%s" % (user.id, user.email, key.code))
+```
+USER‑A — created while the server ran with `base.env` (limit defaulted to `5`):
+```bash
+CONFIG=/tmp/inv/base.env PYTHONPATH=/app /app/venv/bin/python /tmp/inv/r5_make_user.py usera@example.com usera
+```
+```
+MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value
+CREATED user_id=2 email=usera@example.com api_key=[REDACTED API KEY — USER-A (60-char code)]
+```
+USER‑B — created after the restart with `after.env` (limit `10`):
+```bash
+CONFIG=/tmp/inv/after.env PYTHONPATH=/app /app/venv/bin/python /tmp/inv/r5_make_user.py userb@example.com userb
+```
+```
+CREATED user_id=3 email=userb@example.com api_key=[REDACTED API KEY — USER-B (60-char code)]
+```
 
 ### (a) / (c) BEFORE — default limit
 
 Server running with `CONFIG=/tmp/inv/base.env` (a throwaway copy of `tests/test.env` with the
-`MAX_NB_EMAIL_FREE_PLAN` line removed, so the code default `5` applies). Creating USER‑A
-(`usera@example.com`, id 3) even printed the default‑path message
-`MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value` (`app/config.py:123`).
-
+`MAX_NB_EMAIL_FREE_PLAN` line removed, so the code default `5` applies). USER‑A
+(`usera@example.com`, **id 2**) was created by the helper above, which even printed the
+default‑path message `MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value`
+(`app/config.py:123`). The `base.env` server startup confirms which config was loaded:
+```
+[2026-07-01 05:11:06 +0000] [443] [INFO] Starting gunicorn 20.0.4
+[2026-07-01 05:11:06 +0000] [443] [INFO] Listening at: http://0.0.0.0:7777 (443)
+load config file /tmp/inv/base.env
+```
 ```bash
-curl -sS -i http://localhost:7777/api/user_info -H 'Authentication: <USER-A key>'
+curl -sS -i http://localhost:7777/api/user_info -H 'Authentication: [REDACTED API KEY — USER-A]'
 ```
 ```
 HTTP/1.1 200 OK
 Server: gunicorn/20.0.4
+Date: Wed, 01 Jul 2026 05:11:25 GMT
+Connection: close
 Content-Type: application/json
 Content-Length: 194
 Access-Control-Allow-Origin: *
+Set-Cookie: slapp=2e95cd35-d6cb-4f09-af1c-91a4af00be6a.VXi6gtZ1LqjEQtbfVJLuSy_uw6E; Expires=Wed, 08-Jul-2026 05:11:25 GMT; HttpOnly; Path=/; SameSite=Lax
 
 {"can_create_reverse_alias":true,"connected_proton_address":null,"email":"usera@example.com","in_trial":true,"is_premium":true,"max_alias_free_plan":5,"name":"usera","profile_picture_url":null}
 ```
@@ -462,34 +607,44 @@ A throwaway `after.env` (copy of `tests/test.env` with `MAX_NB_EMAIL_FREE_PLAN=1
 via `CONFIG` and the server **restarted** (mandatory, because the value is read at **module import
 time**, `app/config.py:120-124`). The restart log confirms the new config was loaded:
 ```
-[2026-07-01 04:32:13 +0000] [3025] [INFO] Starting gunicorn 20.0.4
-[2026-07-01 04:32:13 +0000] [3025] [INFO] Listening at: http://0.0.0.0:7777 (3025)
+[2026-07-01 05:11:43 +0000] [513] [INFO] Starting gunicorn 20.0.4
+[2026-07-01 05:11:43 +0000] [513] [INFO] Listening at: http://0.0.0.0:7777 (513)
 load config file /tmp/inv/after.env
 ```
-Then USER‑B (`userb@example.com`, id 4) was created.
+Then USER‑B (`userb@example.com`, **id 3**) was created (helper invocation + output shown above).
 
 ### (c) AFTER — both users queried
 
 USER‑A (the **pre‑change** user):
 ```bash
-curl -sS -i http://localhost:7777/api/user_info -H 'Authentication: <USER-A key>'
+curl -sS -i http://localhost:7777/api/user_info -H 'Authentication: [REDACTED API KEY — USER-A]'
 ```
 ```
 HTTP/1.1 200 OK
+Server: gunicorn/20.0.4
+Date: Wed, 01 Jul 2026 05:11:54 GMT
+Connection: close
 Content-Type: application/json
 Content-Length: 195
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=546d4558-bcd5-4b71-8b10-2ad3416c375c.j7zTRV_MoeQaLYrkT4HWngw6rh8; Expires=Wed, 08-Jul-2026 05:11:54 GMT; HttpOnly; Path=/; SameSite=Lax
 
 {"can_create_reverse_alias":true,"connected_proton_address":null,"email":"usera@example.com","in_trial":true,"is_premium":true,"max_alias_free_plan":10,"name":"usera","profile_picture_url":null}
 ```
 
 USER‑B (the **post‑change** user):
 ```bash
-curl -sS -i http://localhost:7777/api/user_info -H 'Authentication: <USER-B key>'
+curl -sS -i http://localhost:7777/api/user_info -H 'Authentication: [REDACTED API KEY — USER-B]'
 ```
 ```
 HTTP/1.1 200 OK
+Server: gunicorn/20.0.4
+Date: Wed, 01 Jul 2026 05:11:54 GMT
+Connection: close
 Content-Type: application/json
 Content-Length: 195
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=bd766d8c-757b-4738-9a76-bf6ef1d0c30d.BiyBSkxzuaVO7eXswnw0ozGN3HQ; Expires=Wed, 08-Jul-2026 05:11:54 GMT; HttpOnly; Path=/; SameSite=Lax
 
 {"can_create_reverse_alias":true,"connected_proton_address":null,"email":"userb@example.com","in_trial":true,"is_premium":true,"max_alias_free_plan":10,"name":"userb","profile_picture_url":null}
 ```
@@ -533,8 +688,8 @@ Every sub‑part of every question is answered above, each backed by a verbatim 
 | **R1** | (b) last table created | **`user_audit_log`** | final `CREATE TABLE` in migration stdout (log line 2819) |
 | **R2** | (a) ready message — Gunicorn | **`Listening at: http://0.0.0.0:7777 (2697)`** | Gunicorn capture block |
 | **R2** | (b) ms delta — Gunicorn | **≈ 0.208 ms** (run 2: 0.231 ms) | timestamped Gunicorn capture |
-| **R2** | (a) ready message — dev server | **No `Running on` line is emitted** (Werkzeug logger disabled, `app/log.py:70-71`) | dev‑server capture block (2 runs) |
-| **R2** | (b) ms delta — dev server | no ready log line; empirical port‑connectable **≈ 1520.573 ms** (run 2: 1446.200 ms) | dev‑server capture + port probe |
+| **R2** | (a) ready message — dev server | Real `python server.py`: **no readiness line emitted** (werkzeug logger disabled, `app/log.py:70-71`) — **limitation stated, not claimed satisfied on the shipped path**. Exact message **`* Running on http://127.0.0.1:7777/ (Press CTRL+C to quit)`** captured only via instrumentation (sub‑path 2b) | dev‑server capture (real + instrumented) |
+| **R2** | (b) ms delta — dev server | Instrumented run: first→ready‑line **≈ 1373.249 ms** (run 2: 1340.633 ms). Real path: **no log‑line delta exists** (line suppressed); empirical port‑connectable **≈ 2666.082 ms** | instrumented capture + real‑path port probe |
 | **R3** | (a) confirms port 25025? | **YES** | both startup lines contain `25025`; port connectable |
 | **R3** | (b) exact message(s) | **`Listen for port 25025`** and **`Start mail controller 0.0.0.0 25025`** | email‑handler capture block |
 | **R4** | (a) JSON error | **`{"error":"Account not activated"}`** | login `curl -i` body |
@@ -546,12 +701,84 @@ Every sub‑part of every question is answered above, each backed by a verbatim 
 | **R5** | (c) exact responses before/after | before `5`; after USER‑A `10`, USER‑B `10` | before/after JSON blocks |
 | **R5** | (d) both users or only new? | **BOTH** reflect `10` | USER‑A + USER‑B "after" JSON |
 
-**Items measured empirically rather than read from a log line:** R2(b) for the **dev server**,
-because the Werkzeug readiness banner is genuinely suppressed by the disabled `werkzeug` logger
-(`app/log.py:70-71`); the "ready to accept connections" instant was therefore measured by TCP port
-connectivity and is stated as such. All other answers are direct log/HTTP/SQL observations.
+**Dev‑server R2 honesty note.** On the shipped `python server.py` path the Werkzeug readiness
+banner is genuinely suppressed by the disabled `werkzeug` logger (`app/log.py:70-71`), so **no
+readiness log line exists there** and that subpart is **not** claimed satisfied on the shipped path;
+its "ready to accept connections" instant on that path is only observable empirically (TCP port
+connectable, `+2666.082 ms`). The **exact** readiness message and its `+1373.249 ms` delta were
+obtained via transparent instrumentation (sub‑path 2b) that re‑enables the werkzeug logger without
+modifying any source file. All other answers are direct log/HTTP/SQL observations.
 
 **Environment honesty.** All timings are specific to the `sl-setup` container run and were measured
 at runtime; they are not generalized. Every other value (counts, table name, ready messages, JSON
 bodies, status code, `f`/`t`, `5`/`10`) is an exact literal reproduced from captured output.
+
+---
+
+## Cleanup and read‑only‑compliance evidence
+
+The `SWE-AtlasQnA-Repo` rule requires the source tree to be left **unchanged except for this answer
+document**, and all temporary observation scripts / `.env` files to be **removed** afterward. The
+verbatim commands and output below (run on the destination branch) prove exactly that.
+
+**Throwaway artifacts that were created and then removed.** All observation scaffolding lived inside
+the **disposable container** under `/tmp/inv/` (never inside the repository): the throwaway configs
+`base.env` and `after.env`, the SQL‑echo `alembic_echo.ini`, and the helper scripts
+`timing_harness.py`, `dev_instrumented.py`, `r5_make_user.py` (plus `gunicorn_*.log` capture files).
+None was ever added to the repository tree, and the container itself is discarded.
+
+**1) Only the answer document differs — working tree (`git status --porcelain`):**
+```
+$ git status --porcelain
+ M blitzy/documentation/app_2cd6ee777f8c.md
+```
+A single entry, the answer document; there are **no** other modified files and **no** untracked
+files (no stray `.env`, harness, curl, SQL, or observation artifacts). *(Snapshot taken during the
+cleanup pass, i.e. before this document's own commit; after committing, the working tree is clean.)*
+
+**2) Only one file changed — diffstat (`git diff --stat`):**
+```
+$ git diff --stat
+ blitzy/documentation/app_2cd6ee777f8c.md | 361 +++++++++++++++++++++++++------
+ 1 file changed, 294 insertions(+), 67 deletions(-)
+```
+`1 file changed` — the answer document only. *(Insertion/deletion counts are a snapshot from the
+cleanup pass.)*
+
+**3) The only change vs the project baseline is this file — name‑status vs baseline
+`2cd6ee777f8c` (`git diff --name-status <baseline> HEAD`):**
+```
+$ git diff --name-status 2cd6ee777f8c HEAD
+A	blitzy/documentation/app_2cd6ee777f8c.md
+$ git log --oneline 2cd6ee777f8c..HEAD
+07a0afc1 Add run-first Q&A document for branch app_2cd6ee777f8c
+```
+Exactly one path is **A**dded relative to the pre‑existing project baseline: the answer document.
+No source, config, test, CI, dependency, or lockfile is modified. *(The `git log` line is the
+cleanup‑pass snapshot; the review‑remediation edits to this same document are committed on top and
+likewise touch only this file, so the baseline `git diff --name-status` remains `A` for this one
+path.)*
+
+**4) No throwaway/observation artifacts remain in the repository — artifact scan:**
+```
+$ find . -path ./.git -prune -o \( -name 'base.env' -o -name 'after.env' \
+    -o -name 'alembic_echo*' -o -name 'dev_instrumented*' -o -name 'timing_harness*' \
+    -o -name 'r5_make_user*' -o -name 'blitzy_adhoc_test_*' -o -name '*.pid' \
+    -o -name 'gunicorn_*.log' -o -name '*_key.txt' -o -name 'inv' \) -print
+(no throwaway/observation artifacts found in the repository tree)
+
+$ git status --porcelain --untracked-files=all | grep '^??' || echo "(no untracked files)"
+(no untracked files)
+
+$ git grep -n '/tmp/inv' -- . ':!blitzy/documentation/app_2cd6ee777f8c.md'
+(none outside the answer document)
+```
+The scan finds none of the throwaway artifact names, no untracked files, and no `/tmp/inv`
+references in any tracked file other than this document (where they legitimately appear as the
+observation paths that were used and then discarded).
+
+> **Read‑only‑compliance conclusion.** The repository is left unchanged **except** for the single
+> added file `blitzy/documentation/app_2cd6ee777f8c.md`; every temporary `.env`/script used for
+> observation was confined to the disposable container and removed, and no artifact remains in the
+> tree.
 
