@@ -124,7 +124,8 @@ CREATE TABLE alembic_version (
 So 80 `CREATE TABLE`s come from migration files + 1 from Alembic = 81 emitted, but only 77
 survive to head. The difference is due to tables that are **created and later renamed/dropped**
 across the 255‑revision chain (e.g. `gen_email`→`alias`, `forward_email`→`contact`,
-`forward_email_log`→`email_log`; `metric` and `partner` each appear twice in the create stream;
+`forward_email_log`→`email_log`; `partner` appears twice in the create stream; `metric` is
+created once and then dropped (with `metric2` a separate surviving metrics table);
 `scope`/`client_scope` are dropped). This is exactly why the count must be read from the live
 schema via `information_schema` rather than inferred from `op.create_table(...)` calls.
 
