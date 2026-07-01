@@ -52,8 +52,13 @@ Every factual claim in this guide is grounded in at least one of four channels, 
    ```
 
    The `"pathname:lineno"` prefix is preserved in every quoted log line below — it *is* part of the
-   evidence. Every process also prints the import banner `>>> init logging <<<` [`app/log.py:L67`] at
-   startup, a useful "the app package imported cleanly" signal.
+   evidence. Every `SL` log line is quoted **fully verbatim** (timestamp, `SL`, level, pid,
+   full absolute `pathname:lineno`, `funcName()`, `message_id`, message); the absolute `pathname`
+   prefix in this environment is the repository checkout root
+   `/tmp/blitzy/app/blitzy-d058b0e8-a79b-48f1-bbdb-e76738cbbc1b_b32b11/`. Every process also prints the
+   import banner `>>> init logging <<<` [`app/log.py:L67`] at startup, a useful "the app package
+   imported cleanly" signal. The only values redacted below are the session cookie and the temporary
+   API key; each redaction is explicitly marked and is **not** presented as verbatim.
 4. **Database row** — a row in PostgreSQL (`users`, `alias`, `email_log`, `job`, …) that records the
    durable effect of an action.
 
@@ -76,19 +81,25 @@ bring-up (per `CONTRIBUTING.md`: `alembic upgrade head && flask dummy-data && py
    ```
 
 2. **Seed baseline records + demo account** with `flask dummy-data`, which runs `fake_data()` +
-   `add_sl_domains()` + `add_proton_partner()` [`server.py:L490-L497`]:
+   `add_sl_domains()` + `add_proton_partner()` [`server.py:L490-L497`]. `fake_data()` only *adds*
+   records (it calls `User.create(email="john@wick.com", …)` [`app/fake_data.py:L43-L52`]), so on the
+   already-seeded `simplelogin` database it would collide on the existing demo user. To capture this
+   command's real first-run output, it was run against a throwaway empty database
+   (`blitzy_seed_probe`, migrated to 77 tables, then dropped) — the output below is verbatim from that
+   run (note the `WARNING` "reset db, add fake data" wording is a log message, not a destructive drop):
 
    ```bash
    $ CONFIG=example.env PYTHONPATH=. FLASK_APP=server.py poetry run flask dummy-data
    ```
    ```text
    >>> init logging <<<
-   2026-07-01 04:12:35,462 - SL - WARNING - 41336 - ".../server.py:494" - dummy_data() -  - reset db, add fake data
-   2026-07-01 04:12:35,462 - SL - DEBUG - 41336 - ".../app/fake_data.py:41" - fake_data() -  - create fake data
-   2026-07-01 04:12:36,231 - SL - INFO - 41336 - ".../init_app.py:44" - add_sl_domains() -  - Add sl.local to SL domain
+   2026-07-01 05:09:58,355 - SL - WARNING - 82208 - "/tmp/blitzy/app/blitzy-d058b0e8-a79b-48f1-bbdb-e76738cbbc1b_b32b11/server.py:494" - dummy_data() -  - reset db, add fake data
+   2026-07-01 05:09:58,355 - SL - DEBUG - 82208 - "/tmp/blitzy/app/blitzy-d058b0e8-a79b-48f1-bbdb-e76738cbbc1b_b32b11/app/fake_data.py:41" - fake_data() -  - create fake data
+   2026-07-01 05:09:59,170 - SL - INFO - 82208 - "/tmp/blitzy/app/blitzy-d058b0e8-a79b-48f1-bbdb-e76738cbbc1b_b32b11/init_app.py:44" - add_sl_domains() -  - Add sl.local to SL domain
    ```
 
-   The demo account is now present (`activated=t`, `is_admin=t`):
+   In the live `simplelogin` database used for every other observation below, the demo account is
+   already present (`activated=t`, `is_admin=t`):
 
    ```bash
    $ docker exec sl-db psql -U myuser -d simplelogin \
@@ -134,15 +145,16 @@ $ CONFIG=example.env PYTHONPATH=. poetry run gunicorn wsgi:app -b 0.0.0.0:7777 -
 **Startup signature** (captured verbatim):
 
 ```text
-[2026-07-01 04:13:18 +0000] [42160] [INFO] Starting gunicorn 20.0.4
-[2026-07-01 04:13:18 +0000] [42160] [INFO] Listening at: http://0.0.0.0:7777 (42160)
-[2026-07-01 04:13:18 +0000] [42160] [INFO] Using worker: sync
-[2026-07-01 04:13:18 +0000] [42170] [INFO] Booting worker with pid: 42170
-[2026-07-01 04:13:18 +0000] [42171] [INFO] Booting worker with pid: 42171
+[2026-07-01 05:01:01 +0000] [76180] [INFO] Starting gunicorn 20.0.4
+[2026-07-01 05:01:01 +0000] [76180] [INFO] Listening at: http://0.0.0.0:7777 (76180)
+[2026-07-01 05:01:01 +0000] [76180] [INFO] Using worker: sync
+[2026-07-01 05:01:01 +0000] [76187] [INFO] Booting worker with pid: 76187
+[2026-07-01 05:01:01 +0000] [76188] [INFO] Booting worker with pid: 76188
 ```
 
-The two `Booting worker` lines correspond to `-w 2` (two workers). The port `7777` matches the local
-dev default `app.run(debug=True, port=7777)` [`server.py:L588`] and the Gunicorn bind.
+The two `Booting worker` lines correspond to `-w 2` (two workers); master pid `76180`, workers `76187`
+and `76188` (referenced again in the Q3.1 process tree). The port `7777` matches the local dev default
+`app.run(debug=True, port=7777)` [`server.py:L588`] and the Gunicorn bind.
 
 **Liveness probe — the health endpoint.** The route is `@app.route("/health", methods=["GET"])`
 [`server.py:L213`] → `def healthcheck():` [`server.py:L214`] → `return "success", 200` [`server.py:L215`]:
@@ -153,18 +165,19 @@ $ curl -i http://localhost:7777/health
 ```http
 HTTP/1.1 200 OK
 Server: gunicorn/20.0.4
-Date: Wed, 01 Jul 2026 04:13:29 GMT
+Date: Wed, 01 Jul 2026 05:01:21 GMT
 Connection: close
 Content-Type: text/html; charset=utf-8
 Content-Length: 7
 Vary: Cookie
-Set-Cookie: slapp=<redacted-session-cookie>; Expires=Wed, 08-Jul-2026 04:13:29 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=<REDACTED session cookie>; Expires=Wed, 08-Jul-2026 05:01:21 GMT; HttpOnly; Path=/; SameSite=Lax
 
 success
 ```
 
 The exact result is **status `200`** and **body `success`** (`Content-Length: 7` — the 7 bytes of
-`success`). This is the definitive "web server is up and responding" signal.
+`success`). This is the definitive "web server is up and responding" signal. (The `slapp` cookie value
+is redacted — it is the only redaction in this block and is not presented as verbatim.)
 
 **Routing is alive — root redirect.** An unauthenticated `GET /` redirects to the login page
 (`redirect(url_for("auth.login"))`) [`server.py:L250-L255`]:
@@ -175,50 +188,107 @@ $ curl -i http://localhost:7777/
 ```http
 HTTP/1.1 302 FOUND
 Server: gunicorn/20.0.4
+Date: Wed, 01 Jul 2026 05:01:21 GMT
+Connection: close
+Content-Type: text/html; charset=utf-8
 Content-Length: 229
 Location: http://localhost:7777/auth/login
-...
+Vary: Cookie
+Set-Cookie: slapp=<REDACTED session cookie>; Expires=Wed, 08-Jul-2026 05:01:21 GMT; HttpOnly; Path=/; SameSite=Lax
+
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
+<title>Redirecting...</title>
+<h1>Redirecting...</h1>
+<p>You should be redirected automatically to target URL: <a href="/auth/login">/auth/login</a>.  If not click the link.
 ```
 
-The `Set-Cookie: slapp=...` header above matches `SESSION_COOKIE_NAME = "slapp"` [`app/config.py:L199`],
+The `Set-Cookie: slapp=…` header above matches `SESSION_COOKIE_NAME = "slapp"` [`app/config.py:L199`],
 confirming the session layer is wired up. Breadth of service is registered by `register_blueprints(app)`
 [`server.py:L233`], which mounts `auth_bp, monitor_bp, dashboard_bp, developer_bp, phone_bp, oauth_bp`
 (at both `/oauth` and `/oauth2`), `onboarding_bp, discover_bp, internal_bp, api_bp` [`server.py:L234-L246`].
 
-**Sign-in signal (dashboard/UI).** Exercising a real login with the seeded `john@wick.com / password`
-(CSRF handled). Success redirects to `dashboard.index` (`return redirect(url_for("dashboard.index"))`)
-[`app/auth/views/login.py:L34`]:
+**Sign-in signal + alias-management signal (dashboard/UI).** The exact temporary script below logs in
+with the seeded `john@wick.com / password` (fetching the `csrf_token` first), then a wrong-password
+attempt, then fetches the authenticated dashboard and checks the alias-management controls
+**case-sensitively**. Success redirects to `dashboard.index`
+(`return redirect(url_for("dashboard.index"))`) [`app/auth/views/login.py:L34`]; a wrong password
+flashes `"Email or password incorrect"` [`app/auth/views/login.py:L49`]:
 
+```python
+# login_probe.py — run with: CONFIG=example.env PYTHONPATH=. python login_probe.py
+import re, requests
+BASE = "http://localhost:7777"
+def csrf(session, path="/auth/login"):
+    html = session.get(BASE + path).text
+    return re.search(r'name="csrf_token"[^>]*value="([^"]+)"', html).group(1)
+# correct login
+s = requests.Session()
+r = s.post(BASE + "/auth/login",
+           data={"csrf_token": csrf(s), "email": "john@wick.com", "password": "password"},
+           allow_redirects=False)
+print("POST /auth/login (correct pw) -> HTTP %s" % r.status_code)
+print("Location: %s" % r.headers.get("Location"))
+# wrong login (fresh session)
+s2 = requests.Session()
+r2 = s2.post(BASE + "/auth/login",
+             data={"csrf_token": csrf(s2), "email": "john@wick.com", "password": "wrong-password"},
+             allow_redirects=False)
+print("POST /auth/login (wrong pw) -> HTTP %s" % r2.status_code)
+for line in r2.text.splitlines():
+    if "Email or password incorrect" in line:
+        print("flash line: %s" % line.strip())
+# authenticated dashboard probe (reuse correct-login session s)
+rr = s.get(BASE + "/", allow_redirects=False)
+print("GET / (authenticated) -> HTTP %s Location: %s" % (rr.status_code, rr.headers.get("Location")))
+d = s.get(BASE + "/dashboard/")
+print("GET /dashboard/ (authenticated) -> HTTP %s" % d.status_code)
+mt = re.search(r"<title>(.*?)</title>", d.text, re.S)
+print("<title> -> %s" % (mt.group(1).strip() if mt else "NONE"))
+for lit in ["Random Alias", "New Custom Alias", "Create"]:
+    print("  contains %r (case-sensitive): %s" % (lit, lit in d.text))
+```
 ```text
-POST /auth/login -> HTTP 302
+POST /auth/login (correct pw) -> HTTP 302
 Location: http://localhost:7777/dashboard/
-```
-
-A **deliberately wrong** password renders the login page (HTTP 200) with the flash
-`"Email or password incorrect"` [`app/auth/views/login.py:L49`], which surfaces in the page as a toastr
-error:
-
-```text
 POST /auth/login (wrong pw) -> HTTP 200
-... <script>toastr.error("Email or password incorrect");</script>
-```
-
-**Alias-management signal.** Once authenticated, `GET /` redirects to `/dashboard/`, and the dashboard
-index (rendered from `templates/dashboard/index.html`) is the alias-management page:
-
-```text
+flash line: <script>toastr.error("Email or password incorrect");</script>
 GET / (authenticated) -> HTTP 302 Location: http://localhost:7777/dashboard/
 GET /dashboard/ (authenticated) -> HTTP 200
-<title> -> Alias | SimpleLogin
-  contains 'Random alias': True
-  contains 'Create': True
-  contains 'New custom alias': True
+<title> -> Alias
+      | SimpleLogin
+  contains 'Random Alias' (case-sensitive): True
+  contains 'New Custom Alias' (case-sensitive): True
+  contains 'Create' (case-sensitive): True
 ```
+
+The wrong-password flash renders as `<script>toastr.error("Email or password incorrect");</script>` —
+the real flash pattern produced by `templates/base.html:L102`
+(`{% for category, message in messages %}<script>toastr.{{category }}("{{ message }}");</script>{% endfor %}`).
+
+**On the exact UI literals (case-sensitive).** The dashboard controls are `New Custom Alias`
+[`templates/dashboard/index.html:L46`] and `Random Alias` [`templates/dashboard/index.html:L56`] — both
+with title-case words. A case-sensitive substring check confirms the exact template literals are present
+and that the lower-case variants are **not**:
+
+```python
+for lit in ["Random Alias","Random alias","New Custom Alias","New custom alias"]:
+    print("  %r in page (case-sensitive): %s" % (lit, lit in d.text))
+```
+```text
+  'Random Alias' in page (case-sensitive): True
+  'Random alias' in page (case-sensitive): False
+  'New Custom Alias' in page (case-sensitive): True
+  'New custom alias' in page (case-sensitive): False
+```
+
+The page `<title>` renders across lines as `\n      Alias\n      | SimpleLogin\n    ` (block title
+`Alias` [`templates/dashboard/index.html:L31`] composed into the base layout's `| SimpleLogin`), which
+whitespace-normalizes to `Alias | SimpleLogin`.
 
 **Reasoning.** `200 success` on `/health` proves the WSGI worker is serving requests; the `302` on `/`
 proves routing + session are functional; the login `302` to `/dashboard/` proves authentication works;
-and the dashboard page (title "Alias | SimpleLogin", with "Random alias" / "New custom alias" controls)
-proves a signed-in user can manage aliases.
+and the dashboard page (title `Alias | SimpleLogin`, with the exact `Random Alias` / `New Custom Alias`
+controls) proves a signed-in user can manage aliases.
 
 ### Q1.2 — Email handler (`aiosmtpd` SMTP daemon)
 
@@ -232,8 +302,8 @@ $ CONFIG=example.env PYTHONPATH=. poetry run python email_handler.py
 
 ```text
 >>> init logging <<<
-2026-07-01 04:13:43,454 - SL - INFO - 42585 - ".../email_handler.py:2403" - <module>() -  - Listen for port 20381
-2026-07-01 04:13:43,457 - SL - DEBUG - 42585 - ".../email_handler.py:2386" - main() -  - Start mail controller 0.0.0.0 20381
+2026-07-01 05:01:03,129 - SL - INFO - 76182 - "/tmp/blitzy/app/blitzy-d058b0e8-a79b-48f1-bbdb-e76738cbbc1b_b32b11/email_handler.py:2403" - <module>() -  - Listen for port 20381
+2026-07-01 05:01:03,131 - SL - DEBUG - 76182 - "/tmp/blitzy/app/blitzy-d058b0e8-a79b-48f1-bbdb-e76738cbbc1b_b32b11/email_handler.py:2386" - main() -  - Start mail controller 0.0.0.0 20381
 ```
 
 - `Listen for port 20381` is `LOG.i("Listen for port %s", args.port)` [`email_handler.py:L2403`]; the
@@ -246,7 +316,7 @@ $ CONFIG=example.env PYTHONPATH=. poetry run python email_handler.py
 **Liveness probe — the socket is actually listening.** Independent TCP connect check:
 
 ```bash
-$ python3 -c "import socket; s=socket.socket(); print('connect_ex =', s.connect_ex(('127.0.0.1',20381)))"
+$ python3 -c "import socket; s=socket.socket(); rc=s.connect_ex(('127.0.0.1',20381)); print(f'port 20381 connect_ex = {rc} (0=open/listening)')"
 ```
 ```text
 port 20381 connect_ex = 0 (0=open/listening)
@@ -274,11 +344,23 @@ none, and `time.sleep(10)` [`job_runner.py:L347`]. So the healthy **idle** signa
 then no output, re-polling every **10 seconds**.
 
 **Liveness probe — force a real cycle.** To capture an actual poll, a throwaway `Job` row was enqueued
-(then deleted). The runner picked it up on its next 10-second poll and logged `LOG.d("Take job %s", job)`
-[`job_runner.py:L334`]:
+(and removed during cleanup) with the exact script below:
+
+```python
+# enqueue_job.py — run with: CONFIG=example.env PYTHONPATH=. python enqueue_job.py
+from app.models import Job
+j = Job.create(name="blitzy_probe_unknown_job", payload={"probe": True}, commit=True)
+print("enqueued Job id=%s name=%s state=%s" % (j.id, j.name, j.state))
+```
+```text
+enqueued Job id=2 name=blitzy_probe_unknown_job state=0
+```
+
+The runner picked it up on its next 10-second poll and logged `LOG.d("Take job %s", job)`
+[`job_runner.py:L334`] (full verbatim from the `job_runner.py` process, pid `76184`):
 
 ```text
-2026-07-01 04:15:06,633 - SL - DEBUG - 42864 - ".../job_runner.py:334" - <module>() -  - Take job <Job 1 blitzy_probe_unknown_job {'probe': True}>
+2026-07-01 05:02:33,399 - SL - DEBUG - 76184 - "/tmp/blitzy/app/blitzy-d058b0e8-a79b-48f1-bbdb-e76738cbbc1b_b32b11/job_runner.py:334" - <module>() -  - Take job <Job 2 blitzy_probe_unknown_job {'probe': True}>
 ```
 
 The job then transitioned `ready(0) → done(2)` (`JobState` is `ready=0, taken=1, done=2, error=3`
@@ -291,7 +373,7 @@ $ docker exec sl-db psql -U myuser -d simplelogin \
 ```text
  id |           name           | state | attempts | taken
 ----+--------------------------+-------+----------+-------
-  1 | blitzy_probe_unknown_job |     2 |        1 | t
+  2 | blitzy_probe_unknown_job |     2 |        1 | t
 ```
 
 **Reasoning.** A `Take job …` line followed by the row advancing to `state=2` (done) proves the runner is
@@ -315,29 +397,61 @@ The route calls `User.create(email=..., name=..., password=..., referral=...)` [
 → `send_activation_email(user, next_url)` [`app/auth/views/register.py:L95`] →
 `render_template("auth/register_waiting_activation.html")` [`app/auth/views/register.py:L104`].
 
-```bash
-$ # POST /auth/register  (csrf_token, email=blitzy-temp-user@gmail.com, password=...)
+The exact temporary script below submits the registration form (fetching the `csrf_token` first) and
+checks the waiting-activation page's literal UI text. It also extracts **only real flashes** rendered by
+`templates/base.html:L102` (`<script>toastr.CATEGORY("MSG");</script>`) — deliberately distinguished from
+the **dormant** `htmx:responseError` handler in `templates/base.html:L184-L186`
+(`toastr.error("Sorry for the inconvenience! Could you refresh the page & retry please?", "Unknown Error")`),
+which is present verbatim in every page's HTML but only fires client-side on an actual htmx error and is
+**not** a flash:
+
+```python
+# register_probe2.py — plain HTTP client against the already-running web server (port 7777).
+# Run with: python register_probe2.py   (requires the `requests` package)
+import re, requests
+BASE = "http://localhost:7777"
+EMAIL = "blitzy-temp-user@gmail.com"
+s = requests.Session()
+tok = re.search(r'name="csrf_token"[^>]*value="([^"]+)"', s.get(BASE+"/auth/register").text).group(1)
+r = s.post(BASE+"/auth/register",
+           data={"csrf_token": tok, "email": EMAIL, "password": "blitzy-temp-pass-123"},
+           allow_redirects=False)
+print("POST /auth/register -> HTTP %s" % r.status_code)
+body = r.text
+for lit, label in [("Activation Email Sent","block title"),
+                   ("An email to validate your email is on its way.","<h1>"),
+                   ("Please check your inbox/spam folder.","<p>")]:
+    print("  page contains %r: %s   (%s)" % (lit, lit in body, label))
+# REAL flashes only: base.html:102 renders <script>toastr.CATEGORY("MSG");</script>
+real_flashes = re.findall(r'<script>toastr\.(\w+)\("([^"]*)"\);</script>', body)
+print("  real flashed messages (base.html:102 pattern): %s" % (real_flashes if real_flashes else "NONE"))
+```
+```text
+POST /auth/register -> HTTP 200
+  page contains 'Activation Email Sent': True   (block title)
+  page contains 'An email to validate your email is on its way.': True   (<h1>)
+  page contains 'Please check your inbox/spam folder.': True   (<p>)
+  real flashed messages (base.html:102 pattern): NONE
 ```
 
 **What the system did:**
 
 1. **HTTP + waiting-activation page.** The response was `HTTP 200` rendering
-   `templates/auth/register_waiting_activation.html`, whose literal UI text is the confirmation signal:
+   `templates/auth/register_waiting_activation.html` [`app/auth/views/register.py:L104`], whose literal
+   UI text — `Activation Email Sent` [`templates/auth/register_waiting_activation.html:L3`],
+   `An email to validate your email is on its way.` [`:L8`], and `Please check your inbox/spam folder.`
+   [`:L9`] — is the confirmation signal. There is **no** real flashed error (`NONE` above); the account
+   was created cleanly.
+
+2. **Activation email — logged, not sent** (because `NOT_SEND_EMAIL=true`). These two lines are the
+   **server-side effect** of the same `register_probe2.py` POST above, captured verbatim from the web
+   server's stdout (the running Gunicorn process, `tee`'d to a log file). They show the `create user`
+   line [`app/auth/views/register.py:L85`] and then the activation email being logged by
+   `mail_sender.send()` [`app/mail_sender.py:L131`] — worker pid `76188`:
 
    ```text
-   POST /auth/register -> HTTP 200
-     page contains 'Activation Email Sent': True                              (block title)
-     page contains 'An email to validate your email is on its way.': True     (<h1>)
-     page contains 'Please check your inbox/spam folder.': True               (<p>)
-   ```
-
-2. **Activation email — logged, not sent** (because `NOT_SEND_EMAIL=true`). The web log shows the
-   `create user` line and then the activation email being logged by `mail_sender.send()`
-   [`app/mail_sender.py:L131`]:
-
-   ```text
-   ... ".../app/auth/views/register.py:85" - register() -  - create user blitzy-temp-user@gmail.com
-   ... ".../app/mail_sender.py:131" - send() -  - send email with subject 'Just one more step to join SimpleLogin', from '"noreply@sl.local" <noreply@sl.local>' to 'blitzy-temp-user@gmail.com'
+   2026-07-01 05:04:25,905 - SL - DEBUG - 76188 - "/tmp/blitzy/app/blitzy-d058b0e8-a79b-48f1-bbdb-e76738cbbc1b_b32b11/app/auth/views/register.py:85" - register() -  - create user blitzy-temp-user@gmail.com
+   2026-07-01 05:04:26,195 - SL - DEBUG - 76188 - "/tmp/blitzy/app/blitzy-d058b0e8-a79b-48f1-bbdb-e76738cbbc1b_b32b11/app/mail_sender.py:131" - send() -  - send email with subject 'Just one more step to join SimpleLogin', from '"noreply@sl.local" <noreply@sl.local>' to 'blitzy-temp-user@gmail.com'
    ```
 
 3. **Database row.** A new `users` row exists, correctly **unactivated** (`activated=f`) until the
@@ -350,7 +464,8 @@ $ # POST /auth/register  (csrf_token, email=blitzy-temp-user@gmail.com, password
    ```text
     id |           email            | activated | is_admin |            name
    ----+----------------------------+-----------+----------+----------------------------
-     3 | blitzy-temp-user@gmail.com | f         | f        | blitzy-temp-user@gmail.com
+     5 | blitzy-temp-user@gmail.com | f         | f        | blitzy-temp-user@gmail.com
+   (1 row)
    ```
 
 **Why this proves correct handling.** The `create user …` log confirms the `User.create` path ran; the
@@ -370,102 +485,148 @@ Exercised **two** ways.
 **(a) Dashboard random-alias control** (signed in as `john@wick.com`). The dashboard POST with
 `form-name=create-random-email` triggers `Alias.create_new_random(user=current_user, scheme=scheme)`
 [`app/dashboard/views/index.py:L104`] and then the success flash
-`flash(f"Alias {alias.email} has been created", "success")` [`app/dashboard/views/index.py:L111`]:
+`flash(f"Alias {alias.email} has been created", "success")` [`app/dashboard/views/index.py:L111`]. The
+exact producing script signs in, grabs a fresh CSRF token, POSTs the create-random-email form, then
+follows the redirect to render the flash via the `templates/base.html:L102` pattern:
 
+```python
+# alias_dashboard2.py — plain HTTP client against the already-running web server (port 7777).
+# Run with: python alias_dashboard2.py   (requires the `requests` package)
+import re, requests
+BASE = "http://localhost:7777"
+s = requests.Session()
+tok = re.search(r'name="csrf_token"[^>]*value="([^"]+)"', s.get(BASE+"/auth/login").text).group(1)
+s.post(BASE+"/auth/login", data={"csrf_token":tok,"email":"john@wick.com","password":"password"}, allow_redirects=False)
+dtok = re.search(r'name="csrf_token"[^>]*value="([^"]+)"', s.get(BASE+"/dashboard/").text).group(1)
+r = s.post(BASE+"/dashboard/", data={"csrf_token":dtok, "form-name":"create-random-email"}, allow_redirects=False)
+loc = r.headers["Location"]
+print("POST /dashboard/ (create-random-email) -> HTTP %s" % r.status_code)
+print("Location: %s" % loc)
+# Location is absolute; GET it directly with the same session to render+consume the flash
+follow = s.get(loc)
+for cat,msg in re.findall(r'<script>toastr\.(\w+)\("([^"]*)"\);</script>', follow.text):
+    print('FLASH (rendered): toastr.%s("%s")' % (cat, msg))
+```
 ```text
 POST /dashboard/ (create-random-email) -> HTTP 302
-Location: http://localhost:7777/dashboard/?highlight_alias_id=13&query=&sort=&filter=
-FLASH (rendered): toastr.success("Alias shorty_shower125@sl.local has been created")
+Location: http://localhost:7777/dashboard/?highlight_alias_id=19&query=&sort=&filter=
+FLASH (rendered): toastr.success("Alias erases_parses553@sl.local has been created")
 ```
 
-The web log confirms the create with the exact alias and owner:
+The web log confirms the create with the exact alias and owner (full verbatim `SL` line, worker pid `76187`):
 
 ```text
-... ".../app/dashboard/views/index.py:110" - index() -  - create new random alias <Alias 13 shorty_shower125@sl.local> for user <User 1 John Wick john@wick.com>
+2026-07-01 05:05:36,460 - SL - DEBUG - 76187 - "/tmp/blitzy/app/blitzy-d058b0e8-a79b-48f1-bbdb-e76738cbbc1b_b32b11/app/dashboard/views/index.py:110" - index() -  - create new random alias <Alias 19 erases_parses553@sl.local> for user <User 1 John Wick john@wick.com>
 ```
 
 **(b) REST API** — `POST /api/alias/random/new` (`new_random_alias`) returns **HTTP `201`** with
-`jsonify(alias=alias.email, ...)` [`app/api/views/new_random_alias.py:L115-L116`]:
+`jsonify(alias=alias.email, ...)` [`app/api/views/new_random_alias.py:L115-L116`]. The API reads the key
+from the `Authentication` header [`app/api/base.py:L17`]. A temporary key is minted with the exact
+reproducible script below (`ApiKey.create` [`app/models.py:L2350`]), captured into the `$API_KEY` shell
+variable so the **real secret is never printed** in the command or its output (it is redacted per the
+read-only/no-secret-exposure requirement):
 
+```python
+# mk_apikey.py — run with: CONFIG=example.env PYTHONPATH=. python mk_apikey.py
+from app.models import ApiKey
+from app.db import Session
+k = ApiKey.create(user_id=1, name="blitzy-temp-probe-key", commit=True)
+print(k.code)
+```
 ```bash
-$ curl -X POST http://localhost:7777/api/alias/random/new -H "Authentication: <api-key>"
+$ API_KEY="$(CONFIG=example.env PYTHONPATH=. python mk_apikey.py)"   # 59-char code captured, not echoed (redacted)
+$ curl -s -w "\nHTTP %{http_code}\n" -X POST http://localhost:7777/api/alias/random/new -H "Authentication: $API_KEY"
 ```
 ```text
-POST /api/alias/random/new -> HTTP 201
-{"alias":"beside_pander301@sl.local","creation_date":"2026-07-01 04:19:10+00:00","creation_timestamp":1782879550,"disable_pgp":false,"email":"beside_pander301@sl.local","enabled":true,"id":14, ...}
+{"alias":"entomb_covert531@sl.local","creation_date":"2026-07-01 05:05:52+00:00","creation_timestamp":1782882352,"disable_pgp":false,"email":"entomb_covert531@sl.local","enabled":true,"id":20,"latest_activity":null,"mailbox":{"email":"john@wick.com","id":1},"mailboxes":[{"email":"john@wick.com","id":1}],"name":null,"nb_block":0,"nb_forward":0,"nb_reply":0,"note":null,"pinned":false,"support_pgp":false}
+
+HTTP 201
 ```
 
-**Database rows** (note the domain is `sl.local`, from `EMAIL_DOMAIN` [`example.env:L22`]):
+**Database rows** — the two aliases created just above (`19` from the dashboard, `20` from REST); the
+domain is `sl.local`, from `EMAIL_DOMAIN` [`example.env:L22`]:
 
 ```bash
 $ docker exec sl-db psql -U myuser -d simplelogin \
-    -c "SELECT id,email,user_id,mailbox_id,enabled FROM alias WHERE email LIKE '%@sl.local' ORDER BY id DESC LIMIT 2;"
+    -c "SELECT id,email,user_id,mailbox_id,enabled FROM alias WHERE id IN (19,20) ORDER BY id DESC;"
 ```
 ```text
- id |           email           | user_id | mailbox_id | enabled
+ id |           email           | user_id | mailbox_id | enabled 
 ----+---------------------------+---------+------------+---------
- 14 | beside_pander301@sl.local |       1 |          1 | t
- 13 | shorty_shower125@sl.local |       1 |          1 | t
+ 20 | entomb_covert531@sl.local |       1 |          1 | t
+ 19 | erases_parses553@sl.local |       1 |          1 | t
+(2 rows)
 ```
 
-**Why this proves correct handling.** The flash `Alias shorty_shower125@sl.local has been created`
-(dashboard) and the `201` + JSON `alias`/`email` fields (REST) are the two API contracts for "alias
-created"; the `create new random alias <Alias 13 …>` log confirms the code path executed; and the new
-`alias` rows (`enabled=t`, owned by `user_id=1`, bound to `mailbox_id=1`) are the durable proof. Both
-generated addresses are on the `sl.local` domain, as configured.
+**Why this proves correct handling.** The flash `Alias erases_parses553@sl.local has been created`
+(dashboard) and the `201` + JSON `alias`/`email` fields (REST, `entomb_covert531@sl.local`) are the two
+API contracts for "alias created"; the `create new random alias <Alias 19 …>` log confirms the code path
+executed; and the new `alias` rows (`enabled=t`, owned by `user_id=1`, bound to `mailbox_id=1`) are the
+durable proof. Both generated addresses are on the `sl.local` domain, as configured.
 
 ### Q2.3 — Have that alias receive an email
 
 **What was done** — deliver a message over SMTP to the email handler on port **`20381`**, `MAIL FROM` an
-external sender, `RCPT TO` the alias created above (`shorty_shower125@sl.local`, owned by John whose
-mailbox `1` is `verified=t`):
+external sender, `RCPT TO` the alias created above (`erases_parses553@sl.local`, owned by John whose
+mailbox `1` is `verified=t`). The exact producing script prints each SMTP step's reply:
 
 ```python
-# temporary observation script (smtplib) — delivered to 127.0.0.1:20381
+# inbound_send.py — plain SMTP client against the already-running email handler (127.0.0.1:20381).
+# Run with: python inbound_send.py
 import smtplib
 from email.mime.text import MIMEText
+ALIAS = "erases_parses553@sl.local"
 msg = MIMEText("Hello alias, this is a Blitzy inbound test message.\n")
 msg["Subject"] = "Blitzy inbound test"
 msg["From"] = "external-sender@example.com"
-msg["To"]   = "shorty_shower125@sl.local"
+msg["To"]   = ALIAS
 with smtplib.SMTP("127.0.0.1", 20381, timeout=30) as smtp:
-    smtp.ehlo("example.com"); smtp.mail("external-sender@example.com")
-    smtp.rcpt("shorty_shower125@sl.local")
-    print(smtp.data(msg.as_string().encode()))
+    print("EHLO      ->", smtp.ehlo("example.com")[0])
+    print("MAIL FROM ->", smtp.mail("external-sender@example.com"))
+    print("RCPT TO   ->", smtp.rcpt(ALIAS))
+    code, resp = smtp.data(msg.as_string().encode())
+    print("DATA (final SMTP reply) -> %s %s" % (code, resp.decode()))
 ```
 
 **SMTP server reply** — the handler accepted the message with the exact success code
-`E200 = "250 Message accepted for delivery"` [`app/email/status.py:L2`]:
+`E200 = "250 Message accepted for delivery"` [`app/email/status.py:L2`] (the tuple form `(250, b'OK')`
+is what `smtplib`'s `mail()`/`rcpt()` return per step):
 
 ```text
-EHLO -> 250
-MAIL FROM -> 250 OK
-RCPT TO -> 250 OK
+EHLO      -> 250
+MAIL FROM -> (250, b'OK')
+RCPT TO   -> (250, b'OK')
 DATA (final SMTP reply) -> 250 Message accepted for delivery
 ```
 
-**Handler log chain** (verbatim; note the single `message_id` `9cf3291f-aa1f-480a-9406-f485e932fddb`
-threaded through every line — that is the log format's `message_id` correlation field in action):
+**Handler log chain** (full verbatim `SL` lines from the email handler, worker pid `76182`; note the
+single `message_id` `788bcb4d-f9be-4639-a74f-30f03ec0d5bc` threaded through every line — that is the log
+format's `message_id` correlation field in action). These are the core forward lines from the handler
+log; intermediate DMARC/header-rewrite lines are omitted between them (each omission marked `[…]`), but
+every line shown is quoted in full with its complete prefix:
 
 ```text
-... ".../email_handler.py:2343" - _handle() - 9cf3291f-... - New message, mail from external-sender@example.com, rctp tos ['shorty_shower125@sl.local']
-... ".../email_handler.py:2202" - handle()  - 9cf3291f-... - Forward phase external-sender@example.com(external-sender@example.com) -> shorty_shower125@sl.local
-... ".../email_handler.py:688"  - forward_email_to_mailbox() - 9cf3291f-... - Forward <Contact 2 external-sender@example.com 13> -> <Alias 13 shorty_shower125@sl.local> -> <Mailbox 1 john@wick.com>
-... ".../app/mail_sender.py:131" - send() - 9cf3291f-... - send email with subject 'Blitzy inbound test', from '"external-sender at example.com" <external-sender_at_example_com_fukfhtl@sl.local>' to 'shorty_shower125@sl.local'
-... ".../email_handler.py:2367" - _handle() - 9cf3291f-... - Finish mail_from external-sender@example.com, rcpt_tos ['shorty_shower125@sl.local'], takes 0.18215370178222656 seconds with return code '250 Message accepted for delivery'<<===
+2026-07-01 05:06:16,802 - SL - INFO - 76182 - "/tmp/blitzy/app/blitzy-d058b0e8-a79b-48f1-bbdb-e76738cbbc1b_b32b11/email_handler.py:2343" - _handle() - 788bcb4d-f9be-4639-a74f-30f03ec0d5bc - New message, mail from external-sender@example.com, rctp tos ['erases_parses553@sl.local'] 
+2026-07-01 05:06:16,930 - SL - DEBUG - 76182 - "/tmp/blitzy/app/blitzy-d058b0e8-a79b-48f1-bbdb-e76738cbbc1b_b32b11/email_handler.py:2202" - handle() - 788bcb4d-f9be-4639-a74f-30f03ec0d5bc - Forward phase external-sender@example.com(external-sender@example.com) -> erases_parses553@sl.local
+2026-07-01 05:06:16,978 - SL - DEBUG - 76182 - "/tmp/blitzy/app/blitzy-d058b0e8-a79b-48f1-bbdb-e76738cbbc1b_b32b11/email_handler.py:688" - forward_email_to_mailbox() - 788bcb4d-f9be-4639-a74f-30f03ec0d5bc - Forward <Contact 4 external-sender@example.com 19> -> <Alias 19 erases_parses553@sl.local> -> <Mailbox 1 john@wick.com>
+2026-07-01 05:06:16,981 - SL - DEBUG - 76182 - "/tmp/blitzy/app/blitzy-d058b0e8-a79b-48f1-bbdb-e76738cbbc1b_b32b11/email_handler.py:740" - forward_email_to_mailbox() - 788bcb4d-f9be-4639-a74f-30f03ec0d5bc - Create <EmailLog 4> for <Contact 4 external-sender@example.com 19>, <User 1 John Wick john@wick.com>, <Mailbox 1 john@wick.com>
+2026-07-01 05:06:16,988 - SL - DEBUG - 76182 - "/tmp/blitzy/app/blitzy-d058b0e8-a79b-48f1-bbdb-e76738cbbc1b_b32b11/app/mail_sender.py:131" - send() - 788bcb4d-f9be-4639-a74f-30f03ec0d5bc - send email with subject 'Blitzy inbound test', from '"external-sender at example.com" <external-sender_at_example_com_ooruszxa@sl.local>' to 'erases_parses553@sl.local'
+2026-07-01 05:06:16,988 - SL - INFO - 76182 - "/tmp/blitzy/app/blitzy-d058b0e8-a79b-48f1-bbdb-e76738cbbc1b_b32b11/email_handler.py:2367" - _handle() - 788bcb4d-f9be-4639-a74f-30f03ec0d5bc - Finish mail_from external-sender@example.com, rcpt_tos ['erases_parses553@sl.local'], takes 0.18649888038635254 seconds with return code '250 Message accepted for delivery'<<===
 ```
 
 Key lines:
 - **`New message, mail from … rctp tos …`** [`email_handler.py:L2343`] — note the (sic) spelling
   `rctp tos` and the trailing space, quoted exactly.
-- **`Forward <Contact 2 …> -> <Alias 13 shorty_shower125@sl.local> -> <Mailbox 1 john@wick.com>`** is
+- **`Forward <Contact 4 …> -> <Alias 19 erases_parses553@sl.local> -> <Mailbox 1 john@wick.com>`** is
   `LOG.d("Forward %s -> %s -> %s", contact, alias, mailbox)` [`email_handler.py:L688`] — the
   **contact → alias → mailbox** forwarding chain.
+- **`Create <EmailLog 4> …`** [`email_handler.py:L740`] — the handler persists the `email_log` row
+  (id `4`, shown in the DB query below) as it forwards.
 - **`send email with subject 'Blitzy inbound test' …`** [`app/mail_sender.py:L131`] — because
   `NOT_SEND_EMAIL=true`, the forwarded message is **logged, not delivered** to a real inbox. The `From`
-  is rewritten to a reverse-alias address (`external-sender_at_example_com_...@sl.local`).
-- **`Finish mail_from … takes 0.18215370178222656 seconds with return code '250 Message accepted for delivery'`**
-  [`email_handler.py:L2367`] — the measured processing time (**0.182 s**) and the returned SMTP status.
+  is rewritten to a reverse-alias address (`external-sender_at_example_com_ooruszxa@sl.local`).
+- **`Finish mail_from … takes 0.18649888038635254 seconds with return code '250 Message accepted for delivery'`**
+  [`email_handler.py:L2367`] — the measured processing time (**≈0.186 s**) and the returned SMTP status.
 
 **Database row — how the message was handled.** A new `email_log` row records the forward. `EmailLog` is
 `class EmailLog(Base, ModelMixin)` [`app/models.py:L2060`] with the columns `is_reply`
@@ -473,12 +634,13 @@ Key lines:
 
 ```bash
 $ docker exec sl-db psql -U myuser -d simplelogin \
-    -c "SELECT id,user_id,alias_id,is_reply,blocked,bounced FROM email_log ORDER BY id DESC LIMIT 1;"
+    -c "SELECT id,user_id,alias_id,contact_id,is_reply,blocked,bounced FROM email_log WHERE id=4;"
 ```
 ```text
- id | user_id | alias_id | is_reply | blocked | bounced
-----+---------+----------+----------+---------+---------
-  2 |       1 |       13 | f        | f       | f
+ id | user_id | alias_id | contact_id | is_reply | blocked | bounced 
+----+---------+----------+------------+----------+---------+---------
+  4 |       1 |       19 |          4 | f        | f       | f
+(1 row)
 ```
 
 **Why this proves correct handling.** The SMTP `250 Message accepted for delivery` is the protocol-level
@@ -505,49 +667,82 @@ the mailbox is **unverified**, the message is handled but **not** forwarded — 
 Each is an **independent `__main__` entry point** that must be launched on its own; the web app neither
 imports nor spawns them. Three independent proofs:
 
-**Proof 1 — by reading.** The web server sources contain **no reference** to the other two components:
+**Proof 1 — by reading.** The web server sources contain **no reference** to the other two components.
+The `grep` returns no matches, so the `|| echo …` fallback fires and prints the explanatory line (this is
+the exact command and its exact stdout):
 
 ```bash
-$ grep -n 'email_handler\|job_runner' server.py wsgi.py
-```
-```text
->>> NONE — web app never imports/spawns email_handler or job_runner
+$ grep -n "email_handler\|job_runner" server.py wsgi.py || echo "(no matches: server.py / wsgi.py never import or spawn email_handler or job_runner)"
+(no matches: server.py / wsgi.py never import or spawn email_handler or job_runner)
 ```
 
 **Proof 2 — process tree.** The Gunicorn master's only children are its two workers (not the handler or
-runner); the three entry-points are distinct top-level processes:
-
-```text
--- gunicorn master 42160 and descendants:
-   child:   42170 .../.venv/bin/gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15
-   child:   42171 .../.venv/bin/gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15
--- the 3 entry-points are distinct top-level processes:
-   42160 .../.venv/bin/gunicorn wsgi:app ...
-   42585 .../.venv/bin/python email_handler.py
-   42864 .../.venv/bin/python job_runner.py
-```
-
-**Proof 3 — empirical.** Stopping **only** the handler and runner leaves the web server fully functional,
-but nothing then listens on `20381` and inbound SMTP is refused:
+runner); the handler and runner are distinct **top-level** processes whose parent PID is `1` (they were
+started independently, not forked by the web app). Exact commands and their exact output (captured in a
+dedicated process-lifecycle run whose PIDs are internally consistent across Proof 2, Proof 3, and the
+restart below — they differ from the per-message PIDs quoted in Q1/Q2/Q3.2 because those were captured in
+a separate earlier run):
 
 ```bash
-$ kill <email_handler_pid> <job_runner_pid>     # web server left running
+$ ps -o pid,ppid,args -p 95281 --ppid 95281    # gunicorn master + its workers
+    PID    PPID COMMAND
+  95281       1 /tmp/blitzy/app/blitzy-d058b0e8-a79b-48f1-bbdb-e76738cbbc1b_b32b11/.venv/bin/python .venv/bin/gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15 --pid /tmp/blitzy_cap2/web.pid
+  95285   95281 /tmp/blitzy/app/blitzy-d058b0e8-a79b-48f1-bbdb-e76738cbbc1b_b32b11/.venv/bin/python .venv/bin/gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15 --pid /tmp/blitzy_cap2/web.pid
+  95286   95281 /tmp/blitzy/app/blitzy-d058b0e8-a79b-48f1-bbdb-e76738cbbc1b_b32b11/.venv/bin/python .venv/bin/gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15 --pid /tmp/blitzy_cap2/web.pid
+
+$ ps -o pid,ppid,args -C python | grep -E "email_handler.py|job_runner.py"    # the two other entry points
+  95282       1 .venv/bin/python email_handler.py
+  95283       1 .venv/bin/python job_runner.py
+```
+
+The master (`95281`) has exactly two children — the workers `95285`/`95286` (their `PPID` is `95281`).
+The email handler (`95282`) and job runner (`95283`) have `PPID 1` — they are **not** descendants of the
+web app. (The `--pid /tmp/blitzy_cap2/web.pid` flag was added only so this observation run could capture
+the master PID reliably; it does not change behavior.)
+
+**Proof 3 — empirical.** Stopping **only** the handler (`95282`) and runner (`95283`) leaves the web
+server fully functional, but nothing then listens on `20381` and inbound SMTP is refused. Each command is
+shown immediately above its exact stdout:
+
+```bash
+$ kill 95282 95283      # stop ONLY the email handler + job runner; web server left running
 $ curl -s -o /dev/null -w "GET /health -> HTTP %{http_code}\n" http://localhost:7777/health
-$ python3 -c "import socket;print('20381 connect_ex =', socket.socket().connect_ex(('127.0.0.1',20381)))"
-```
-```text
-GET /health -> HTTP 200, body content: success        # web server UNAFFECTED
+GET /health -> HTTP 200
+$ curl -s http://localhost:7777/health; echo
+success
+$ python3 -c 'import socket; rc=socket.socket().connect_ex(("127.0.0.1",20381)); print(f"port 20381 connect_ex = {rc} (0=open, non-zero=closed/refused)")'
 port 20381 connect_ex = 111 (0=open, non-zero=closed/refused)
-SMTP connect FAILED as expected: ConnectionRefusedError [Errno 111] Connection refused
+$ python3 -c 'import smtplib
+try:
+    smtplib.SMTP("127.0.0.1", 20381, timeout=5)
+    print("connected (unexpected)")
+except ConnectionRefusedError as e:
+    print("SMTP connect -> %r" % e)'
+SMTP connect -> ConnectionRefusedError(111, 'Connection refused')
 ```
 
-Restarting them independently brings them back online (the handler re-logs its bind, the port reopens):
+The web tier is **UNAFFECTED** (`/health` still `200`, body still `success`), while port `20381` is
+closed (`connect_ex = 111`) and a direct SMTP connect raises `ConnectionRefusedError` — proving the
+handler/runner are not managed by the web app.
 
+Restarting them independently brings them back online. The handler re-logs its bind (full verbatim lines
+from the restarted process log, fresh pid `95983`) and the port reopens; the job runner returns as a
+fresh top-level process (`95984`):
+
+```bash
+$ CONFIG=example.env PYTHONPATH=. python email_handler.py &   # restart handler
+$ CONFIG=example.env PYTHONPATH=. python job_runner.py &      # restart job runner
+```
 ```text
-... ".../email_handler.py:2403" - <module>() -  - Listen for port 20381
-... ".../email_handler.py:2386" - main() -  - Start mail controller 0.0.0.0 20381
+2026-07-01 05:47:19,669 - SL - INFO - 95983 - "/tmp/blitzy/app/blitzy-d058b0e8-a79b-48f1-bbdb-e76738cbbc1b_b32b11/email_handler.py:2403" - <module>() -  - Listen for port 20381
+2026-07-01 05:47:19,670 - SL - DEBUG - 95983 - "/tmp/blitzy/app/blitzy-d058b0e8-a79b-48f1-bbdb-e76738cbbc1b_b32b11/email_handler.py:2386" - main() -  - Start mail controller 0.0.0.0 20381
+```
+```bash
+$ python3 -c 'import socket; rc=socket.socket().connect_ex(("127.0.0.1",20381)); print(f"port 20381 connect_ex = {rc} (0=open again)")'
 port 20381 connect_ex = 0 (0=open again)
-job_runner RUNNING (pid 48428)
+$ ps -o pid,args -p 95984   # job runner back up
+    PID COMMAND
+  95984 .venv/bin/python job_runner.py
 ```
 
 **Reasoning / production mapping.** Because the web app does not start them, in production these run as
@@ -566,42 +761,87 @@ job_runner RUNNING (pid 48428)
 
 **Failure / edge scenarios (correct handling across situations):**
 
-- **Unknown job name (exercised).** A queued job whose name matches none of the dispatcher's
-  `config.JOB_*` cases hits the `else:` branch `LOG.e("Unknown job name %s", job.name)` [`job_runner.py:L304`]
-  (dispatch in `process_job` [`job_runner.py:L188`]). Captured:
+- **Unknown job name (exercised).** This is the **same `Job 2`** enqueued in Q1.3 (via `enqueue_job.py`,
+  `name="blitzy_probe_unknown_job"`) — a name that matches none of the dispatcher's `config.JOB_*` cases,
+  so `process_job` [`job_runner.py:L188`] falls to its `else:` branch `LOG.e("Unknown job name %s", job.name)`
+  [`job_runner.py:L304`]. Full verbatim lines from the `job_runner.py` process (pid `76184`) — note the
+  second line is level **`ERROR`**, and `LOG.e` emits a trailing `NoneType: None` because it logs with
+  `exc_info` while no exception is active:
 
   ```text
-  ... ".../job_runner.py:334" - <module>() -  - Take job <Job 1 blitzy_probe_unknown_job {'probe': True}>
-  ... ".../job_runner.py:304" - process_job() -  - Unknown job name blitzy_probe_unknown_job
+  2026-07-01 05:02:33,399 - SL - DEBUG - 76184 - "/tmp/blitzy/app/blitzy-d058b0e8-a79b-48f1-bbdb-e76738cbbc1b_b32b11/job_runner.py:334" - <module>() -  - Take job <Job 2 blitzy_probe_unknown_job {'probe': True}>
+  2026-07-01 05:02:33,403 - SL - ERROR - 76184 - "/tmp/blitzy/app/blitzy-d058b0e8-a79b-48f1-bbdb-e76738cbbc1b_b32b11/job_runner.py:304" - process_job() -  - Unknown job name blitzy_probe_unknown_job
+  NoneType: None
   ```
 
-  The job is still marked `taken`, logged as an `ERROR`, and advanced to `state=done(2)` (`attempts=1`) —
-  i.e. it fails **loudly but gracefully**, without wedging the loop or retrying forever.
+  Because `process_job` **logs the error but does not raise**, control returns to the runner loop, which
+  unconditionally sets `job.state = JobState.done.value` (`2`) at [`job_runner.py:L344`] and commits — so
+  the DB row ends at `state=2 (done), attempts=1, taken=t` (shown in Q1.3). It fails **loudly but
+  gracefully**: logged as an `ERROR`, but without wedging the loop or retrying forever.
 
-- **Disabled alias (exercised).** Sending to a **disabled** alias (`blitzy-disabled-probe@sl.local`,
-  `enabled=False`). The handler's `if not alias.enabled or contact.block_forward:` branch
+- **Disabled alias (exercised).** A disabled alias was created with the exact script below, then a
+  message was delivered to it. The handler's `if not alias.enabled or contact.block_forward:` branch
   [`email_handler.py:L596`] logs and records a **blocked** `EmailLog` (`blocked=True`)
-  [`email_handler.py:L601`]:
+  [`email_handler.py:L601`].
 
+  ```python
+  # mk_disabled.py — run with: CONFIG=example.env PYTHONPATH=. python mk_disabled.py
+  from app.models import Alias
+  from app.db import Session
+  a = Alias.create(email="blitzy-disabled-probe@sl.local", user_id=1, mailbox_id=1, enabled=False, commit=True)
+  print("created alias id=%s email=%s enabled=%s" % (a.id, a.email, a.enabled))
+  ```
+  The disabled alias exists in the DB (`enabled=f`):
+  ```bash
+  $ docker exec sl-db psql -U myuser -d simplelogin -c "SELECT id,email,enabled FROM alias WHERE id=21;"
+  ```
   ```text
-  ... ".../email_handler.py:597" - handle_forward() - ... - <Alias 15 blitzy-disabled-probe@sl.local> is disabled, do not forward
+   id |             email              | enabled 
+  ----+--------------------------------+---------
+   21 | blitzy-disabled-probe@sl.local | f
+  (1 row)
+  ```
+  Deliver to it (same `smtplib` pattern as Q2.3, `RCPT TO` the disabled alias):
+  ```python
+  # inbound_disabled.py — run with: python inbound_disabled.py
+  import smtplib
+  from email.mime.text import MIMEText
+  ALIAS = "blitzy-disabled-probe@sl.local"
+  msg = MIMEText("To a disabled alias.\n")
+  msg["Subject"] = "Blitzy disabled-alias probe"
+  msg["From"] = "external-sender@example.com"
+  msg["To"] = ALIAS
+  with smtplib.SMTP("127.0.0.1", 20381, timeout=30) as smtp:
+      smtp.ehlo("example.com"); smtp.mail("external-sender@example.com"); smtp.rcpt(ALIAS)
+      code, resp = smtp.data(msg.as_string().encode())
+      print("DATA (final SMTP reply) -> %s %s" % (code, resp.decode()))
+  ```
+  ```text
   DATA (final SMTP reply) -> 250 Message accepted for delivery
   ```
+  The handler logs the disabled decision (full verbatim line, pid `76182`, message_id
+  `c2988694-4eaa-4c2b-9294-d4cb015c9503`):
+  ```text
+  2026-07-01 05:06:59,051 - SL - DEBUG - 76182 - "/tmp/blitzy/app/blitzy-d058b0e8-a79b-48f1-bbdb-e76738cbbc1b_b32b11/email_handler.py:597" - handle_forward() - c2988694-4eaa-4c2b-9294-d4cb015c9503 - <Alias 21 blitzy-disabled-probe@sl.local> is disabled, do not forward
+  ```
+  And a **blocked** `email_log` row is recorded (`blocked=t`):
   ```bash
   $ docker exec sl-db psql -U myuser -d simplelogin \
-      -c "SELECT id,alias_id,is_reply,blocked,bounced FROM email_log WHERE alias_id=15;"
+      -c "SELECT id,alias_id,contact_id,is_reply,blocked,bounced FROM email_log WHERE alias_id=21;"
   ```
   ```text
-   id | alias_id | is_reply | blocked | bounced
-  ----+----------+----------+---------+---------
-    3 |       15 | f        | t       | f
+   id | alias_id | contact_id | is_reply | blocked | bounced 
+  ----+----------+------------+----------+---------+---------
+    5 |       21 |          5 | f        | t       | f
+  (1 row)
   ```
 
   The message is **accepted** (`250`) but **not forwarded**, and recorded with `blocked=t`. By design the
-  handler returns a `2xx` (`status.E200`) rather than a `5xx` so the sender does not permanently fail —
-  *"by default return 2\*\* instead of 5\*\* to allow user to receive emails again when alias is enabled"*
-  — unless the user set `block_behaviour == return_5xx`, in which case it returns `E502`
-  [`email_handler.py:L607-L612`].
+  handler returns a `2xx` (`status.E200`) rather than a `5xx` so the sender does not permanently fail — the
+  source comment reads *"by default return 2\*\* instead of 5\*\* to allow user to receive emails again when
+  alias is enabled or contact is unblocked"* [`email_handler.py:L606-L607`] — unless the user set
+  `block_behaviour == return_5xx`, in which case it returns `E502` (`res_status = status.E502`)
+  [`email_handler.py:L608-L610`].
 
 - **Unverified mailbox (verified by reading, not run).** When forwarding targets an unverified mailbox
   the handler returns `status.E517` [`email_handler.py:L635`], defined as
@@ -639,7 +879,7 @@ edge cases. Observing those signatures across success **and** failure paths is w
 | **Q1** | Email handler up? | Q1.2 — `Listen for port 20381` / `Start mail controller 0.0.0.0 20381`; `connect_ex=0` |
 | **Q1** | Job runner up? | Q1.3 — `Take job …`; 10-second poll; row → `state=done` |
 | **Q1** | Logs/UI confirming sign-in works | Q1.1 — login `302 → /dashboard/`; wrong-pw toastr `Email or password incorrect` |
-| **Q1** | Logs/UI confirming alias management works | Q1.1 — `/dashboard/` → `200`, title "Alias \| SimpleLogin", Random/New-custom controls |
+| **Q1** | Logs/UI confirming alias management works | Q1.1 — `/dashboard/` → `200`, title `Alias \| SimpleLogin`, exact `Random Alias`/`New Custom Alias` controls (case-sensitive: True) |
 | **Q2** | Create a new account | Q2.1 — waiting-activation page; `create user` + activation-email log; `users` row `activated=f` |
 | **Q2** | Create an alias | Q2.2 — flash `Alias …@sl.local has been created`; REST `201`; `alias` rows |
 | **Q2** | Alias receives an email | Q2.3 — SMTP `250 Message accepted for delivery`; `New message`/`Forward`/`Finish` logs; `email_log` row |
@@ -662,8 +902,8 @@ edge cases. Observing those signatures across success **and** failure paths is w
   call line (e.g. `New message …` reports `email_handler.py:2343`; the string literal itself sits on the
   next line). Observed values take precedence over any prior citation.
 - **Temporary test data:** the temp account (`blitzy-temp-user@gmail.com`), temp aliases
-  (`shorty_shower125@sl.local`, `beside_pander301@sl.local`, `blitzy-disabled-probe@sl.local`), the temp
-  `job`/`email_log` rows, and the temp API key created for these observations were **removed** after
-  capture; only the standard `flask dummy-data` demo seed (`john@wick.com`) remains. No source file was
-  modified.
+  (`erases_parses553@sl.local`, `entomb_covert531@sl.local`, `posing_inking890@sl.local`,
+  `blitzy-disabled-probe@sl.local`), the temp `job`/`email_log`/`contact` rows, and the temp API key
+  (`blitzy-temp-probe-key`) created for these observations were **removed** after capture; only the
+  standard `flask dummy-data` demo seed (`john@wick.com`) remains. No source file was modified.
 
