@@ -24,7 +24,7 @@ shown immediately below the exact command/code that produced it.
 |------|------------------|
 | Python | `Python 3.10.20` (in-project virtualenv `./.venv`; the system `python3` is 3.13 and is **not** used) |
 | Dependency manager | `Poetry (version 1.8.5)` |
-| Database | PostgreSQL `13.23` — `/var/run/postgresql:5432 - accepting connections` |
+| Database | PostgreSQL `13.23` — `localhost:5432 - accepting connections` (the `DB_URI` host [`example.env:L75`]) |
 | Cache/session store | Redis — `PONG` on `localhost:6379` |
 | App config file | `example.env` (loaded via `CONFIG=example.env`) |
 | Key local flags | `NOT_SEND_EMAIL=true` [`example.env:L19`], `EMAIL_DOMAIN=sl.local` [`example.env:L22`], `URL=http://localhost:7777` [`example.env:L6`], `DISABLE_ONBOARDING=true` [`example.env:L150`] |
@@ -843,11 +843,88 @@ $ ps -o pid,args -p 95984   # job runner back up
   `block_behaviour == return_5xx`, in which case it returns `E502` (`res_status = status.E502`)
   [`email_handler.py:L608-L610`].
 
-- **Unverified mailbox (verified by reading, not run).** When forwarding targets an unverified mailbox
-  the handler returns `status.E517` [`email_handler.py:L635`], defined as
-  `E517 = "550 SL E517 unverified mailbox"` [`app/email/status.py:L53`]. (Related: `E516 = "550 SL E516
-  invalid mailbox"` [`app/email/status.py:L52`], `E518 = "550 SL E518 Disabled mailbox"`
-  [`app/email/status.py:L54`].)
+- **Unverified mailbox (exercised).** A fresh **unverified** mailbox and an alias whose *only* mailbox is
+  that unverified mailbox were created with the script below, then a message was delivered to the alias.
+  The handler returns `status.E516` (`550 SL E516 invalid mailbox`) [`app/email/status.py:L52`] — **not**
+  `E517` — because the unverified mailbox is filtered out of `alias.mailboxes` *before* the forwarding loop
+  runs (root cause below).
+
+  ```python
+  # mk_unverified.py — run with: CONFIG=example.env PYTHONPATH=. python mk_unverified.py
+  from app.models import Alias, Mailbox
+  mb = Mailbox.create(user_id=1, email="blitzy-unverified-mb-qafix1782@gmail.com", verified=False, commit=True)
+  print(f"created mailbox id={mb.id} email={mb.email} verified={mb.verified}")
+  a = Alias.create(email="blitzy-unverified-alias-qafix1782@sl.local", user_id=1, mailbox_id=mb.id, enabled=True, commit=True)
+  print(f"created alias id={a.id} email={a.email} enabled={a.enabled} mailbox_id={a.mailbox_id}")
+  print(f"alias.mailbox.verified={a.mailbox.verified}")
+  print(f"len(alias.mailboxes)={len(a.mailboxes)}  (verified-only filtered list)")
+  ```
+  ```text
+  created mailbox id=12 email=blitzy-unverified-mb-qafix1782@gmail.com verified=False
+  created alias id=32 email=blitzy-unverified-alias-qafix1782@sl.local enabled=True mailbox_id=12
+  alias.mailbox.verified=False
+  len(alias.mailboxes)=0  (verified-only filtered list)
+  ```
+  The alias points at the unverified mailbox, and its `mailboxes` list resolves to **empty**:
+  ```bash
+  $ docker exec sl-db psql -U myuser -d simplelogin \
+      -c "SELECT a.id AS alias_id, a.mailbox_id, m.verified AS mb_verified FROM alias a JOIN mailbox m ON m.id=a.mailbox_id WHERE a.id=32;"
+  ```
+  ```text
+   alias_id | mailbox_id | mb_verified 
+  ----------+------------+-------------
+         32 |         12 | f
+  (1 row)
+  ```
+  Deliver to it (same `smtplib` pattern as Q2.3, `RCPT TO` the alias):
+  ```python
+  # send_unverified.py — run with: python send_unverified.py
+  import smtplib
+  from email.message import EmailMessage
+  ALIAS = "blitzy-unverified-alias-qafix1782@sl.local"
+  msg = EmailMessage()
+  msg["From"] = "external-sender-qafix1782@example.com"; msg["To"] = ALIAS
+  msg["Subject"] = "Blitzy QA fix unverified-mailbox probe"; msg.set_content("probe")
+  with smtplib.SMTP("127.0.0.1", 20381, timeout=30) as s:
+      s.ehlo("qafix-probe.local")
+      try:
+          s.send_message(msg)
+      except smtplib.SMTPDataError as e:
+          code, resp = e.args
+          print("DATA reply code=%s" % code)
+          print("DATA reply text=%s" % resp.decode())
+  ```
+  ```text
+  DATA reply code=550
+  DATA reply text=SL E516 invalid mailbox
+  ```
+  The handler logs `no valid mailboxes` and finishes with the `E516` return code (full verbatim lines, pid
+  `204020`, message_id `44e335b7-94c1-4a69-9d6c-e081c794ac37`):
+  ```text
+  2026-07-01 08:46:02,527 - SL - WARNING - 204020 - "/tmp/blitzy/app/blitzy-d058b0e8-a79b-48f1-bbdb-e76738cbbc1b_b32b11/email_handler.py:626" - handle_forward() - 44e335b7-94c1-4a69-9d6c-e081c794ac37 - no valid mailboxes for <Alias 32 blitzy-unverified-alias-qafix1782@sl.local>
+  2026-07-01 08:46:02,528 - SL - INFO - 204020 - "/tmp/blitzy/app/blitzy-d058b0e8-a79b-48f1-bbdb-e76738cbbc1b_b32b11/email_handler.py:2367" - _handle() - 44e335b7-94c1-4a69-9d6c-e081c794ac37 - Finish mail_from external-sender-qafix1782@example.com, rcpt_tos ['blitzy-unverified-alias-qafix1782@sl.local'], takes 0.16011571884155273 seconds with return code '550 SL E516 invalid mailbox'<<===
+  ```
+  Unlike the disabled-alias case, **no `email_log` row is created** — the handler returns `E516` before any
+  `EmailLog` is written:
+  ```bash
+  $ docker exec sl-db psql -U myuser -d simplelogin -c "SELECT count(*) AS email_log_rows FROM email_log WHERE alias_id=32;"
+  ```
+  ```text
+   email_log_rows 
+  ----------------
+                0
+  (1 row)
+  ```
+  **Root cause / why `E516` and not `E517`:** `alias.mailboxes` [`app/models.py:L1579-L1589`] filters to
+  verified mailboxes only — `ret = [mb for mb in ret if mb.verified]` [`app/models.py:L1586`] — so for a
+  direct alias whose only mailbox is unverified the list is **empty**. `handle_forward` then takes the
+  `if not mailboxes:` branch [`email_handler.py:L625`], logs `no valid mailboxes for %s`
+  [`email_handler.py:L626`], and returns `status.E516` [`email_handler.py:L630`]. The `E517` branch
+  (`E517 = "550 SL E517 unverified mailbox"` [`app/email/status.py:L53`]) lives at
+  [`email_handler.py:L633-L635`] **inside** the `for mailbox in mailboxes:` loop [`email_handler.py:L632`],
+  which only iterates the already-verified list — so it is **not reached** by this direct-alias scenario.
+  (Related: `E516 = "550 SL E516 invalid mailbox"` [`app/email/status.py:L52`], `E518 = "550 SL E518
+  Disabled mailbox"` [`app/email/status.py:L54`].)
 
 - **Permanent rejection / SPF downgrade (verified by reading, not run).** Permanent failures return `5xx`
   codes. If a would-be `5xx` bounce has a return-path that fails SPF, `_handle` rewrites it to a `2xx`
@@ -866,8 +943,9 @@ has additional standalone entry points that likewise do not auto-start with the 
 **Reasoning.** "Functioning as intended" for these background components is not a single OK/response —
 it is (a) the **steady cadence / persistent bind** during normal operation, plus (b) the **correct
 per-situation signatures** above: a blocked `EmailLog` for a disabled alias, an `Unknown job name` error
-with the job still completing, and the documented `E517`/`E502`/`E216` status codes for the mailbox/SPF
-edge cases. Observing those signatures across success **and** failure paths is what confirms they work.
+with the job still completing, and the observed/documented `E516`/`E502`/`E216` status codes for the
+mailbox/SPF edge cases. Observing those signatures across success **and** failure paths is what confirms
+they work.
 
 ---
 
@@ -886,24 +964,30 @@ edge cases. Observing those signatures across success **and** failure paths is w
 | **Q2** | What happens when a new account interacts with aliases / tries to receive mail | Q2.1–Q2.3 + closing paragraph; disabled/unverified paths in Q3.2 |
 | **Q2** | How does the system show it was handled correctly | Every action shows the HTTP/flash/log/SMTP/DB channel(s) |
 | **Q3** | Do handler & job runner auto-start in background? | Q3.1 — **No**; three proofs (grep, process tree, empirical stop/restart) |
-| **Q3** | Behavior confirming they work across situations | Q3.2 — steady cadence/bind + unknown-job, disabled-alias, `E517`, `E216` signatures |
+| **Q3** | Behavior confirming they work across situations | Q3.2 — steady cadence/bind + unknown-job, disabled-alias, unverified-mailbox `E516`, `E216` signatures |
 
 ## Caveats & explicitly unverifiable items
 
 - **`NOT_SEND_EMAIL=true` (local):** activation and forwarded emails are **logged, not delivered**
   [`app/mail_sender.py:L130-L137`]. Claims about "receiving" mail are therefore proven by the log chain +
   `email_log` row, not by an external inbox.
-- **Verified by reading, not run:** the **unverified-mailbox** (`E517` [`email_handler.py:L635`]),
-  **invalid/disabled-mailbox** (`E516`/`E518`), and **SPF `5xx`→`E216` downgrade**
-  [`email_handler.py:L2357-L2366`] paths were confirmed from source, not executed, and are labeled as such
-  in Q3.2.
+- **Unverified-mailbox path — exercised:** this was actually run and returns `E516` (`no valid mailboxes`
+  [`email_handler.py:L626`] → `550 SL E516 invalid mailbox` [`app/email/status.py:L52`]), captured with its
+  reproduction script and verbatim logs in Q3.2 above. The `E517` branch [`email_handler.py:L633-L635`]
+  is guarded by `if not mailbox.verified` *inside* the loop over the already verified-filtered
+  `alias.mailboxes` [`app/models.py:L1586`], so it is not reached by a direct alias whose only mailbox is
+  unverified.
+- **Verified by reading, not run:** the **disabled-mailbox** (`E518 = "550 SL E518 Disabled mailbox"`
+  [`app/email/status.py:L54`]) and **SPF `5xx`→`E216` downgrade** [`email_handler.py:L2357-L2366`] paths
+  were confirmed from source, not executed, and are labeled as such in Q3.2.
 - **Line-number drift:** references were re-confirmed against the current source by grepping the quoted
   literal. Where a `LOG.i(...)`/`LOG.d(...)` call spans two lines, the runtime-reported `lineno` is the
   call line (e.g. `New message …` reports `email_handler.py:2343`; the string literal itself sits on the
   next line). Observed values take precedence over any prior citation.
 - **Temporary test data:** the temp account (`blitzy-temp-user@gmail.com`), temp aliases
   (`erases_parses553@sl.local`, `entomb_covert531@sl.local`, `posing_inking890@sl.local`,
-  `blitzy-disabled-probe@sl.local`), the temp `job`/`email_log`/`contact` rows, and the temp API key
-  (`blitzy-temp-probe-key`) created for these observations were **removed** after capture; only the
-  standard `flask dummy-data` demo seed (`john@wick.com`) remains. No source file was modified.
+  `blitzy-disabled-probe@sl.local`, `blitzy-unverified-alias-qafix1782@sl.local`), the temp unverified
+  mailbox (`blitzy-unverified-mb-qafix1782@gmail.com`), the temp `job`/`email_log`/`contact` rows, and the
+  temp API key (`blitzy-temp-probe-key`) created for these observations were **removed** after capture;
+  only the standard `flask dummy-data` demo seed (`john@wick.com`) remains. No source file was modified.
 
