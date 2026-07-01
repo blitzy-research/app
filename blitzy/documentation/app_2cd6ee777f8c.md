@@ -374,9 +374,9 @@ overrides it.
 ### Verbatim captured output
 
 ```
-[2026-07-01 04:28:49.353Z | +   980.584 ms] 2026-07-01 04:28:49 - SL - INFO - 2816 - "/app/email_handler.py:2403" - <module>() -  - Listen for port 25025
-[2026-07-01 04:28:49.355Z | +   982.433 ms] 2026-07-01 04:28:49 - SL - DEBUG - 2816 - "/app/email_handler.py:2386" - main() -  - Start mail controller 0.0.0.0 25025
-### RESULT port_connectable_offset=985.153 ms   (empirical ready-to-accept-connections)
+[2026-07-01 09:41:59.705Z | +   925.287 ms] 2026-07-01 09:41:59,705 - SL - INFO - 5905 - "/app/email_handler.py:2403" - <module>() -  - Listen for port 25025
+[2026-07-01 09:41:59.707Z | +   926.918 ms] 2026-07-01 09:41:59,707 - SL - DEBUG - 5905 - "/app/email_handler.py:2386" - main() -  - Start mail controller 0.0.0.0 25025
+### RESULT port_connectable_offset=929.990 ms   (empirical ready-to-accept-connections)
 ```
 TCP port 25025 became connectable immediately afterward, confirming the aiosmtpd `Controller`
 actually bound to `0.0.0.0:25025`.
@@ -387,10 +387,10 @@ actually bound to `0.0.0.0:25025`.
 > **Answer R3(b):** two lines confirm it (shown within the standard `app/log.py` format —
 > `asctime - name - levelname - process - "pathname:lineno" - funcName() - message_id - message`):
 > - INFO (from `__main__`, `email_handler.py:2403`): **`Listen for port 25025`**
->   → `2026-07-01 04:28:49 - SL - INFO - 2816 - "/app/email_handler.py:2403" - <module>() -  - Listen for port 25025`
+>   → `2026-07-01 09:41:59,705 - SL - INFO - 5905 - "/app/email_handler.py:2403" - <module>() -  - Listen for port 25025`
 > - DEBUG (from `main()` after `controller.start()`, `email_handler.py:2386`):
 >   **`Start mail controller 0.0.0.0 25025`**
->   → `2026-07-01 04:28:49 - SL - DEBUG - 2816 - "/app/email_handler.py:2386" - main() -  - Start mail controller 0.0.0.0 25025`
+>   → `2026-07-01 09:41:59,707 - SL - DEBUG - 5905 - "/app/email_handler.py:2386" - main() -  - Start mail controller 0.0.0.0 25025`
 
 **Rationale.** `Listen for port 25025` is `LOG.i("Listen for port %s", args.port)`
 (`email_handler.py:2403`), logged from the `__main__` block **before** binding. `Start mail
@@ -654,6 +654,12 @@ time**, `app/config.py:120-124`). The restart log confirms the new config was lo
 load config file /tmp/inv/after.env
 ```
 Then USER‑B (`userb@example.com`, **id 3**) was created (helper invocation + output shown above).
+
+> **Answer R5(b):** the configuration was changed to `MAX_NB_EMAIL_FREE_PLAN=10` (throwaway
+> `after.env` selected via `CONFIG`), the server was **restarted** (confirmed by the `load config
+> file /tmp/inv/after.env` line above, required because the value is read once at module‑import
+> time, `app/config.py:120-124`), and a **second** new user USER‑B (`userb@example.com`, id 3) was
+> created — after which `/api/user_info` is queried for both users in (c).
 
 ### (c) AFTER — both users queried
 
