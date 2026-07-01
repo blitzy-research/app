@@ -857,7 +857,30 @@ body: {"error":"Alias creation time is expired, please retry"}
 DB: alias count 85 → 85 (diff 0)
 ```
 
-**Reasoning for the nuance:** the AAP anticipated a `400 "Tampered suffix"` (`app/api/views/new_custom_alias.py:L189-L191`). In practice, `SignatureExpired` **is a subclass of** `BadSignature`, and a flipped signature also raises `BadSignature`; `check_suffix_signature` catches **all** `BadSignature` and returns `None`, which routes to the **412** "expired" branch. The `400 "Tampered suffix"` branch (an `except Exception` for a *non‑`BadSignature`* error) is therefore **not reachable via a JSON request** in this environment. Stated explicitly per Rule 5. On the dashboard, expired → `LOG.w("Alias creation time expired for %s", ...)` + flash `"Alias creation time is expired, please retry"` (`app/dashboard/views/custom_alias.py:L92-L93`); tampered → flash `"Unknown error, refresh the page"` (`L96-L97`).
+**DASHBOARD (tampered vs. missing)** — the dashboard form POST is session‑ and CSRF‑protected, so the producer logs in as `john@wick.com`, reads a fresh `signed-alias-suffix` value from the rendered `/dashboard/custom_alias` form, then submits `POST /dashboard/custom_alias`. Two inputs were driven live — a **tampered** suffix (one middle signature character flipped) and a **missing** `signed-alias-suffix` field — proving the dashboard is **structurally identical** to the API (a tampered signature reaches the same "expired" branch, not an "unknown error"):
+
+```
+$ # authenticated session (cookie `slapp`) + CSRF from GET /dashboard/custom_alias; mailboxes=1
+$ # valid suffix read from the rendered form: @old.com.akTZ-Q.LGyHFczIZP7-bNvEYGzAesuhXpU
+
+# (a) TAMPERED — flip signature index 13, 'N' → 'A': @old.com.akTZ-Q.LGyHFczIZP7-bAvEYGzAesuhXpU
+$ POST /dashboard/custom_alias   form: prefix=tamperdash & signed-alias-suffix=<tampered> & mailboxes=1 & csrf_token=<session>
+→ 302 FOUND → (followed) 200 /dashboard/custom_alias
+flash: toastr.warning("Alias creation time is expired, please retry")
+log:   2026-07-01 09:12:25,183 - SL - WARNING - 8553 - "/app/app/dashboard/views/custom_alias.py:92" - custom_alias() -  - Alias creation time expired for <User 1 John Wick john@wick.com>
+DB: alias count 122 → 122 (diff 0)
+
+# (b) MISSING signed-alias-suffix — the field omitted entirely (a non-BadSignature error)
+$ POST /dashboard/custom_alias   form: prefix=missingdash & mailboxes=1 & csrf_token=<session>   (no signed-alias-suffix)
+→ 302 FOUND → (followed) 200 /dashboard/custom_alias
+flash: toastr.error("Unknown error, refresh the page")
+log:   2026-07-01 09:12:25,328 - SL - WARNING - 8553 - "/app/app/dashboard/views/custom_alias.py:96" - custom_alias() -  - Alias suffix is tampered, user <User 1 John Wick john@wick.com>
+DB: alias count 122 → 122 (diff 0)
+```
+
+Only the two Flask flashes rendered via `base.html:L102` are shown above; the unconditional `toastr.success("Copied to clipboard")` present in the same HTML comes from `base.html:L170` and is static page boilerplate, not a flash.
+
+**Reasoning for the nuance:** the AAP anticipated a `400 "Tampered suffix"` (`app/api/views/new_custom_alias.py:L189-L191`). In practice, `SignatureExpired` **is a subclass of** `BadSignature`, and a flipped signature also raises `BadSignature`; `check_suffix_signature` catches **all** `BadSignature` and returns `None`, which routes to the **412** "expired" branch. The `400 "Tampered suffix"` branch (an `except Exception` for a *non‑`BadSignature`* error) is therefore **not reachable via a JSON request** in this environment. Stated explicitly per Rule 5. On the dashboard the flow is **structurally identical** to the API: because `check_suffix_signature` (`app/alias_suffix.py:L37-L42`) swallows every `BadSignature` → `None`, **both** an expired suffix **and** a tampered (flipped‑signature) suffix reach the `if not suffix:` branch (`app/dashboard/views/custom_alias.py:L91-L94`) → `LOG.w("Alias creation time expired for %s", ...)` (`L92`) + flash `"Alias creation time is expired, please retry"` (`L93`, category `"warning"`) — captured live in the DASHBOARD block above (log `custom_alias.py:92`). The `except Exception:` branch (`L95-L98`) → `LOG.w("Alias suffix is tampered, user %s", ...)` (`L96`) + flash `"Unknown error, refresh the page"` (`L97`, category `"error"`) is reachable **only** by a *non‑`BadSignature`* error — e.g. a **missing** `signed-alias-suffix` field, observed live above (log `custom_alias.py:96`). The dashboard therefore mirrors the API's "412 not 400" nuance rather than exposing a distinct "unknown error" surface for tampering.
 
 ### E5 — Free‑plan quota
 
