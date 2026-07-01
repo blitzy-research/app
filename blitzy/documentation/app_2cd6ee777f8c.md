@@ -478,7 +478,23 @@ The payload shape comes from `serialize_alias_info_v2` (`app/api/serializer.py:L
 
 The extra top‑level `"alias"` key (equal to the email) is added by the view's `jsonify(alias=<email>, **serialize_alias_info_v2(...))` wrapper (`new_random_alias.py:L114`; `new_custom_alias.py:L233`), not by the serializer.
 
-**Reasoning.** The dashboard follows the Post/Redirect/Get pattern so a browser refresh does not re‑submit the form — hence the 302 to `dashboard.index` plus a one‑shot flash. The API follows REST conventions — `201 Created` with the newly created resource serialized as JSON — so programmatic clients receive the alias directly. Response timings were also observed (see R5): the dashboard POST took `0.0205s` and the API POST `0.1208s`.
+**Reasoning.** The dashboard follows the Post/Redirect/Get pattern so a browser refresh does not re‑submit the form — hence the 302 to `dashboard.index` plus a one‑shot flash. The API follows REST conventions — `201 Created` with the newly created resource serialized as JSON — so programmatic clients receive the alias directly. Response timings were also observed live: the `after_request()` handler at `server.py:L284` logs a `... takes <seconds>` line for every request, so, after the R2 login, one dashboard create and one API create were driven against the running server (`http://localhost:7777`) and their timing lines were tailed verbatim from the server's stdout (`/tmp/sl_server.log`):
+
+```text
+# $CJ = the logged-in session cookie jar and $CSRF = the dashboard csrf_token, both from the R2 login flow
+$ curl -sS -o /dev/null -w '%{http_code}\n' -b "$CJ" -c "$CJ" \
+    --data-urlencode 'form-name=create-random-email' --data-urlencode "csrf_token=$CSRF" \
+    http://localhost:7777/dashboard/
+302
+2026-07-01 10:11:07,998 - SL - DEBUG - 8553 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /dashboard/ ImmutableMultiDict([]) 302, takes 0.020314931869506836
+
+$ curl -sS -o /dev/null -w '%{http_code}\n' -H 'Authentication: code' -H 'Content-Type: application/json' \
+    -X POST http://localhost:7777/api/alias/random/new -d '{"note":"R3 timing capture"}'
+201
+2026-07-01 10:11:08,636 - SL - DEBUG - 8553 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/alias/random/new ImmutableMultiDict([]) 201, takes 0.02480483055114746
+```
+
+Both `after_request()` lines report the elapsed seconds directly: the dashboard POST logged `takes 0.020314931869506836` (roughly `0.0203s`) and the API POST `takes 0.02480483055114746` (roughly `0.0248s`). A single API create returns `201`; the `429` documented in R6 appears only under the burst (rate-limit) test.
 
 
 ---
@@ -576,7 +592,7 @@ def get_or_create_today_metric() -> DailyMetric:
 
 The `date` column is `unique=True` (`app/models.py:L3270`). Both branches were demonstrated at runtime:
 
-- **UPDATE branch** (today's row already exists) — the diff above (`UPDATE daily_metric ... nb_alias=14`).
+- **UPDATE branch** (today's row already exists) — the diff above (`UPDATE daily_metric ... nb_alias=34`).
 - **INSERT branch** — after deleting today's row, a creation produced an INSERT (verbatim):
 
 ```text
