@@ -33,9 +33,9 @@ And can that contact-lookup-by-`reply_email` logic **misroute a reply to a diffe
 
 ## Method & scope (run-first)
 
-This is a **strictly read-only** investigation governed by the rule *"SWE-AtlasQnA-Repo"*. No existing repository file was modified; the only artifact produced is this document. The methodology was **run-first**: before writing any prose, two observation scripts were re-created under `/tmp/obs` (outside the repository), executed with the project's pinned interpreter, and their output captured verbatim; the scripts were then removed, leaving the working tree byte-for-byte unchanged. See §5 for the exact reproduction commands and the clean-tree confirmation.
+This is a **strictly read-only** investigation governed by the rule *"SWE-AtlasQnA-Repo"*. No existing repository file was modified; the only artifact produced is this document. The methodology was **run-first**: before writing any prose, the observation scripts (§2.1, §2.2, plus a short cross-version SQL-fidelity check in §2.3) were re-created under `/tmp/obs` (outside the repository), executed with the project's pinned interpreter, and their output captured verbatim; the scripts were then removed, leaving the working tree byte-for-byte unchanged. See §5 for the exact reproduction commands and the clean-tree confirmation.
 
-The scripts were run with the repository's own git-ignored virtual environment (`.venv/bin/python`), which pins **Python 3.10.20 + SQLAlchemy 1.3.24 + unidecode** — i.e., the exact production stack. This matters: the emitted-SQL form `LIMIT 1 OFFSET 0` is characteristic of SQLAlchemy 1.3.x, and the non-ascii normalization requires the real `unidecode`. Every requested value below is quoted as an exact literal with its `file:line` reference; every factual claim traces to a code citation or to the captured output. Where something cannot be verified from reading or running the code, that is stated explicitly.
+The scripts were run with the repository's own git-ignored virtual environment (`.venv/bin/python`), which pins **Python 3.10.20 + SQLAlchemy 1.3.24 + unidecode** — i.e., the exact production stack. This matters: the non-ascii normalization requires the real `unidecode`, and the lookup SQL is exercised under the exact pinned SQLAlchemy 1.3.24 (the `LIMIT 1 OFFSET 0` rendering itself is not version-specific — 1.3.24 and 2.0.x emit it identically for SQLite; see §2.3). Every requested value below is quoted as an exact literal with its `file:line` reference; every factual claim traces to a code citation or to the captured output. Where something cannot be verified from reading or running the code, that is stated explicitly.
 
 ---
 
@@ -213,6 +213,7 @@ Reverse-aliases are created automatically for each sender in `replace_header_whe
 ```python
 # app/email_utils.py:1145-1153
             random_length = random.randint(20, 50)
+            # do not use the ra+ anymore
             # reply_email = f"ra+{random_string(random_length)}@{config.EMAIL_DOMAIN}"
             reply_email = f"{random_string(random_length)}@{reply_domain}"
 
@@ -444,7 +445,23 @@ get_by(reply_email='never_created@sl.local') -> None  (None => handle_reply retu
 
 ### 2.3 Fidelity note — both SQL forms are the same query
 
-The raw `before_cursor_execute` hook captures the **parameterized** statement `... WHERE contact.reply_email = ?  LIMIT ? OFFSET ?` with **bound params `('rrace_...@sl.local', 1, 0)`**. The **literal** form `... LIMIT 1 OFFSET 0` is the *same* query, produced by compiling it with `literal_binds=True`; the `?` placeholders are simply filled by the params `(…, 1, 0)`. Both are shown above so the emitted SQL is presented honestly rather than as an idealized literal. The explicit `OFFSET` clause (rather than a bare `LIMIT`) is characteristic of **SQLAlchemy 1.3.x**, corroborated by the printed `SQLAlchemy version: 1.3.24`. The two facts that matter for routing: **(a)** `.first()` applies `LIMIT 1`, and **(b)** there is **no `ORDER BY`**, so the single returned row is chosen in an unspecified order.
+The raw `before_cursor_execute` hook captures the **parameterized** statement `... WHERE contact.reply_email = ?  LIMIT ? OFFSET ?` with **bound params `('rrace_...@sl.local', 1, 0)`**. The **literal** form `... LIMIT 1 OFFSET 0` is the *same* query, produced by compiling it with `literal_binds=True`; the `?` placeholders are simply filled by the params `(…, 1, 0)`. Both are shown above so the emitted SQL is presented honestly rather than as an idealized literal. The `LIMIT ... OFFSET` rendering is **not** specific to a single SQLAlchemy release — it is emitted identically by SQLAlchemy 1.3.24 and 2.0.x for SQLite, so the `OFFSET` clause does **not** by itself identify the version (verified by re-running the identical `.first()` query under both stacks, below). The pinned version is confirmed independently by the printed `SQLAlchemy version: 1.3.24` (§2.2), not by the `OFFSET` clause. The two facts that matter for routing — **(a)** `.first()` applies `LIMIT 1`, and **(b)** there is **no `ORDER BY`** — are version-independent, so the single returned row is chosen in an unspecified order.
+
+**Cross-version check** — the identical `.first()` lookup, captured with the same `before_cursor_execute` hook as §2.2, run under each stack:
+
+```bash
+.venv/bin/python /tmp/obs/obs3_cross_version_sql.py   # pinned SQLAlchemy 1.3.24
+python3          /tmp/obs/obs3_cross_version_sql.py   # system SQLAlchemy 2.0.51
+```
+
+```text
+v 1.3.24 | actual cursor stmt: SELECT ... WHERE contact.reply_email = ? LIMIT ? OFFSET ? | params: ('x', 1, 0)
+v 1.3.24 | contains ORDER BY? False | contains LIMIT? True
+v 2.0.51 | actual cursor stmt: SELECT ... WHERE contact.reply_email = ? LIMIT ? OFFSET ? | params: ('x', 1, 0)
+v 2.0.51 | contains ORDER BY? False | contains LIMIT? True
+```
+
+Both releases emit the byte-identical `... WHERE contact.reply_email = ? LIMIT ? OFFSET ?` with params `('x', 1, 0)` and `contains ORDER BY? False` — confirming the `OFFSET` form is version-independent while the routing-critical `LIMIT 1` / no-`ORDER BY` facts hold across both.
 
 
 ---
@@ -578,7 +595,7 @@ The project's own documentation describes the reverse-alias as being `generated 
 # reply
 ```
 
-**Run-first.** Both scripts (§2.1, §2.2) were created under `/tmp/obs` (outside the repository), run with `.venv/bin/python`, their output captured verbatim, and then removed.
+**Run-first.** The scripts (§2.1, §2.2, and the §2.3 cross-version check) were created under `/tmp/obs` (outside the repository), run with `.venv/bin/python` (and, for the cross-version check, additionally the system `python3` / SQLAlchemy 2.0.51), their output captured verbatim, and then removed.
 
 **Read-only guarantee.** No existing repository file was modified, added, or deleted other than this document. The temporary scripts lived outside the repository and were removed:
 
