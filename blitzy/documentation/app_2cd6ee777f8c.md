@@ -39,7 +39,7 @@ aiosmtpd 1.4.2
 gunicorn 20.0.4
 ```
 
-These match the pins declared in the project manifest: `pyproject.toml:L2` `target-version = ['py310']`, `pyproject.toml:L61` `python = "^3.10"`, `pyproject.toml:L62` `flask = "^1.1.2"`, `pyproject.toml:L66` `gunicorn = "^20.0.4"`, `pyproject.toml:L71` `psycopg2-binary = "^2.9.3"`, `pyproject.toml:L77` `Flask-Migrate = "^2.5.3"`, `pyproject.toml:L87` `aiosmtpd = "^1.2"` (resolved to `1.4.2`), and `pyproject.toml:L116` `SQLAlchemy = "1.3.24"`. The container image base is `Dockerfile:L8` `FROM python:3.10` (an earlier stage builds frontend assets with `Dockerfile:L2` `FROM node:10.17.0-alpine as npm`).
+These match the pins declared in the project manifest: `pyproject.toml:L2` `target-version = ['py310']`, `pyproject.toml:L61` `python = "^3.10"`, `pyproject.toml:L62` `flask = "^1.1.2"`, `pyproject.toml:L66` `gunicorn = "^20.0.4"`, `pyproject.toml:L71` `psycopg2-binary = "^2.9.3"`, `pyproject.toml:L77` `Flask-Migrate = "^2.5.3"`, `pyproject.toml:L87` `aiosmtpd = "^1.2"` (resolved to `1.4.2`), and `pyproject.toml:L116` `SQLAlchemy = "1.3.24"`. The container image base is `Dockerfile:L8` `FROM python:3.10` (an earlier stage builds frontend assets with `Dockerfile:L2` `FROM node:10.17.0-alpine AS npm`).
 
 The three behaviors below depend on:
 
@@ -596,7 +596,7 @@ The role of the empty `SLDomain`/`public_domain` table is indirect: it governs w
 
 ### The `aiosmtpd` contract (sub‑part d)
 
-That the `550` string is delivered to the sending client follows from the `aiosmtpd` handler‑hook contract. Per the `aiosmtpd` documentation, a handler that implements a hook "assumes responsibility for the status messages returned to the client"; the hook's return value **is** the SMTP response, and if the hook returns `None` or raises, the framework logs the error and returns a `451` instead. The `Controller` "creates a TCP‑based server, listening on an `ip_address:port` pair." In SimpleLogin, `email_handler.py:L2289` `async def handle_DATA(self, server, session, envelope)` returns the value produced by `email_handler.py:L2335` `def _handle(...)`, which returns the value from the module‑level `email_handler.py:L1945` `def handle(envelope, msg) -> str:` (`email_handler.py:L2233` `return res[0][1]`) — i.e. the `status.E515` string bubbles all the way out and becomes the end‑of‑DATA reply. This is exactly what the raw wire capture above shows (`reply: b'550 SL E515 Email not exist\r\n'`).
+That the `550` string is delivered to the sending client follows from the `aiosmtpd` handler‑hook contract. Per the `aiosmtpd` documentation, a handler that implements a hook "assumes responsibility for the status messages returned to the client"; the hook's return value **is** the SMTP response, and if the hook returns `None` or raises, the framework logs the error and returns a `451` instead. The `Controller` "creates a TCP‑based server, listening on an `ip_address:port` pair." In SimpleLogin, `email_handler.py:L2289` `async def handle_DATA(self, server, session, envelope)` returns the value produced by `email_handler.py:L2335` `def _handle(...)`, which returns the value from the module‑level `email_handler.py:L1945` `def handle(envelope: Envelope, msg: Message) -> str:` (`email_handler.py:L2233` `return res[0][1]`) — i.e. the `status.E515` string bubbles all the way out and becomes the end‑of‑DATA reply. This is exactly what the raw wire capture above shows (`reply: b'550 SL E515 Email not exist\r\n'`).
 
 ### Caveats — E216 / E207 / E404 (sub‑part e)
 
