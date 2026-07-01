@@ -31,7 +31,7 @@ And can that contact-lookup-by-`reply_email` logic **misroute a reply to a diffe
 
 ---
 
-## Method & scope (read-first)
+## Method & scope (run-first)
 
 This is a **strictly read-only** investigation governed by the rule *"SWE-AtlasQnA-Repo"*. No existing repository file was modified; the only artifact produced is this document. The methodology was **run-first**: before writing any prose, two observation scripts were re-created under `/tmp/obs` (outside the repository), executed with the project's pinned interpreter, and their output captured verbatim; the scripts were then removed, leaving the working tree byte-for-byte unchanged. See §5 for the exact reproduction commands and the clean-tree confirmation.
 
@@ -258,13 +258,13 @@ flowchart TD
     B --> C{"Domain valid?<br/>(email_handler.py:977-981)"}
     C -- "no" --> E501["return False, status.E501<br/>(email_handler.py:981)"]
     C -- "yes" --> D["normalize_reply_email<br/>(email_handler.py:984)"]
-    D --> F["Contact.get_by(reply_email).first()<br/>NO ORDER BY (email_handler.py:986,<br/>models.py:83-84)"]
+    D --> F["Contact.get_by(reply_email).first()<br/>NO ORDER BY (email_handler.py:986,<br/>app/models.py:83-84)"]
     F -- "no row" --> E502["return False, status.E502<br/>(email_handler.py:989)"]
     F -- "1+ rows" --> G["arbitrary LIMIT 1 winner"]
     G --> H["alias = contact.alias (L994)<br/>user = alias.user (L1004)"]
     H --> I["EmailLog is_reply=True,<br/>user_id=contact.user_id (L1042-1050)"]
     subgraph RACE["Why duplicates exist (lock-free TOCTOU)"]
-      R1["generate_reply_email:<br/>available_sl_email check<br/>(email_utils.py:1150)"]
+      R1["generate_reply_email:<br/>available_sl_email check<br/>(app/email_utils.py:1150)"]
       R2["Contact.create commit<br/>(email_handler.py:294) — no lock,<br/>no DB unique on reply_email"]
       R1 -. "concurrent" .-> R2
       R2 -. "inserts duplicate reply_email" .-> F
@@ -546,7 +546,7 @@ The misrouting is the product of **three reinforcing properties** of the contact
 ### 4.3 Excluded causes (to bound the claim)
 
 - **Random collision is NOT the cause.** `generate_reply_email` uses `random_string(random.randint(20, 50))` (`app/email_utils.py:1145`, `app/email_utils.py:1148`) over the 26-letter lowercase alphabet `letters = string.ascii_lowercase` (`app/utils.py:43`, within `random_string` at `app/utils.py:41-47`) — an astronomically large space. Duplicates arise from the concurrency race (§4.1.2) and/or normalization (§4.2), **not** from random chance.
-- **Replica lag is excluded.** PostgreSQL runs as a single primary (no application-level read replica), so a temporary failure to resolve corresponds to the **uncommitted-row window** — the lookup returns `None` → `status.E502` (§2.2 step 5) — rather than a stale read from a lagging replica.
+- **Replica lag is excluded (application-code inference).** The application binds its ORM to a *single* engine and connection built from one `config.DB_URI` — `engine = create_engine(config.DB_URI, ...)`, `connection = engine.connect()`, `Session = scoped_session(sessionmaker(bind=connection))` (`app/db.py:9-14`), where `DB_URI = os.environ["DB_URI"]` (`app/config.py:192`). The reply path therefore reads and writes through this one connection with **no application-level read-replica routing**, so a temporary failure to resolve corresponds to the **uncommitted-row window** — the lookup returns `None` → `status.E502` (§2.2 step 5) — rather than a stale read from a lagging replica. *(The physical production deployment topology — whether a read replica sits behind `DB_URI` — is a deployment concern that was **not independently verified**; this exclusion rests solely on what the application code proves: a single read/write connection.)*
 
 ### 4.4 Authorization note
 
