@@ -52,9 +52,22 @@ export CONFIG=tests/test.env  # drives app/config.py -> prints "load config file
 #   CONFIG=tests/test.env FLASK_APP=server.py flask db upgrade
 # Verified: alembic head = 32f25cbf12f6, 77 tables, incl. alias / api_key / mailbox / users.
 
-# Confirm the branch / deliverable filename:
-git rev-parse --abbrev-ref HEAD   # -> app_2cd6ee777f8c (source branch this file is named after)
+# Provenance of the exact checkout used for capture (verbatim observed output):
+git rev-parse HEAD                 # -> 2cd6ee777f8c2d3531559588bcfb18627ffb5d2c
+git rev-parse --abbrev-ref HEAD    # -> HEAD   (the capture checkout is a DETACHED HEAD: not on a named branch)
+git branch --show-current          # -> (prints an empty line, confirming no current branch)
+git describe --all                 # -> tags/v4.53.2-6-g2cd6ee77
 ```
+
+> **Provenance note (naming vs. observed output).** The deliverable filename
+> `app_2cd6ee777f8c.md` is derived from the **source branch name** `app_2cd6ee777f8c`
+> (the task's file-naming rule) — it is **not** the output of a `git` command in the capture
+> container. As the verbatim output above shows, the capture container checks the repository
+> out at a **detached `HEAD`** on commit `2cd6ee777f8c2d3531559588bcfb18627ffb5d2c`, so
+> `git rev-parse --abbrev-ref HEAD` prints `HEAD` (no branch name) while `git rev-parse HEAD`
+> prints the commit SHA `2cd6ee777f8c…`. The commit SHA is therefore the reliable provenance
+> anchor; the branch label is only an informational naming input and can differ from one
+> checkout to another.
 
 Key config literals used, all from `tests/test.env` (verified):
 `URL=http://localhost` (`L2`), `EMAIL_DOMAIN=sl.local` (`L8`),
@@ -102,6 +115,66 @@ HTTP 200
 > The image does not ship `ss`/`netstat`, so the bound socket is evidenced by
 > Gunicorn's own `Listening at:` line plus the successful `curl` above rather than a
 > socket-table dump.
+
+### Command run (development, Flask/Werkzeug built-in server)
+
+```bash
+CONFIG=tests/test.env python server.py
+# server.py:L598-L599: `if __name__ == "__main__": local_main()` -> `app.run(debug=True, port=7777)` (server.py:L588)
+```
+
+### Observed output (verbatim — development-server startup)
+
+```text
+load config file /app/tests/test.env
+>>> URL: http://localhost
+Upload files to local dir
+>>> init logging <<<
+2026-07-01 05:06:00,637 - SL - DEBUG - 3475 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+ * Serving Flask app "server" (lazy loading)
+ * Environment: production
+   WARNING: This is a development server. Do not use it in a production deployment.
+   Use a production WSGI server instead.
+ * Debug mode: on
+load config file /app/tests/test.env
+>>> URL: http://localhost
+Upload files to local dir
+>>> init logging <<<
+2026-07-01 05:06:02,492 - SL - DEBUG - 3488 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+```
+
+(The `load config file …`, `>>> URL: …`, `>>> init logging <<<`, and `SL - DEBUG` lines are the
+standard import banners explained in Q2. They appear **twice** because `debug=True` starts the Werkzeug
+reloader, which re-imports the app in a child process — pids `3475` then `3488` above.)
+
+**Important, observed nuance — the Werkzeug `* Running on http://127.0.0.1:7777/` line does NOT appear**,
+even though the server is in fact listening on that address. In this stack (Werkzeug **1.0.1**, Flask
+**1.1.2**) Werkzeug emits its `* Running on …`, `* Restarting with stat`, and `* Debugger is active!`
+startup lines through the **`werkzeug` logger**, and that logger is **disabled** at `app/log.py:L70-L71`
+(`log = logging.getLogger("werkzeug")`; `log.disabled = True` — see Q2). A `grep -c "Running on"` over the
+captured startup output returns **`0`**, confirming the suppression. The lines that survive are the ones
+Flask prints via `click.echo` rather than the logger: `* Serving Flask app "server" (lazy loading)`,
+`* Environment: production`, the two-line development-server `WARNING`, and `* Debug mode: on`.
+
+Because the `Running on` line is suppressed, the loopback bind is proven directly from a live request:
+
+```bash
+$ curl -si http://127.0.0.1:7777/health
+HTTP/1.0 200 OK
+Content-Type: text/html; charset=utf-8
+Content-Length: 7
+Set-Cookie: slapp=0a1f774b-5713-42b9-a4d1-340845272a51.dGxU2Oz9uMKQ10PFVtwUC9obCWg; Expires=Wed, 08-Jul-2026 05:06:08 GMT; HttpOnly; Path=/; SameSite=Lax
+Server: Werkzeug/1.0.1 Python/3.10.18
+Date: Wed, 01 Jul 2026 05:06:08 GMT
+
+success
+```
+
+The `Server: Werkzeug/1.0.1 Python/3.10.18` response header — contrast Gunicorn's `Server: gunicorn/20.0.4`
+in Q3 — plus the `HTTP/1.0` status line confirm this is the **development** server, and the successful
+`200` on `127.0.0.1:7777` confirms it is bound on **loopback**. Werkzeug defaults the host to `127.0.0.1`
+(loopback only) precisely because `app.run(...)` at `server.py:L588` is called with **no `host=` argument** —
+in contrast to Gunicorn's explicit `-b 0.0.0.0:7777` (all interfaces).
 
 ### Explanation (file:line)
 
@@ -309,16 +382,17 @@ and `app/models.py:L613` `user.default_mailbox_id = mb.id`. An `ApiKey` was then
 is enforced by `can_create_new_alias()` (`app/models.py:L867`); a fresh user with 0 aliases passes.
 
 ```bash
-CONFIG=tests/test.env python /tmp/seed.py     # temporary script, deleted after capture
+CONFIG=tests/test.env python /tmp/seed_doc.py   # temporary script, deleted after capture
 ```
 
-Observed seed output (the 60-char API code is redacted here as it is a credential):
+Observed seed output — the script's own `print` lines below (the create-app import banners are
+identical to Q2 and are omitted here; the 60-char `ApiKey.code` is redacted as a credential):
 
 ```text
 API_CODE: <redacted 60-char ApiKey.code — generated by random_string(60), app/models.py:L2366>
-USER_ID: 1632
-DEFAULT_MAILBOX_ID: 1938
-USER_EMAIL: doc_demo@mailbox.test
+USER_ID: 1633
+DEFAULT_MAILBOX_ID: 1939
+USER_EMAIL: doc_demo_zgmtarfp@mailbox.test
 ALIAS_GENERATOR: 1
 ```
 
@@ -329,54 +403,89 @@ containing the newly created alias's full v2 info plus a top-level `alias` field
 
 #### Command run
 
+A single POST is issued; its response **headers** and **body** are written to separate files so the
+exact returned bytes can be shown raw and then pretty-printed by an explicit transform. The 60-char
+`ApiKey.code` is redacted (`<API_CODE>`) as a credential:
+
 ```bash
-curl -i -X POST http://127.0.0.1:7777/api/alias/random/new \
+curl -sS -X POST http://127.0.0.1:7777/api/alias/random/new \
      -H "Authentication: <API_CODE>" \
-     -H "Content-Type: application/json" -d '{}'
+     -H "Content-Type: application/json" -d '{}' \
+     -D /tmp/q4_headers.txt -o /tmp/q4_body.json
 ```
 
-#### Observed output (verbatim — status line + headers)
+#### Observed output (verbatim — response status line + headers, `cat /tmp/q4_headers.txt`)
 
 ```text
 HTTP/1.1 201 CREATED
 Server: gunicorn/20.0.4
-Date: Wed, 01 Jul 2026 04:30:47 GMT
+Date: Wed, 01 Jul 2026 05:12:12 GMT
 Connection: close
 Content-Type: application/json
-Content-Length: 430
+Content-Length: 448
 Access-Control-Allow-Origin: *
-Set-Cookie: slapp=7544f352-b9b5-499d-a1f2-9591914b2be6.gDgxfwkYbe1XvRuBtPJbOZ9zvAk; Expires=Wed, 08-Jul-2026 04:30:47 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=c898064f-af4a-4d7f-afc0-15b8de0c4906.z78zj-f8qiu_aWXS1Akp7Fom9_g; Expires=Wed, 08-Jul-2026 05:12:12 GMT; HttpOnly; Path=/; SameSite=Lax
 ```
 
-#### Observed output (verbatim — JSON body, pretty-printed)
+#### Observed output (verbatim — raw response body exactly as returned by the server, `cat /tmp/q4_body.json`)
+
+The server returns **compact** JSON with no whitespace between tokens, because Flask's `jsonify`
+uses `separators=(",", ":")` when not pretty-printing and then appends a single trailing newline —
+`dumps(data, indent=indent, separators=separators) + "\n"` (`flask/json/__init__.py:L356,L370` in the
+pinned Flask 1.1.2). The visible JSON text on the single line below is **447 bytes**; the server appends
+one trailing `\n`, giving the **448-byte** body measured by `Content-Length: 448` above. Keys are
+alphabetically ordered because Flask sorts keys by default (`JSON_SORT_KEYS = True` in Flask 1.1.2). The
+447-vs-448 relationship was confirmed directly on the saved body file:
+
+```bash
+wc -c /tmp/q4_body.json                    # total bytes returned by the server
+tail -c1 /tmp/q4_body.json | od -An -c     # inspect the final byte
+```
+
+```text
+448 /tmp/q4_body.json
+   \n
+```
+
+The exact bytes of the body follow (the trailing `\n` is the 448th byte and is not visible as a glyph):
+
+```text
+{"alias":"riyals_blames194@sl.local","creation_date":"2026-07-01 05:12:12+00:00","creation_timestamp":1782882732,"disable_pgp":false,"email":"riyals_blames194@sl.local","enabled":true,"id":2679,"latest_activity":null,"mailbox":{"email":"doc_demo_zgmtarfp@mailbox.test","id":1939},"mailboxes":[{"email":"doc_demo_zgmtarfp@mailbox.test","id":1939}],"name":null,"nb_block":0,"nb_forward":0,"nb_reply":0,"note":null,"pinned":false,"support_pgp":false}
+```
+
+#### Same body, pretty-printed by `python -m json.tool` (a transform of the exact bytes above — NOT raw curl output)
+
+```bash
+python -m json.tool /tmp/q4_body.json
+```
 
 ```json
 {
-  "alias": "aweigh_taints940@sl.local",
-  "creation_date": "2026-07-01 04:30:47+00:00",
-  "creation_timestamp": 1782880247,
-  "disable_pgp": false,
-  "email": "aweigh_taints940@sl.local",
-  "enabled": true,
-  "id": 2677,
-  "latest_activity": null,
-  "mailbox": {
-    "email": "doc_demo@mailbox.test",
-    "id": 1938
-  },
-  "mailboxes": [
-    {
-      "email": "doc_demo@mailbox.test",
-      "id": 1938
-    }
-  ],
-  "name": null,
-  "nb_block": 0,
-  "nb_forward": 0,
-  "nb_reply": 0,
-  "note": null,
-  "pinned": false,
-  "support_pgp": false
+    "alias": "riyals_blames194@sl.local",
+    "creation_date": "2026-07-01 05:12:12+00:00",
+    "creation_timestamp": 1782882732,
+    "disable_pgp": false,
+    "email": "riyals_blames194@sl.local",
+    "enabled": true,
+    "id": 2679,
+    "latest_activity": null,
+    "mailbox": {
+        "email": "doc_demo_zgmtarfp@mailbox.test",
+        "id": 1939
+    },
+    "mailboxes": [
+        {
+            "email": "doc_demo_zgmtarfp@mailbox.test",
+            "id": 1939
+        }
+    ],
+    "name": null,
+    "nb_block": 0,
+    "nb_forward": 0,
+    "nb_reply": 0,
+    "note": null,
+    "pinned": false,
+    "support_pgp": false
 }
 ```
 
@@ -393,13 +502,13 @@ from `serialize_alias_info_v2` (`app/api/serializer.py:L55`, field dict `app/api
 - `name`: `null` by default
 - `enabled`: `true`
 - `note`: `null` (no note sent)
-- `creation_date`: `alias.created_at.format()` → `"2026-07-01 04:30:47+00:00"`
-- `creation_timestamp`: `alias.created_at.timestamp` → `1782880247`
+- `creation_date`: `alias.created_at.format()` → `"2026-07-01 05:12:12+00:00"`
+- `creation_timestamp`: `alias.created_at.timestamp` → `1782882732`
 - `nb_forward`: `0` (`nb_forward`)
 - `nb_block`: `0` (from `nb_blocked`)
 - `nb_reply`: `0`
-- `mailbox`: `{id, email}` of the alias's mailbox → `{"id": 1938, "email": "doc_demo@mailbox.test"}`
-- `mailboxes`: list of `{id, email}` (at least one) → `[{"id": 1938, "email": "doc_demo@mailbox.test"}]`
+- `mailbox`: `{id, email}` of the alias's mailbox → `{"id": 1939, "email": "doc_demo_zgmtarfp@mailbox.test"}`
+- `mailboxes`: list of `{id, email}` (at least one) → `[{"id": 1939, "email": "doc_demo_zgmtarfp@mailbox.test"}]`
 - `support_pgp`: `false` (`alias.mailbox_support_pgp()`)
 - `disable_pgp`: `false`
 - `latest_activity`: `null` (no activity yet)
@@ -411,32 +520,42 @@ This matches the documented contract: `docs/api.md:L399` `#### POST /api/alias/r
 
 > The alias domain is `@sl.local`, which is `EMAIL_DOMAIN` (`tests/test.env:L8`), the default used
 > when the user has no custom/public alias domain configured. The word-style local part
-> (`aweigh_taints940`) follows from `ALIAS_GENERATOR=1` on the seeded user.
+> (`riyals_blames194`) follows from `ALIAS_GENERATOR=1` on the seeded user.
 
 ### Q4b — what ends up in the database (which table, what values)
 
 **Answer:** the row is inserted into the **`alias`** table. Its persisted values match the
 JSON response exactly (same `email`), and `mailbox_id` equals the user's `default_mailbox_id`.
 
-#### Command run
+#### Commands run
+
+The DB is queried non-interactively with `PGPASSWORD=test` (the `test` role/password from
+`tests/test.env`), against the live PostgreSQL on port **5432**. Three separate queries are run — the
+alias row, a table-name confirmation, and the mailbox referenced by `mailbox_id`:
 
 ```bash
-psql -h localhost -p 5432 -U test -d test -x -c \
+# 1) the persisted alias row (expanded output)
+PGPASSWORD=test psql -h localhost -p 5432 -U test -d test -x -c \
 "SELECT id, email, user_id, mailbox_id, enabled, flags, note, name, disable_pgp, \
         pinned, automatic_creation, custom_domain_id, directory_id, created_at, updated_at \
- FROM alias WHERE id = 2677;"
-# table-name confirmation:
-psql -h localhost -p 5432 -U test -d test -tAc "SELECT to_regclass('public.alias');"
+ FROM alias WHERE id = 2679;"
+
+# 2) confirm the destination table exists
+PGPASSWORD=test psql -h localhost -p 5432 -U test -d test -tAc "SELECT to_regclass('public.alias');"
+
+# 3) resolve the mailbox referenced by mailbox_id
+PGPASSWORD=test psql -h localhost -p 5432 -U test -d test -x -c \
+"SELECT id, email, user_id FROM mailbox WHERE id = 1939;"
 ```
 
-#### Observed output (verbatim)
+#### Observed output (verbatim — query 1: the alias row)
 
 ```text
 -[ RECORD 1 ]------+---------------------------
-id                 | 2677
-email              | aweigh_taints940@sl.local
-user_id            | 1632
-mailbox_id         | 1938
+id                 | 2679
+email              | riyals_blames194@sl.local
+user_id            | 1633
+mailbox_id         | 1939
 enabled            | t
 flags              | 0
 note               |
@@ -446,12 +565,29 @@ pinned             | f
 automatic_creation | f
 custom_domain_id   |
 directory_id       |
-created_at         | 2026-07-01 04:30:47.964418
+created_at         | 2026-07-01 05:12:12.515483
 updated_at         |
-
--- to_regclass('public.alias') -> alias
--- mailbox 1938 -> doc_demo@mailbox.test (user_id 1632)
 ```
+
+#### Observed output (verbatim — query 2: table-name confirmation)
+
+```text
+alias
+```
+
+#### Observed output (verbatim — query 3: the mailbox referenced by `mailbox_id`)
+
+```text
+-[ RECORD 1 ]---------------------------
+id      | 1939
+email   | doc_demo_zgmtarfp@mailbox.test
+user_id | 1633
+```
+
+Together these confirm: the destination table is **`alias`** (query 2 returns `alias`); the persisted
+row's `email` (`riyals_blames194@sl.local`) is **byte-identical to the JSON `email`/`alias`**; and
+`mailbox_id = 1939` (query 3) is the seeded user's `default_mailbox_id` — mailbox `1939` =
+`doc_demo_zgmtarfp@mailbox.test`, owned by `user_id 1633`.
 
 #### Column-by-column explanation (file:line)
 
@@ -462,12 +598,12 @@ Destination table is **`alias`** — `app/models.py:L1469` `class Alias(Base, Mo
 (`app/models.py:L1750-L1754`), and is then committed at
 `app/api/views/new_random_alias.py:L107` `Session.commit()`.
 
-- `id = 2677` — primary key from `ModelMixin` (`app/models.py:L63`).
-- `email = aweigh_taints940@sl.local` — `app/models.py:L1477` `email = sa.Column(sa.String(128), unique=True, nullable=False)`.
+- `id = 2679` — primary key from `ModelMixin` (`app/models.py:L63`).
+- `email = riyals_blames194@sl.local` — `app/models.py:L1477` `email = sa.Column(sa.String(128), unique=True, nullable=False)`.
   **Identical to the JSON `email`/`alias`** returned to the client.
-- `user_id = 1632` — `app/models.py:L1474` FK to `users.id`; the seeded user.
-- `mailbox_id = 1938` — `app/models.py:L1506`; equals the user's `default_mailbox_id`
-  (mailbox `1938` = `doc_demo@mailbox.test`), because `create_new_random` passes
+- `user_id = 1633` — `app/models.py:L1474` FK to `users.id`; the seeded user.
+- `mailbox_id = 1939` — `app/models.py:L1506`; equals the user's `default_mailbox_id`
+  (mailbox `1939` = `doc_demo_zgmtarfp@mailbox.test`), because `create_new_random` passes
   `mailbox_id=user.default_mailbox_id`.
 - `enabled = t` (true) — `app/models.py:L1482` `enabled = sa.Column(sa.Boolean(), default=True, nullable=False)`.
 - `flags = 0` — `app/models.py:L1483` (default `0`).
@@ -477,7 +613,7 @@ Destination table is **`alias`** — `app/models.py:L1469` `class Alias(Base, Mo
 - `pinned = f` (false) — `app/models.py:L1545` (`default=False, server_default="0"`).
 - `automatic_creation = f` (false) — `app/models.py:L1494`.
 - `custom_domain_id =` (NULL), `directory_id =` (NULL) — none set for a random alias on the default domain.
-- `created_at = 2026-07-01 04:30:47.964418` — `ModelMixin` `app/models.py:L64`
+- `created_at = 2026-07-01 05:12:12.515483` — `ModelMixin` `app/models.py:L64`
   (`ArrowType`, `default=arrow.utcnow`, `nullable=False`). This is the source of the JSON
   `creation_date` (`created_at.format()`) and `creation_timestamp` (`created_at.timestamp`).
 - `updated_at =` (NULL) — `ModelMixin` `app/models.py:L65` (`default=None, onupdate=arrow.utcnow`);
@@ -505,31 +641,70 @@ established **eagerly** at module load. The SQLAlchemy help token is
 
 ### Command run (database unreachable)
 
+The database is made unreachable by pointing `DB_URI` at port **15432**, where nothing is listening
+(the live PostgreSQL is on `5432`). The command mirrors the capture pattern used elsewhere in this
+document — source the base app env, then override `DB_URI` to the dead port:
+
 ```bash
-CONFIG=tests/test.env    # DB_URI from tests/test.env:L17 -> localhost:15432 (nothing listening)
-unset DB_URI             # ensure the dead port 15432 is used, not a working override
-python -c "import wsgi"  # wsgi.py:L1 does "from server import create_app"
+. /tmp/sl_env.sh                                              # base app env (URL, FLASK_SECRET, MEM_STORE_URI, GNUPGHOME=/tmp/test_gnupg, ...)
+. /app/venv/bin/activate
+export CONFIG=tests/test.env                                  # tests/test.env:L17 sets DB_URI -> localhost:15432
+export DB_URI="postgresql://test:test@localhost:15432/test"   # force the dead port (nothing is listening on 15432)
+python -c "import wsgi"                                        # wsgi.py:L1 -> "from server import create_app"
 ```
 
 Port 15432 was confirmed closed beforehand (`ConnectionRefusedError: [Errno 111] Connection refused`).
 
-### Observed output (verbatim — banners, then the full traceback)
+### Observed output (verbatim — banners, then the full traceback, no omissions)
 
-Import-time banners print first, then the connect fails:
+Import-time banners print first (stdout). Because `sl_env.sh` presets `GNUPGHOME=/tmp/test_gnupg`, the
+`WARNING: Use a temp directory for GNUPGHOME ...` line is **not** emitted here (that warning appears only
+when `GNUPGHOME` is unset):
 
 ```text
 load config file /app/tests/test.env
 >>> URL: http://localhost
-WARNING: Use a temp directory for GNUPGHOME /tmp/ceqrcotamiiwohkykcsd
 Upload files to local dir
 >>> init logging <<<
 ```
+
+Then the eager connect fails. The **complete** traceback (stderr, 107 lines) is reproduced below in
+full — no ellipses, no omissions. It is a *chained* traceback: the driver's `psycopg2.OperationalError`
+first, then `The above exception was the direct cause of the following exception:`, then the wrapping
+`sqlalchemy.exc.OperationalError` with the `http://sqlalche.me/e/13/e3q8` help token:
 
 ```text
 Traceback (most recent call last):
   File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/base.py", line 2336, in _wrap_pool_connect
     return fn()
-  ...
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/base.py", line 304, in unique_connection
+    return _ConnectionFairy._checkout(self)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/base.py", line 778, in _checkout
+    fairy = _ConnectionRecord.checkout(pool)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/base.py", line 495, in checkout
+    rec = pool._do_get()
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/impl.py", line 139, in _do_get
+    with util.safe_reraise():
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/util/langhelpers.py", line 68, in __exit__
+    compat.raise_(
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/util/compat.py", line 182, in raise_
+    raise exception
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/impl.py", line 137, in _do_get
+    return self._create_connection()
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/base.py", line 309, in _create_connection
+    return _ConnectionRecord(self)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/base.py", line 440, in __init__
+    self.__connect(first_connect_check=True)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/base.py", line 660, in __connect
+    with util.safe_reraise():
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/util/langhelpers.py", line 68, in __exit__
+    compat.raise_(
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/util/compat.py", line 182, in raise_
+    raise exception
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/base.py", line 656, in __connect
+    connection = pool._invoke_creator(self)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/strategies.py", line 114, in connect
+    return dialect.connect(*cargs, **cparams)
   File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/default.py", line 508, in connect
     return self.dbapi.connect(*cargs, **cparams)
   File "/app/venv/lib/python3.10/site-packages/psycopg2/__init__.py", line 122, in connect
@@ -554,7 +729,50 @@ Traceback (most recent call last):
     from app.db import Session
   File "/app/app/db.py", line 12, in <module>
     connection = engine.connect()
-  ...
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/base.py", line 2263, in connect
+    return self._connection_cls(self, **kwargs)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/base.py", line 104, in __init__
+    else engine.raw_connection()
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/base.py", line 2369, in raw_connection
+    return self._wrap_pool_connect(
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/base.py", line 2339, in _wrap_pool_connect
+    Connection._handle_dbapi_exception_noconnection(
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/base.py", line 1583, in _handle_dbapi_exception_noconnection
+    util.raise_(
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/util/compat.py", line 182, in raise_
+    raise exception
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/base.py", line 2336, in _wrap_pool_connect
+    return fn()
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/base.py", line 304, in unique_connection
+    return _ConnectionFairy._checkout(self)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/base.py", line 778, in _checkout
+    fairy = _ConnectionRecord.checkout(pool)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/base.py", line 495, in checkout
+    rec = pool._do_get()
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/impl.py", line 139, in _do_get
+    with util.safe_reraise():
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/util/langhelpers.py", line 68, in __exit__
+    compat.raise_(
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/util/compat.py", line 182, in raise_
+    raise exception
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/impl.py", line 137, in _do_get
+    return self._create_connection()
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/base.py", line 309, in _create_connection
+    return _ConnectionRecord(self)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/base.py", line 440, in __init__
+    self.__connect(first_connect_check=True)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/base.py", line 660, in __connect
+    with util.safe_reraise():
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/util/langhelpers.py", line 68, in __exit__
+    compat.raise_(
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/util/compat.py", line 182, in raise_
+    raise exception
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/base.py", line 656, in __connect
+    connection = pool._invoke_creator(self)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/strategies.py", line 114, in connect
+    return dialect.connect(*cargs, **cparams)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/default.py", line 508, in connect
+    return self.dbapi.connect(*cargs, **cparams)
   File "/app/venv/lib/python3.10/site-packages/psycopg2/__init__.py", line 122, in connect
     conn = _connect(dsn, connection_factory=connection_factory, **kwasync)
 sqlalchemy.exc.OperationalError: (psycopg2.OperationalError) connection to server at "localhost" (::1), port 15432 failed: Connection refused
@@ -565,9 +783,46 @@ connection to server at "localhost" (127.0.0.1), port 15432 failed: Connection r
 (Background on this error at: http://sqlalche.me/e/13/e3q8)
 ```
 
-Programmatic confirmation of the exception identity and break location:
+The exception identity and the application-code break location were also confirmed programmatically
+with a small temporary script (`/tmp/q5_confirm.py`, removed after capture) that imports `wsgi`,
+catches the exception, and reports the last application-source frame in the traceback:
+
+```python
+import traceback, sys
+create_app_reached = False
+try:
+    import wsgi
+    create_app_reached = True
+except Exception as e:
+    frames = traceback.extract_tb(sys.exc_info()[2])
+    # the last frame in the application source tree (/app/app or /app root), not site-packages
+    app_frames = [f for f in frames if f.filename.startswith("/app/") and "site-packages" not in f.filename]
+    brk = app_frames[-1]
+    orig = getattr(e, "orig", None)
+    print("EXC_TYPE           :", type(e).__module__ + "." + type(e).__name__)
+    print("HAS_ORIG           :", orig is not None)
+    print("ORIG_TYPE          :", type(orig).__module__ + "." + type(orig).__name__)
+    print("SA_CODE_URL        :", "e3q8                     # -> http://sqlalche.me/e/13/e3q8" if "e3q8" in str(e) else "(not found)")
+    print("BREAK_FILE         :", brk.filename)
+    print("BREAK_LINE         :", brk.lineno)
+    print("BREAK_CODE         :", brk.line)
+    print("DEEPEST_DRIVER_FRAME:", frames[-1].filename.split("/site-packages/")[-1] + ":" + str(frames[-1].lineno))
+print("CREATE_APP_REACHED :", str(create_app_reached) + " (exception raised during import, before wsgi.py:3 app = create_app())")
+```
+
+```bash
+python /tmp/q5_confirm.py
+```
+
+Its output (the first four lines are the same import banners shown above; the identity lines follow).
+Note `BREAK_FILE = /app/app/db.py`, `BREAK_LINE = 12` is the **application** break point, while
+`DEEPEST_DRIVER_FRAME = psycopg2/__init__.py:122` is the deepest driver frame in the traceback:
 
 ```text
+load config file /app/tests/test.env
+>>> URL: http://localhost
+Upload files to local dir
+>>> init logging <<<
 EXC_TYPE           : sqlalchemy.exc.OperationalError
 HAS_ORIG           : True
 ORIG_TYPE          : psycopg2.OperationalError
@@ -575,6 +830,7 @@ SA_CODE_URL        : e3q8                     # -> http://sqlalche.me/e/13/e3q8
 BREAK_FILE         : /app/app/db.py
 BREAK_LINE         : 12
 BREAK_CODE         : connection = engine.connect()
+DEEPEST_DRIVER_FRAME: psycopg2/__init__.py:122
 CREATE_APP_REACHED : False (exception raised during import, before wsgi.py:3 app = create_app())
 ```
 
@@ -627,8 +883,11 @@ Every question and sub-part is answered with quoted, observed runtime evidence a
 
 - [x] **Q1 — bind port.** `7777` for both runtimes; Gunicorn `0.0.0.0:7777` (all interfaces,
   proven by `Listening at: http://0.0.0.0:7777 (2876)`) vs dev server `127.0.0.1:7777`
-  (loopback, `server.py:L588` `app.run(debug=True, port=7777)` with no `host=`).
-  Anchors: `Dockerfile:L44,L47`, `wsgi.py:L1,L3`, `server.py:L588,L598-L599`.
+  (loopback). Dev-server runtime captured from `CONFIG=tests/test.env python server.py`: the
+  Werkzeug `* Running on …` line is **suppressed** (disabled `werkzeug` logger, `app/log.py:L70-L71`;
+  `grep -c "Running on"` = `0`), so the loopback bind is proven by a live request returning
+  `HTTP/1.0 200` with header `Server: Werkzeug/1.0.1 Python/3.10.18` on `127.0.0.1:7777`.
+  Source anchors: `Dockerfile:L44,L47`, `wsgi.py:L1,L3`, `server.py:L588,L598-L599` (`app.run(debug=True, port=7777)` with no `host=`).
 - [x] **Q2 — startup logs.** Verbatim banners `load config file /app/tests/test.env`
   (`app/config.py:L68`), `>>> URL: http://localhost` (`app/config.py:L80`),
   `Upload files to local dir` (`app/config.py:L328`), `>>> init logging <<<` (`app/log.py:L67`),
@@ -638,13 +897,16 @@ Every question and sub-part is answered with quoted, observed runtime evidence a
 - [x] **Q3 — health body AND status.** Body `success` (**7 bytes**, `Content-Length: 7`),
   status **`200`**, `Content-Type: text/html; charset=utf-8` (`server.py:L213-L215`).
 - [x] **Q4a — JSON response.** HTTP **`201 CREATED`**, `Content-Type: application/json`,
-  full v2 body enumerated (`app/api/views/new_random_alias.py:L114-L117`,
-  `app/api/serializer.py:L55-L79`); corroborated by `docs/api.md:L399-L412,L430-L458`.
+  `Content-Length: 448`; raw compact body shown as returned by the server AND the same bytes
+  pretty-printed by `python -m json.tool` (transform command shown); full v2 body enumerated
+  (`app/api/views/new_random_alias.py:L114-L117`, `app/api/serializer.py:L55-L79`); corroborated by
+  `docs/api.md:L399-L412,L430-L458`.
 - [x] **Q4b — database write.** Table **`alias`** (`app/models.py:L1470`); every persisted
-  column value quoted from the real row (id `2677`, `email` matches the JSON exactly,
-  `mailbox_id=1938` = user's `default_mailbox_id`, `enabled=t`, `flags=0`, `note`/`name`/`updated_at` NULL,
-  `disable_pgp=f`, `pinned=f`, `automatic_creation=f`); insert path
-  `app/models.py:L1721,L1750-L1754` + `app/api/views/new_random_alias.py:L107`.
+  column value quoted from the real row via `PGPASSWORD=test psql` (id `2679`, `email`
+  `riyals_blames194@sl.local` matches the JSON exactly, `mailbox_id=1939` = user's `default_mailbox_id`,
+  `enabled=t`, `flags=0`, `note`/`name`/`updated_at` NULL, `disable_pgp=f`, `pinned=f`,
+  `automatic_creation=f`); table-name confirmation and mailbox lookup shown as separate verbatim
+  outputs; insert path `app/models.py:L1721,L1750-L1754` + `app/api/views/new_random_alias.py:L107`.
 - [x] **Q5 — DB unavailable at startup.** `sqlalchemy.exc.OperationalError` wrapping
   `psycopg2.OperationalError`, raised at **import time before `create_app()`** at
   `app/db.py:L12` `connection = engine.connect()`; help token `http://sqlalche.me/e/13/e3q8`
