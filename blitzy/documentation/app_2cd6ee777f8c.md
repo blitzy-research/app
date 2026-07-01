@@ -522,7 +522,8 @@ The web log confirms the create with the exact alias and owner (full verbatim `S
 **(b) REST API** — `POST /api/alias/random/new` (`new_random_alias`) returns **HTTP `201`** with
 `jsonify(alias=alias.email, ...)` [`app/api/views/new_random_alias.py:L115-L116`]. The API reads the key
 from the `Authentication` header [`app/api/base.py:L17`]. A temporary key is minted with the exact
-reproducible script below (`ApiKey.create` [`app/models.py:L2350`]), captured into the `$API_KEY` shell
+reproducible script below (`ApiKey.create` [`app/models.py:L2365`], whose `code = random_string(60)`
+[`app/models.py:L2366`] mints the 60-char key), captured into the `$API_KEY` shell
 variable so the **real secret is never printed** in the command or its output (it is redacted per the
 read-only/no-secret-exposure requirement):
 
