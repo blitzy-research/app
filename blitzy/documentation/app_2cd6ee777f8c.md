@@ -659,7 +659,7 @@ call #5 -> HTTP 200  at 05:32:48.997526849
 
 **File:line references & rationale:**
 
-- Each authenticated call with a key present executes the `else` branch: `g.api_key.last_used = arrow.now()`, `g.api_key.times += 1`, then `Session.commit()` (`app/api/base.py:30-32`). Five calls therefore set `times = 5` and stamp `last_used` with the last call's time.
+- Each authenticated call with a key present executes the `else` branch: `api_key.last_used = arrow.now()`, `api_key.times += 1`, then `Session.commit()` (`app/api/base.py:30-32`). (This local `api_key` is the same `ApiKey` instance later bound via `g.api_key = api_key` at `app/api/base.py:42`.) Five calls therefore set `times = 5` and stamp `last_used` with the last call's time.
 - Model: `class ApiKey` (`app/models.py:2350`), `__tablename__ = "api_key"` (`app/models.py:2353`), unique `code` (`app/models.py:2356`), `last_used` ArrowType default `None` (`app/models.py:2358`), `times` Integer default `0`, not-null (`app/models.py:2359`), `sudo_mode_at` ArrowType default `None` (`app/models.py:2360`). Nothing in the authenticated read path touches `sudo_mode_at`, so it stays `NULL`.
 - Note: this update happens **only** on the key-present branch. The keyless session-fallback path of Q1 sets `g.api_key = None` (`app/api/base.py:42`) and does **not** touch these counters — consistent with the fresh key starting at `times = 0` until the keyed calls were made.
 
