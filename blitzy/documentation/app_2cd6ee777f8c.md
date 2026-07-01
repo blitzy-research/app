@@ -534,7 +534,7 @@ k = ApiKey.create(user_id=1, name="blitzy-temp-probe-key", commit=True)
 print(k.code)
 ```
 ```bash
-$ API_KEY="$(CONFIG=example.env PYTHONPATH=. python mk_apikey.py)"   # 59-char code captured, not echoed (redacted)
+$ API_KEY="$(CONFIG=example.env PYTHONPATH=. python mk_apikey.py)"   # 60-char code captured, not echoed (redacted)
 $ curl -s -w "\nHTTP %{http_code}\n" -X POST http://localhost:7777/api/alias/random/new -H "Authentication: $API_KEY"
 ```
 ```text
