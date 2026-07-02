@@ -146,10 +146,10 @@ Cite `@app.route("/health", methods=["GET"])` [server.py:L213], `def healthcheck
 $ curl -sS -D - -o /tmp/login.html http://localhost:7777/auth/login
 HTTP/1.0 200 OK
 Content-Type: text/html; charset=utf-8
-Content-Length: 369826
-Set-Cookie: slapp=860b18f7-24f6-49ed-af15-ecc1b8fe7d92.x_nkrC7ahtuNjQLLdAAMcrun9VQ; Expires=Wed, 08-Jul-2026 23:40:08 GMT; HttpOnly; Path=/; SameSite=Lax
+Content-Length: 235552
+Set-Cookie: slapp=b087a668-fc3e-4bc7-bc16-3be278d767f4.HjM2ZnR3Yl4Bk86xII4xqyBtPns; Expires=Thu, 09-Jul-2026 06:05:52 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
-Date: Wed, 01 Jul 2026 23:40:08 GMT
+Date: Thu, 02 Jul 2026 06:05:52 GMT
 $ grep -oE 'name="(csrf_token|email|password)"|>Log in<' /tmp/login.html
 name="csrf_token"
 name="email"
@@ -157,7 +157,7 @@ name="password"
 >Log in<
 ```
 
-This confirms the `auth` blueprint is mounted and the login page renders with a CSRF-protected `email`/`password` form on port `7777`. Cite the route `@auth_bp.route("/login", methods=["GET", "POST"])` [app/auth/views/login.py:L21] → `def login():` [app/auth/views/login.py:L25], whose `return render_template(` [app/auth/views/login.py:L74] uses `"auth/login.html",` [app/auth/views/login.py:L75]; in that template the form is `<form method="post">` [templates/auth/login.html:L16] with `{{ form.csrf_token }}` [templates/auth/login.html:L17] and the email field at [templates/auth/login.html:L20].
+This confirms the `auth` blueprint is mounted and the login page renders with a CSRF-protected `email`/`password` form on port `7777`. Cite the route `@auth_bp.route("/login", methods=["GET", "POST"])` [app/auth/views/login.py:L21] → `def login():` [app/auth/views/login.py:L25], whose `return render_template(` [app/auth/views/login.py:L74] uses `"auth/login.html",` [app/auth/views/login.py:L75]; in that template the form is `<form method="post">` [templates/auth/login.html:L16] with `{{ form.csrf_token }}` [templates/auth/login.html:L17] and the email field at [templates/auth/login.html:L20]. Note on the body size: the dev server runs with `debug=True` (`app.run(debug=True, ...)` [server.py:L588]), which injects the Flask Debug Toolbar into every HTML page — the login body is therefore ~235 KB, and its exact `Content-Length` varies by a few hundred bytes per request because the toolbar embeds per-request timing/profiler values and a fresh CSRF token (repeated captures observed sizes such as `235257`, `235462`, and the `235552` shown above). The stable readiness signal is the reproducible `HTTP/1.0 200 OK` plus the CSRF-protected `email`/`password` form, not the precise byte count.
 
 **Claim: unauthenticated access to the root is redirected to login — authentication gates the app.** Command `curl -sS -i http://localhost:7777/`:
 
