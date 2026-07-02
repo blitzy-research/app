@@ -35,15 +35,15 @@ python 3.10.20
 | Component | Version | Source of truth |
 |---|---|---|
 | Python | 3.10.20 | `pyproject.toml:61` (`python = "^3.10"`) |
-| flask | 1.1.2 | `poetry.lock` |
-| werkzeug | 1.0.1 | `poetry.lock` |
-| flask-login | 0.5.0 | `poetry.lock` (`session_protection = "strong"`, `app/extensions.py:8`) |
-| flask-limiter | 1.4 | `poetry.lock` (login rate limit `10/minute`) |
-| itsdangerous | 1.1.0 | `poetry.lock` (session cookie signer + alias‑suffix `TimestampSigner`) |
-| redis | 4.6.0 | `poetry.lock` (session/rate‑limit backend client) |
-| aiosmtpd | 1.4.2 | `poetry.lock` (inbound SMTP handler) |
-| arrow | 0.16.0 | `poetry.lock` (`last_used`, sudo window timestamps) |
-| newrelic | 8.8.0 | `poetry.lock` (Q8 custom event) |
+| flask | 1.1.2 | `poetry.lock:910-911` |
+| werkzeug | 1.0.1 | `poetry.lock:3423-3424` |
+| flask-login | 0.5.0 | `poetry.lock:1029-1030` (`session_protection = "strong"`, `app/extensions.py:8`) |
+| flask-limiter | 1.4 | `poetry.lock:1013-1014` (login rate limit `10/minute`) |
+| itsdangerous | 1.1.0 | `poetry.lock:1617-1618` (session cookie signer + alias‑suffix `TimestampSigner`) |
+| redis | 4.6.0 | `poetry.lock:2674-2675` (session/rate‑limit backend client) |
+| aiosmtpd | 1.4.2 | `poetry.lock:126-127` (inbound SMTP handler) |
+| arrow | 0.16.0 | `poetry.lock:201-202` (`last_used`, sudo window timestamps) |
+| newrelic | 8.8.0 | `poetry.lock:1946-1947` (Q8 custom event) |
 | PostgreSQL server | 13 | Docker `postgres:13`, host port `15432` |
 | Redis server | 6 | Docker `redis:6`, host port `6379` |
 
@@ -72,12 +72,13 @@ python 3.10.20
   Observed startup (verbatim):
 
   ```
-  [2026-07-01 22:03:54 +0000] [40980] [INFO] Starting gunicorn 20.0.4
-  [2026-07-01 22:03:54 +0000] [40980] [INFO] Listening at: http://127.0.0.1:7777 (40980)
-  [2026-07-01 22:03:54 +0000] [40980] [INFO] Using worker: sync
-  [2026-07-01 22:03:54 +0000] [40982] [INFO] Booting worker with pid: 40982
-  load config file /tmp/.../tests/test.env
+  [2026-07-01 23:19:06 +0000] [78060] [INFO] Starting gunicorn 20.0.4
+  [2026-07-01 23:19:06 +0000] [78060] [INFO] Listening at: http://127.0.0.1:7777 (78060)
+  [2026-07-01 23:19:06 +0000] [78060] [INFO] Using worker: sync
+  [2026-07-01 23:19:06 +0000] [78062] [INFO] Booting worker with pid: 78062
+  load config file /tmp/blitzy/app/blitzy-e6bd4ef2-3871-4201-bbb0-d8a73e55fcc7_d3dd50/tests/test.env
   >>> URL: http://localhost
+  WARNING: Use a temp directory for GNUPGHOME /tmp/nhhlaiayjehsawuvrmbn
   Upload files to local dir
   >>> init logging <<<
   ```
@@ -102,8 +103,8 @@ email        = q_investigation@mailbox.test
 password     = investig8-pw          (a made-up test password)
 alias_id     = 1287
 alias_email  = simplelogin-newsletter.narrow598@sl.local
-api_key_id   = 91
-api_key_code = ltxgzsgc…             (60-char random ephemeral test key; truncated here)
+api_key_id   = 92
+api_key_code = cfbprsh…             (60-char random ephemeral test key; truncated here)
 ```
 
 ### Methodology notes
@@ -200,18 +201,18 @@ HTTP status_code: 500
 Content-Type: application/json
 Response body (text): {"error":"Internal error"}
 ----- SERVER LOG delta during DELETE /api/user -----
-2026-07-01 22:05:23,086 - SL - ERROR - 40982 - "/tmp/.../server.py:390" - error_handler() -  - 'NoneType' object has no attribute 'sudo_mode_at'
+2026-07-01 23:19:28,146 - SL - ERROR - 78062 - "/tmp/blitzy/app/blitzy-e6bd4ef2-3871-4201-bbb0-d8a73e55fcc7_d3dd50/server.py:390" - error_handler() -  - 'NoneType' object has no attribute 'sudo_mode_at'
 Traceback (most recent call last):
-  File ".../flask/app.py", line 1950, in full_dispatch_request
+  File "/tmp/blitzy/app/blitzy-e6bd4ef2-3871-4201-bbb0-d8a73e55fcc7_d3dd50/.venv/lib/python3.10/site-packages/flask/app.py", line 1950, in full_dispatch_request
     rv = self.dispatch_request()
-  File ".../flask/app.py", line 1936, in dispatch_request
+  File "/tmp/blitzy/app/blitzy-e6bd4ef2-3871-4201-bbb0-d8a73e55fcc7_d3dd50/.venv/lib/python3.10/site-packages/flask/app.py", line 1936, in dispatch_request
     return self.view_functions[rule.endpoint](**req.view_args)
-  File ".../app/api/base.py", line 69, in decorated
+  File "/tmp/blitzy/app/blitzy-e6bd4ef2-3871-4201-bbb0-d8a73e55fcc7_d3dd50/app/api/base.py", line 69, in decorated
     if not check_sudo_mode_is_active(g.api_key):
-  File ".../app/api/base.py", line 47, in check_sudo_mode_is_active
+  File "/tmp/blitzy/app/blitzy-e6bd4ef2-3871-4201-bbb0-d8a73e55fcc7_d3dd50/app/api/base.py", line 47, in check_sudo_mode_is_active
     return api_key.sudo_mode_at and g.api_key.sudo_mode_at >= arrow.now().shift(
 AttributeError: 'NoneType' object has no attribute 'sudo_mode_at'
-2026-07-01 22:05:23,086 - SL - DEBUG - 40982 - ".../server.py:284" - after_request() -  - 127.0.0.1 DELETE /api/user ImmutableMultiDict([]) 500, takes 0.003726959228515625
+2026-07-01 23:19:28,147 - SL - DEBUG - 78062 - "/tmp/blitzy/app/blitzy-e6bd4ef2-3871-4201-bbb0-d8a73e55fcc7_d3dd50/server.py:284" - after_request() -  - 127.0.0.1 DELETE /api/user ImmutableMultiDict([]) 500, takes 0.005501270294189453
 ```
 
 **Answer (reported exactly as observed).**
@@ -259,7 +260,8 @@ signer = itsdangerous.Signer("secret", salt="session", key_derivation="hmac")
 sid = signer.unsign(slapp_cookie).decode()
 r = redis.Redis(host="localhost", port=6379)
 raw = r.get(f"session:{sid}"); ttl = r.ttl(f"session:{sid}")
-print(repr(raw[:200])); print(hex(raw[0])); print(ttl)
+print(len(raw)); print(hex(raw[0])); print(ttl)
+print(repr(raw))                       # FULL raw value, not truncated
 data = pickle.loads(raw); print(data); print(sorted(data.keys()))
 ```
 
@@ -267,21 +269,23 @@ data = pickle.loads(raw); print(data); print(sorted(data.keys()))
 
 ```
 ########## Q3: session storage format (authenticated session) ##########
-session key layout: session:0a82aa68-c621-43cd-8934-7952635c3654   (SESSION_PREFIX:'session' + ':' + uuid)
+session key layout: session:3a0fbe8e-d4c0-4cc8-8d84-36ebe3379166   (SESSION_PREFIX:'session' + ':' + uuid)
 TTL(seconds): 604800
 raw type: bytes len: 300
 raw first byte (hex): 0x80 (pickle protocol opcode \x80 => pickle stream)
-raw bytes (repr, first 200): b'\x80\x04\x95!\x01\x00\x00\x00\x00\x00\x00}\x94(\x8c\n_permanent\x94\x88\x8c\x06_fresh\x94\x88\x8c\ncsrf_token\x94\x8c(a38f4f24a3187cec2dc2396a7c0e615beee99706\x94\x8c\x08_user_id\x94\x8c$a05c7925-b487-4e09-b1ad-9398e22877fe\x94\x8c\x03_id\x94\x8c\x80f4a4143536f3e6712e19e6ce901a12f1ff7e8c98d04dd3e4'
+raw bytes (repr, full 300): b'\x80\x04\x95!\x01\x00\x00\x00\x00\x00\x00}\x94(\x8c\n_permanent\x94\x88\x8c\x06_fresh\x94\x88\x8c\ncsrf_token\x94\x8c(16208a9b9aeb793c752da1ae02aab73a6667dee5\x94\x8c\x08_user_id\x94\x8c$a05c7925-b487-4e09-b1ad-9398e22877fe\x94\x8c\x03_id\x94\x8c\x80f4a4143536f3e6712e19e6ce901a12f1ff7e8c98d04dd3e41c746e85093b48a1bfaa93650d1759a0cb7f13cba57b7f96e40ed981f0c49af1cb94f9905ee1dd03\x94\x8c\tsudo_time\x94JL\x9eEju.'
 pickle.loads -> type: dict
-deserialized dict: {'_permanent': True, '_fresh': True, 'csrf_token': 'a38f4f24a3187cec2dc2396a7c0e615beee99706', '_user_id': 'a05c7925-b487-4e09-b1ad-9398e22877fe', '_id': 'f4a4143536f3e6712e19e6ce901a12f1ff7e8c98d04dd3e41c746e85093b48a1bfaa93650d1759a0cb7f13cba57b7f96e40ed981f0c49af1cb94f9905ee1dd03', 'sudo_time': 1782943684}
+deserialized dict: {'_permanent': True, '_fresh': True, 'csrf_token': '16208a9b9aeb793c752da1ae02aab73a6667dee5', '_user_id': 'a05c7925-b487-4e09-b1ad-9398e22877fe', '_id': 'f4a4143536f3e6712e19e6ce901a12f1ff7e8c98d04dd3e41c746e85093b48a1bfaa93650d1759a0cb7f13cba57b7f96e40ed981f0c49af1cb94f9905ee1dd03', 'sudo_time': 1782947404}
 deserialized dict keys: ['_fresh', '_id', '_permanent', '_user_id', 'csrf_token', 'sudo_time']
 ```
 
 **Answer.**
 
 - **Raw bytes.** The stored value is a Python `bytes` object of length `300`; its first byte is
-  `0x80`. Evidence: `raw type: bytes len: 300` and `raw first byte (hex): 0x80`. The full leading
-  bytes are shown in the `raw bytes (repr, first 200)` line, beginning `b'\x80\x04\x95…'`.
+  `0x80`. Evidence: `raw type: bytes len: 300` and `raw first byte (hex): 0x80`. The **complete**
+  300‑byte value is shown verbatim on the `raw bytes (repr, full 300):` line, beginning
+  `b'\x80\x04\x95!\x01\x00\x00\x00\x00\x00\x00}\x94(…'` and ending `…\x94JL\x9eEju.` (the trailing
+  `u.` is the pickle `SETITEMS`+`STOP` opcodes).
 - **Format is Python `pickle`.** The `\x80` opcode is the pickle `PROTO` marker and `\x80\x04`
   indicates **pickle protocol 4**. Evidence: the `\x80\x04` prefix in the repr, and
   `pickle.loads -> type: dict` succeeding.
@@ -291,7 +295,7 @@ deserialized dict keys: ['_fresh', '_id', '_permanent', '_user_id', 'csrf_token'
   `csrf_token` is Flask‑WTF's token, `sudo_time` is set by `after_login`
   (`app/auth/views/login_utils.py:37`), and `_permanent` is the permanent‑session flag.
 - **Session key structure.** The Redis key is `session:<uuid>` —
-  `session:0a82aa68-c621-43cd-8934-7952635c3654`. Evidence: the `session key layout:` line.
+  `session:3a0fbe8e-d4c0-4cc8-8d84-36ebe3379166`. Evidence: the `session key layout:` line.
 - **TTL.** `604800` seconds (7 days) for this authenticated session. Evidence:
   `TTL(seconds): 604800`.
 
@@ -321,38 +325,77 @@ before and after values.
 **How it was run.** A fresh `requests.Session` made an anonymous `GET /auth/login` (capturing and
 decoding the `slapp` cookie → session id BEFORE), then `POST /auth/login` with correct credentials
 on the same session (decoding the `slapp` cookie → session id AFTER). The Redis dictionary was
-dumped both times.
+dumped both times. The exact script executed was:
+
+```python
+import re, pickle, requests, redis, itsdangerous
+URL = "http://127.0.0.1:7777"
+EMAIL, PASSWORD = "q_investigation@mailbox.test", "investig8-pw"
+# same signer the app uses to sign the cookie -> app/session.py:37-41
+signer = itsdangerous.Signer("secret", salt="session", key_derivation="hmac")
+rds = redis.from_url("redis://localhost")
+def sid_of(cookie): return signer.unsign(cookie).decode()          # slapp cookie -> session id
+def csrf(html): return re.search(r'name="csrf_token"[^>]*value="([^"]+)"', html).group(1)
+
+s = requests.Session()
+r = s.get(URL + "/auth/login")                                     # anonymous request
+cb = s.cookies.get("slapp"); sid_b = sid_of(cb)                    # BEFORE session id
+d_b = pickle.loads(rds.get(f"session:{sid_b}"))                    # BEFORE redis dict
+print("BEFORE login:")
+print("  slapp cookie (raw):", cb)
+print("  decoded session id (BEFORE):", sid_b)
+print("  redis dict (BEFORE):", d_b)
+print("  redis keys (BEFORE):", sorted(d_b.keys()))
+print("  redis TTL (BEFORE):", rds.ttl(f"session:{sid_b}"))
+
+r2 = s.post(URL + "/auth/login",                                   # log in on the SAME session
+            data={"email": EMAIL, "password": PASSWORD, "csrf_token": csrf(r.text)},
+            allow_redirects=False)
+ca = s.cookies.get("slapp"); sid_a = sid_of(ca)                    # AFTER session id
+d_a = pickle.loads(rds.get(f"session:{sid_a}"))                    # AFTER redis dict
+print(f"\nAFTER login (POST /auth/login -> {r2.status_code} {r2.headers.get('Location')}):")
+print("  slapp cookie (raw):", ca)
+print("  decoded session id (AFTER):", sid_a)
+print("  redis keys (AFTER):", sorted(d_a.keys()))
+print("  '_user_id' in AFTER dict:", "_user_id" in d_a, "value:", d_a.get("_user_id"))
+print("  redis TTL (AFTER):", rds.ttl(f"session:{sid_a}"))
+print("\n>>> Q4 CONCLUSION:")
+print("  session id BEFORE:", sid_b)
+print("  session id AFTER :", sid_a)
+print("  SAME identifier across login?:", sid_b == sid_a)
+```
 
 **Observed output (verbatim).**
 
 ```
 ########## Q4: session identifier BEFORE vs AFTER login ##########
 BEFORE login:
-  slapp cookie (raw): 0a82aa68-c621-43cd-8934-7952635c3654.1Jj6mgkpliogv__U2fQJC6nlJF8
-  decoded session id (BEFORE): 0a82aa68-c621-43cd-8934-7952635c3654
-  redis dict (BEFORE): {'_permanent': True, '_fresh': False, 'csrf_token': 'a38f4f24a3187cec2dc2396a7c0e615beee99706'}
+  slapp cookie (raw): 3a0fbe8e-d4c0-4cc8-8d84-36ebe3379166.RbR1R8Hf4vhMj8KkAi6b61oJHcc
+  decoded session id (BEFORE): 3a0fbe8e-d4c0-4cc8-8d84-36ebe3379166
+  redis dict (BEFORE): {'_permanent': True, '_fresh': False, 'csrf_token': '16208a9b9aeb793c752da1ae02aab73a6667dee5'}
   redis keys (BEFORE): ['_fresh', '_permanent', 'csrf_token']
+  redis TTL (BEFORE): 300
 
-AFTER login (POST /auth/login -> 302 ):
-  Set-Cookie slapp (on 302): 0a82aa68-c621-43cd-8934-7952635c3654.1Jj6mgkpliogv__U2fQJC6nlJF8
-  decoded session id (AFTER, from Set-Cookie): 0a82aa68-c621-43cd-8934-7952635c3654
-  decoded session id (AFTER, from jar): 0a82aa68-c621-43cd-8934-7952635c3654
+AFTER login (POST /auth/login -> 302 http://127.0.0.1:7777/dashboard/):
+  slapp cookie (raw): 3a0fbe8e-d4c0-4cc8-8d84-36ebe3379166.RbR1R8Hf4vhMj8KkAi6b61oJHcc
+  decoded session id (AFTER): 3a0fbe8e-d4c0-4cc8-8d84-36ebe3379166
   redis keys (AFTER): ['_fresh', '_id', '_permanent', '_user_id', 'csrf_token', 'sudo_time']
   '_user_id' in AFTER dict: True value: a05c7925-b487-4e09-b1ad-9398e22877fe
+  redis TTL (AFTER): 604800
 
 >>> Q4 CONCLUSION:
-  session id BEFORE: 0a82aa68-c621-43cd-8934-7952635c3654
-  session id AFTER : 0a82aa68-c621-43cd-8934-7952635c3654
+  session id BEFORE: 3a0fbe8e-d4c0-4cc8-8d84-36ebe3379166
+  session id AFTER : 3a0fbe8e-d4c0-4cc8-8d84-36ebe3379166
   SAME identifier across login?: True
 ```
 
 **Answer (reported exactly as observed).**
 
 - **The identifier is UNCHANGED across login** — it is *not* replaced with a new one.
-  - BEFORE value: `0a82aa68-c621-43cd-8934-7952635c3654`. Evidence:
-    `decoded session id (BEFORE): 0a82aa68-c621-43cd-8934-7952635c3654`.
-  - AFTER value: `0a82aa68-c621-43cd-8934-7952635c3654`. Evidence:
-    `decoded session id (AFTER, from Set-Cookie): 0a82aa68-c621-43cd-8934-7952635c3654`.
+  - BEFORE value: `3a0fbe8e-d4c0-4cc8-8d84-36ebe3379166`. Evidence:
+    `decoded session id (BEFORE): 3a0fbe8e-d4c0-4cc8-8d84-36ebe3379166`.
+  - AFTER value: `3a0fbe8e-d4c0-4cc8-8d84-36ebe3379166`. Evidence:
+    `decoded session id (AFTER): 3a0fbe8e-d4c0-4cc8-8d84-36ebe3379166`.
   - Direct comparison: `SAME identifier across login?: True`.
 - **Only the session *data* changes**: it gains `_user_id` (plus `_id` and `sudo_time`). Evidence:
   keys go from `['_fresh', '_permanent', 'csrf_token']` (BEFORE) to `['_fresh', '_id', '_permanent',
@@ -412,7 +455,7 @@ for k, v in fwd.items(): print(f"{k}: {v}")
 ########## email_handler.handle result (SMTP status) ##########
   result: 250 Message accepted for delivery  (status.E200 == 250 Message accepted for delivery )
   stored (forwarded) emails count: 1
-  forward envelope_to (mailbox): q5_ucadpntk@mailbox.test
+  forward envelope_to (mailbox): q5_ddmnutwk@mailbox.test
 
 ########## Q5: FORWARDED message headers (what actually goes out) ##########
   Subject: Q5 header fate test
@@ -420,29 +463,29 @@ for k, v in fwd.items(): print(f"{k}: {v}")
   Content-Transfer-Encoding: 7bit
   MIME-Version: 1.0
   X-SimpleLogin-Type: Forward
-  X-SimpleLogin-EmailLog-ID: 407
+  X-SimpleLogin-EmailLog-ID: 409
   X-SimpleLogin-Envelope-From: sender@external-example.test
   X-SimpleLogin-Original-From: sender@external-example.test
-  X-SimpleLogin-Envelope-To: icicle_phases012@sl.local
-  Date: Wed, 01 Jul 2026 22:09:43 -0000
-  From: "sender at external-example.test" <sender_at_external-example_test_qhajjllq@sl.local>
-  Reply-To: "original-replyto at some-other-domain.test" <original-replyto_at_some-other-domain_test_bfwxwyu@sl.local>
-  To: icicle_phases012@sl.local
-  DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/simple; d=sl.local; ...
+  X-SimpleLogin-Envelope-To: airmen_newels204@sl.local
+  Date: Wed, 01 Jul 2026 23:13:02 -0000
+  From: "sender at external-example.test" <sender_at_external-example_test_iwmju@sl.local>
+  Reply-To: "original-replyto at some-other-domain.test" <original-replyto_at_some-other-domain_test_oyullxz@sl.local>
+  To: airmen_newels204@sl.local
+  DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/simple; d=sl.local; i=@sl.local; q=dns/txt; s=dkim; t=1782947582; h=message-id : date : subject : from : to; bh=Ck5SoRNWUpSR4X0COv7R5ub2pUTtl6xz4dTFz++ji4M=; b=CioeuEwjAZ1fU0DGhIe5v7KRgfLB7c9aaJCk0/z05rzluGK8acOgsNTzglvf/mSt1zYgm hoef1STHaY7Af6hMb48P8lLHJaILNkavX8YUSsuEeWaTGCpf22Yls4C0SgtpJj91ZlVGXNC lDOmKg9HlqIV2RvVvG6dxbDCEiiTSlk=
 ```
 
 ```
 ########## Q5: FATE of the THREE named headers ##########
   (a) custom 'X-Test-Custom' (orig 'hello123'): present_in_forward=False value=[]  -> STRIPPED
   (b) 'Received' header:                        present_in_forward=False value=[]  -> STRIPPED
-  (c) 'Reply-To' header: original='original-replyto@some-other-domain.test'  forwarded_value=['"original-replyto at some-other-domain.test" <original-replyto_at_some-other-domain_test_bfwxwyu@sl.local>']
+  (c) 'Reply-To' header: original='original-replyto@some-other-domain.test'  forwarded_value=['"original-replyto at some-other-domain.test" <original-replyto_at_some-other-domain_test_oyullxz@sl.local>']
        original Reply-To preserved? False  -> original STRIPPED, replaced by reverse-alias
 ```
 
 Corroborating log line emitted during the rewrite (verbatim):
 
 ```
-2026-07-01 22:09:43,869 - SL - DEBUG - 43984 - ".../email_handler.py:873" - forward_email_to_mailbox() -  - Reply-To header, new:"original-replyto at some-other-domain.test" <original-replyto_at_some-other-domain_test_bfwxwyu@sl.local>, old:None
+2026-07-01 23:13:02,941 - SL - DEBUG - 75825 - "/tmp/blitzy/app/blitzy-e6bd4ef2-3871-4201-bbb0-d8a73e55fcc7_d3dd50/email_handler.py:873" - forward_email_to_mailbox() -  - Reply-To header, new:"original-replyto at some-other-domain.test" <original-replyto_at_some-other-domain_test_oyullxz@sl.local>, old:None
 ```
 
 **Answer — each of the three named headers by name.**
@@ -454,7 +497,7 @@ Corroborating log line emitted during the rewrite (verbatim):
   `(b) 'Received' header: present_in_forward=False value=[]  -> STRIPPED`.
 - **(c) `Reply-To` header → the ORIGINAL is STRIPPED, then a NEW `Reply-To` pointing to a
   reverse‑alias is added.** The forwarded `Reply-To` value is
-  `"original-replyto at some-other-domain.test" <original-replyto_at_some-other-domain_test_bfwxwyu@sl.local>`,
+  `"original-replyto at some-other-domain.test" <original-replyto_at_some-other-domain_test_oyullxz@sl.local>`,
   which is **not** the original `original-replyto@some-other-domain.test`. Evidence:
   `original Reply-To preserved? False  -> original STRIPPED, replaced by reverse-alias`, plus the
   `Reply-To header, new:… , old:None` log line — `old:None` shows the original header had already
@@ -512,7 +555,7 @@ for age in [599, 600, 601, 700]:
 itsdangerous version: 1.1.0
 app signer class: TimestampSigner
 CUSTOM_ALIAS_SECRET == FLASK_SECRET + 'custom_alias' -> 'secretcustom_alias'
-SIGNED: test.suffix.akWQWA.H0_91wBbsxongROxEfdt7zRMlkQ
+SIGNED: test.suffix.akWflA.MucDNT6IHNuTXZVCTlWiNTZTVlo
 IMMEDIATE unsign(max_age=600): test.suffix
 age=599s: VALID -> test.suffix
 age=600s: VALID -> test.suffix
@@ -557,43 +600,49 @@ SimpleLogin's wrapper deliberately collapses any bad/expired signature to `None`
 **Question.** When making several API calls with the same key, what DB fields get updated and what
 actual values are observed after the calls?
 
-**How it was run.** The seeded `ApiKey` row (`id=91`) was read directly from PostgreSQL with raw
-SQL **before** any call, then **N = 5** authenticated calls were made to `GET /api/user_info` with
-the header `Authentication: <api_key.code>`, then the row was re‑read **after**:
+**How it was run.** A dedicated fresh `ApiKey` row (`id=93`), created via `ApiKey.create(...)` for
+this measurement so the usage counters start from a pristine `times = 0` (the initially‑seeded key
+had already been exercised by earlier probes), was read directly from PostgreSQL with raw SQL
+**before** any call, then **N = 5** authenticated calls were made to `GET /api/user_info` with the
+header `Authentication: <api_key.code>`, then the row was re‑read **after**:
 
 ```python
-SELECT id, code, times, last_used, sudo_mode_at, created_at, updated_at FROM api_key WHERE id=91;
-# ... 5x requests.get(".../api/user_info", headers={"Authentication": CODE}) ...
+SELECT id, code, times, last_used, sudo_mode_at, created_at, updated_at FROM api_key WHERE id=93;
+for _ in range(5):
+    requests.get("http://127.0.0.1:7777/api/user_info", headers={"Authentication": CODE})
 ```
 
 **Observed output (verbatim).**
 
 ```
 ----- BEFORE any API call (raw SQL SELECT) -----
-  id = 91
+  id = 93
+  code = 'dsmzqkdqqxxifiekljutwwhqkvfavushoecrliugmtlhvcenjtoppfwglhdl'
   times = 0
   last_used = None
   sudo_mode_at = None
-  created_at = datetime.datetime(2026, 7, 1, 22, 3, 25, 217502)
+  created_at = datetime.datetime(2026, 7, 1, 23, 15, 34, 23989)
   updated_at = None
 
   per-call HTTP statuses: [200, 200, 200, 200, 200]
 
 ----- AFTER 5 API calls (raw SQL SELECT) -----
-  id = 91
+  id = 93
+  code = 'dsmzqkdqqxxifiekljutwwhqkvfavushoecrliugmtlhvcenjtoppfwglhdl'
   times = 5
-  last_used = datetime.datetime(2026, 7, 1, 22, 6, 2, 532290)
+  last_used = datetime.datetime(2026, 7, 1, 23, 15, 34, 119554)
   sudo_mode_at = None
-  created_at = datetime.datetime(2026, 7, 1, 22, 3, 25, 217502)
-  updated_at = datetime.datetime(2026, 7, 1, 22, 6, 2, 532522)
+  created_at = datetime.datetime(2026, 7, 1, 23, 15, 34, 23989)
+  updated_at = datetime.datetime(2026, 7, 1, 23, 15, 34, 119795)
 
 ----- FIELD-BY-FIELD TRANSITIONS -----
+  id: 93  ->  93   [unchanged]
+  code: 'dsmzqkdqqxxifiekljutwwhqkvfavushoecrliugmtlhvcenjtoppfwglhdl'  ->  'dsmzqkdqqxxifiekljutwwhqkvfavushoecrliugmtlhvcenjtoppfwglhdl'   [unchanged]
   times: 0  ->  5   [CHANGED]
-  last_used: None  ->  datetime.datetime(2026, 7, 1, 22, 6, 2, 532290)   [CHANGED]
+  last_used: None  ->  datetime.datetime(2026, 7, 1, 23, 15, 34, 119554)   [CHANGED]
   sudo_mode_at: None  ->  None   [unchanged]
-  created_at: datetime.datetime(2026, 7, 1, 22, 3, 25, 217502)  ->  datetime.datetime(2026, 7, 1, 22, 3, 25, 217502)   [unchanged]
-  updated_at: None  ->  datetime.datetime(2026, 7, 1, 22, 6, 2, 532522)   [CHANGED]
-  id: 91  ->  91   [unchanged]
+  created_at: datetime.datetime(2026, 7, 1, 23, 15, 34, 23989)  ->  datetime.datetime(2026, 7, 1, 23, 15, 34, 23989)   [unchanged]
+  updated_at: None  ->  datetime.datetime(2026, 7, 1, 23, 15, 34, 119795)   [CHANGED]
 ```
 
 **Answer — each field named.**
@@ -601,15 +650,19 @@ SELECT id, code, times, last_used, sudo_mode_at, created_at, updated_at FROM api
 - **`times`: `0` → `5`.** It increments exactly once per call; with `N = 5` calls the value is
   `times = 5`. Evidence: `times: 0  ->  5   [CHANGED]` (and `per-call HTTP statuses: [200, 200, 200,
   200, 200]`).
-- **`last_used`: `None` → `2026-07-01 22:06:02.532290`.** It moves from `None` to the timestamp of
-  the latest call. Evidence: `last_used: None  ->  datetime.datetime(2026, 7, 1, 22, 6, 2, 532290)
+- **`last_used`: `None` → `2026-07-01 23:15:34.119554`.** It moves from `None` to the timestamp of
+  the latest call. Evidence: `last_used: None  ->  datetime.datetime(2026, 7, 1, 23, 15, 34, 119554)
   [CHANGED]`.
-- **`updated_at`: `None` → `2026-07-01 22:06:02.532522`** (reported even though it is not in the
+- **`updated_at`: `None` → `2026-07-01 23:15:34.119795`** (reported even though it is not in the
   question's obvious code path). Each call modifies the row, so the `ModelMixin` auto‑`onupdate`
-  fires. Evidence: `updated_at: None  ->  datetime.datetime(2026, 7, 1, 22, 6, 2, 532522) [CHANGED]`.
+  fires. Evidence: `updated_at: None  ->  datetime.datetime(2026, 7, 1, 23, 15, 34, 119795) [CHANGED]`.
 - **`sudo_mode_at`: unchanged (`None`).** Evidence: `sudo_mode_at: None  ->  None   [unchanged]`.
-- **`created_at` and `id` (and `code`): unchanged.** Evidence:
-  `created_at: … [unchanged]`, `id: 91  ->  91   [unchanged]`.
+- **`code`: unchanged.** The 60‑character key value is byte‑for‑byte identical before and after all
+  five calls. Evidence:
+  `code: 'dsmzqkdqqxxifiekljutwwhqkvfavushoecrliugmtlhvcenjtoppfwglhdl'  ->  'dsmzqkdqqxxifiekljutwwhqkvfavushoecrliugmtlhvcenjtoppfwglhdl'   [unchanged]`.
+- **`created_at` and `id`: unchanged.** Evidence:
+  `created_at: datetime.datetime(2026, 7, 1, 23, 15, 34, 23989)  ->  … [unchanged]` and
+  `id: 93  ->  93   [unchanged]`.
 
 **Citations.** When a valid API key is present, `authorize_request()` runs
 `api_key.last_used = arrow.now()`, `api_key.times += 1`, `Session.commit()`
@@ -655,17 +708,17 @@ HTTP status_code: 200
 Location header: None
 ----- FULL response headers -----
   Server: gunicorn/20.0.4
-  Date: Wed, 01 Jul 2026 22:06:19 GMT
+  Date: Wed, 01 Jul 2026 23:19:28 GMT
   Connection: close
   Content-Type: text/html; charset=utf-8
   Content-Length: 7290
-  Set-Cookie: slapp=28bc2438-be46-441b-b8b1-2f97c2ab3008.vbifMMziVCEOSNapcym3R-0h6fQ; Expires=Wed, 08-Jul-2026 22:06:19 GMT; HttpOnly; Path=/; SameSite=Lax
+  Set-Cookie: slapp=13fe2e77-041a-4170-be45-c04d5451bfb1.PsTi4o2_HvFjSR90mjnDPpte5CM; Expires=Wed, 08-Jul-2026 23:19:28 GMT; HttpOnly; Path=/; SameSite=Lax
 ----- body checks -----
   body length: 7290
   contains 'Email or password incorrect': True
-  flash snippet: 'ger (red) -->                         <script>toastr.error("Email or password incorrect");</script> '
+  flash snippet: '<script>toastr.error("Email or password incorrect");</script>'
 ----- SERVER LOG delta during POST /auth/login (wrong password) -----
-2026-07-01 22:06:19,366 - SL - DEBUG - 40982 - ".../server.py:284" - after_request() -  - 127.0.0.1 POST /auth/login ImmutableMultiDict([]) 200, takes 0.24010515213012695
+2026-07-01 23:19:28,796 - SL - DEBUG - 78062 - "/tmp/blitzy/app/blitzy-e6bd4ef2-3871-4201-bbb0-d8a73e55fcc7_d3dd50/server.py:284" - after_request() -  - 127.0.0.1 POST /auth/login ImmutableMultiDict([]) 200, takes 0.2405989170074463
 ```
 
 **Answer (reported exactly as observed).**
@@ -680,7 +733,7 @@ Location header: None
     `<script>toastr.error("Email or password incorrect");</script>`.
 - **Log messages.** Exactly **one** stdout log line was emitted for the request — the SimpleLogin
   `after_request` access line:
-  `127.0.0.1 POST /auth/login ImmutableMultiDict([]) 200, takes 0.24010515213012695`. Evidence:
+  `127.0.0.1 POST /auth/login ImmutableMultiDict([]) 200, takes 0.2405989170074463`. Evidence:
   the `SERVER LOG delta` block (a single line).
   - **This corrects the intuitive expectation of "no log line."** There is **no** Werkzeug access
     line (that logger is disabled, `app/log.py:70-71`) and **no** `LOG.*` line from the
@@ -722,8 +775,8 @@ Every distinct thing each question asks for, confirmed present above with verbat
 - **Q3** — raw bytes shown (`bytes`, len `300`, leading `0x80` / `\x80\x04`); format stated as
   **pickle** (protocol 4); deserialized keys listed by name (`_fresh`, `_id`, `_permanent`,
   `_user_id`, `csrf_token`, `sudo_time`); key layout `session:<uuid>` shown; TTL `604800`.
-- **Q4** — concrete BEFORE (`0a82aa68-c621-43cd-8934-7952635c3654`) and AFTER
-  (`0a82aa68-c621-43cd-8934-7952635c3654`) identifier values shown; conclusion **unchanged**
+- **Q4** — concrete BEFORE (`3a0fbe8e-d4c0-4cc8-8d84-36ebe3379166`) and AFTER
+  (`3a0fbe8e-d4c0-4cc8-8d84-36ebe3379166`) identifier values shown; conclusion **unchanged**
   (`SAME identifier across login?: True`), reported as observed; data gains `_user_id`.
 - **Q5** — all three named headers addressed by name: custom `X-Test-Custom` **stripped**,
   `Received` **stripped**, `Reply-To` **original stripped and replaced** by a reverse‑alias — each
@@ -731,8 +784,10 @@ Every distinct thing each question asks for, confirmed present above with verbat
 - **Q6** — exact window `600` seconds; success→expiry transition shown (valid at 599/600, expired
   at 601/700); exact message `Signature age {age} > 600 seconds`; wrapper returns `None` at expiry.
 - **Q7** — each `ApiKey` field named: `times` (`0` → `5`, with N = 5 explicit), `last_used`
-  (`None` → `2026-07-01 22:06:02.532290`), `sudo_mode_at` (**unchanged**, `None`), and `updated_at`
-  (auto‑changed, `None` → `2026-07-01 22:06:02.532522`), with before/after DB values pasted.
+  (`None` → `2026-07-01 23:15:34.119554`), `sudo_mode_at` (**unchanged**, `None`), and `updated_at`
+  (auto‑changed, `None` → `2026-07-01 23:15:34.119795`), as well as `code` (**unchanged** — the 60-character key is byte-for-byte identical before and
+  after all five calls; full value shown in Q7's evidence block above). Before/after DB values were
+  pasted for every field, including `code`.
 - **Q8** — HTTP status = `200`; body contains `Email or password incorrect`; the actual observed
   log line reported (the single `after_request` access line) with the explicit note that the
   failed branch itself logs nothing and the Werkzeug access logger is disabled; rate limit
