@@ -126,13 +126,25 @@ Date: Wed, 01 Jul 2026 23:25:54 GMT
   Source: `server.py:251` `def index():` -> `server.py:255` `return redirect(url_for("auth.login"))`.
   The `Server:` header confirms Werkzeug 1.0.1 on Python 3.10.18.
 
-- **`GET /auth/login` -> HTTP 200, 344030 bytes, no DB query, no error.** **KEY FINDING: opening the
+- **`GET /auth/login` -> HTTP 200, no DB query, no error.** **KEY FINDING: opening the
   login page does NOT raise on an empty DB** — the anonymous form renders fine. Command
   `curl -s -b cookies.txt -c cookies.txt -o login.html -w 'HTTP %{http_code}, %{size_download} bytes\n' http://127.0.0.1:7777/auth/login`:
 
 ```
-HTTP 200, 344030 bytes
+HTTP 200, 342155 bytes
 ```
+
+  The invariant, reproducible signal here is the **`HTTP 200`** (the GET renders without touching the
+  database — any query against the empty DB would raise `UndefinedTable`, as the POST below does). The
+  `size_download` value is **not** deterministic and must not be read as a fixed page size: because
+  `local_main()` enables the Flask-DebugToolbar profiler under `debug=True` (`server.py:579`
+  `app.config["DEBUG_TB_PROFILER_ENABLED"] = True`, `server.py:582` `DebugToolbarExtension(app)`), the
+  returned HTML embeds the toolbar's profiler panel whose per-request `CPU:`/`View:` timing values
+  differ on every request, and the first (cold) request after startup is substantially larger than warm
+  ones. Across repeated fetches the same page measured ~214,300–215,200 bytes on warm requests and
+  ~342,000 bytes on the first cold request after startup; only the `HTTP 200` (and the absence of any
+  `UndefinedTable` error) is stable. (By contrast, the POST 500 body below is a stable 5744 bytes,
+  because the debug toolbar is not injected into the error response.)
 
   Reason: the `auth_bp` blueprint has no `before_request` hook (`app/auth/base.py:1-5`), and the
   template `templates/auth/login.html` carries no anonymous DB-backed data.
@@ -423,6 +435,7 @@ $ python -c "from app.db import Session; from app.models import Job; j=Job.creat
 ```
 2026-07-01 23:38:24,635 - SL - DEBUG - 2875 - "/app/job_runner.py:334" - <module>() -  - Take job <Job 1 test-job {}>
 2026-07-01 23:38:24,639 - SL - ERROR - 2875 - "/app/job_runner.py:304" - process_job() -  - Unknown job name test-job
+NoneType: None
 ```
 
 ```
@@ -437,6 +450,16 @@ $ PGPASSWORD=test psql -h localhost -U test -d test -c "select id,name,taken,sta
   `LOG.e("Unknown job name %s", job.name)`; `JobState` values `ready=0`, `taken=1`, `done=2`
   (`app/models.py:254-256`). The unknown job name is logged and the loop continues without raising, so
   the row reaches `state=2` (done).
+
+  The bare **`NoneType: None`** line that immediately follows the ERROR is emitted deterministically (it
+  appears after every `Unknown job name` line, confirmed across repeated jobs) and is **not** an error
+  in itself: `LOG.e` is aliased to `logging.Logger.exception` (`app/log.py:77`
+  `logging.Logger.e = logging.Logger.exception`), which always logs with `exc_info=True`. At
+  `job_runner.py:304` that call sits in a plain `else` branch — **not** inside an `except` block — so
+  `sys.exc_info()` is `(None, None, None)`, and the logging formatter renders that empty exception info
+  as the literal text `NoneType: None`. (This is the same `LOG.e` = `Logger.exception` mechanism that,
+  in Q1, prints the *full* chained traceback — there it runs inside the active `@app.errorhandler`
+  exception context, so `exc_info` carries the real `ProgrammingError`.)
 
 ### Cross-service database proof
 
