@@ -257,7 +257,7 @@ Command: `/app/venv/bin/python event_listener.py listener` (the `listener` subco
 
 ### 7. Cron scheduler (yacron) — real scheduled dispatch of `cron.py`
 
-The shipped schedule is defined in `crontab.yml`, e.g. the growth‑stats job: `command: python /code/cron.py -j stats` [`crontab.yml:L3`] on a daily `schedule: "0 0 * * *"` [`crontab.yml:L5`]. To **observe an actual yacron dispatch within the session** (rather than wait until midnight), I ran real yacron with a temporary config whose **only** change from the shipped entry is the schedule (`* * * * *`, every minute); the dispatched command is byte‑identical to `crontab.yml`'s (`cd /app && /app/venv/bin/python cron.py -j stats`). Verbatim yacron output for one dispatch:
+The shipped schedule is defined in `crontab.yml`, e.g. the growth‑stats job: `command: python /code/cron.py -j stats` [`crontab.yml:L3`] on a daily `schedule: "0 0 * * *"` [`crontab.yml:L5`]. To **observe an actual yacron dispatch within the session** (rather than wait until midnight), I ran real yacron with a temporary config using the schedule `* * * * *` (every minute) and the command `cd /app && /app/venv/bin/python cron.py -j stats`. That dispatched command is **behaviorally equivalent to the shipped `stats` cron entry** — both invoke `cron.py -j stats` — but it is **not byte‑identical** to `crontab.yml`'s `command: python /code/cron.py -j stats` [`crontab.yml:L3`]: the shipped entry uses the image install path `/code` and a bare `python`, whereas in this container the code lives at `/app` and the interpreter is the venv `/app/venv/bin/python`. The freshly re‑observed argv confirms the exact form of the command actually dispatched: `will execute argv ['/bin/bash', '-c', 'cd /app && /app/venv/bin/python cron.py -j stats']`. Verbatim yacron output for one dispatch:
 
 ```
 DEBUG:yacron:Job SimpleLogin growth stats (* * * * *) is scheduled for now
@@ -274,7 +274,7 @@ INFO:yacron:Job SimpleLogin growth stats exit code 0; has stdout: true, has stde
 INFO:yacron:Cron job SimpleLogin growth stats: reporting success
 ```
 
-- **yacron scheduled and spawned the job**: `is scheduled for now` → `Starting job SimpleLogin growth stats` → `will execute argv ['/bin/bash', '-c', 'cd /app && /app/venv/bin/python cron.py -j stats']` → `Job SimpleLogin growth stats spawned`. This is the real scheduler dispatching `cron.py -j <job>` exactly as `crontab.yml` prescribes [`crontab.yml:L3`].
+- **yacron scheduled and spawned the job**: `is scheduled for now` → `Starting job SimpleLogin growth stats` → `will execute argv ['/bin/bash', '-c', 'cd /app && /app/venv/bin/python cron.py -j stats']` → `Job SimpleLogin growth stats spawned`. This is the real scheduler dispatching `cron.py -j <job>` following the same invocation pattern that `crontab.yml` prescribes [`crontab.yml:L3`] (behaviorally equivalent to the shipped `stats` entry; the container‑specific path form is noted above).
 - **The spawned `cron.py` ran and exited cleanly**: its own SL log lines are captured on yacron's stdout — `Start running cronjob` [`cron.py:L1263`], `Compute growth and daily monitoring stats` [`cron.py:L1275`], and the benign default‑config `ADMIN_EMAIL not set, nothing to do` [`cron.py:L540`] — then yacron reports `exit code 0` and `reporting success`. (Across the run yacron dispatched the job twice — at `01:14:09` pid `3508` and `01:15:02` pid `3518` — confirming the schedule fires repeatably.)
 
 > **Label — non‑default vs. on‑demand.** The **schedule** used above (`* * * * *`) is a non‑default value chosen only so a dispatch could be observed live; the shipped schedule is `"0 0 * * *"` [`crontab.yml:L5`]. For comparison, invoking the job **on‑demand** — `/app/venv/bin/python cron.py -j stats` — produced the identical three SL cron lines (`Start running cronjob` / `Compute growth and daily monitoring stats` / `ADMIN_EMAIL not set, nothing to do`), but that path bypasses the scheduler and is therefore **not** scheduler evidence on its own.
@@ -311,6 +311,15 @@ The registration created the user and returned the "check your email" waiting pa
 - **`create user blitzytmp_reg@example.com`** [`app/auth/views/register.py:L85`] — the `User` row is created.
 - **`POST /auth/register`** returned **`200`** — the response renders `auth/register_waiting_activation.html` [`app/auth/views/register.py:L104`], whose page title is **`Activation Email Sent`** [`templates/auth/register_waiting_activation.html:L3`]. This is the visible "we've emailed you a verification link" confirmation.
 - **Duplicate‑registration guard.** Re‑posting the same address flashes an error rather than creating a second user — the flashed string is `Email {email} already used` [`app/auth/views/register.py:L82`], observed as the exact message `Email blitzytmp_reg@example.com already used` on the returned page.
+
+**Observed browser‑console behavior on the waiting page (benign, default self‑hosted config).** Driving the registration through a **real browser** (rather than `curl`) and inspecting the DevTools console after landing on the waiting page shows the page is **visually correct** — it renders the `Activation Email Sent` card with the heading "An email to validate your email is on its way." and no visible error — yet the console emits two messages from the analytics wiring:
+
+```
+[log]   Analytics should only be enabled in prod
+[error] Uncaught ReferenceError: plausible is not defined
+```
+
+This is a **benign, non‑blocking** artifact of the default self‑hosted configuration, not a failure of any registration step (the `User`/`ActivationCode` rows are created and the waiting page is served with HTTP `200`, exactly as above; the subsequent verify → login → dashboard steps all succeed). Cause → effect: the analytics loader `static/js/an.js` bails out early on any non‑production host — `if (!window.location.host.endsWith('simplelogin.io')) { console.log("Analytics should only be enabled in prod"); return; }` [`static/js/an.js:L3-L5`] — so it never reaches the line that would define the global stub `window.plausible = window.plausible || function() {…}` [`static/js/an.js:L28`]; and `base.html` injects the real Plausible library only when `PLAUSIBLE_HOST`/`PLAUSIBLE_DOMAIN` are set [`templates/base.html:L72-L75`], which they are not by default. The waiting page's own inline script then calls `plausible('Complete registration')` **unconditionally** [`templates/auth/register_waiting_activation.html:L14`], and because `plausible` is undefined on `localhost` the browser throws the `ReferenceError`. Guarding that inline call (e.g. `if (window.plausible) plausible('Complete registration')`) would remove the console error, but modifying the template is **out of scope for this read‑only investigation**, so the behaviour is reported here as observed rather than changed.
 
 ### The verification email and its activation link (three clearly‑labelled evidence levels)
 
@@ -413,7 +422,7 @@ The forward into the dashboard is already visible above: after both activation a
 
 ### Rate limiting on the auth endpoints (observed reality)
 
-Both `/auth/login` and `/auth/activate` carry a `10/minute` rate limit applied with `@limiter.limit` [`app/auth/views/login.py:L22-L24`; `app/auth/views/activate.py:L14-L16`], where the limit is only **deducted on a failed attempt** — the decorator's predicate is `deduct_when=lambda r: hasattr(g, "deduct_limit") and g.deduct_limit`. `/auth/register` has **no** limiter decorator [`app/auth/views/register.py:L31`]. Observed full status sequences:
+Both `/auth/login` and `/auth/activate` carry a `10/minute` rate limit applied with `@limiter.limit` [`app/auth/views/login.py:L22-L24`; `app/auth/views/activate.py:L14-L16`], where the limit is only **deducted on a failed attempt** — the decorator's predicate is `deduct_when=lambda r: hasattr(g, "deduct_limit") and g.deduct_limit`. `/auth/register` has **no** limiter decorator [`app/auth/views/register.py:L31`]. Observed full status sequences **from one run in this session** (the exact positions are single‑run evidence, not stable thresholds — see the variability note below):
 
 ```
 /auth/login  (15 wrong-password attempts):
@@ -426,10 +435,26 @@ Both `/auth/login` and `/auth/activate` carry a `10/minute` rate limit applied w
 [200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200]
 ```
 
-- **`/auth/login`**: the first `429` appears at attempt **#14** (failed logins return `200` re‑rendering the page; only the 14th trips the limit).
-- **`/auth/activate`**: the first `429` appears at attempt **#13**, and the sequence interleaves (`429`, then `400`, then `429`).
-- **`/auth/register`**: no `429` at all — consistent with having no limiter.
-- **Why the threshold is ~2× the "10/minute" nominal and interleaves.** The limiter storage is in‑memory per process: `MEM_STORE_URI` defaults to `None` [`app/config.py:L568`] and `limiter = Limiter(key_func=__key_func)` [`app/extensions.py:L23`] is constructed with no shared backend. With Gunicorn running `-w 2` (workers `3398`/`3399`), **each worker keeps its own counter**, so the effective threshold is roughly two independent buckets of 10 and which worker serves a given request determines whether it is counted — hence the ~13–14 boundary and the interleaved `429`/non‑`429` pattern. This is observed behaviour of the default configuration, reported as‑is.
+- **`/auth/login`**: in this run the first `429` appeared at attempt **#14** (failed logins return `200` re‑rendering the page). **This position is not stable** — it depends on accumulated per‑worker counter state, as the re‑verification below shows.
+- **`/auth/activate`**: in this run the first `429` appeared at attempt **#13**, and the sequence interleaved (`429`, then `400`, then `429`). Again, this is a **single‑run** position, not a fixed attempt number.
+- **`/auth/register`**: no `429` at all — this is a **structural** fact (not a per‑run artifact): the route has no limiter decorator [`app/auth/views/register.py:L31`].
+- **Why the exact first‑`429` position varies (and why the effective threshold is ~2× the "10/minute" nominal).** The limiter storage is in‑memory per process: `MEM_STORE_URI` defaults to `None` [`app/config.py:L568`] and `limiter = Limiter(key_func=__key_func)` [`app/extensions.py:L23`] is constructed with no shared backend. With Gunicorn running `-w 2`, **each worker keeps its own counter**, so the effective ceiling is roughly two independent buckets of 10, and which worker serves a given request — plus whatever counter state prior requests already accumulated — determines whether any specific attempt is the one that trips the limit. The precise first‑`429` attempt number is therefore **non‑deterministic run to run**; only the presence of the `10/minute` limiter on `/auth/login` and `/auth/activate`, its absence on `/auth/register`, and the deduct‑on‑failure semantics are stable, source‑grounded facts. This is observed behaviour of the default configuration, reported as‑is.
+
+> **Re‑verification of the non‑determinism (fresh runs, same session, default `-w 2`).** Re‑running the loops confirms the exact positions shift with counter state. Two back‑to‑back `/auth/login` runs (20 wrong‑password attempts each) produced first‑`429` at attempt **#11**, then at attempt **#2** on the immediately following run (the second run starts with the first run's counters already near/over the ceiling):
+>
+> ```
+> RUN-1 /auth/login  (20 wrong-pw):    [200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 429, 200, 200, 200, 200, 200, 200, 200, 200, 200]  first429_at=11
+> RUN-2 /auth/login  (20 wrong-pw):    [200, 429, 429, 429, 429, 429, 429, 429, 429, 429, 429, 429, 429, 429, 429, 429, 429, 429, 429, 429]  first429_at=2
+> ```
+>
+> and two `/auth/activate` runs (20 invalid‑code attempts each) produced first‑`429` at attempt **#17**, then at attempt **#1**:
+>
+> ```
+> RUN-1 /auth/activate (20 invalid-code): [400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 429, 429, 400, 429]  first429_at=17
+> RUN-2 /auth/activate (20 invalid-code): [429, 400, 429, 400, 400, 429, 429, 429, 429, 429, 429, 429, 429, 429, 429, 429, 429, 429, 429, 429]  first429_at=1
+> ```
+>
+> The first‑`429` attempt number moved from `#14`→`#11`→`#2` (login) and `#13`→`#17`→`#1` (activate) across runs — so the sequences above are **evidence of one run only**, and the stable, portable claims are the source‑level ones (limiter presence/absence and deduct‑on‑failure), not any particular attempt number.
 
 ---
 
@@ -616,11 +641,13 @@ The temporary observation processes started for Q2/Q3 — the non‑default web 
 
 ### Host repository left pristine (only the deliverable)
 
-`git status --porcelain` in the host repository root (`/tmp/blitzy/app/blitzy-04138eae-fe6d-47c5-986f-bf39151cbea3_34759f`) shows only this document; no source, config, dependency, migration, or test file was modified, added, or deleted:
+The read‑only mandate is satisfied: the only change this investigation makes to the host repository is this Q&A answer document under `blitzy/documentation/`; no source, config, dependency, migration, template, or test file was modified, added, or deleted.
+
+**Author‑run evidence (historical — captured while authoring, before this document was committed).** While the document was still an in‑progress, un‑committed change, `git status --porcelain` in the host repository root (`/tmp/blitzy/app/blitzy-04138eae-fe6d-47c5-986f-bf39151cbea3_34759f`) showed only the in‑progress document and nothing else:
 
 ```
  M blitzy/documentation/app_2cd6ee777f8c.md
 ```
 
-This satisfies the read‑only mandate: the sole change to the repository is the addition of this Q&A answer document under `blitzy/documentation/`.
+**Current repository state.** Once the document is committed it becomes part of `HEAD`, so the **current** working tree is clean: `git status --porcelain` returns **no output**, while `git ls-files blitzy/documentation/app_2cd6ee777f8c.md` still lists the tracked deliverable. The two states express the same guarantee — apart from this single added document, the repository is left byte‑for‑byte unchanged. (The `M` line above is therefore author‑run evidence of the change being introduced, not a claim about the current committed state.)
 
