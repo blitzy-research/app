@@ -42,7 +42,7 @@ Flask-Migrate==2.5.3
 alembic==1.4.3
 ```
 
-These match the manifest pins: Python `^3.10` [pyproject.toml:61] (base image `FROM python:3.10` [Dockerfile:8]), `SQLAlchemy = "1.3.24"` [pyproject.toml:116], `Flask = "^1.1.2"` [pyproject.toml:62], `psycopg2-binary = "^2.9.3"` [pyproject.toml:71], `python-dotenv = "^0.14.0"` [pyproject.toml:68], `Flask-Migrate = "^2.5.3"` [pyproject.toml:77]. Note the installed **aiosmtpd is `1.4.2`** whereas the manifest pins `aiosmtpd = "^1.2"` [pyproject.toml:87]; the observed value `1.4.2` is reported (it also appears in the SMTP banner in Q2).
+These match the manifest pins: Python `^3.10` [pyproject.toml:61] (base image `FROM python:3.10` [Dockerfile:8]), `SQLAlchemy = "1.3.24"` [pyproject.toml:116], `flask = "^1.1.2"` [pyproject.toml:62], `psycopg2-binary = "^2.9.3"` [pyproject.toml:71], `python-dotenv = "^0.14.0"` [pyproject.toml:68], `Flask-Migrate = "^2.5.3"` [pyproject.toml:77]. Note the installed **aiosmtpd is `1.4.2`** whereas the manifest pins `aiosmtpd = "^1.2"` [pyproject.toml:87]; the observed value `1.4.2` is reported (it also appears in the SMTP banner in Q2).
 
 #### 1.1.1 Canonical setup commands and the observed setup state
 
@@ -791,7 +791,7 @@ Upload files to local dir
 2026-07-03 01:19:18,765 - SL - DEBUG - 91017 - "/tmp/blitzy/app/blitzy-33f70bcd-a718-4307-83f4-2e539e81e639_3e4fde/email_handler.py:2386" - main() -  - Start mail controller 0.0.0.0 20381
 ```
 
-The last two lines are the readiness markers: `Listen for port 20381` (`LOG.i("Listen for port %s", args.port)` [email_handler.py:2403], default `20381` [email_handler.py:2399]) and `Start mail controller 0.0.0.0 20381` (`LOG.d("Start mail controller %s %s", controller.hostname, controller.port)` [email_handler.py:2386], from `Controller(MailHandler(), hostname="0.0.0.0", port=port)` [email_handler.py:2382]).
+The last two lines are the readiness markers: `Listen for port 20381` (`LOG.i("Listen for port %s", args.port)` [email_handler.py:2403], default `20381` [email_handler.py:2399]) and `Start mail controller 0.0.0.0 20381` (`LOG.d("Start mail controller %s %s", controller.hostname, controller.port)` [email_handler.py:2386], from `Controller(MailHandler(), hostname="0.0.0.0", port=port)` [email_handler.py:2383]).
 
 Inject a real message through the **live aiosmtpd listener** on `localhost:20381` using `smtplib` (this exercises the real `MailHandler.handle_DATA` path — no handler function is called directly). The complete client script `/tmp/blitzy_repro/inject_q3.py`:
 
