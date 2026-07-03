@@ -6,7 +6,7 @@ Every behavioural statement below sits next to the **actual runtime output** tha
 
 > **Citation convention.** Every `file:line` reference uses the **full path from the repository root** (e.g. `app/auth/views/register.py:L85`, `events/event_sink.py:L18`, `app/events/event_dispatcher.py:L24`). Root‑level scripts are cited by their bare name (e.g. `email_handler.py:L2343`, `job_runner.py:L334`, `server.py:L215`) because they live at the repository root. There are **two** distinct event packages and both are cited by their real paths: `events/` (`events/event_sink.py`, `events/event_source.py`, `events/runner.py`) and `app/events/` (`app/events/event_dispatcher.py`). All line numbers were verified against the checked‑out source (`HEAD`).
 
-> **Observation session.** All evidence below was captured in a single consistent run on **2026‑07‑03, 01:12–01:36 UTC**, inside the canonical container. Process ids are therefore stable across the quotes: web workers `3398`/`3399` (gunicorn master `3396`), SMTP handler `3419`, job runner `3420`, event listener `3421`/`4256`. Raw output was captured to log files and is quoted **verbatim** (no ellipses inside observed‑output fences; any redaction is marked `[REDACTED]` and explained).
+> **Observation session.** All evidence below was captured in a single consistent run on **2026‑07‑03, 01:12–01:36 UTC**, inside the canonical container. Process ids are therefore stable across the quotes: web workers `3398`/`3399` (gunicorn master `3396`), SMTP handler `3419`, job runner `3420`, event listener `3421`/`4138`. Raw output was captured to log files and is quoted **verbatim** (no ellipses inside observed‑output fences; any redaction is marked `[REDACTED]` and explained). The single exception is the two-worker Gunicorn startup fence in Q1 §1 below: because each worker prints an identical preamble block, that fence shows the block once (collapsed for brevity), and the full, un-collapsed two-worker preamble is then quoted verbatim in the supplementary capture that follows it.
 
 ---
 
@@ -44,7 +44,7 @@ $ redis-server --version | grep -o "v=[0-9.]*"
 v=7.0.15
 ```
 
-> **Node note.** The project's front‑end is built with **Node v10** (`FROM node:10.17.0-alpine AS npm` [`Dockerfile:L2`]; "Node v10 for the frontend" [`CONTRIBUTING.md:L24`]). In this image the static assets are **prebuilt**, so Node is not needed at runtime — the `v18.19.0` present on `PATH` plays no part in serving requests. This is stated for completeness of the build environment.
+> **Node note.** The project's front‑end is built with **Node v10** (`FROM node:10.17.0-alpine AS npm` [`Dockerfile:L2`]; "Node v10 for front-end." [`CONTRIBUTING.md:L24`]). In this image the static assets are **prebuilt**, so Node is not needed at runtime — the `v18.19.0` present on `PATH` plays no part in serving requests. This is stated for completeness of the build environment.
 
 ### Provisioning / migration / seed (exact commands + verification)
 
@@ -126,7 +126,7 @@ Readiness is confirmed by the **startup output of five processes** plus a health
 
 ### 1. Web application (the authentication surface) — Gunicorn on `0.0.0.0:7777`
 
-Command: `/app/venv/bin/gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15`. Verbatim startup:
+Command: `/app/venv/bin/gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15`. Startup from the observation session (abridged — the identical second-worker preamble block is collapsed here for brevity; each of the two workers actually prints the full preamble, and the complete un-collapsed two-worker output is quoted verbatim in the supplementary capture that follows the notes below):
 
 ```
 [2026-07-03 01:12:27 +0000] [3396] [INFO] Starting gunicorn 20.0.4
@@ -149,6 +149,36 @@ Upload files to local dir
 - **Two workers are up** (`-w 2`): `Booting worker with pid: 3398` and `Booting worker with pid: 3399`. Each worker independently boots the app, hence the banner block prints twice.
 - **Logging is initialised** per worker: `>>> init logging <<<` [`app/log.py:L67`], immediately followed by the first `SL` log line, confirming the uniform format [`app/log.py:L12-L15`] and logger name `SL` [`app/log.py:L79`] are live.
 - The `MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value` and `Paddle param not set` lines are benign default‑config notices printed by `app/config.py`; `Upload files to local dir` confirms local file storage (no S3) — all consistent with a default self‑hosted bring‑up.
+
+**Supplementary capture — full two-worker preamble, verbatim (fresh run of the identical command).** Because `-w 2` starts two independent workers and each boots the app in its own process, the entire preamble block — including a *worker-specific* `GNUPGHOME` temp directory — prints once per worker. The session fence above collapses the identical second block for brevity; the capture below, taken from a fresh run of the exact same command, shows both blocks in full with nothing removed:
+
+```
+[2026-07-03 05:20:16 +0000] [8575] [INFO] Starting gunicorn 20.0.4
+[2026-07-03 05:20:16 +0000] [8575] [INFO] Listening at: http://0.0.0.0:7777 (8575)
+[2026-07-03 05:20:16 +0000] [8575] [INFO] Using worker: sync
+[2026-07-03 05:20:16 +0000] [8577] [INFO] Booting worker with pid: 8577
+[2026-07-03 05:20:16 +0000] [8578] [INFO] Booting worker with pid: 8578
+>>> URL: http://localhost:7777
+MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value
+Paddle param not set
+WARNING: Use a temp directory for GNUPGHOME /tmp/sqnfdybtephchttnofmd
+Upload files to local dir
+>>> init logging <<<
+2026-07-03 05:20:17,085 - SL - DEBUG - 8577 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+>>> URL: http://localhost:7777
+MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value
+Paddle param not set
+WARNING: Use a temp directory for GNUPGHOME /tmp/rvcqhccunqqonkejxjnn
+Upload files to local dir
+>>> init logging <<<
+2026-07-03 05:20:17,109 - SL - DEBUG - 8578 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+[2026-07-03 05:20:22 +0000] [8575] [INFO] Handling signal: term
+[2026-07-03 05:20:22 +0000] [8578] [INFO] Worker exiting (pid: 8578)
+[2026-07-03 05:20:22 +0000] [8577] [INFO] Worker exiting (pid: 8577)
+[2026-07-03 05:20:22 +0000] [8575] [INFO] Shutting down: Master
+```
+
+Across two fresh runs of the identical command, each run emitted the preamble exactly twice — two `>>> URL` lines, two `GNUPGHOME` temp-directory warnings (with *distinct* temp paths), and two `>>> init logging <<<` lines per run — confirming the duplication is stable and not a one-off, which is why the note above states the banner block prints twice.
 
 ### 2. Health check — `GET /health` returns `success, 200`
 
@@ -265,7 +295,7 @@ INFO:yacron:Cron job SimpleLogin growth stats: reporting success
 
 ## Q2 — The new‑user journey: register → verify → login → dashboard
 
-> *"What happens when a user registers, verifies their address and tries to log in? What visible behavior confirms that the system is handling every step correctly and forwarding the user into the dashboard as expected?"*
+> *"walking through the typical product experience as if you were a new user signing up for the first time. What happens when a user registers verifies their address and tries to log in. What visible behavior confirms that the system is handling every step correctly and forwarding the user into the dashboard as expected?"*
 
 Every step below was exercised through the **real HTTP entry points** on `http://localhost:7777` with a temporary user (`blitzytmp_reg@example.com`, later cleaned up). Server‑side log lines and per‑request access‑log lines are quoted verbatim.
 
@@ -405,7 +435,7 @@ Both `/auth/login` and `/auth/activate` carry a `10/minute` rate limit applied w
 
 ## Q3 — Behind the scenes: background jobs and internal services
 
-> *"What does the application do behind the scenes during that flow? Are there any indicators that background jobs or internal services are doing their part to support email forwarding or identity verification? What should I expect to observe at runtime that tells me these moving pieces are active and talking to each other properly?"*
+> *"what the application does behind the scenes during that flow. Are there any indicators that background jobs or internal services are doing their part to support email forwarding or identity verification. What should I expect to observe at runtime that tells me these moving pieces are active and talking to each other properly?"*
 
 The "moving pieces" do **not** call each other by RPC — they communicate through **shared PostgreSQL state**: the web app enqueues `Job` rows that the job runner drains, and alias‑creation events become `SyncEvent` rows announced by PostgreSQL `NOTIFY` that the event listener consumes. Below, each mechanism is observed at runtime.
 
@@ -428,7 +458,7 @@ Because `DISABLE_ONBOARDING=true` [`example.env:L150`] suppresses onboarding `Jo
   2026-07-03 01:29:27,059 - SL - ERROR - 3420 - "/app/job_runner.py:304" - process_job() -  - Unknown job name blitzy-observe-unknown
   ```
 
-  Real job names dispatch to real handlers instead — e.g. the alias‑creation‑events handler keyed on `JobType.SEND_ALIAS_CREATION_EVENTS` [`job_runner.py:L295-L302`]. The `Unknown job name` line is the visible proof that `process_job` is actually inspecting `job.name` and routing on it.
+  Real job names dispatch to real handlers instead — e.g. the alias‑creation‑events handler keyed on `config.JOB_SEND_ALIAS_CREATION_EVENTS` (value `"send-alias-creation-events"` [`app/config.py:L311`]) [`job_runner.py:L295-L302`]. The `Unknown job name` line is the visible proof that `process_job` is actually inspecting `job.name` and routing on it.
 - These ten jobs were temporary observation artifacts and are removed in the Cleanup section.
 
 ### 2. Email forwarding lifecycle — the SMTP handler on port `20381`
@@ -492,7 +522,7 @@ And the temporary webhook receiver logged the delivery verbatim:
 ```
 
 - **`Got NOTIFY: pid=4195 channel=simplelogin_sync_events payload=3`** [`events/event_source.py:L55`] — the listener received the PostgreSQL notification on the `LISTEN simplelogin_sync_events` channel it subscribed to at startup [`events/event_source.py:L47`]. This is the direct proof the web/dispatcher side and the listener side are **talking to each other** through Postgres.
-- **`Sending event 3 to http://localhost:8929/`** [`events/event_sink.py:L22`] → **`Event 3 sent successfully to webhook`** [`events/event_sink.py:L39`] — the `HttpEventSink` POSTed the serialized event and got HTTP 200; the receiver confirms `ct=application/x-protobuf bytes=80` (matching the 80‑byte payload).
+- **`Sending event 3 to http://localhost:8929/`** [`events/event_sink.py:L22`] → **`Event 3 sent successfully to webhook`** [`events/event_sink.py:L39`] — the `HttpEventSink` POSTed the serialized event and got HTTP 200. The success path is gated by `if res.status_code != 200:` [`events/event_sink.py:L33`]: a non-200 response would take the `if` branch (log `Failed to send event to webhook` and return `False`), while the observed 200 falls through to the `else` branch that emits the `Event 3 sent successfully to webhook` line quoted above and returns `True`. The receiver confirms `ct=application/x-protobuf bytes=80` (matching the 80‑byte payload).
 - **`Marked 3 as done`** [`events/runner.py:L28`] and the row is deleted on success [`events/runner.py:L27`]; a follow‑up `SELECT count(*) FROM sync_event` returned `0`, confirming the consume‑and‑delete lifecycle. (The alternative sink, `ConsoleEventSink`, simply logs `Handling event {id}` for local dry‑runs [`events/event_sink.py:L43-L46`].)
 
 ### Q3 summary
