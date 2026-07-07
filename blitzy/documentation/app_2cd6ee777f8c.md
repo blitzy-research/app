@@ -131,14 +131,14 @@ $ docker exec sl-app bash -c "source /root/sl_env.sh && psql \"\$DB_URI\" -tAc \
 
 ```
 $ docker exec sl-app bash -c "source /root/sl_env.sh && psql \"\$DB_URI\" -c \"SELECT indexname, indexdef FROM pg_indexes WHERE tablename='contact' AND indexname IN ('ix_contact_reply_email','uq_contact') ORDER BY indexname;\""
-       indexname        |                                        indexdef                                        
+       indexname        |                                        indexdef
 ------------------------+----------------------------------------------------------------------------------------
  ix_contact_reply_email | CREATE INDEX ix_contact_reply_email ON public.contact USING btree (reply_email)
  uq_contact             | CREATE UNIQUE INDEX uq_contact ON public.contact USING btree (alias_id, website_email)
 (2 rows)
 
 $ docker exec sl-app bash -c "source /root/sl_env.sh && psql \"\$DB_URI\" -c \"SELECT conname, pg_get_constraintdef(oid) AS definition FROM pg_constraint WHERE conrelid='contact'::regclass AND contype='u' ORDER BY conname;\""
-  conname   |            definition            
+  conname   |            definition
 ------------+----------------------------------
  uq_contact | UNIQUE (alias_id, website_email)
 (1 row)
