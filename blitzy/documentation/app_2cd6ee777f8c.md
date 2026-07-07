@@ -365,12 +365,22 @@ Because the code is a secret, this document never prints it. Instead, activation
 $ psql -tAc "SELECT activated FROM users WHERE id=6;"                    # -> f
 $ psql -tAc "SELECT count(*) FROM activation_code WHERE user_id=6;"      # -> 1
 
-# Consume the real code via the activation endpoint (code redacted here):
-$ curl -sS -i -L "http://localhost:7777/auth/activate?code=<redacted>"
+# Consume the real code via the activation endpoint (code redacted here). The -c cookie
+# jar matters: activate() calls login_user(user) (app/auth/views/activate.py:50), which
+# sets the session cookie, and curl's cookie engine then resends it on the -L follow so
+# the request reaches the @login_required /dashboard/ (HTTP 200) and renders the flash.
+# Only -c (write) is used, not -b (read), so a newly-registered user's initial request
+# never carries a stale prior session, which activate() would otherwise reject with
+# HTTP 400 "You are already logged in" (app/auth/views/activate.py:18-22). The full response is
+# saved once, then the status chain and flash line are grepped so each command reproduces:
+$ curl -sS -i -L -c "$OBS/act.cookies" \
+       "http://localhost:7777/auth/activate?code=<redacted>" > "$OBS/activate.out"
+$ grep -iE '^HTTP/|^Location:' "$OBS/activate.out"
 HTTP/1.0 302 FOUND
 Location: http://localhost:7777/dashboard/
 HTTP/1.0 200 OK
-# the followed dashboard page renders the flash from app/auth/views/activate.py:56:
+# the followed dashboard page (dashboard/index.html) renders the flash from app/auth/views/activate.py:56:
+$ grep -o 'Your account has been activated' "$OBS/activate.out" | head -1
 Your account has been activated
 
 # AFTER — the account is active and the code has been consumed (deleted):
@@ -379,6 +389,8 @@ $ psql -tAc "SELECT count(*) FROM activation_code WHERE user_id=6;"      # -> 0
 ```
 
 The state transition is unambiguous: `users.activated` flips **f → t** and the `activation_code` count drops **1 → 0**, exactly as `activate()` does at `app/auth/views/activate.py:49` (and the code row is deleted on use). The `302 → /dashboard/` redirect plus the `Your account has been activated` flash are the UI confirmation. The account can now sign in.
+
+**Observed discrepancy — cookie persistence matters.** Running the *same* activation URL **without** a cookie jar still activates the account server-side (the `activated f → t` and code `1 → 0` transitions above are byte-for-byte identical), but the redirect chain differs: `302 → /dashboard/`, then a second `302 → /auth/login?next=%2Fdashboard%2F%3F`, then a final `200` on the *login* page (`auth/login.html`), with the flash **not** rendered. That is because the session cookie set by `login_user` at `app/auth/views/activate.py:50` is discarded, so curl's `-L` follow to the `@login_required` `/dashboard/` is unauthenticated. Persisting the cookie — a browser, or `curl -c` as shown above — is what makes the dashboard-rendered flash reproduce; the server-side activation itself is unaffected either way.
 
 ### 3.3 Alias creation
 
