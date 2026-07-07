@@ -780,8 +780,11 @@ STABILITY ACROSS RUNS
 validly-signed identifier, that same `session_id` is reused to build the `ServerSession` (no new
 UUID is minted). The login flow calls Flask-Login's `login_user()`, which writes `_user_id` into the
 existing session dict but does **not** rotate the identifier. Flask-Login runs with
-`session_protection = "strong"` at `app/extensions.py:8`, which regenerates the *remember-me* token
-and `_fresh`/`_id` markers but does **not** change the server-side session id or the `slapp` UUID.
+`session_protection = "strong"` at `app/extensions.py:8`, which on each request re-computes the
+client fingerprint and compares it against the session's `_id` (the fingerprint `login_user()`
+itself writes, alongside `_fresh`); on a mismatch it clears the session dict and the *remember-me*
+cookie. It therefore acts only on the session *contents* and does **not** change the server-side
+session id or the `slapp` UUID.
 
 **Cause → effect.** Since `open_session` reuses the already-signed UUID and the login path never
 calls a session-rotation primitive, the pre-login identifier persists verbatim into the
@@ -1026,8 +1029,8 @@ whitelist; arbitrary inbound `X-` headers like `X-Custom-Test` are still strippe
 local-parts are randomly generated per contact, so they differ run-to-run; their `@sl.local`
 structure is deterministic.)
 
-**Citation.** The whitelist `headers_to_keep` is assembled at `email_handler.py:793-806` (plus
-`headers.MIME_HEADERS` at `email_handler.py:806`) and applied by `delete_all_headers_except(msg,
+**Citation.** The whitelist `headers_to_keep` is assembled at `email_handler.py:793-807` (plus
+`headers.MIME_HEADERS` at `email_handler.py:807`) and applied by `delete_all_headers_except(msg,
 headers_to_keep)` at `email_handler.py:810`; the generic stripper is
 `app/email_utils.py:536-542`, function `delete_all_headers_except` (it lowercases the whitelist and
 deletes every header not in it). Neither `Received` (`app/email/headers.py:14`) nor `Reply-To`
