@@ -13,7 +13,7 @@
 - **The forwarding destination (R3):** `alias = contact.alias` [L994] → `user = alias.user` [L1004] → authorized `mailbox = get_mailbox_from_mail_from(mail_from, alias)` [L1019/L1364] → the message is relayed to `contact.website_email` [~L1226].
 - **Across many identical replies (R4):** resolution is **stable/deterministic when `reply_email` is unique** — 12/12 events resolved to the same Contact in each of two separate process runs.
 - **Can the same reply email resolve to different Contacts over time? (R5):** **Yes — once a duplicate `reply_email` exists.** The `reply_email` column is a **non-unique** index, so two Contacts can share a `reply_email`; the unordered `.first()` then returns a **database-arbitrary** matching row. Observed live: the *same* reply address resolved to Contact 327 (user 904) and, after an unrelated write reordered the heap, to Contact 328 (user 905).
-- **Can resolution fail temporarily? (R6):** **Yes.** A syntactically-valid reverse-alias with no matching Contact returns `E502` [L987-L989]; this is *temporary* (it resolves as soon as the Contact exists). A separate *normalization asymmetry* can make a stored Contact permanently unreachable via its own address (also `E502`), and a bad reply domain yields `E501` [L977-L981].
+- **Can resolution fail temporarily? (R6):** **Yes.** A syntactically-valid reverse-alias with no matching Contact returns `E502` [L987-L989]; this is *temporary* (it resolves as soon as the Contact exists). A separate *normalization asymmetry* can make a stored Contact permanently unreachable via its own address (also `E502`), and a bad reply domain yields `E501` [L977-L981]. Two further guard branches reject a reply *after* the Contact resolves: an unknown resolved-alias domain yields `E503` [L1000-L1002] and a disabled account yields `E504` [L1007-L1009] — both reject rather than forward (observed live in E7/E8).
 - **Correct-now-wrong-later? (R7):** A mis-resolution **usually bounces with `E214`** because `get_mailbox_from_mail_from` rejects a sender that is not authorized for the *resolved* alias. But it **silently delivers to the wrong user** when the resolved alias has `disable_email_spoofing_check=True` [L1021-L1029], or delivers to the wrong contact when a mailbox is shared/authorized so `mail_from` matches.
 - **Root cause (R8/R9):** reply routing **assumes `reply_email` uniquely identifies one Contact**, but that uniqueness is enforced only **softly** (a check-then-act loop at generation time [`app/email_utils.py`:L1136-L1151 + `available_sl_email` `app/models.py`:L1425-L1432]) and by **no** DB constraint (`reply_email` is `index=True`, non-unique [`app/models.py`:L1899; migration `...78403c7b8089_.py`:L22]; the only unique constraint is `uq_contact(alias_id, website_email)` [`app/models.py`:L1874-L1876; migration `...0809266d08ca_.py`:L45]). The lookup is an unordered `LIMIT 1`. Therefore **if** a duplicate `reply_email` ever exists, the arbitrary row selection can pick the wrong Contact → wrong alias → wrong user; the anti-spoofing mailbox check is the mitigating control that usually converts this into an `E214` rejection rather than a silent misdelivery.
 - **Calibrated risk:** a *natural* collision of the 20–50-char random local part [`app/email_utils.py`:L1145] is astronomically unlikely, so this is a **latent** uniqueness/timing defect — it fires when a duplicate `reply_email` is introduced administratively/programmatically (or by any future code path that inserts `reply_email` without the soft check) — **not** a routinely-triggered bug in normal operation.
@@ -65,7 +65,86 @@ $ cd /tmp/blitzy/app/blitzy-c2a41c33-7e7e-4397-9fc6-7fc76ebf8165_9eedb3 && \
 blitzy-c2a41c33-7e7e-4397-9fc6-7fc76ebf8165
 ```
 
-The evidence chain is at HEAD **`2cd6ee77`**. (The `handle` function address varies per interpreter process; it is shown only to prove the module imported and `handle` is callable.)
+The evidence was gathered against the pre-existing SimpleLogin baseline **`2cd6ee77`** — this deliverable adds **only** the documentation file on top of that commit, so the SimpleLogin source the evidence runs against is byte-identical between `2cd6ee77` and the committed HEAD (see [Read-only guarantee](#read-only-guarantee-repository-left-unchanged)). (The `handle` function address varies per interpreter process; it is shown only to prove the module imported and `handle` is callable.)
+
+### Canonical setup provenance (build, dependencies, migration)
+
+The container is the **prebuilt canonical image**; its build provisions, in order: **(1)** a Python **3.10** base [`Dockerfile`:L8 `FROM python:3.10`]; **(2)** a virtualenv at `/app/venv` into which the **pinned** dependencies from `pyproject.toml`/`poetry.lock` are installed (SQLAlchemy `1.3.24` [`pyproject.toml`:L116], Flask `1.1.2`, aiosmtpd `1.4.2`, alembic `1.4.3`, psycopg2-binary `2.9.3`, …); **(3)** **PostgreSQL 15** and Redis started; and **(4)** the schema created by **`alembic upgrade head`** against `DB_URI` [`example.env`:L75 / canonical `/root/sl_env.sh`]. The commands below **verify** that provisioned state — first the dependency/venv provenance, then the migration state — using the same canonical `docker exec sl-app bash -c 'source /root/sl_env.sh && …'` wrapper as every other command in this document.
+
+**(A) Dependency / venv provenance (command + complete unedited output):**
+
+```
+$ docker exec sl-app bash -c 'source /root/sl_env.sh && cd /app && \
+    echo "### venv interpreter ###" && /app/venv/bin/python --version && \
+    echo "### venv location ###" && ls -d /app/venv && \
+    echo "### pinned dependency provenance (subset, canonical pins) ###" && \
+    /app/venv/bin/pip freeze | grep -iE "^(Flask|Flask-SQLAlchemy|Flask-Migrate|SQLAlchemy|SQLAlchemy-Utils|aiosmtpd|alembic|psycopg2|psycopg2-binary|arrow)==" | sort && \
+    echo "### total installed packages (pip freeze | wc -l) ###" && \
+    /app/venv/bin/pip freeze | wc -l'
+### venv interpreter ###
+Python 3.10.18
+### venv location ###
+/app/venv
+### pinned dependency provenance (subset, canonical pins) ###
+Flask-Migrate==2.5.3
+Flask-SQLAlchemy==2.5.1
+Flask==1.1.2
+SQLAlchemy-Utils==0.36.8
+SQLAlchemy==1.3.24
+aiosmtpd==1.4.2
+alembic==1.4.3
+arrow==0.16.0
+psycopg2-binary==2.9.3
+### total installed packages (pip freeze | wc -l) ###
+177
+```
+
+These are exactly the versions pinned by `pyproject.toml`/`poetry.lock` (SQLAlchemy `1.3.24`, Flask `1.1.2`, aiosmtpd `1.4.2`, alembic `1.4.3`, psycopg2-binary `2.9.3`, arrow `0.16.0`), confirming the **canonical** stack rather than the host's incompatible Python 3.12 / SQLAlchemy 2.0.
+
+**(B) Migration state — `alembic upgrade head` provenance (command + complete unedited output; startup banner filtered as disclosed):**
+
+```
+$ docker exec sl-app bash -c 'source /root/sl_env.sh && cd /app && \
+    echo "$ alembic current" && /app/venv/bin/alembic current && \
+    echo "$ alembic heads"   && /app/venv/bin/alembic heads && \
+    echo "$ alembic upgrade head   # idempotent: DB already at head, no steps run" && /app/venv/bin/alembic upgrade head' \
+    | grep -v -E "load config file|>>> URL:|WARNING: Use a temp|Upload files to local|>>> init logging|load words file"
+$ alembic current
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+32f25cbf12f6 (head)
+$ alembic heads
+32f25cbf12f6 (head)
+$ alembic upgrade head   # idempotent: DB already at head, no steps run
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+```
+
+`alembic current` == `alembic heads` == **`32f25cbf12f6 (head)`**, and re-running **`alembic upgrade head`** executes **no** migration steps (it prints only the two context lines), proving the schema is already fully migrated. The provisioned schema has **77** base tables:
+
+```
+$ docker exec sl-app bash -c "source /root/sl_env.sh && psql \"\$DB_URI\" -tAc \"select count(*) from information_schema.tables where table_schema='public' and table_type='BASE TABLE';\""
+77
+```
+
+**(C) DB-level `contact` schema (the migrated indexes/constraints R5/R8 depend on):**
+
+```
+$ docker exec sl-app bash -c "source /root/sl_env.sh && psql \"\$DB_URI\" -c \"SELECT indexname, indexdef FROM pg_indexes WHERE tablename='contact' AND indexname IN ('ix_contact_reply_email','uq_contact') ORDER BY indexname;\""
+       indexname        |                                        indexdef                                        
+------------------------+----------------------------------------------------------------------------------------
+ ix_contact_reply_email | CREATE INDEX ix_contact_reply_email ON public.contact USING btree (reply_email)
+ uq_contact             | CREATE UNIQUE INDEX uq_contact ON public.contact USING btree (alias_id, website_email)
+(2 rows)
+
+$ docker exec sl-app bash -c "source /root/sl_env.sh && psql \"\$DB_URI\" -c \"SELECT conname, pg_get_constraintdef(oid) AS definition FROM pg_constraint WHERE conrelid='contact'::regclass AND contype='u' ORDER BY conname;\""
+  conname   |            definition            
+------------+----------------------------------
+ uq_contact | UNIQUE (alias_id, website_email)
+(1 row)
+```
+
+At the **live database** level this confirms exactly what the migrations declare: `ix_contact_reply_email` is a plain **`CREATE INDEX`** (no `UNIQUE`) [migration `2021_071310_78403c7b8089_.py`:L22; `app/models.py`:L1899], while the only unique constraint is `uq_contact` on `(alias_id, website_email)` [migration `2020_031711_0809266d08ca_.py`:L45; `app/models.py`:L1874-L1876]. This is the ground truth behind R5/R8: **nothing at the DB level prevents two Contacts from sharing a `reply_email`.**
 
 ---
 
@@ -472,6 +551,123 @@ input='reply+aébc@sl.local'
 
 Characters disallowed by `_ALLOWED_CHARS` (`#`, `%`) are rewritten to `_`, and non-ASCII (`é`) is transliterated (`convert_to_id`, `app/email_validation.py`:L27-L28) — any of which shifts the lookup key away from a stored value that contained the original character.
 
+### Two further post-resolution reply-handler guard branches — E503 and E504
+
+The `E501`/`E502` cases above fail *before or at* Contact resolution. `handle_reply` has **two more guard branches that reject a reply *after* the Contact has already resolved** — so the reply is *not* forwarded, mirroring the "reject rather than deliver" behaviour of the R7 anti-spoofing gate. Exercising them completes the full set of reply-handler status codes the question's methodology enumerates (**E501/E502/E503/E504/E214**).
+
+**Experiment E7 (E503 — resolved alias is on an unknown domain).** After the Contact resolves, `handle_reply` sanity-checks the *resolved alias's own* domain: `if not is_valid_alias_address_domain(alias.email): LOG.e("%s domain isn't known", alias); return False, status.E503` [`email_handler.py`:L1000-L1002]. `is_valid_alias_address_domain` [`app/email_utils.py`:L557] returns `True` only for an `SLDomain` or a **verified** `CustomDomain`. This reproduces the very scenario the code comment names [`email_handler.py`:L998-L999] — *"a user have removed a domain but due to a bug, the aliases are still there"*. I seed a **verified** `CustomDomain`, put the alias on it, create the Contact (its `reply_email` on `EMAIL_DOMAIN` so routing + `E501` pass), then **administratively remove** the domain (`CustomDomain.verified = False`, labelled admin/programmatic) and drive the reply. Before/during/after state is captured.
+
+Command + complete unedited output (banner filtered, as disclosed above):
+
+```
+$ docker exec sl-app bash -c 'source /root/sl_env.sh && cd /app && /app/venv/bin/python /tmp/sl_investigation/e7_e503.py' \
+    | grep -v -E "load config file|>>> URL:|WARNING: Use a temp|Upload files to local|>>> init logging|load words file"
+==============================================================================
+E7 (E503) SEED: User + VERIFIED CustomDomain + Alias-on-that-domain + Contact
+==============================================================================
+2026-07-06 23:54:05,548 - SL - INFO - 3744 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-06 23:54:05,575 - SL - INFO - 3744 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+User.id             = 919
+CustomDomain        = id=129 domain='31jz8eap.example' verified=True
+Alias.id            = 1601
+Alias.email         = mrsxox@31jz8eap.example   (lives on the custom domain above)
+Contact.id          = 346  alias_id=1601 user_id=919
+Contact.reply_email = reply+fgp976ymyxx089ab@sl.local   (on sl.local: routes to handle_reply + passes E501)
+
+E7 BEFORE (domain present & verified):
+  is_valid_alias_address_domain(alias.email) -> True   (app/email_utils.py:L557)
+
+E7 DURING: ADMIN/PROGRAMMATIC domain removal -> CustomDomain.verified = False (commit)
+           (simulates email_handler.py:L998-L999: 'user removed a domain but aliases still there')
+E7 AFTER  (domain removed/unverified):
+  is_valid_alias_address_domain(alias.email) -> False   (unknown domain -> E503 branch email_handler.py:L1000-L1002)
+
+==============================================================================
+E7 DRIVE: email_handler.handle(envelope, msg)  [email_handler.py:L1945] -> handle_reply [L966]
+  envelope.mail_from = user_iqb5lodqjr@mailbox.test
+  envelope.rcpt_tos  = ['reply+fgp976ymyxx089ab@sl.local']
+==============================================================================
+2026-07-06 23:54:05,603 - SL - DEBUG - 3744 - "/app/email_handler.py:1963" - handle() -  - Cannot parse Postfix queue ID from None None
+2026-07-06 23:54:05,604 - SL - DEBUG - 3744 - "/app/email_handler.py:1980" - handle() -  - ==>> Handle mail_from:user_iqb5lodqjr@mailbox.test, rcpt_tos:['reply+fgp976ymyxx089ab@sl.local'], header_from:None, header_to:reply+fgp976ymyxx089ab@sl.local, cc:None, reply-to:None, message_id:<e7-e503@investigation.local>, client_ip:None, headers:[('To', 'reply+fgp976ymyxx089ab@sl.local'), ('Subject', 'E7 E503 probe'), ('Message-ID', '<e7-e503@investigation.local>'), ('Content-Type', 'text/plain; charset="utf-8"'), ('Content-Transfer-Encoding', '7bit'), ('MIME-Version', '1.0')], mail_options:[], rcpt_options:[]
+[SPY Contact.get_by] kwargs={'reply_email': 'user_iqb5lodqjr@mailbox.test'} -> None
+[SPY Contact.get_by] kwargs={'reply_email': 'reply+fgp976ymyxx089ab@sl.local'} -> Contact(id=346, alias_id=1601, user_id=919, website_email='rvybzvvnbhptdjlaacrq@rvybzvvnbhptdjlaacrq.com')
+[SPY Contact.get_by] kwargs={'reply_email': 'reply+fgp976ymyxx089ab@sl.local'} -> Contact(id=346, alias_id=1601, user_id=919, website_email='rvybzvvnbhptdjlaacrq@rvybzvvnbhptdjlaacrq.com')
+2026-07-06 23:54:05,607 - SL - DEBUG - 3744 - "/app/email_handler.py:2196" - handle() -  - Reply phase user_iqb5lodqjr@mailbox.test(None) -> reply+fgp976ymyxx089ab@sl.local
+[SPY Contact.get_by] kwargs={'reply_email': 'reply+fgp976ymyxx089ab@sl.local'} -> Contact(id=346, alias_id=1601, user_id=919, website_email='rvybzvvnbhptdjlaacrq@rvybzvvnbhptdjlaacrq.com')
+2026-07-06 23:54:05,614 - SL - ERROR - 3744 - "/app/email_handler.py:1001" - handle_reply() -  - <Alias 1601 mrsxox@31jz8eap.example> domain isn't known
+NoneType: None
+
+==============================================================================
+E7 RESULT (after):
+==============================================================================
+handle() status returned = '550 SL E503'
+  status.E503 = '550 SL E503'  (app/email/status.py:L40)   match=True
+outbound messages captured = 0  (0 => reply was NOT forwarded to anyone)
+EmailLog rows for Contact 346: before=0 after=0  (unchanged => no reply relayed)
+E7 DONE
+```
+
+**Reasoning & before/during/after (E7):** the `[SPY Contact.get_by]` line shows the Contact **did resolve** (`id=346, alias_id=1601, user_id=919`) — this is *not* a lookup failure. **Before** the removal, `is_valid_alias_address_domain(alias.email)` is `True`; **during**, `CustomDomain.verified` is set to `False`; **after**, the same check is `False`. Driving the reply then hits the L1000-L1002 branch: the handler logs `<Alias 1601 mrsxox@31jz8eap.example> domain isn't known` [`email_handler.py`:L1001] and returns `status.E503` = `"550 SL E503"` [`app/email/status.py`:L40]. Nothing is relayed (`outbound messages captured = 0`; `EmailLog … before=0 after=0`). (The trailing `NoneType: None` is the app's own `LOG.e` traceback line, emitted with no active exception — real, unedited handler output.) This is a **post-resolution** rejection: resolution succeeded, but the resolved alias's domain is no longer managed by SimpleLogin.
+
+**Experiment E8 (E504 — resolved user cannot send/receive).** Immediately after the E503 check, `handle_reply` re-reads `user = alias.user` and rejects a disabled account: `if not user.can_send_or_receive(): LOG.i(f"User {user} cannot send emails"); return False, status.E504` [`email_handler.py`:L1007-L1009]. A subtle ordering fact makes this branch distinct from the earlier `E502` "soft-deleted user" gate: the L990 `E502` gate uses `contact.user.is_active()` [`app/models.py`:L766-L769], which checks **only** `delete_on`, whereas `can_send_or_receive()` [`app/models.py`:L886-L895] **also** checks `disabled`. So setting `user.disabled = True` (with `delete_on = None`) **passes** the L990 `E502` gate but **trips** L1007 `E504`. Before/during/after state is captured.
+
+Command + complete unedited output (banner filtered):
+
+```
+$ docker exec sl-app bash -c 'source /root/sl_env.sh && cd /app && /app/venv/bin/python /tmp/sl_investigation/e8_e504.py' \
+    | grep -v -E "load config file|>>> URL:|WARNING: Use a temp|Upload files to local|>>> init logging|load words file"
+==============================================================================
+E8 (E504) SEED: User + random Alias(@sl.local) + Contact  (all normal, domain valid)
+==============================================================================
+2026-07-06 23:54:08,163 - SL - INFO - 3763 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-06 23:54:08,176 - SL - DEBUG - 3763 - "/app/app/models.py:1459" - generate_random_alias_email() -  - generate email hauled_reship461@sl.local
+2026-07-06 23:54:08,183 - SL - INFO - 3763 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+User.id             = 920  email=user_hcnodxy5xo@mailbox.test
+Alias.id            = 1603  email=hauled_reship461@sl.local   (on sl.local: passes E503)
+Contact.id          = 347  alias_id=1603 user_id=920
+Contact.reply_email = reply+94ql02m71q14hcdz@sl.local
+
+E8 BEFORE (user enabled):
+  user.disabled            = False
+  user.delete_on           = None
+  user.is_active()         = True          (app/models.py:L766-L769; checks delete_on only)
+  user.can_send_or_receive = True          (app/models.py:L886-L895; checks disabled + delete_on)
+
+E8 DURING: ADMIN/PROGRAMMATIC account disable -> user.disabled = True (commit)
+E8 AFTER  (user disabled):
+  user.disabled            = True
+  user.delete_on           = None
+  user.is_active()         = True          (still True: delete_on is None -> PASSES L990 E502 gate)
+2026-07-06 23:54:08,198 - SL - INFO - 3763 - "/app/app/models.py:888" - can_send_or_receive() -  - User <User 920 Test User user_hcnodxy5xo@mailbox.test> is disabled. Cannot receive or send emails
+  user.can_send_or_receive = False         (now False -> TRIPS L1007 E504)
+
+==============================================================================
+E8 DRIVE: email_handler.handle(envelope, msg)  [email_handler.py:L1945] -> handle_reply [L966]
+  envelope.mail_from = user_hcnodxy5xo@mailbox.test
+  envelope.rcpt_tos  = ['reply+94ql02m71q14hcdz@sl.local']
+==============================================================================
+2026-07-06 23:54:08,205 - SL - DEBUG - 3763 - "/app/email_handler.py:1963" - handle() -  - Cannot parse Postfix queue ID from None None
+2026-07-06 23:54:08,207 - SL - DEBUG - 3763 - "/app/email_handler.py:1980" - handle() -  - ==>> Handle mail_from:user_hcnodxy5xo@mailbox.test, rcpt_tos:['reply+94ql02m71q14hcdz@sl.local'], header_from:None, header_to:reply+94ql02m71q14hcdz@sl.local, cc:None, reply-to:None, message_id:<e8-e504@investigation.local>, client_ip:None, headers:[('To', 'reply+94ql02m71q14hcdz@sl.local'), ('Subject', 'E8 E504 probe'), ('Message-ID', '<e8-e504@investigation.local>'), ('Content-Type', 'text/plain; charset="utf-8"'), ('Content-Transfer-Encoding', '7bit'), ('MIME-Version', '1.0')], mail_options:[], rcpt_options:[]
+[SPY Contact.get_by] kwargs={'reply_email': 'user_hcnodxy5xo@mailbox.test'} -> None
+[SPY Contact.get_by] kwargs={'reply_email': 'reply+94ql02m71q14hcdz@sl.local'} -> Contact(id=347, alias_id=1603, user_id=920, website_email='qodddwddysndapfddvqi@qodddwddysndapfddvqi.com')
+[SPY Contact.get_by] kwargs={'reply_email': 'reply+94ql02m71q14hcdz@sl.local'} -> Contact(id=347, alias_id=1603, user_id=920, website_email='qodddwddysndapfddvqi@qodddwddysndapfddvqi.com')
+2026-07-06 23:54:08,210 - SL - DEBUG - 3763 - "/app/email_handler.py:2196" - handle() -  - Reply phase user_hcnodxy5xo@mailbox.test(None) -> reply+94ql02m71q14hcdz@sl.local
+[SPY Contact.get_by] kwargs={'reply_email': 'reply+94ql02m71q14hcdz@sl.local'} -> Contact(id=347, alias_id=1603, user_id=920, website_email='qodddwddysndapfddvqi@qodddwddysndapfddvqi.com')
+2026-07-06 23:54:08,212 - SL - INFO - 3763 - "/app/app/models.py:888" - can_send_or_receive() -  - User <User 920 Test User user_hcnodxy5xo@mailbox.test> is disabled. Cannot receive or send emails
+2026-07-06 23:54:08,212 - SL - INFO - 3763 - "/app/email_handler.py:1008" - handle_reply() -  - User <User 920 Test User user_hcnodxy5xo@mailbox.test> cannot send emails
+
+==============================================================================
+E8 RESULT (after):
+==============================================================================
+handle() status returned = '550 SL E504 Account disabled'
+  status.E504 = '550 SL E504 Account disabled'  (app/email/status.py:L41)   match=True
+outbound messages captured = 0  (0 => reply was NOT forwarded to anyone)
+EmailLog rows for Contact 347: before=0 after=0  (unchanged => no reply relayed)
+E8 DONE
+```
+
+**Reasoning & before/during/after (E8):** the spy shows the Contact **resolved** (`id=347, alias_id=1603, user_id=920`). **Before**, `user.disabled=False`, `is_active()=True`, `can_send_or_receive()=True`; **during**, `user.disabled` is set to `True`; **after**, `is_active()` is *still* `True` (so the L990 `E502` gate passes) while `can_send_or_receive()` is now `False` (the model logs *"User … is disabled"* at `app/models.py`:L888). Driving the reply hits the L1007-L1009 branch: the handler logs `User <User 920 …> cannot send emails` [`email_handler.py`:L1008] and returns `status.E504` = `"550 SL E504 Account disabled"` [`app/email/status.py`:L41]. Again nothing is relayed (`outbound = 0`; `EmailLog before=0 after=0`). `E504` is *temporary* in the ordinary sense — re-enabling the account (`disabled=False`) restores delivery.
+
 ---
 
 ## R7 — Correct-now-wrong-later (anti-spoofing outcome)
@@ -566,6 +762,8 @@ $ docker exec sl-app bash -c 'source /root/sl_env.sh && cd /app && /app/venv/bin
 
 **Reasoning (before / during / after):** **before**, no Contact exists for `(alias 1583, fvncqvosdlhjltmijhcr@…)`; **during**, the first `Contact.create` succeeds (id 335) and the second — same `(alias_id, website_email)`, but a *freshly generated* `reply_email` R2 — hits `uq_contact` and raises the verbatim `duplicate key value violates unique constraint "uq_contact" DETAIL: Key (alias_id, website_email)=(1583, fvncqvosdlhjltmijhcr@fvncqvosdlhjltmijhcr.com) already exists.`; `create_contact` catches it, rolls back, and refetches; **after**, exactly one Contact (id 335) survives and both callers converge on it. Crucially, the loser's generated `reply_email` **R2 is discarded on rollback** (`exists anywhere? False`), so the *contact-creation* path itself never leaves a duplicate `reply_email`. The higher-level `create_contact()` is likewise idempotent (`ids (337, 337)`, `created flags=(True,False)`). The point of R8 is the **asymmetry**: `(alias, website_email)` is protected by a real constraint and a convergence mechanism, while `reply_email` has neither — its uniqueness rests entirely on the soft TOCTOU check (#2) and, once violated, on an unordered `first()` (#3).
 
+**Concurrency note — E6 is a *serialized* reproduction, not truly simultaneous execution.** The two `Contact.create` calls (and the two `create_contact()` calls) in E6 run **sequentially within a single process and DB session**; the `IntegrityError` is provoked and caught *in-line*, not by two wall-clock-concurrent workers. E6 therefore demonstrates the **same** `uq_contact` + `IntegrityError` **rollback/refetch convergence path** that `create_contact` [`app/contact_utils.py`:L113-L119] uses to reconcile concurrent creations for the same `(alias, sender)` — the *outcome* is identical (exactly one surviving Contact; the loser's freshly-generated `reply_email` discarded on rollback) — but it does **not** reproduce simultaneous timing. True wall-clock concurrency would additionally exercise the check-then-act (TOCTOU) window in `available_sl_email`/`generate_reply_email` (#2 above), which no DB constraint guards; that window is analysed here from the code (it is a race by construction, not one this serialized demonstration triggers), and it is precisely why `reply_email` uniqueness is only *soft*.
+
 **Calibrated risk (this is the key nuance).** A *natural* collision is astronomically unlikely: the no-sender branch draws a random local part of `random.randint(20, 50)` characters [`app/email_utils.py`:L1145] from a large alphabet, so `available_sl_email` essentially never sees a real clash, and E2 confirms normal multi-event resolution is perfectly stable (R4). Therefore the practical exposure is **latent**: it requires a duplicate `reply_email` that is *administratively or programmatically* introduced (bulk import, manual DB edit, a future code path that sets `reply_email` explicitly, or a genuine concurrent double-generate under the TOCTOU window), after which the unordered `first()` (E3) selects a database-arbitrary Contact — and that selection can even change over time (E3 flip). It is a latent uniqueness/timing weakness, not a routinely-fired defect.
 
 ---
@@ -594,26 +792,40 @@ $ docker exec sl-app bash -c 'source /root/sl_env.sh && cd /app && /app/venv/bin
 
 ## Read-only guarantee (repository left unchanged)
 
-All observation scripts lived in the container's own `/tmp/sl_investigation/` (which is **not** bind-mounted into the repository) and were removed afterward; no tracked file was edited. The working tree at the repository root contains **only** the new deliverable, and **no tracked file is modified** (`git diff --stat HEAD` is empty):
+All observation scripts lived in the container's own `/tmp/sl_investigation/` (which is **not** bind-mounted into the repository) and were removed afterward; **no tracked source, test, migration, or configuration file was added, modified, or deleted.** The only change this deliverable introduces — in either the working tree or the commit history — is the single new documentation file.
+
+The authoritative, commit-state proof is the diff against the **pre-existing SimpleLogin baseline** `2cd6ee77` (the commit immediately before this deliverable): it shows exactly one *added* path and **no** modified source file.
 
 ```
 $ cd /tmp/blitzy/app/blitzy-c2a41c33-7e7e-4397-9fc6-7fc76ebf8165_9eedb3
-$ git rev-parse --abbrev-ref HEAD && git rev-parse --short HEAD
-blitzy-c2a41c33-7e7e-4397-9fc6-7fc76ebf8165
-2cd6ee77
 
-$ git diff --stat HEAD
-$ echo "[empty output above = no tracked file modified]"
-[empty output above = no tracked file modified]
+$ git diff --name-status 2cd6ee77 HEAD
+A	blitzy/documentation/app_2cd6ee777f8c.md
 
-$ git status --porcelain
-?? blitzy/
+$ git diff --name-status 2cd6ee77 HEAD -- ':!blitzy'   # any NON-doc (source/test/migration/config) change?
+$ echo "[empty output above = no source/test/migration/config file changed]"
+[empty output above = no source/test/migration/config file changed]
 
 $ find blitzy/ -type f
 blitzy/documentation/app_2cd6ee777f8c.md
 ```
 
-The single untracked path `blitzy/` holds exactly one file — this deliverable. No source, test, migration, or configuration file was added, modified, or deleted. (`static/upload/` appears only as a git-*ignored* pre-existing directory and is not part of this change.)
+**Why the embedded `git status` phrasing matters (authoring-time vs. committed state).** These describe the *same* single-file change at two points in its life:
+
+- **At authoring time** (before this deliverable was committed) the file was *untracked*, so `git status --porcelain` printed `?? blitzy/` and `git diff --stat HEAD` was empty (an untracked file is not part of any diff-against-`HEAD`).
+- **In the committed review state** (what a reviewer sees) the file is part of the commit, so it appears as the **added** path in the baseline diff above (`A blitzy/documentation/app_2cd6ee777f8c.md`); the working tree is clean and both `git status --porcelain` and `git diff --stat HEAD` are empty:
+
+```
+$ git status --porcelain
+$ echo "[empty = working tree clean; nothing uncommitted]"
+[empty = working tree clean; nothing uncommitted]
+
+$ git diff --stat HEAD
+$ echo "[empty = no tracked file differs from HEAD]"
+[empty = no tracked file differs from HEAD]
+```
+
+Either way, exactly one file — this deliverable — is introduced, and **zero** SimpleLogin source/test/migration/config files are touched. (`static/upload/` appears only as a git-*ignored* pre-existing directory and is not part of this change.)
 
 ---
 
@@ -624,7 +836,7 @@ The single untracked path `blitzy/` holds exactly one file — this deliverable.
 - [x] **R3 — Runtime values observed.** Extracted `reply_email`, resolved `Contact(id=324, alias_id=1564, user_id=901)`, `alias`=1564, `user`=901, `mailbox`=1037, outbound `website_email`, status `E200`, `EmailLog id=595 is_reply=True`. Evidence: **E1** (L1051 line + result table).
 - [x] **R4 — Behavior across multiple reply events.** Stable: `{325:12}` then `{326:12}` across 2 process runs; all `E200`. Evidence: **E2** (SAME input, N=12, ≥2 runs).
 - [x] **R5 — Same reply email → different Contacts over time.** **Yes** once a duplicate exists: unordered `first()` returns a database-arbitrary row; SAME input flipped `327(user 904) → 328(user 905)` after an unrelated `UPDATE` reordered the heap. Evidence: **E3 setup + E3 observe (≥2 runs) + E3 flip**.
-- [x] **R6 — Temporary non-resolution.** `E502` "no contact" [L988] (temporary — resolves once Contact exists); normalization asymmetry (`#`→`_` at L984) makes a stored Contact permanently unreachable via its own address; `E501` wrong domain [L980]. Evidence: **E4a/E4b/E4c** + `probe_norm`.
+- [x] **R6 — Temporary non-resolution.** `E502` "no contact" [L988] (temporary — resolves once Contact exists); normalization asymmetry (`#`→`_` at L984) makes a stored Contact permanently unreachable via its own address; `E501` wrong domain [L980]; plus the two **post-resolution** reply-handler guards — `E503` unknown resolved-alias domain [L1000-L1002] and `E504` account disabled [L1007-L1009]. All five reply-handler status codes the methodology enumerates are exercised at runtime against the real `handle()` entry point: **E501/E502** (E4a/E4b/E4c), **E503** (E7), **E504** (E8), and **E214** (E5, in R7). Evidence: **E4a/E4b/E4c** + `probe_norm` + **E7** (E503) + **E8** (E504).
 - [x] **R7 — Correct-now-wrong-later.** Mis-resolution usually **bounces** with `E214` (gate `get_mailbox_from_mail_from` → `None`, L1019/L1364); **silently delivers to the wrong user** when `disable_email_spoofing_check=True` (L1021-L1029) or a shared mailbox lets `mail_from` match. Evidence: **E5 (i)/(ii)/(Y)** — silent wrong-user delivery captured as `EmailLog id=640 user_id=908` while the replier is user 907.
 - [x] **R8 — Root causes.** (i) uniqueness assumption not DB-enforced (`uq_contact` covers only `(alias_id, website_email)` [`app/models.py`:L1874-L1876; migration L45]; `reply_email` non-unique [L1899; migration L22]); (ii) soft TOCTOU generation (`generate_reply_email` + `available_sl_email` [`app/email_utils.py`:L1136-L1151; `app/models.py`:L1425-L1432]); (iii) unordered `first()` [L84]; (iv) contact-creation race guarded only for `(alias, website_email)` via `uq_contact` + `IntegrityError` rollback/refetch [`app/contact_utils.py`:L113-L119], `reply_email` unguarded. Calibrated: **latent** (natural 20-50-char collision astronomically unlikely). Evidence: **E3 + E6**.
 - [x] **R9 — Cause → Effect.** envelope recipient (L972) → normalized (L984) → unordered `get_by(...).first()` (L986 → L84) → `alias`/`user`/`mailbox` (L994/L1004/L1019) → relay to `website_email` (~L1226); a duplicate + arbitrary/time-varying selection picks the wrong alias/user; anti-spoofing (L1364) usually converts that to an `E214` bounce, except under `disable_email_spoofing_check`/shared-mailbox. Evidence: **E1–E6 synthesized**.
