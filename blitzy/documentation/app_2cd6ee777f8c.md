@@ -90,7 +90,29 @@ CONFIG=/app/tests/test.env python -m pytest -o addopts="" -p no:rerunfailures \
 
 ### DB state, before/during/after, and clean-up
 
-The `flask_client` fixture opens `connection.begin()` and calls `transaction.rollback()` at teardown (`tests/conftest.py:L61,L74-L77`). **Observed reality on this canonical PG13 run:** the rows created by a run are fully visible **during** the run (which is what the Q4 answer relies on — the harness reads the freshly-committed IDs/timestamps live within the same Session), and the teardown `rollback()` **leaves the database rows unchanged** — a probe from a fresh connection immediately after `run1` (from a pristine, freshly-migrated DB) found `0` rows in `contact`, `email_log`, and `message_id_matching`. The autoincrement sequences are **not** transactional, so they advance even though the rows are rolled back; that is precisely why `run2` observes higher IDs than `run1` (e.g. `Contact.id` `1 → 2`, forward `EmailLog.id` `1 → 3`) despite each run starting from `max id = 0`. To fully guarantee the environment is left clean regardless of rollback semantics, the **throwaway PostgreSQL 13 instance created for this investigation was dropped entirely afterward** and the temporary harness was deleted (see "Read-only confirmation").
+The `flask_client` fixture opens `connection.begin()` and calls `transaction.rollback()` at teardown (`tests/conftest.py:L61,L74-L77`). **Observed reality (verified at runtime — see the probe below):** the rows created by a run are fully visible **during** the run (which is what the Q4 answer relies on — the harness reads the freshly-committed IDs/timestamps live within the same Session), and the teardown `rollback()` does **not** remove them. The `Session` is bound directly to a single module-level `connection` (`app/db.py:L12,L14`) and the fixture uses the plain `connection.begin()` / `transaction.rollback()` pattern with **no** `SAVEPOINT`/`begin_nested()` restart, so the first of `handle()`'s internal `Session.commit()` calls (e.g. `EmailLog.create(..., commit=True)` at `email_handler.py:L732`; also `L644,L759,L780,L882,L927`) issues a real `COMMIT` that ends the fixture's outer transaction — the teardown `rollback()` is therefore a **no-op** for those already-committed rows, and **they persist** after teardown. A runtime probe driving the real `handle()` under `flask_client` confirms this: an **independent** connection already sees the `contact`/`email_log`/`user_audit_log` rows **during** the run (proving the internal commit escaped the fixture transaction), and a fresh connection still sees them **after** the fixture's `rollback()`/`Session.close()`. This teardown behavior is a Python-side SQLAlchemy transaction semantic (hence DB-version independent); the probe below was run against the warmed baseline **PostgreSQL 15** for confirmation and does not affect the four substantive answers. The autoincrement sequences are **not** transactional and advance regardless, which is why `run2` observes higher IDs than `run1` (e.g. `Contact.id` `1 → 2`, forward `EmailLog.id` `1 → 3`). The environment was therefore left clean **not** by the fixture rollback but **solely** by dropping the **throwaway PostgreSQL instance created for this investigation** after the run (re-confirming the tables were empty) and by deleting the temporary harness (see "Read-only confirmation").
+
+Complete, unedited probe output — real `handle()` forward under `flask_client`, `before` → `during` → `after` the teardown — that produced the rollback observation above:
+
+```
+# clear Redis bl:* alias-create rate-limit keys; TRUNCATE ... RESTART IDENTITY CASCADE; then, in container sl-setup:
+# CONFIG=/app/tests/test.env python -m pytest -o addopts="" -p no:rerunfailures -q -s tests/<throwaway_probe>.py
+# (BEFORE/AFTER row counts read from an independent, freshly-opened psql connection)
+=== BEFORE (fresh psql): rows before the forward ===
+contact=0 email_log=0 user_audit_log=0
+=== DURING (pytest: real handle() under flask_client; external conn proves commits escape) ===
+FWD ext_email_log_start=0
+FWD after_seed ext_email_log=0 ext_users=0 in_sess_users(via alias)=pogrom_blivet115@sl.local
+FWD status='250 Message accepted for delivery' E200=True
+FWD after_handle in_sess: contact=1 email_log=1 ual=1
+FWD after_handle ext_fresh: contact=1 email_log=1 ual=1 users=1
+FWD END_OF_TEST (fixture teardown rollback happens after this line)
+1 passed, 18 warnings in 0.45s
+=== AFTER (fresh psql, post-pytest = post-fixture-rollback/Session.close): rows persist ===
+contact=1 email_log=1 user_audit_log=1
+```
+
+> A note on the earlier apparent inconsistency: while repeating this probe dozens of times, some runs showed `0` rows afterward — but those were **not** rollback cleanups; they were `429 Too Many Requests` failures from the Redis-backed alias-creation limiter (`check_bucket_limit`, `app/rate_limiter.py:L40`), which is keyed per `user_id` and accumulated across repeated runs that reused `user_id=1`. Clearing the `bl:*` buckets before each run yields a deterministic result: **20/20 successful forwards left their rows in the database** after the teardown `rollback()`.
 
 ### Read-only confirmation
 
@@ -434,7 +456,7 @@ From: "spoofedemailsource at gmail.com"
  <spoofedemailsource_at_gmail_com_vfrjnqnmr@sl.local>
 ```
 
-**So the transformed `From` is:** a quoted display name `"spoofedemailsource at gmail.com"` followed by the reverse-alias in angle brackets. This is produced by `Contact.new_addr()` (`app/models.py:L2008`) with the **default** `SenderFormatEnum.AT` (`= 0`, `app/models.py:L204`; the `User.sender_format` default is `0`). For the `AT` format, `new_addr()` computes `formatted_email = self.website_email.replace("@", " at ").strip()` → `spoofedemailsource at gmail.com`, and because the contact has no distinct display name it uses that as the whole `new_name`, then returns `sl_formataddr((new_name, self.reply_email))` (`app/models.py:L2044`). `sl_formataddr()` (`app/email_utils.py:L1501`) wraps `email.utils.formataddr` with `Header(addr, "utf-8")` to yield RFC-2047 form. Here the value is pure ASCII, so **no** `=?utf-8?...?=` encoding appears; a non-ASCII display name would be RFC-2047 encoded. (Had the contact carried a display name distinct from its email, the `AT` branch would render `"<Name> - spoofedemailsource at gmail.com" <reply_email>` — `app/models.py:L2028-L2033`.)
+**So the transformed `From` is:** a quoted display name `"spoofedemailsource at gmail.com"` followed by the reverse-alias in angle brackets. This is produced by `Contact.new_addr()` (`app/models.py:L2008`) with the **default** `SenderFormatEnum.AT` (`= 0`, `app/models.py:L204`; the `User.sender_format` default is `0`). For the `AT` format, `new_addr()` computes `formatted_email = self.website_email.replace("@", " at ").strip()` → `spoofedemailsource at gmail.com`, and because the contact has no distinct display name it uses that as the whole `new_name`, then returns `sl_formataddr((new_name, self.reply_email))` (`app/models.py:L2045`). `sl_formataddr()` (`app/email_utils.py:L1501`) wraps `email.utils.formataddr` with `Header(addr, "utf-8")` to yield RFC-2047 form. Here the value is pure ASCII, so **no** `=?utf-8?...?=` encoding appears; a non-ASCII display name would be RFC-2047 encoded. (Had the contact carried a display name distinct from its email, the `AT` branch would render `"<Name> - spoofedemailsource at gmail.com" <reply_email>` — `app/models.py:L2028-L2033`.)
 
 ### The reverse-alias (`reply_email`) address format — observed
 
@@ -523,7 +545,7 @@ Stable structure across runs: the log message text, the `E200`/`E515` status str
 
 **Canonical runtime.** All values were produced against the canonical stack — Python 3.10.18 and **PostgreSQL 13.23 on port `15432`** (matching `postgres:13` at `.github/workflows/main.yml:L47` and `DB_URI` at `tests/test.env:L17`), with SQLAlchemy 1.3.24, Flask 1.1.2, aiosmtpd 1.4.2, arrow 0.16.0 (see the `RUNTIME` block). No non-canonical substitutions were made.
 
-**DB left unchanged / clean-up.** As detailed in "Environment & method," the `flask_client` fixture's `transaction.rollback()` leaves the DB rows unchanged (verified `0` rows after `run1`), while the non-transactional autoincrement sequences advance. The freshly-committed IDs/timestamps were read live during each run; the throwaway PostgreSQL 13 instance was then dropped entirely, and the temporary harness deleted, so both the repository and the environment are left in their original state.
+**DB left unchanged / clean-up.** As detailed in "Environment & method," the `flask_client` fixture's `transaction.rollback()` does **not** roll back rows once `handle()` has committed them — the `Session` is bound directly to the module-level `connection` with no `SAVEPOINT` restart (`app/db.py:L12,L14`; `tests/conftest.py:L61,L74-L77`), so the rows a run commits **persist** after teardown (verified at runtime — see the probe in "Environment & method"), while the non-transactional autoincrement sequences advance. The freshly-committed IDs/timestamps were read live during each run. The environment was left clean **solely** by dropping the throwaway PostgreSQL instance afterward (re-confirming the tables were empty) and deleting the temporary harness, so both the repository and the environment are left in their original state.
 
 **Adjacent branches noted as context only (not exercised as answers).** These are alternative outcomes the code can produce but are outside the two Q1 conditions asked about:
 
