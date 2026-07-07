@@ -284,7 +284,7 @@ connect_ex = 0 (0 = listening)
 
 ```bash
 $ curl -sSi http://localhost:7777/ | grep -E '^HTTP/|^Location:'
-HTTP/1.1 302 FOUND
+HTTP/1.0 302 FOUND
 Location: http://localhost:7777/auth/login
 $ curl -s -o /dev/null -w "%{http_code}\n" http://localhost:7777/auth/login
 200
@@ -292,7 +292,7 @@ $ curl -s -o /dev/null -w "%{http_code}\n" -L http://localhost:7777/        # fo
 200
 ```
 
-The root path (`GET /`) is the unauthenticated `index` redirect to `auth.login`; the returned login HTML is `templates/auth/login.html` (page `<title>` is `Login | SimpleLogin`, with an "Email address" label, a password field, and a hidden `csrf_token` input). **Observed accessibility note (source unchanged):** Chrome DevTools flags the login form with the advisory *"No label associated with a form field"* and *"An element doesn't have an autocomplete attribute"* (the visible label text lives in surrounding markup, not a formal `<label for=…>` association, and the password input has no `autocomplete`). These are pre-existing characteristics of `templates/auth/login.html` — reported here (not fixed) because this task is strictly read-only; they are DevTools *issues/advisories*, **not** JavaScript console errors, and do not affect the auth flow. Logging in with the seeded demo account **`john@wick.com` / `password`** via the **real** `POST /auth/login` (CSRF token scraped from the preceding GET) 302-redirects to the dashboard:
+The status line reads **`HTTP/1.0`** because the documented `python server.py` invocation (§1.3, §2.1) runs the Werkzeug **development** server, whose `WSGIRequestHandler.protocol_version` defaults to `HTTP/1.0`; the production `gunicorn wsgi:app` entry (§1.3) instead responds **`HTTP/1.1 302 FOUND`** for the identical redirect (both were launched and re-probed to confirm). The redirect `Location`, the `/auth/login` 200, and the followed-redirect 200 are identical under either server — only the protocol-version token differs. The root path (`GET /`) is the unauthenticated `index` redirect to `auth.login`; the returned login HTML is `templates/auth/login.html` (page `<title>` is `Login | SimpleLogin`, with an "Email address" label, a password field, and a hidden `csrf_token` input). **Observed accessibility note (source unchanged):** Chrome DevTools flags the login form with the advisory *"No label associated with a form field"* and *"An element doesn't have an autocomplete attribute"* (the visible label text lives in surrounding markup, not a formal `<label for=…>` association, and the password input has no `autocomplete`). These are pre-existing characteristics of `templates/auth/login.html` — reported here (not fixed) because this task is strictly read-only; they are DevTools *issues/advisories*, **not** JavaScript console errors, and do not affect the auth flow. Logging in with the seeded demo account **`john@wick.com` / `password`** via the **real** `POST /auth/login` (CSRF token scraped from the preceding GET) 302-redirects to the dashboard:
 
 ```
 GET  /auth/login                                            -> HTTP 200  (title "Login | SimpleLogin")
