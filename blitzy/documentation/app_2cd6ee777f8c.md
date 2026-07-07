@@ -197,7 +197,7 @@ The banner prints **twice** because the Flask dev server's auto-reloader spawns 
 
 ### 2.2 Build stamp (default/canonical build value)
 
-**Direct answer:** the default local build reports `SHA1 = "dev"`, so the webapp's `VERSION` is `"dev"` and the (disabled) Sentry release would be `"app@dev"`. **Reasoning:** `app/build_info.py:1-2` hard-codes `SHA1 = "dev"` and `BUILD_TIME = "1652365083"` for non-CI builds; `server.py:50` imports `SHA1`, `server.py:418` sets `VERSION = SHA1` (injected into templates), and `server.py:115` computes `release=f"app@{SHA1}"` for Sentry (guarded by `if SENTRY_DSN`, `server.py:112`, which is unset locally so Sentry is not initialized).
+**Direct answer:** the default local build reports `SHA1 = "dev"`, so the webapp's `VERSION` is `"dev"` and the (disabled) Sentry release would be `"app@dev"`. **Reasoning:** `app/build_info.py:1-2` hard-codes `SHA1 = "dev"` and `BUILD_TIME = "1652365083"` for non-CI builds; `server.py:50` imports `SHA1`, `server.py:418` sets `VERSION = SHA1` (injected into templates), and `server.py:115` computes `release=f"app@{SHA1}"` for Sentry (guarded by `if SENTRY_DSN`, `server.py:111`, which is unset locally so Sentry is not initialized).
 
 **Observed** (evaluated in the app context):
 
@@ -218,7 +218,7 @@ dev 1652365083
 2026-07-07 01:18:32,455 - SL - DEBUG - 12925 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET /auth/login ImmutableMultiDict([]) 200, takes 0.10395097732543945
 ```
 
-**Honest correction #2 (observed overrides an AAP anchor).** `add_sl_domains()` and `add_proton_partner()` are **not** invoked during `create_app`/`init_extensions` on webapp startup; they live in the `@app.cli.command("dummy-data")` handler (`server.py` ~L490-497) and in `init_app.py`'s `__main__` block (`init_app.py:69`). Consequently the **webapp** log contains **no** "SL domain" lines. Running the init routines directly through their real entry point (`python init_app.py`) shows them, grounded in `init_app.py`:
+**Honest correction #2 (observed overrides an AAP anchor).** `add_sl_domains()` and `add_proton_partner()` are **not** invoked during `create_app`/`init_extensions` on webapp startup; both are invoked in the `@app.cli.command("dummy-data")` handler (`server.py:490-497`, which calls `add_sl_domains()` at `server.py:496` and `add_proton_partner()` at `server.py:497`), while `init_app.py`'s `__main__` block (`init_app.py:69-73`) runs only `load_pgp_public_keys()` and `add_sl_domains()` (not `add_proton_partner()`). Consequently the **webapp** log contains **no** "SL domain" lines. Running the init routines directly through their real entry point (`python init_app.py`) shows them, grounded in `init_app.py`:
 
 ```
 2026-07-07 01:17:54,950 - SL - DEBUG - 12872 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
@@ -795,4 +795,4 @@ $ git status --porcelain -uall
 | Edge: wrong hCaptcha (inferred) | §5.8 |
 | Cleanup + clean `git status` | §6 |
 
-**Honest corrections vs. expectation (surfaced during observation):** (1) the Werkzeug "Running on …" line is suppressed by `app/log.py:70-71`, so HTTP readiness is confirmed via reachability + the `after_request` log at `server.py:284` (§2.3); (2) `add_sl_domains()`/`add_proton_partner()` are **not** called on webapp startup — they run in the `dummy-data` CLI command and `init_app.py`'s `__main__`, so the webapp log has no "SL domain" lines (§2.3).
+**Honest corrections vs. expectation (surfaced during observation):** (1) the Werkzeug "Running on …" line is suppressed by `app/log.py:70-71`, so HTTP readiness is confirmed via reachability + the `after_request` log at `server.py:284` (§2.3); (2) `add_sl_domains()`/`add_proton_partner()` are **not** called on webapp startup — both run in the `dummy-data` CLI command (`server.py:496-497`), while `init_app.py`'s `__main__` runs only `load_pgp_public_keys()` and `add_sl_domains()`, so the webapp log has no "SL domain" lines (§2.3).
