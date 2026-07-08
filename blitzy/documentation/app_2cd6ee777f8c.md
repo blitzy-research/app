@@ -26,9 +26,11 @@ All observations below were captured under the repository's own canonical config
   `CONFIG` environment variable and resolved at `app/config.py:L65-L69`
   (`config_file = os.environ.get("CONFIG")` → `print("load config file", config_file)` →
   `load_dotenv(...)`).
-- **Runtime**: **Python 3.10.20** — the canonical pin. `Dockerfile:L8` declares
-  `FROM python:3.10`, the CI matrix pins `python-version: ["3.10"]` at
-  `.github/workflows/main.yml:L40`, and `pyproject.toml:L61` declares `python = "^3.10"`.
+- **Runtime**: **Python 3.10.18** — observed via `python --version` in the canonical
+  warmed image. `Dockerfile:L8` declares `FROM python:3.10`, a **floating** tag whose
+  exact patch version resolves by build date (so it may differ across builds); the CI
+  matrix pins `python-version: ["3.10"]` at `.github/workflows/main.yml:L40`, and
+  `pyproject.toml:L61` declares `python = "^3.10"`.
 - **Schema**: applied with `CONFIG=tests/test.env alembic upgrade head`, producing
   **77 tables** (Alembic head `32f25cbf12f6`).
 - **PostgreSQL**: reachable on port **15432**, from
@@ -516,41 +518,62 @@ Stop PostgreSQL, then attempt to import/start the app and capture stderr:
 ### Verbatim observed output (both layers)
 
 ```
-psycopg2.OperationalError: connection to server at "localhost" (127.0.0.1), port 15432 failed: Connection refused
+psycopg2.OperationalError: connection to server at "localhost" (::1), port 15432 failed: Connection refused
 	Is the server running on that host and accepting TCP/IP connections?
-connection to server at "localhost" (::1), port 15432 failed: Cannot assign requested address
+connection to server at "localhost" (127.0.0.1), port 15432 failed: Connection refused
 	Is the server running on that host and accepting TCP/IP connections?
 
-sqlalchemy.exc.OperationalError: (psycopg2.OperationalError) connection to server at "localhost" (127.0.0.1), port 15432 failed: Connection refused ... (Background on this error at: http://sqlalche.me/e/13/e3q8)
+sqlalchemy.exc.OperationalError: (psycopg2.OperationalError) connection to server at "localhost" (::1), port 15432 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
+connection to server at "localhost" (127.0.0.1), port 15432 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
+
+(Background on this error at: http://sqlalche.me/e/13/e3q8)
 ```
 
 ### Why (cause → effect)
 
 The low-level driver error is `psycopg2.OperationalError`: the connect is attempted
-against `localhost`, which resolves to both IPv4 `127.0.0.1` (**Connection refused** — no
-listener on port `15432`) and IPv6 `::1` (**Cannot assign requested address**). SQLAlchemy
-then wraps that driver exception into `sqlalchemy.exc.OperationalError` (note the
+against `localhost`, which resolves to **both** IPv6 `::1` and IPv4 `127.0.0.1` — in that
+order, because `/etc/hosts` lists `::1 localhost` and the resolver returns the IPv6 entry
+first. In the canonical environment **both** address attempts fail with **Connection
+refused**: there is no listener on port `15432`, and because `::1` is assigned to the
+loopback interface (`/proc/net/if_inet6` shows `::1` on `lo`), `connect(::1:15432)` returns
+`ECONNREFUSED` ("Connection refused") rather than `EADDRNOTAVAIL`. SQLAlchemy then wraps
+that driver exception into `sqlalchemy.exc.OperationalError` (note the
 `(psycopg2.OperationalError)` prefix and the `http://sqlalche.me/e/13/e3q8` background
 link — the `13` marks SQLAlchemy 1.3.x). Because the failing `engine.connect()` call runs
 at **module import** (`app/db.py:L12`) rather than inside a request handler or inside
 `create_app()`, the failure is **fatal to process startup** — the interpreter cannot even
 finish importing `server`, so no HTTP server is ever started and no request is ever served.
 
+The **per-address errno and the address ordering are environment-dependent** — they hinge
+on whether `::1` is bound to the loopback interface and on the `localhost` resolution
+order. On a host where `::1` is **not** assigned to loopback, the IPv6 attempt instead
+returns **`Cannot assign requested address`** (`EADDRNOTAVAIL`) and IPv4 `127.0.0.1` may be
+listed first. What is **invariant** across environments is the **two-layer
+`psycopg2.OperationalError` → `sqlalchemy.exc.OperationalError`** wrapping, the **eager
+break at `app/db.py:L12` at import time**, the port `15432`, and the
+`sqlalche.me/e/13/e3q8` link.
+
 
 ---
 
 ## Environment caveats
 
-Two deviations from the strict canonical pins existed in the investigation environment.
+Two environment caveats about dependency and service versions are recorded here for
+reproducibility.
 **Neither affects any of the four answers above** — none of them touches the port, health,
 alias, or database-startup code paths.
 
-- **`cbor2` substitution.** The lockfile pins `cbor2==5.2.0`, whose source distribution is
-  unusable in this environment: its `setuptools_scm`-derived version resolves to `0.0.0`,
-  and the sdist is rejected by both pip and uv. The nearest wheeled release,
-  `cbor2==5.4.6`, was substituted. `cbor2` is used only for FIDO/WebAuthn paths and is
-  **not** exercised by the port, health, alias, or database-startup code paths. `pip check`
-  reported "No broken requirements found."
+- **`cbor2`.** The canonical warmed image ships the **exact lockfile pin `cbor2==5.2.0`**
+  (verified: `import cbor2` succeeds and a `dumps`/`loads` round-trip works), so **no
+  substitution is needed** in this environment. In a *from-scratch* Poetry build the
+  `cbor2==5.2.0` sdist can instead fail to build — its `setuptools_scm`-derived version
+  resolves to `0.0.0` and the sdist is rejected by pip/uv — in which case the nearest
+  wheeled release `cbor2==5.4.6` is substituted; that scenario does **not** apply to the
+  canonical warmed image. Either way, `cbor2` is used only for FIDO/WebAuthn paths and is
+  **not** exercised by the port, health, alias, or database-startup code paths.
 - **PostgreSQL version.** The investigation used **PostgreSQL 15.13** (on port `15432` to
   match the unmodified `tests/test.env` `DB_URI` — `SHOW server_version` returned
   `15.13 (Debian 15.13-0+deb12u1)`), whereas the CI canonical version is **PostgreSQL 13**
@@ -571,8 +594,8 @@ evidence, sibling variant, and causal reason:
 - [x] **Alias JSON — both endpoints.** `201` JSON (verbatim 17-key body) from `POST /api/alias/random/new` (`app/api/views/new_random_alias.py:L21`, return tuple `L114-L117`, shape from `serialize_alias_info_v2` `app/api/serializer.py:L55-L93`). Sibling `POST /api/v3/alias/custom/new` (`app/api/views/new_custom_alias.py:L115`, handler `L119`) returns the identical shape; observed `email='my-custom-prefix.b7n3s9wh@sl.local'`.
 - [x] **Table name.** `alias` — `Alias.__tablename__ = "alias"` at `app/models.py:L1470`; historical `gen_email` → `alias` rename observed in the live PostgreSQL catalog (sequence `gen_email_id_seq`, constraint `gen_email_pkey` — these auto-generated names are **not** in `app/models.py`; table created as `gen_email` at `migrations/versions/5e549314e1e2_.py:L92-L101`, renamed at `migrations/versions/2020_031711_e9395fe234a4_.py:L20-L21`).
 - [x] **Persisted values.** The `id=2` row columns (`email`, `user_id=1`, `mailbox_id=1`, `enabled=True`, `note`, `name=None`, `created_at=<Arrow 2026-07-07T22:19:53.776515+00:00>`, `updated_at=None`, `automatic_creation=False`, `pinned=False`, `disable_pgp=False`), mapped to the JSON fields. `mailbox_id=1` resolved from `user.default_mailbox_id` (`app/models.py:L1753`), created by `User.create` (`app/models.py:L611-L613`).
-- [x] **PostgreSQL-down error.** Two-layer verbatim error: `psycopg2.OperationalError` (IPv4 `127.0.0.1` Connection refused; IPv6 `::1` Cannot assign requested address; port `15432`) wrapped by `sqlalchemy.exc.OperationalError` (`http://sqlalche.me/e/13/e3q8`).
+- [x] **PostgreSQL-down error.** Two-layer verbatim error: `psycopg2.OperationalError` (in the canonical environment **both** IPv6 `::1` and IPv4 `127.0.0.1` → Connection refused, `::1` listed first; port `15432`) wrapped by `sqlalchemy.exc.OperationalError` (`http://sqlalche.me/e/13/e3q8`). The per-address errno/ordering is environment-dependent (`::1` → `Cannot assign requested address` on a host where `::1` is not bound to loopback); the two-layer wrapping and the eager break at `app/db.py:L12` at import time are invariant.
 - [x] **Break location.** `app/db.py:L12` `connection = engine.connect()` (eager, import-time), reached via `server.py:L31` → `app/admin_model.py:L11` → `app/models.py:L32` → `app/db.py:L12`.
 - [x] **Both alias endpoints, both server entry points, happy + error paths.** Random + custom alias endpoints; dev + gunicorn entry points; health/alias happy paths + PostgreSQL-down error path — all exercised.
-- [x] **Both environment caveats disclosed.** `cbor2==5.2.0` → `5.4.6` substitution; PostgreSQL `15.13` vs CI `13` (`.github/workflows/main.yml:L47`) — neither affects the four answers.
+- [x] **Both environment caveats disclosed.** `cbor2==5.2.0` is present as the exact lockfile pin in the canonical warmed image (no substitution needed; a from-scratch build may substitute `5.4.6`); PostgreSQL `15.13` vs CI `13` (`.github/workflows/main.yml:L47`) — neither affects the four answers.
 
