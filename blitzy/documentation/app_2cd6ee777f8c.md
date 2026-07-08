@@ -37,9 +37,11 @@ All observations below were captured under the repository's own canonical config
   `tests/test.env:L78` `MEM_STORE_URI=redis://localhost`.
 - **Domains / URL**: `EMAIL_DOMAIN=sl.local` (`tests/test.env:L8`) and
   `URL=http://localhost` (`tests/test.env:L2`).
-- **Canonical dependency versions** (from `poetry.lock`): Flask `1.1.2`, Werkzeug
-  `1.0.1`, gunicorn `20.0.4`, Flask-SQLAlchemy `2.5.1`, SQLAlchemy `1.3.24`,
-  psycopg2-binary `2.9.3`, arrow `0.16.0`.
+- **Canonical dependency versions** (each pinned in `poetry.lock` at the cited line):
+  Flask `1.1.2` (`poetry.lock:L911`), Werkzeug `1.0.1` (`poetry.lock:L3424`), gunicorn
+  `20.0.4` (`poetry.lock:L1448`), Flask-SQLAlchemy `2.5.1` (`poetry.lock:L1076`),
+  SQLAlchemy `1.3.24` (`poetry.lock:L3054`), psycopg2-binary `2.9.3`
+  (`poetry.lock:L2221`), arrow `0.16.0` (`poetry.lock:L202`).
 
 Canonical invocations used throughout:
 
@@ -76,12 +78,17 @@ genuinely bound (proven by the kernel socket table below). This is caused by the
   **`server.py:L588`**. It is entered via the module guard
   `if __name__ == "__main__": local_main()` at **`server.py:L598-L599`**.
 - Because **no `host` argument** is passed to `app.run(...)`, Flask defaults the bind host
-  to loopback. **[Confirmed by web research]** Flask's own `app.run()` implementation
-  resolves an unspecified host with `"if host is None: host = '127.0.0.1'"` (Flask source,
-  `pallets/flask`), which is why the dev server binds `127.0.0.1`. Binding `0.0.0.0`
-  instead, per the Flask documentation, "This tells your operating system to listen on all
-  public IPs." — which is exactly what the gunicorn production invocation does with its
-  explicit `-b 0.0.0.0:7777`.
+  to loopback. This is grounded in the **installed Flask `1.1.2` source** in the canonical
+  environment (`site-packages/flask/app.py`): the `run()` docstring documents the default at
+  `flask/app.py:L918-L921` — "*Defaults to `'127.0.0.1'` or the host in the `SERVER_NAME`
+  config variable if present*" — and the resolution logic is `_host = "127.0.0.1"` at
+  `flask/app.py:L969` followed by `host = host or sn_host or _host` at `flask/app.py:L977`.
+  With `host=None` (none passed) and no `SERVER_NAME` host configured, that expression
+  evaluates to `"127.0.0.1"`, which is why the dev server binds loopback. Binding `0.0.0.0`
+  instead, per the official Flask documentation, "This tells your operating system to listen
+  on all public IPs" (Flask Quickstart,
+  <https://flask.palletsprojects.com/en/stable/quickstart/>) — which is exactly what the
+  gunicorn production invocation does with its explicit `-b 0.0.0.0:7777`.
 - **Production entry point**: `Dockerfile:L47`
   `CMD ["gunicorn","wsgi:app","-b","0.0.0.0:7777","-w","2","--timeout","15"]`; the exposed
   port is `Dockerfile:L44` `EXPOSE 7777`; the canonical Python is `Dockerfile:L8`
@@ -250,17 +257,19 @@ exclusion list, so it does produce one; that contrast is the observed proof.
 
 ### Sibling monitor endpoints (for completeness)
 
-The monitor blueprint is registered at `app/monitor/base.py`
+The monitor blueprint is registered at `app/monitor/base.py:L3`
 (`monitor_bp = Blueprint(name="monitor", import_name=__name__, url_prefix="/")`), and its
 handlers live in `app/monitor/views.py`:
 
-- `GET /live -> b'live'` — handler `def live(): return "live"`
-  (route `@monitor_bp.route("/live")`).
-- `GET /git -> b'dev'` — handler `def git_sha1(): return SHA1`
-  (route `@monitor_bp.route("/git")`); the build SHA1 defaults to `dev` in a local,
-  non-CI build (`SHA1` imported from `app.build_info`).
-- `/exception` — deliberately raises an exception (route `@monitor_bp.route("/exception")`),
-  used to exercise error reporting.
+- `GET /live -> b'live'` — handler `def live(): return "live"` at
+  `app/monitor/views.py:L10-L12` (route `@monitor_bp.route("/live")`).
+- `GET /git -> b'dev'` — handler `def git_sha1(): return SHA1` at
+  `app/monitor/views.py:L5-L7` (route `@monitor_bp.route("/git")`); the build SHA1 defaults
+  to `dev` in a local, non-CI build (`SHA1` imported from `app.build_info` at
+  `app/monitor/views.py:L1`).
+- `/exception` — deliberately raises an exception, handler `def test_exception():` at
+  `app/monitor/views.py:L15-L17` (route `@monitor_bp.route("/exception")`), used to
+  exercise error reporting.
 
 
 ---
@@ -287,9 +296,11 @@ Creating an alias requires an authenticated user, an API key, and a default mail
 at `app/models.py:L611` it calls `Mailbox.create(user_id=..., email=..., verified=True)`,
 and at `app/models.py:L613` it sets `user.default_mailbox_id = mb.id`. An API key is
 created via `ApiKey.create` (`app/models.py:L2365`). These mirror the canonical test
-seeding helpers `create_new_user` / `random_token` in `tests/utils.py` and the
-`create_app` fixture in `tests/conftest.py`. This is why the seeded user already has a
-usable default mailbox (`id=1`) when the alias is created.
+seeding helpers `create_new_user` (`tests/utils.py:L17-L31`) and `random_token`
+(`tests/utils.py:L66-L67`), and the `create_app` usage in `tests/conftest.py`
+(`from server import create_app` at `tests/conftest.py:L20`; `app = create_app()` at
+`tests/conftest.py:L23`). This is why the seeded user already has a usable default mailbox
+(`id=1`) when the alias is created.
 
 ### Authentication
 
@@ -407,11 +418,52 @@ invariant.
 
 ### Historical schema rename (observed)
 
-The real `alias` schema reveals a historical rename from `gen_email` → `alias`: the primary
-key defaults from `nextval('gen_email_id_seq')` and the primary-key constraint is named
-`gen_email_pkey` (`app/models.py`). The table was historically named `gen_email` and later
-renamed to `alias`, which is why the sequence and constraint retain the `gen_email_*`
-names. This is disclosed as an observed schema detail.
+The live `alias` schema reveals a historical rename from `gen_email` → `alias`: the `id`
+primary key still defaults from the sequence `gen_email_id_seq`, and the primary-key
+constraint is still named `gen_email_pkey`, even though the table itself is now named
+`alias` (`Alias.__tablename__ = "alias"` at `app/models.py:L1470`). These `gen_email_*`
+names are **not** written anywhere in `app/models.py`; they are auto-generated by
+PostgreSQL and were read directly from the running database catalog.
+
+Exact command (run against the live schema on PostgreSQL `15.13`):
+
+```
+PGPASSWORD=test psql -h localhost -p 15432 -U test -d test \
+  -c "SELECT pg_get_serial_sequence('alias','id') AS id_sequence;" \
+  -c "SELECT conname AS pk_constraint FROM pg_constraint WHERE conrelid='alias'::regclass AND contype='p';" \
+  -c "SELECT column_name, column_default FROM information_schema.columns WHERE table_name='alias' AND column_name='id';"
+```
+
+Verbatim observed output:
+
+```
+       id_sequence
+-------------------------
+ public.gen_email_id_seq
+(1 row)
+
+ pk_constraint
+----------------
+ gen_email_pkey
+(1 row)
+
+ column_name |            column_default
+-------------+---------------------------------------
+ id          | nextval('gen_email_id_seq'::regclass)
+(1 row)
+```
+
+Why (cause → effect): the table was **created** as `gen_email` — with a serial `id` column
+and a primary key — at `migrations/versions/5e549314e1e2_.py:L92-L101`
+(`op.create_table('gen_email', sa.Column('id', sa.Integer(), autoincrement=True,
+nullable=False), ..., sa.PrimaryKeyConstraint('id'), ...)`). PostgreSQL derives the implicit
+object names from the table name at creation time, which is what produced the sequence
+`gen_email_id_seq` (backing the serial `id`) and the constraint `gen_email_pkey`. A later
+migration, `migrations/versions/2020_031711_e9395fe234a4_.py:L20-L21`
+(`def upgrade(): op.rename_table("gen_email", "alias")`), renames **only the table** — not
+its owned sequence, nor its primary-key constraint — so both retain their original
+`gen_email_*` names, exactly as observed above. This is disclosed as an observed schema
+detail.
 
 ### Why (cause → effect)
 
@@ -499,9 +551,10 @@ alias, or database-startup code paths.
   `cbor2==5.4.6`, was substituted. `cbor2` is used only for FIDO/WebAuthn paths and is
   **not** exercised by the port, health, alias, or database-startup code paths. `pip check`
   reported "No broken requirements found."
-- **PostgreSQL version.** The investigation used **PostgreSQL 16.14** (on port `15432` to
-  match the unmodified `tests/test.env` `DB_URI`), whereas the CI canonical version is
-  **PostgreSQL 13** (`.github/workflows/main.yml`). The observed alias schema, JSON
+- **PostgreSQL version.** The investigation used **PostgreSQL 15.13** (on port `15432` to
+  match the unmodified `tests/test.env` `DB_URI` — `SHOW server_version` returned
+  `15.13 (Debian 15.13-0+deb12u1)`), whereas the CI canonical version is **PostgreSQL 13**
+  (`.github/workflows/main.yml:L47` `image: postgres:13`). The observed alias schema, JSON
   responses, and the Q4 error text are not sensitive to this difference.
 
 ---
@@ -515,11 +568,11 @@ evidence, sibling variant, and causal reason:
 - [x] **Startup logs.** Gunicorn INFO lines (`Starting gunicorn 20.0.4`, `Listening at: http://0.0.0.0:7777`, `Using worker: sync`, two `Booting worker` lines) + the SL bootstrap block (`app/config.py:L68,L80,L262,L328`; `app/log.py:L67`; `app/utils.py:L17`). Werkzeug "Running on" banner **absent** — cause: `werkzeug` logger disabled at `app/log.py:L70-L71`.
 - [x] **Health body.** Exactly `success` (raw ASCII, no trailing newline) — `server.py:L213-L215` `return "success", 200`. Evidence: `body=b'success'`.
 - [x] **Health status + Content-Type.** `200` with `Content-Type: text/html; charset=utf-8` — observed `status=200 content_type='text/html; charset=utf-8'`. `/health` excluded from `after_request` timing at `server.py:L281` (timing `LOG.d` at `server.py:L284`), verified by contrast with `/live`.
-- [x] **Alias JSON — both endpoints.** `201` JSON (verbatim 18-key body) from `POST /api/alias/random/new` (`app/api/views/new_random_alias.py:L21`, return tuple `L114-L117`, shape from `serialize_alias_info_v2` `app/api/serializer.py:L55-L93`). Sibling `POST /api/v3/alias/custom/new` (`app/api/views/new_custom_alias.py:L115`, handler `L119`) returns the identical shape; observed `email='my-custom-prefix.b7n3s9wh@sl.local'`.
-- [x] **Table name.** `alias` — `Alias.__tablename__ = "alias"` at `app/models.py:L1470`; historical `gen_email` → `alias` rename (PK default `nextval('gen_email_id_seq')`, constraint `gen_email_pkey`).
+- [x] **Alias JSON — both endpoints.** `201` JSON (verbatim 17-key body) from `POST /api/alias/random/new` (`app/api/views/new_random_alias.py:L21`, return tuple `L114-L117`, shape from `serialize_alias_info_v2` `app/api/serializer.py:L55-L93`). Sibling `POST /api/v3/alias/custom/new` (`app/api/views/new_custom_alias.py:L115`, handler `L119`) returns the identical shape; observed `email='my-custom-prefix.b7n3s9wh@sl.local'`.
+- [x] **Table name.** `alias` — `Alias.__tablename__ = "alias"` at `app/models.py:L1470`; historical `gen_email` → `alias` rename observed in the live PostgreSQL catalog (sequence `gen_email_id_seq`, constraint `gen_email_pkey` — these auto-generated names are **not** in `app/models.py`; table created as `gen_email` at `migrations/versions/5e549314e1e2_.py:L92-L101`, renamed at `migrations/versions/2020_031711_e9395fe234a4_.py:L20-L21`).
 - [x] **Persisted values.** The `id=2` row columns (`email`, `user_id=1`, `mailbox_id=1`, `enabled=True`, `note`, `name=None`, `created_at=<Arrow 2026-07-07T22:19:53.776515+00:00>`, `updated_at=None`, `automatic_creation=False`, `pinned=False`, `disable_pgp=False`), mapped to the JSON fields. `mailbox_id=1` resolved from `user.default_mailbox_id` (`app/models.py:L1753`), created by `User.create` (`app/models.py:L611-L613`).
 - [x] **PostgreSQL-down error.** Two-layer verbatim error: `psycopg2.OperationalError` (IPv4 `127.0.0.1` Connection refused; IPv6 `::1` Cannot assign requested address; port `15432`) wrapped by `sqlalchemy.exc.OperationalError` (`http://sqlalche.me/e/13/e3q8`).
 - [x] **Break location.** `app/db.py:L12` `connection = engine.connect()` (eager, import-time), reached via `server.py:L31` → `app/admin_model.py:L11` → `app/models.py:L32` → `app/db.py:L12`.
 - [x] **Both alias endpoints, both server entry points, happy + error paths.** Random + custom alias endpoints; dev + gunicorn entry points; health/alias happy paths + PostgreSQL-down error path — all exercised.
-- [x] **Both environment caveats disclosed.** `cbor2==5.2.0` → `5.4.6` substitution; PostgreSQL `16.14` vs CI `13` — neither affects the four answers.
+- [x] **Both environment caveats disclosed.** `cbor2==5.2.0` → `5.4.6` substitution; PostgreSQL `15.13` vs CI `13` (`.github/workflows/main.yml:L47`) — neither affects the four answers.
 
