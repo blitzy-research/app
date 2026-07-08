@@ -16,12 +16,12 @@ All reported values below were produced in the **canonical Python 3.10 build** d
 
 | Item | Value |
 |------|-------|
-| Canonical image | `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_simple-login_app_1.0` (container name `sl-app`) |
+| Canonical image | `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_simple-login_app_1.0` (container name `sl_app`) |
 | Interpreter | **Python 3.10.18** (canonical) |
 | App entry point | `wsgi:app` (`wsgi.py` exposes `app = create_app()`) |
 | Web server | `gunicorn 20.0.4`, `--bind 127.0.0.1:7788 --workers 1 --timeout 120` |
 | Session backend | Redis 7 at `redis://localhost` (`MEM_STORE_URI`) |
-| Database | PostgreSQL 15 at `postgresql://test:test@localhost:5432/test` (`DB_URI`) |
+| Database | PostgreSQL 15 at `postgresql://test:test@localhost:15432/test` (`DB_URI`) |
 | Secret | `FLASK_SECRET=secret` (a **local test value**, not a real credential — from the project's `tests/test.env` template) |
 | Seed user | `john@wick.com` / `password` (activated admin; created by `flask dummy-data`) |
 | Sentry | `SENTRY_DSN` **unset** in the canonical local build &rarr; Sentry never initialized |
@@ -29,16 +29,16 @@ All reported values below were produced in the **canonical Python 3.10 build** d
 ### Canonical image identity
 
 ```console
-$ docker inspect --format '{{.Config.Image}}' sl-app
+$ docker inspect --format '{{.Config.Image}}' sl_app
 ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_simple-login_app_1.0
 ```
 
 ### Canonical interpreter
 
 ```console
-$ docker exec sl-app bash -lc 'source /app/venv/bin/activate && python --version'
+$ docker exec sl_app bash -lc 'source /app/venv/bin/activate && python --version'
 Python 3.10.18
-$ docker exec sl-app bash -lc 'source /app/venv/bin/activate && python -c "import sys; print(sys.executable)"'
+$ docker exec sl_app bash -lc 'source /app/venv/bin/activate && python -c "import sys; print(sys.executable)"'
 /app/venv/bin/python
 ```
 
@@ -79,7 +79,7 @@ INFO  [alembic.runtime.migration] Will assume transactional DDL.
 The login user is created by the canonical seed command **`flask dummy-data`**. It was run during setup; re-running it now shows the seed already exists (a genuine `UniqueViolation` on `john@wick.com`), which is exactly why the login flow below succeeds. The complete, unedited output of the exact command follows.
 
 ```console
-$ docker exec sl-app bash -lc 'set -a && source /app/slenv.sh && set +a && source /app/venv/bin/activate && cd /app && flask dummy-data'
+$ docker exec sl_app bash -lc 'source /app/venv/bin/activate && cd /app && CONFIG=tests/test.env FLASK_APP=server.py flask dummy-data'
 >>> URL: http://localhost
 WARNING: Use a temp directory for GNUPGHOME /tmp/ybkjghcyneqbttjwwklg
 Upload files to local dir
@@ -172,21 +172,21 @@ DETAIL:  Key (email)=(john@wick.com) already exists.
 **Seed-user verification (SQL):**
 
 ```console
-$ docker exec sl-app bash -lc 'set -a && source /app/slenv.sh && set +a && psql "$DB_URI" -tAc "SELECT id,email,activated,is_admin FROM users WHERE email='"'"'john@wick.com'"'"'"'
+$ docker exec sl_app bash -lc 'psql "postgresql://test:test@localhost:15432/test" -tAc "SELECT id,email,activated,is_admin FROM users WHERE email='"'"'john@wick.com'"'"'"'
 395|john@wick.com|t|t
 ```
 
 i.e. user id `395`, `activated = t`, `is_admin = t`.
 
-### Runtime environment (`/app/slenv.sh`)
+### Runtime environment (`CONFIG=tests/test.env`)
 
-The app is launched with the canonical environment sourced from `/app/slenv.sh`: `FLASK_SECRET=secret`, `MEM_STORE_URI=redis://localhost`, `DB_URI=postgresql://test:test@localhost:5432/test`, `URL=http://localhost` (so `SESSION_COOKIE_SECURE` is **not** set — plain HTTP, matching `server.py:160-161`), `FLASK_APP=server.py`, `DISABLE_RATE_LIMIT=1`, `EVENT_WEBHOOK_DISABLE=1`.
+The app is launched with the canonical environment selected by **`CONFIG=tests/test.env`** — the repository-tracked dotenv that `app/config.py:65` loads (`config_file = os.environ.get("CONFIG")`). It supplies `FLASK_SECRET=secret`, `MEM_STORE_URI=redis://localhost`, `DB_URI=postgresql://test:test@localhost:15432/test`, and `URL=http://localhost` (so `SESSION_COOKIE_SECURE` is **not** set — plain HTTP, matching `server.py:160-161`). Two variables the session/CLI paths need are **not** in that dotenv and are therefore set explicitly on the relevant command lines below: `FLASK_APP=server.py` (for the `flask dummy-data` seed command) and `PYTHONPATH=/app` (so a helper invoked as `python /tmp/<script>.py` can `import wsgi`/`app.*`; an inline `python -c` does not need it because the current directory is already on `sys.path`). `tests/test.env` is the same template the project uses for its test/CI runs, and `FLASK_SECRET=secret` is a **local test value**, not a real credential.
 
 ### Server invocation (canonical, detached; stdout+stderr captured for the R4 log-surface inspection)
 
 ```console
-$ docker exec sl-app bash -lc 'set -a && source /app/slenv.sh && set +a && source /app/venv/bin/activate && cd /app && nohup gunicorn --bind 127.0.0.1:7788 --workers 1 --timeout 120 wsgi:app > /tmp/sl_server.log 2>&1 &'
-$ sleep 6 && docker exec sl-app bash -lc 'sed -n "1,9p" /tmp/sl_server.log'
+$ docker exec sl_app bash -lc 'source /app/venv/bin/activate && cd /app && CONFIG=tests/test.env nohup gunicorn --bind 127.0.0.1:7788 --workers 1 --timeout 120 wsgi:app > /tmp/sl_server.log 2>&1 &'
+$ sleep 6 && docker exec sl_app bash -lc 'sed -n "1,9p" /tmp/sl_server.log'
 [2026-07-08 06:43:39 +0000] [17154] [INFO] Starting gunicorn 20.0.4
 [2026-07-08 06:43:39 +0000] [17154] [INFO] Listening at: http://127.0.0.1:7788 (17154)
 [2026-07-08 06:43:39 +0000] [17154] [INFO] Using worker: sync
@@ -203,7 +203,7 @@ The gunicorn **master pid is 17154** and the single **worker pid is 17155** — 
 ### Required precondition — the session interface is Redis-backed, and the serializer is stdlib `pickle`
 
 ```console
-$ docker exec sl-app bash -lc 'set -a && source /app/slenv.sh && set +a && source /app/venv/bin/activate && cd /app && python -c "
+$ docker exec sl_app bash -lc 'source /app/venv/bin/activate && cd /app && CONFIG=tests/test.env python -c "
 from wsgi import app
 si = app.session_interface
 print(\"session_interface =\", type(si).__module__ + \".\" + type(si).__name__)
@@ -318,8 +318,8 @@ print("RedisStorage (plain) storage-related attributes:", [n for n in dir(limits
 ```
 
 ```console
-$ docker cp obs_wiring.py sl-app:/tmp/obs_wiring.py
-$ docker exec sl-app bash -lc 'set -a && source /app/slenv.sh && set +a && source /app/venv/bin/activate && cd /app && python /tmp/obs_wiring.py'
+$ docker cp obs_wiring.py sl_app:/tmp/obs_wiring.py
+$ docker exec sl_app bash -lc 'source /app/venv/bin/activate && cd /app && CONFIG=tests/test.env PYTHONPATH=/app python /tmp/obs_wiring.py'
 >>> URL: http://localhost
 WARNING: Use a temp directory for GNUPGHOME /tmp/zrbtekqjuhkxvyepexes
 Upload files to local dir
@@ -616,7 +616,7 @@ Both malformed cases in R3 returned a **302** to `/auth/login?next=…` and a su
 The complete stdout window captured from the gunicorn server (`/tmp/sl_server.log`) across the entire driver run — every login, logout, and poisoned request — contains **only** the benign request-completion `DEBUG` lines emitted by `after_request()` at `server.py:284` (plus the `after_login()` `DEBUG` lines at `login_utils.py:35,44`). There is **no** deserialization error line anywhere:
 
 ```console
-$ docker exec sl-app bash -lc 'sed -n "10,$p" /tmp/sl_server.log'
+$ docker exec sl_app bash -lc 'sed -n "10,$p" /tmp/sl_server.log'
 
 2026-07-08 06:43:47,327 - SL - DEBUG - 17155 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET / ImmutableMultiDict([]) 302, takes 0.0003006458282470703
 2026-07-08 06:43:47,355 - SL - DEBUG - 17155 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET /auth/login ImmutableMultiDict([]) 200, takes 0.01956939697265625
@@ -660,7 +660,7 @@ $ docker exec sl-app bash -lc 'sed -n "10,$p" /tmp/sl_server.log'
 Automated content scan of the **entire** server log for error markers (`grep -c`):
 
 ```console
-$ for p in UnpicklingError Traceback pickle " ERROR "; do echo "log contains '$p' ? $(docker exec sl-app grep -c \"$p\" /tmp/sl_server.log)"; done
+$ for p in UnpicklingError Traceback pickle " ERROR "; do echo "log contains '$p' ? $(docker exec sl_app grep -c \"$p\" /tmp/sl_server.log)"; done
 
 log contains 'UnpicklingError' ? 0
 log contains 'Traceback'      ? 0
@@ -674,7 +674,7 @@ log contains ' ERROR '        ? 0
 ### R4(c) — Sentry
 
 ```console
-$ docker exec sl-app bash -lc 'set -a && source /app/slenv.sh && set +a && source /app/venv/bin/activate && cd /app && python -c "import app.config as c; print(\"SENTRY_DSN =\", repr(getattr(c, \"SENTRY_DSN\", None)))"'
+$ docker exec sl_app bash -lc 'source /app/venv/bin/activate && cd /app && CONFIG=tests/test.env python -c "import app.config as c; print(\"SENTRY_DSN =\", repr(getattr(c, \"SENTRY_DSN\", None)))"'
 
 >>> URL: http://localhost
 WARNING: Use a temp directory for GNUPGHOME /tmp/nkfipfppdjkikpcevzfq
@@ -816,8 +816,8 @@ $ redis EXISTS session:539e2087-3de9-477a-a39b-b783b4e9e247 -> 1   (untouched, n
 The single script below (`obs_driver.py`) is the exact driver used to produce every runtime block in R2/R3/R5/R6. It was copied into the container and run under the canonical venv:
 
 ```console
-$ docker cp obs_driver.py sl-app:/tmp/obs_driver.py
-$ docker exec sl-app bash -lc 'set -a && source /app/slenv.sh && set +a && source /app/venv/bin/activate && cd /app && python /tmp/obs_driver.py'
+$ docker cp obs_driver.py sl_app:/tmp/obs_driver.py
+$ docker exec sl_app bash -lc 'source /app/venv/bin/activate && python /tmp/obs_driver.py'
 ```
 
 Its complete stdout/stderr is reproduced verbatim across the R2/R3/R5/R6 evidence blocks above (each condition's block is a contiguous slice of this one run). The full script:
@@ -840,7 +840,7 @@ import itsdangerous
 from redis import Redis
 
 BASE = "http://127.0.0.1:7788"
-SECRET = "secret"            # FLASK_SECRET from slenv.sh (local test value)
+SECRET = "secret"            # FLASK_SECRET from tests/test.env (local test value)
 EMAIL = "john@wick.com"
 PASSWORD = "password"
 
@@ -1207,7 +1207,7 @@ The runtime observations above are the primary evidence; the following published
 The packages on the session code path, with versions read from the running canonical interpreter (matching the `poetry.lock` pins in AAP §0.6.1):
 
 ```console
-$ docker exec sl-app bash -lc 'source /app/venv/bin/activate && python -c "import importlib.metadata as m,sys;print(\"python:\",sys.version.split()[0]);[print(f\"{p}: {m.version(p)}\") for p in [\"Flask\",\"Flask-Login\",\"itsdangerous\",\"Werkzeug\",\"redis\",\"Flask-Limiter\",\"limits\"]]"'
+$ docker exec sl_app bash -lc 'source /app/venv/bin/activate && python -c "import importlib.metadata as m,sys;print(\"python:\",sys.version.split()[0]);[print(f\"{p}: {m.version(p)}\") for p in [\"Flask\",\"Flask-Login\",\"itsdangerous\",\"Werkzeug\",\"redis\",\"Flask-Limiter\",\"limits\"]]"'
 
 python: 3.10.18
 Flask: 1.1.2
