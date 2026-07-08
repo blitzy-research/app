@@ -105,7 +105,7 @@ This establishes the canonical entities used throughout: **User A** `id=595`, it
 
 ## R1 — How the reply email is derived from an inbound reply
 
-**Direct answer:** the reply email is **not parsed out of any header** — it is taken **verbatim from the SMTP envelope recipient** (`RCPT TO`). In `handle_reply()` the first substantive statement is `reply_email = rcpt_to` [email_handler.py:972]; after a domain guard it is normalized in place, `reply_email = normalize_reply_email(reply_email)` [email_handler.py:984], which lower-cases and replaces every character outside `_ALLOWED_CHARS` [app/email_validation.py:9] with `_` [app/email_validation.py:33-34]. For a well-formed reverse alias, normalization is a no-op.
+**Direct answer:** the reply email is **not parsed out of any header** — it is taken **verbatim from the SMTP envelope recipient** (`RCPT TO`). In `handle_reply()` the first substantive statement is `reply_email = rcpt_to` [email_handler.py:972]; after a domain guard it is normalized in place, `reply_email = normalize_reply_email(reply_email)` [email_handler.py:984], which replaces every character outside `_ALLOWED_CHARS` [app/email_validation.py:9] with `_` [app/email_validation.py:33-34]. It does **not** change case — `_ALLOWED_CHARS` contains both `A-Z` and `a-z` [app/email_validation.py:9] and the function body has no `.lower()` call [app/email_validation.py:25-38]. The lower-case form of every real reverse alias is instead established **earlier**, at generation time, by `generate_reply_email()` [app/email_utils.py:1103] — through `sanitize_email()` [app/utils.py:100-101] and `convert_to_id()` [app/utils.py:52] (both lower-case) and `random_string()` [app/utils.py:43] (which draws only from `string.ascii_lowercase`) — not by `normalize_reply_email()`. For a well-formed reverse alias, normalization is a no-op.
 
 The reply payload driven through the real entry point:
 
@@ -147,6 +147,34 @@ normalize_reply_email(R) = 'sender_at_external_test_ycnjnjlzcw@sl.local' | equal
 - The final `handle()` return is **`'250 Message accepted for delivery'`**, and the outbound send is logged `send email from encode_cosmic143@sl.local to sender@external.test` [email_handler.py:1212] — i.e. **to `contact.website_email`**, established here for the R3 discussion.
 
 **Sibling variant — normalization collision (why derivation is lossy).** The three inputs `ab#cd@…`, `ab$cd@…`, and `ab cd@…` all normalize to the **same** `ab_cd@sl.local` (last three lines above). Because `#`, `$`, and space are all outside `_ALLOWED_CHARS`, each maps to `_` [app/email_validation.py:33-34]. Two distinct raw envelope recipients can therefore collapse to one `reply_email` string — an independent, second way a lookup on `reply_email` can point at the "wrong" contact.
+
+**Supplementary observation — normalization preserves case; lower-casing happens at generation, not normalization.** To confirm the correction above at runtime, `normalize_reply_email()` was driven with mixed-case input, alongside the generation helpers, in the canonical container (a rolled-back probe — the `contact` table is left unchanged).
+
+**Command:** `docker exec sl-work bash -lc 'cd /app && python /tmp/obs_normalize.py'` — segment of that run:
+
+```
+### A) normalize_reply_email() does NOT change case (only maps disallowed chars -> '_') ###
+normalize_reply_email('AB#CD@SL.local') = 'AB_CD@SL.local'
+normalize_reply_email('MiXeD#Case$X@sl.local') = 'MiXeD_Case_X@sl.local'
+normalize_reply_email('sender_at_external_test_ycnjnjlzcw@sl.local') = 'sender_at_external_test_ycnjnjlzcw@sl.local'
+
+Does normalize_reply_email source contain '.lower(' ? -> False
+_ALLOWED_CHARS (email_validation.py:9) = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.+@'
+A-Z all in _ALLOWED_CHARS: True
+a-z all in _ALLOWED_CHARS: True
+
+### B) Lower-casing actually done by the GENERATION helpers ###
+sanitize_email('SENDER@External.TEST') = 'sender@external.test'   (app/utils.py:100-101)
+convert_to_id('SENDER@External.TEST')  = 'sender@external.test'   (app/utils.py:52)
+random_string(30) = 'tjprbymtuyhrypwqnecjojothtmwyb'   islower=True   (app/utils.py:43 ascii_lowercase)
+
+### C) generate_reply_email() REAL path -> lowercase reverse alias ###
+generate_reply_email('SENDER@External.TEST', alias.email='boldly_derail064@sl.local') = 'sender_at_external_test_pahdnpm@sl.local'
+R == R.lower() -> True
+Contact count before=66 after=66 (rollback => no DB pollution)
+```
+
+**Reading the output (cause → effect):** `AB#CD@SL.local` normalizes to `AB_CD@SL.local` — the upper-case letters survive and only `#` becomes `_`; `MiXeD#Case$X@sl.local` → `MiXeD_Case_X@sl.local` likewise preserves its mixed case, and the function source contains no `.lower(` call (`-> False`). The lower-case form of every real reverse alias therefore originates at **generation** time, not normalization: `sanitize_email('SENDER@External.TEST')` and `convert_to_id('SENDER@External.TEST')` both return `'sender@external.test'`, and `random_string()` yields only `string.ascii_lowercase`, so the full generated alias (here `sender_at_external_test_pahdnpm@sl.local`) is already lower-case (`R == R.lower()` **True**) before `handle_reply()` ever calls `normalize_reply_email()`. (The random token produced by `random_string()` differs run-to-run; the deterministic lines — case preservation, the `.lower(`-absence check, the helper outputs, and `R == R.lower()` — are stable across runs. The `contact` count returns `66 → 66` because the generation probe is rolled back.)
 
 ---
 
