@@ -601,6 +601,35 @@ v3 carries the same decorator chain (`:116-118`) and the same suffix/quota/dupli
 
 The suffix branch (`:184-191`) is identical in effect to v2. This was **observed, not inferred**: the v3 endpoint was driven with `mailbox_ids=[default_mailbox_id]` for a valid suffix (`201`, Condition 1 v3 — `prefix.buldyq@sl.local`, id 1707, with its own `AliasAuditLog` row, §F.3), and for the expired, tampered, garbage, and empty suffixes (all `412` with `LOG.w` at `new_custom_alias.py:187`, §A.4), and for a duplicate payload (`201` then `409` with `LOG.d` at `new_custom_alias.py:202`, §F.4). The §A mislabel therefore applies equally to v3, confirmed against the live v3 handler.
 
+> **Observed out-of-scope divergence (documented, not remediated): v2 returns `500` where v3 returns `400` for a malformed *prefix*.** While exercising the real endpoints, an adjacent behaviour surfaced that is *outside* the signed-suffix / creation-limit question this document answers but is recorded here for completeness. Because v3 validates the prefix up front with `check_alias_prefix` (`new_custom_alias.py:167-168` → `alias_utils.py:418`, pattern `[0-9a-z-_.]{1,}` and length `≤ 40`) and v2 has **no** prefix-format guard, a prefix that survives `convert_to_id` (`utils.py:50-56`, which only lowercases, unidecodes, and strips spaces) but yields an invalid e-mail local part flows unchecked into `Alias.create` → `Alias.get_custom_domain` → `validate_email(..., allow_smtputf8=False)` (`models.py:1656`, `models.py:1617`). The v2 handler's sole `try/except` wraps only `check_suffix_signature` (`new_custom_alias.py:69-76`), so the resulting `email_validator.EmailSyntaxError` is **unhandled** and Flask returns `500 {"error":"Internal error"}`; v3 rejects the same prefix cleanly with `400 {"error":"alias prefix invalid format or too long"}`. Observed over a real gunicorn server with a 65-character prefix (local part exceeds the 64-octet limit) — the same `500`-vs-`400` divergence also occurs for a non-atext character such as `(`:
+>
+> ```text
+> # POST /api/v2/alias/custom/new   alias_prefix='aaaaaaaa…(65 'a')'   (valid fresh signed_suffix)
+> HTTP/1.1 500 INTERNAL SERVER ERROR
+> Content-Type: application/json
+> Content-Length: 27
+> BODY: {"error":"Internal error"}
+> # gunicorn server-side traceback (unhandled EmailSyntaxError, propagated from the Alias.create call):
+> Traceback (most recent call last):
+>   …
+>   File "/code/app/api/views/new_custom_alias.py", line 96, in new_custom_alias_v2
+>     alias = Alias.create(
+>   File "/code/app/models.py", line 1656, in create
+>     custom_domain = Alias.get_custom_domain(email)
+>   File "/code/app/models.py", line 1617, in get_custom_domain
+>     alias_domain = validate_email(
+>   …
+> email_validator.EmailSyntaxError: The email address is too long before the @-sign (8 characters too many).
+>
+> # POST /api/v3/alias/custom/new   same alias_prefix (check_alias_prefix rejects it first)
+> HTTP/1.1 400 BAD REQUEST
+> Content-Type: application/json
+> Content-Length: 52
+> BODY: {"error":"alias prefix invalid format or too long"}
+> ```
+>
+> This is a **pre-existing v2 robustness gap on the prefix path**, independent of the signed-suffix validation and the four creation-limit enforcers that are the subject of O1–O4. Per the read-only, diagnosis-only scope of this task (AAP §0.5.2 "*Any modification or addition to existing source files*" and "*Fixing … any other defect … not remediation*"; AAP §0.7.3 "*No remediation*"; and the prompt's "*keep the codebase unchanged*"), it is **documented but deliberately not fixed** here; a future remediation task would wrap the v2 prefix/creation path in the same validation v3 already performs.
+
 ### D.3 Dashboard sibling (secondary)
 
 `app/dashboard/views/custom_alias.py` reuses `get_alias_suffixes` / `check_suffix_signature` / `verify_prefix_suffix` under the same `@limiter.limit(ALIAS_LIMIT, methods=["POST"])` (`:31`) and `@parallel_limiter.lock(name="alias_creation")` (`:33`). It is a **web-form** flow that `flash(...)`es "Alias creation time is expired, please retry" (`:90,93`) rather than returning JSON/`412`, so it shares the same collapse/mislabel. Noted as a sibling only — the question is API-focused.
@@ -688,6 +717,8 @@ Per-condition (each cell is the outcome of the *same* request submitted twice):
 | 6 duplicate (v2, v3) | `201`,`409` / `201`,`409` | `201`,`409` / `201`,`409` |
 | 7 quota (start count 1) | `201,201,400` @attempt 3 | `201,201,400` @attempt 3 |
 | 9 concurrency (lock held, ×2) | `429`, `429` | `429`, `429` |
+
+The complete, unedited `RUN2` output blocks for every cell in this table — on both v2 and v3, and including the v3 cells for Conditions 5, 7, and 9 that the table above does not separately tabulate — are embedded verbatim in **appendix §H.1**, where this extended run's own aggregate distribution `{201:8, 400:6, 409:2, 412:16, 429:4}` is reconciled line-for-line to the byte-identical baseline above.
 
 These are *not* the source of the reported intermittency — they are stable. The intermittency comes from the four causes below, where the *same* request can succeed or fail depending on timing, concurrency, or backend state.
 
@@ -955,6 +986,7 @@ The complete, unedited blocks for the remaining conditions are reproduced verbat
 - **Condition 7 (quota, count before/after):** §C.1.
 - **Condition 9 (concurrency → `429`):** §E.2.
 - **Condition 10 (Flask-Limiter burst, real gunicorn):** §E.3.
+- **Every condition, complete second run (`RUN2`), on both v2 and v3 — full unedited blocks:** appendix **§H** (which also supplies the previously-absent v3 blocks for Conditions 5, 7, 8, 9, and 10, and a third-run `RUN3` confirmation in §H.4).
 
 **Condition 5 — mismatch (validly-signed suffix for a domain the user cannot use), v2, identical input ×2:**
 
@@ -1149,11 +1181,11 @@ NOTE: the auto-created newsletter alias already consumed 1 token-bucket hit at s
   FULL BODY [32 bytes, CT='application/json']: {"error":"Rate limit exceeded"}
 ```
 
-RUN2 reproduced both breach points identically — PAID `-> 51/50` at POST #50 and FREE `-> 11/10` at POST #10 (same `LOG.i` at `rate_limiter.py:33`, same 32-byte JSON `429`).
+RUN2 reproduced both breach points identically — PAID `-> 51/50` at POST #50 and FREE `-> 11/10` at POST #10 (same `LOG.i` at `rate_limiter.py:33`, same 32-byte JSON `429`). The complete, unedited `RUN2` blocks for the token bucket — on **both v2 and v3**, PAID and FREE — are embedded in **appendix §H.2**; §H.4 confirms the `RUN3` breach values (`51/50`, `11/10`) are identical.
 
 ### F.6 Condition 10 — Flask-Limiter burst over a REAL gunicorn server
 
-The complete burst block (six identical real HTTP POSTs, full `curl -D -` headers + bodies, and the gunicorn `SL` rate-limit log line) is embedded in §E.3. It shows `201, 409, 409, 409, 409, 429`, with the `429` carrying **no** rate-limit headers.
+The complete burst block (six identical real HTTP POSTs, full `curl -D -` headers + bodies, and the gunicorn `SL` rate-limit log line) is embedded in §E.3. It shows `201, 409, 409, 409, 409, 429`, with the `429` carrying **no** rate-limit headers. The additional complete burst blocks — v2 (`RUN2`) and **v3** (`RUN2` and `RUN3`, captured ~65 s apart so the rolling window fully resets) — are embedded in **appendix §H.3**.
 
 ### F.7 Repository unchanged — final `git status`
 
@@ -1174,6 +1206,1180 @@ The single added path is `blitzy/documentation/app_2cd6ee777f8c.md` (this file),
 
 ---
 
+## §H — Appendix: Complete Unedited RUN2 / RUN3 Output Blocks (v2 and v3)
+
+This appendix embeds the **complete, unedited** second-run (`RUN2`) output blocks that §A–§F reference — every condition on **both** `POST /api/v2/alias/custom/new` and `POST /api/v3/alias/custom/new` — plus the previously-absent **v3** blocks for Conditions 5, 7, 8, 9, and 10. Each block is reproduced verbatim from the live capture: the interleaved `SL` log lines, the `STATUS-LINE`, the full `RESPONSE-HEADERS` set, the `JSON-BODY` (or `curl -D -` headers + body for the real-server burst), and the `<<<END-BLOCK>>>` delimiter emitted by the observation harness.
+
+### H.0 How to read these blocks (independent-run provenance)
+
+These blocks were captured in an **independent later run** against the same canonical stack (`CONFIG=tests/test.env`; PostgreSQL 13 on `:15432`; Redis on `:6379`; interpreter and locked dependency versions exactly as in *Runtime & Methodology*). Because the run is independent and the backing database had been re-migrated since the `RUN1` capture in §A–§F, every block legitimately carries its **own** fresh user IDs, alias IDs, and wall-clock timestamps (users in the ~83–133 range; timestamps at `2026-07-08 10:1x–10:30`). Fresh identifiers on an independent run are the expected, honest signature of a genuine re-execution — **not** a copy of `RUN1`. What is invariant across runs, and what the investigation turns on, is the *observable behaviour*: the status codes, the exact error strings, the response-header sets (and the absence of any `X-RateLimit-*`/`Retry-After` header), the `file:line` of each `SL` log entry, and the limiter breach values (`51/50`, `11/10`). All commands are exactly those listed in §F.1.
+
+### H.1 Conditions 1–7 & 9 — complete `RUN2` blocks (v2 and v3), via the Flask test client
+
+**Aggregate status distribution of this `RUN2` (18 blocks, 36 outcomes):**
+
+```text
+RUN2 status distribution (this appendix)
+  201 : 8
+  400 : 6
+  409 : 2
+  412 : 16
+  429 : 4
+```
+
+**Reconciliation to the §E.0 baseline.** §E.0 tabulates the *matched-cell subset* (RUN1 vs RUN2) as byte-identical at `{201:6, 400:3, 409:2, 412:16, 429:2}` (29 outcomes). This appendix's `RUN2` is a **superset** of that subset: it additionally exercises the **v3** cells for Conditions **5, 7, and 9** (the cells flagged as missing). Restricting the blocks below to exactly the cells §E.0 measured reproduces `{201:6, 400:3, 409:2, 412:16, 429:2}` identically; the three added v3 cells contribute exactly `+2×201` (Condition 7 v3), `+3×400` (Condition 5 v3 ×2 and Condition 7 v3 ×1), and `+2×429` (Condition 9 v3), giving `{201:8, 400:6, 409:2, 412:16, 429:4}`. Re-running this identical input a third time (`RUN3`) produced the **byte-identical** distribution `{201:8, 400:6, 409:2, 412:16, 429:4}` (see §H.4).
+
+**Condition 1 — valid fresh suffix (v2 then v3); each also shows `alias_count_after` and the real `AliasAuditLog` `action='create'` row proving the success audit:**
+
+```text
+===== [RUN2] CONDITION 1 — valid fresh suffix (v2) =====
+user=user_a9e21sc3um@mailbox.test id=83 default_mailbox_id=84 start_count=1
+signed_suffix=.slider@sl.local.ak4jGQ.GByoGVr9Ku347cJ2iBaKLqhVagI
+2026-07-08 10:14:50,013 - SL - INFO - 16215 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:14:50,021 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.049078941345214844
+STATUS-LINE: 201 CREATED | status_code: 201
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 433
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:50 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"alias":"prefix.slider@sl.local","creation_date":"2026-07-08 10:14:50+00:00","creation_timestamp":1783505690,"disable_pgp":false,"email":"prefix.slider@sl.local","enabled":true,"id":166,"latest_activity":null,"mailbox":{"email":"user_a9e21sc3um@mailbox.test","id":84},"mailboxes":[{"email":"user_a9e21sc3um@mailbox.test","id":84}],"name":null,"nb_block":0,"nb_forward":0,"nb_reply":0,"note":null,"pinned":false,"support_pgp":false}
+
+
+alias_count_after=2
+--- AliasAuditLog query for created alias (proves success audit) ---
+AUDIT-RECORD: id=166 user_id=83 alias_id=166 alias_email='prefix.slider@sl.local' action='create' message='New alias created' created_at=2026-07-08T10:14:50.013823+00:00
+<<<END-BLOCK>>>
+
+===== [RUN2] CONDITION 1 — valid fresh suffix (v3) =====
+user=user_ix7665edx4@mailbox.test id=84 default_mailbox_id=85 start_count=1
+signed_suffix=.stales@sl.local.ak4jGg.E4jkzK9zMnqX1nWTkpP6zbBK2wg
+2026-07-08 10:14:50,633 - SL - INFO - 16215 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:14:50,640 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.046386003494262695
+STATUS-LINE: 201 CREATED | status_code: 201
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 433
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:50 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"alias":"prefix.stales@sl.local","creation_date":"2026-07-08 10:14:50+00:00","creation_timestamp":1783505690,"disable_pgp":false,"email":"prefix.stales@sl.local","enabled":true,"id":168,"latest_activity":null,"mailbox":{"email":"user_ix7665edx4@mailbox.test","id":85},"mailboxes":[{"email":"user_ix7665edx4@mailbox.test","id":85}],"name":null,"nb_block":0,"nb_forward":0,"nb_reply":0,"note":null,"pinned":false,"support_pgp":false}
+
+
+alias_count_after=2
+--- AliasAuditLog query for created alias (proves success audit) ---
+AUDIT-RECORD: id=168 user_id=84 alias_id=168 alias_email='prefix.stales@sl.local' action='create' message='New alias created' created_at=2026-07-08T10:14:50.634092+00:00
+<<<END-BLOCK>>>
+```
+
+**Condition 2 — expired suffix (age 700 s > 600 s), the *same* request submitted twice, on v2 and v3 → `412 {"error":"Alias creation time is expired, please retry"}` + `LOG.w` at `new_custom_alias.py:72`/`:187`:**
+
+```text
+===== [RUN2] CONDITION 2 — expired suffix (age 700s>600s) (v2); SAME request x2 =====
+user=user_ezoz7vxpr2@mailbox.test id=85
+IDENTICAL signed_suffix (posted twice): .poohed@sl.local.ak4gXw.s9BviE-RWEzPdaZagNvzinGclp0
+----- v2 expired attempt 1 (identical input) -----
+2026-07-08 10:14:51,216 - SL - WARNING - 16215 - "/code/app/api/views/new_custom_alias.py:72" - new_custom_alias_v2() -  - Alias creation time expired for <User 85 Test User user_ezoz7vxpr2@mailbox.test>
+2026-07-08 10:14:51,217 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 412, takes 0.009405851364135742
+STATUS-LINE: 412 PRECONDITION FAILED | status_code: 412
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 57
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:51 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"error":"Alias creation time is expired, please retry"}
+
+
+----- v2 expired attempt 2 (identical input) -----
+2026-07-08 10:14:51,227 - SL - WARNING - 16215 - "/code/app/api/views/new_custom_alias.py:72" - new_custom_alias_v2() -  - Alias creation time expired for <User 85 Test User user_ezoz7vxpr2@mailbox.test>
+2026-07-08 10:14:51,228 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 412, takes 0.009474039077758789
+STATUS-LINE: 412 PRECONDITION FAILED | status_code: 412
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 57
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:51 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"error":"Alias creation time is expired, please retry"}
+
+<<<END-BLOCK>>>
+
+===== [RUN2] CONDITION 2 — expired suffix (age 700s>600s) (v3); SAME request x2 =====
+user=user_bnledf8acz@mailbox.test id=86
+IDENTICAL signed_suffix (posted twice): .merino@sl.local.ak4gXw.xkjQ_UvqKKLmO9WUdrCQVwjS0IM
+----- v3 expired attempt 1 (identical input) -----
+2026-07-08 10:14:51,800 - SL - WARNING - 16215 - "/code/app/api/views/new_custom_alias.py:187" - new_custom_alias_v3() -  - Alias creation time expired for <User 86 Test User user_bnledf8acz@mailbox.test>
+2026-07-08 10:14:51,800 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 412, takes 0.01037907600402832
+STATUS-LINE: 412 PRECONDITION FAILED | status_code: 412
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 57
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:51 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"error":"Alias creation time is expired, please retry"}
+
+
+----- v3 expired attempt 2 (identical input) -----
+2026-07-08 10:14:51,811 - SL - WARNING - 16215 - "/code/app/api/views/new_custom_alias.py:187" - new_custom_alias_v3() -  - Alias creation time expired for <User 86 Test User user_bnledf8acz@mailbox.test>
+2026-07-08 10:14:51,812 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 412, takes 0.010120153427124023
+STATUS-LINE: 412 PRECONDITION FAILED | status_code: 412
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 57
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:51 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"error":"Alias creation time is expired, please retry"}
+
+<<<END-BLOCK>>>
+```
+
+**Condition 3 — tampered suffix (last char mutated), same request twice, v2 and v3. `raw check_suffix_signature(tampered) = None` is shown inline; the observed status is `412` (the *expired* message), NOT `400 "Tampered suffix"` — the headline mislabel:**
+
+```text
+===== [RUN2] CONDITION 3 — tampered suffix (last char mutated) (v2); SAME request x2 =====
+user=user_tpj5dt684z@mailbox.test id=87
+valid   : .tampword@sl.local.ak4jHA.3qxgxjBAo7o8RgG2cSTelLFTR9U
+tampered: .tampword@sl.local.ak4jHA.3qxgxjBAo7o8RgG2cSTelLFTR9A
+raw check_suffix_signature(tampered) = None
+----- v2 tampered attempt 1 (identical input) -----
+2026-07-08 10:14:52,384 - SL - WARNING - 16215 - "/code/app/api/views/new_custom_alias.py:72" - new_custom_alias_v2() -  - Alias creation time expired for <User 87 Test User user_tpj5dt684z@mailbox.test>
+2026-07-08 10:14:52,384 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 412, takes 0.01176309585571289
+STATUS-LINE: 412 PRECONDITION FAILED | status_code: 412
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 57
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:52 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"error":"Alias creation time is expired, please retry"}
+
+
+----- v2 tampered attempt 2 (identical input) -----
+2026-07-08 10:14:52,394 - SL - WARNING - 16215 - "/code/app/api/views/new_custom_alias.py:72" - new_custom_alias_v2() -  - Alias creation time expired for <User 87 Test User user_tpj5dt684z@mailbox.test>
+2026-07-08 10:14:52,395 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 412, takes 0.009386777877807617
+STATUS-LINE: 412 PRECONDITION FAILED | status_code: 412
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 57
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:52 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"error":"Alias creation time is expired, please retry"}
+
+<<<END-BLOCK>>>
+
+===== [RUN2] CONDITION 3 — tampered suffix (last char mutated) (v3); SAME request x2 =====
+user=user_t6wz5115o8@mailbox.test id=88
+valid   : .tampword@sl.local.ak4jHA.3qxgxjBAo7o8RgG2cSTelLFTR9U
+tampered: .tampword@sl.local.ak4jHA.3qxgxjBAo7o8RgG2cSTelLFTR9A
+raw check_suffix_signature(tampered) = None
+----- v3 tampered attempt 1 (identical input) -----
+2026-07-08 10:14:52,967 - SL - WARNING - 16215 - "/code/app/api/views/new_custom_alias.py:187" - new_custom_alias_v3() -  - Alias creation time expired for <User 88 Test User user_t6wz5115o8@mailbox.test>
+2026-07-08 10:14:52,968 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 412, takes 0.011034011840820312
+STATUS-LINE: 412 PRECONDITION FAILED | status_code: 412
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 57
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:52 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"error":"Alias creation time is expired, please retry"}
+
+
+----- v3 tampered attempt 2 (identical input) -----
+2026-07-08 10:14:52,982 - SL - WARNING - 16215 - "/code/app/api/views/new_custom_alias.py:187" - new_custom_alias_v3() -  - Alias creation time expired for <User 88 Test User user_t6wz5115o8@mailbox.test>
+2026-07-08 10:14:52,983 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 412, takes 0.0137481689453125
+STATUS-LINE: 412 PRECONDITION FAILED | status_code: 412
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 57
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:52 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"error":"Alias creation time is expired, please retry"}
+
+<<<END-BLOCK>>>
+```
+
+**Condition 4 — garbage and empty suffixes, same request twice each, v2 and v3 → the same collapsed `412` path:**
+
+```text
+===== [RUN2] CONDITION 4 — garbage suffix (v2); SAME request x2 =====
+user=user_i7nlzzqmcj@mailbox.test id=89 signed_suffix='garbage'
+----- v2 garbage attempt 1 (identical input) -----
+2026-07-08 10:14:53,550 - SL - WARNING - 16215 - "/code/app/api/views/new_custom_alias.py:72" - new_custom_alias_v2() -  - Alias creation time expired for <User 89 Test User user_i7nlzzqmcj@mailbox.test>
+2026-07-08 10:14:53,551 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 412, takes 0.009218692779541016
+STATUS-LINE: 412 PRECONDITION FAILED | status_code: 412
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 57
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:53 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"error":"Alias creation time is expired, please retry"}
+
+
+----- v2 garbage attempt 2 (identical input) -----
+2026-07-08 10:14:53,561 - SL - WARNING - 16215 - "/code/app/api/views/new_custom_alias.py:72" - new_custom_alias_v2() -  - Alias creation time expired for <User 89 Test User user_i7nlzzqmcj@mailbox.test>
+2026-07-08 10:14:53,561 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 412, takes 0.00905156135559082
+STATUS-LINE: 412 PRECONDITION FAILED | status_code: 412
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 57
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:53 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"error":"Alias creation time is expired, please retry"}
+
+<<<END-BLOCK>>>
+
+===== [RUN2] CONDITION 4 — empty suffix (v2); SAME request x2 =====
+user=user_4dviwies7b@mailbox.test id=90 signed_suffix=''
+----- v2 empty attempt 1 (identical input) -----
+2026-07-08 10:14:54,131 - SL - WARNING - 16215 - "/code/app/api/views/new_custom_alias.py:72" - new_custom_alias_v2() -  - Alias creation time expired for <User 90 Test User user_4dviwies7b@mailbox.test>
+2026-07-08 10:14:54,132 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 412, takes 0.00903463363647461
+STATUS-LINE: 412 PRECONDITION FAILED | status_code: 412
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 57
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:54 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"error":"Alias creation time is expired, please retry"}
+
+
+----- v2 empty attempt 2 (identical input) -----
+2026-07-08 10:14:54,142 - SL - WARNING - 16215 - "/code/app/api/views/new_custom_alias.py:72" - new_custom_alias_v2() -  - Alias creation time expired for <User 90 Test User user_4dviwies7b@mailbox.test>
+2026-07-08 10:14:54,142 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 412, takes 0.009093284606933594
+STATUS-LINE: 412 PRECONDITION FAILED | status_code: 412
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 57
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:54 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"error":"Alias creation time is expired, please retry"}
+
+<<<END-BLOCK>>>
+
+===== [RUN2] CONDITION 4 — garbage suffix (v3); SAME request x2 =====
+user=user_gh4rxnbp6i@mailbox.test id=91 signed_suffix='garbage'
+----- v3 garbage attempt 1 (identical input) -----
+2026-07-08 10:14:54,715 - SL - WARNING - 16215 - "/code/app/api/views/new_custom_alias.py:187" - new_custom_alias_v3() -  - Alias creation time expired for <User 91 Test User user_gh4rxnbp6i@mailbox.test>
+2026-07-08 10:14:54,716 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 412, takes 0.01105809211730957
+STATUS-LINE: 412 PRECONDITION FAILED | status_code: 412
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 57
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:54 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"error":"Alias creation time is expired, please retry"}
+
+
+----- v3 garbage attempt 2 (identical input) -----
+2026-07-08 10:14:54,727 - SL - WARNING - 16215 - "/code/app/api/views/new_custom_alias.py:187" - new_custom_alias_v3() -  - Alias creation time expired for <User 91 Test User user_gh4rxnbp6i@mailbox.test>
+2026-07-08 10:14:54,728 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 412, takes 0.010507583618164062
+STATUS-LINE: 412 PRECONDITION FAILED | status_code: 412
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 57
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:54 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"error":"Alias creation time is expired, please retry"}
+
+<<<END-BLOCK>>>
+
+===== [RUN2] CONDITION 4 — empty suffix (v3); SAME request x2 =====
+user=user_pfajk7t1eb@mailbox.test id=92 signed_suffix=''
+----- v3 empty attempt 1 (identical input) -----
+2026-07-08 10:14:55,300 - SL - WARNING - 16215 - "/code/app/api/views/new_custom_alias.py:187" - new_custom_alias_v3() -  - Alias creation time expired for <User 92 Test User user_pfajk7t1eb@mailbox.test>
+2026-07-08 10:14:55,300 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 412, takes 0.010412454605102539
+STATUS-LINE: 412 PRECONDITION FAILED | status_code: 412
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 57
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:55 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"error":"Alias creation time is expired, please retry"}
+
+
+----- v3 empty attempt 2 (identical input) -----
+2026-07-08 10:14:55,311 - SL - WARNING - 16215 - "/code/app/api/views/new_custom_alias.py:187" - new_custom_alias_v3() -  - Alias creation time expired for <User 92 Test User user_pfajk7t1eb@mailbox.test>
+2026-07-08 10:14:55,312 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 412, takes 0.01001286506652832
+STATUS-LINE: 412 PRECONDITION FAILED | status_code: 412
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 57
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:55 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"error":"Alias creation time is expired, please retry"}
+
+<<<END-BLOCK>>>
+```
+
+**Condition 5 — prefix/suffix mismatch (a validly-signed suffix for a domain the user cannot use), same request twice, on v2 and v3 → `400 {"error":"wrong alias prefix or suffix"}` (this v3 cell is one of the CP-flagged additions):**
+
+```text
+===== [RUN2] CONDITION 5 — prefix/suffix mismatch (v2); validly-signed unavailable domain =====
+user=user_trisd7x8zn@mailbox.test id=93
+signed bad-domain suffix: @w083ka.test.ak4jHw.-EilJRhTjGRPxsqunKBc1zlsKRY  raw_unsigned='@w083ka.test'
+----- v2 mismatch attempt 1 (identical input) -----
+2026-07-08 10:14:55,891 - SL - ERROR - 16215 - "/code/app/alias_suffix.py:61" - verify_prefix_suffix() -  - wrong alias suffix @w083ka.test, user <User 93 Test User user_trisd7x8zn@mailbox.test>
+NoneType: None
+2026-07-08 10:14:55,891 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 400, takes 0.01755046844482422
+STATUS-LINE: 400 BAD REQUEST | status_code: 400
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 41
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:55 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"error":"wrong alias prefix or suffix"}
+
+
+----- v2 mismatch attempt 2 (identical input) -----
+2026-07-08 10:14:55,910 - SL - ERROR - 16215 - "/code/app/alias_suffix.py:61" - verify_prefix_suffix() -  - wrong alias suffix @w083ka.test, user <User 93 Test User user_trisd7x8zn@mailbox.test>
+NoneType: None
+2026-07-08 10:14:55,910 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 400, takes 0.017368555068969727
+STATUS-LINE: 400 BAD REQUEST | status_code: 400
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 41
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:55 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"error":"wrong alias prefix or suffix"}
+
+<<<END-BLOCK>>>
+
+===== [RUN2] CONDITION 5 — prefix/suffix mismatch (v3); validly-signed unavailable domain =====
+user=user_h46smui2ky@mailbox.test id=94
+signed bad-domain suffix: @a21p66.test.ak4jIA.re90ZwGg4ICGOfXSol4Yaa4hJTk  raw_unsigned='@a21p66.test'
+----- v3 mismatch attempt 1 (identical input) -----
+2026-07-08 10:14:56,560 - SL - ERROR - 16215 - "/code/app/alias_suffix.py:61" - verify_prefix_suffix() -  - wrong alias suffix @a21p66.test, user <User 94 Test User user_h46smui2ky@mailbox.test>
+NoneType: None
+2026-07-08 10:14:56,561 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 400, takes 0.018247127532958984
+STATUS-LINE: 400 BAD REQUEST | status_code: 400
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 41
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:56 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"error":"wrong alias prefix or suffix"}
+
+
+----- v3 mismatch attempt 2 (identical input) -----
+2026-07-08 10:14:56,580 - SL - ERROR - 16215 - "/code/app/alias_suffix.py:61" - verify_prefix_suffix() -  - wrong alias suffix @a21p66.test, user <User 94 Test User user_h46smui2ky@mailbox.test>
+NoneType: None
+2026-07-08 10:14:56,580 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 400, takes 0.017951488494873047
+STATUS-LINE: 400 BAD REQUEST | status_code: 400
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 41
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:56 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"error":"wrong alias prefix or suffix"}
+
+<<<END-BLOCK>>>
+```
+
+**Condition 6 — duplicate: one IDENTICAL valid payload posted twice (a state change between attempts), v2 and v3 → `201` then `409`:**
+
+```text
+===== [RUN2] CONDITION 6 — duplicate (v2); IDENTICAL valid payload posted twice (state change) =====
+user=user_xah2gnbdvw@mailbox.test id=95
+IDENTICAL payload (posted twice): alias_prefix='dupero2q' signed_suffix=.yeoman@sl.local.ak4jIQ.LwjSGiT15hep4ll9ZVsFrjbzSGQ
+----- v2 duplicate attempt 1 (identical input) -----
+2026-07-08 10:14:57,172 - SL - INFO - 16215 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:14:57,179 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.041579484939575195
+STATUS-LINE: 201 CREATED | status_code: 201
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 437
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:57 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"alias":"dupero2q.yeoman@sl.local","creation_date":"2026-07-08 10:14:57+00:00","creation_timestamp":1783505697,"disable_pgp":false,"email":"dupero2q.yeoman@sl.local","enabled":true,"id":180,"latest_activity":null,"mailbox":{"email":"user_xah2gnbdvw@mailbox.test","id":96},"mailboxes":[{"email":"user_xah2gnbdvw@mailbox.test","id":96}],"name":null,"nb_block":0,"nb_forward":0,"nb_reply":0,"note":null,"pinned":false,"support_pgp":false}
+
+
+----- v2 duplicate attempt 2 (identical input) -----
+2026-07-08 10:14:57,207 - SL - DEBUG - 16215 - "/code/app/api/views/new_custom_alias.py:87" - new_custom_alias_v2() -  - full alias already used dupero2q.yeoman@sl.local
+2026-07-08 10:14:57,207 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 409, takes 0.02675318717956543
+STATUS-LINE: 409 CONFLICT | status_code: 409
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 58
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:57 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"error":"alias dupero2q.yeoman@sl.local already exists"}
+
+<<<END-BLOCK>>>
+
+===== [RUN2] CONDITION 6 — duplicate (v3); IDENTICAL valid payload posted twice (state change) =====
+user=user_e3wwh3f4cg@mailbox.test id=96
+IDENTICAL payload (posted twice): alias_prefix='dupeqe3r' signed_suffix=.clanks@sl.local.ak4jIQ.JU8MGuZ_7vt-ZEUQW1ZA7ypc468
+----- v3 duplicate attempt 1 (identical input) -----
+2026-07-08 10:14:57,806 - SL - INFO - 16215 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:14:57,813 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04373764991760254
+STATUS-LINE: 201 CREATED | status_code: 201
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 437
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:57 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"alias":"dupeqe3r.clanks@sl.local","creation_date":"2026-07-08 10:14:57+00:00","creation_timestamp":1783505697,"disable_pgp":false,"email":"dupeqe3r.clanks@sl.local","enabled":true,"id":182,"latest_activity":null,"mailbox":{"email":"user_e3wwh3f4cg@mailbox.test","id":97},"mailboxes":[{"email":"user_e3wwh3f4cg@mailbox.test","id":97}],"name":null,"nb_block":0,"nb_forward":0,"nb_reply":0,"note":null,"pinned":false,"support_pgp":false}
+
+
+----- v3 duplicate attempt 2 (identical input) -----
+2026-07-08 10:14:57,844 - SL - DEBUG - 16215 - "/code/app/api/views/new_custom_alias.py:202" - new_custom_alias_v3() -  - full alias already used dupeqe3r.clanks@sl.local
+2026-07-08 10:14:57,845 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 409, takes 0.02866077423095703
+STATUS-LINE: 409 CONFLICT | status_code: 409
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 58
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:57 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"error":"alias dupeqe3r.clanks@sl.local already exists"}
+
+<<<END-BLOCK>>>
+```
+
+**Condition 7 — count quota: create up to `MAX_NB_EMAIL_FREE_PLAN` then one more, on v2 and v3 → `201,201,400` with the `400` at attempt 3; `count before/after` shown each attempt (this v3 cell is one of the CP-flagged additions):**
+
+```text
+===== [RUN2] CONDITION 7 — count quota (v2); create up to MAX then one more =====
+user=user_95f3fmiywy@mailbox.test id=97
+start count (includes auto newsletter alias) = 1
+CONSTANT signed_suffix across attempts: .tipper@sl.local.ak4jIg.D9pkMxXDtTjpTJfFF_OTwtxhkpg
+----- quota attempt 1 (count before=1) prefix=q1tipper -----
+2026-07-08 10:14:58,447 - SL - INFO - 16215 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:14:58,454 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04336261749267578
+STATUS-LINE: 201 CREATED | status_code: 201
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 437
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:58 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"alias":"q1tipper.tipper@sl.local","creation_date":"2026-07-08 10:14:58+00:00","creation_timestamp":1783505698,"disable_pgp":false,"email":"q1tipper.tipper@sl.local","enabled":true,"id":184,"latest_activity":null,"mailbox":{"email":"user_95f3fmiywy@mailbox.test","id":98},"mailboxes":[{"email":"user_95f3fmiywy@mailbox.test","id":98}],"name":null,"nb_block":0,"nb_forward":0,"nb_reply":0,"note":null,"pinned":false,"support_pgp":false}
+
+
+count after = 2
+----- quota attempt 2 (count before=2) prefix=q2tipper -----
+2026-07-08 10:14:58,496 - SL - INFO - 16215 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:14:58,503 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04112529754638672
+STATUS-LINE: 201 CREATED | status_code: 201
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 437
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:58 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"alias":"q2tipper.tipper@sl.local","creation_date":"2026-07-08 10:14:58+00:00","creation_timestamp":1783505698,"disable_pgp":false,"email":"q2tipper.tipper@sl.local","enabled":true,"id":185,"latest_activity":null,"mailbox":{"email":"user_95f3fmiywy@mailbox.test","id":98},"mailboxes":[{"email":"user_95f3fmiywy@mailbox.test","id":98}],"name":null,"nb_block":0,"nb_forward":0,"nb_reply":0,"note":null,"pinned":false,"support_pgp":false}
+
+
+count after = 3
+----- quota attempt 3 (count before=3) prefix=q3tipper -----
+2026-07-08 10:14:58,519 - SL - DEBUG - 16215 - "/code/app/api/views/new_custom_alias.py:49" - new_custom_alias_v2() -  - user <User 97 Test User user_95f3fmiywy@mailbox.test> cannot create any custom alias
+2026-07-08 10:14:58,519 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 400, takes 0.008816242218017578
+STATUS-LINE: 400 BAD REQUEST | status_code: 400
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 141
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:58 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"error":"You have reached the limitation of a free account with the maximum of 3 aliases, please upgrade your plan to create more aliases"}
+
+
+count after = 3
+<<<END-BLOCK>>>
+
+===== [RUN2] CONDITION 7 — count quota (v3); create up to MAX then one more =====
+user=user_0zd2eg6naw@mailbox.test id=98
+start count (includes auto newsletter alias) = 1
+CONSTANT signed_suffix across attempts: .recent@sl.local.ak4jIw.AB2dyb8Ce9SgOYU0om3P-21_-YM
+----- quota attempt 1 (count before=1) prefix=q1recent -----
+2026-07-08 10:14:59,126 - SL - INFO - 16215 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:14:59,133 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.0439143180847168
+STATUS-LINE: 201 CREATED | status_code: 201
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 437
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:59 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"alias":"q1recent.recent@sl.local","creation_date":"2026-07-08 10:14:59+00:00","creation_timestamp":1783505699,"disable_pgp":false,"email":"q1recent.recent@sl.local","enabled":true,"id":187,"latest_activity":null,"mailbox":{"email":"user_0zd2eg6naw@mailbox.test","id":99},"mailboxes":[{"email":"user_0zd2eg6naw@mailbox.test","id":99}],"name":null,"nb_block":0,"nb_forward":0,"nb_reply":0,"note":null,"pinned":false,"support_pgp":false}
+
+
+count after = 2
+----- quota attempt 2 (count before=2) prefix=q2recent -----
+2026-07-08 10:14:59,179 - SL - INFO - 16215 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:14:59,186 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04471087455749512
+STATUS-LINE: 201 CREATED | status_code: 201
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 437
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:59 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"alias":"q2recent.recent@sl.local","creation_date":"2026-07-08 10:14:59+00:00","creation_timestamp":1783505699,"disable_pgp":false,"email":"q2recent.recent@sl.local","enabled":true,"id":188,"latest_activity":null,"mailbox":{"email":"user_0zd2eg6naw@mailbox.test","id":99},"mailboxes":[{"email":"user_0zd2eg6naw@mailbox.test","id":99}],"name":null,"nb_block":0,"nb_forward":0,"nb_reply":0,"note":null,"pinned":false,"support_pgp":false}
+
+
+count after = 3
+----- quota attempt 3 (count before=3) prefix=q3recent -----
+2026-07-08 10:14:59,203 - SL - DEBUG - 16215 - "/code/app/api/views/new_custom_alias.py:138" - new_custom_alias_v3() -  - user <User 98 Test User user_0zd2eg6naw@mailbox.test> cannot create any custom alias
+2026-07-08 10:14:59,204 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 400, takes 0.00905156135559082
+STATUS-LINE: 400 BAD REQUEST | status_code: 400
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 141
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:59 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"error":"You have reached the limitation of a free account with the maximum of 3 aliases, please upgrade your plan to create more aliases"}
+
+
+count after = 3
+<<<END-BLOCK>>>
+```
+
+**Condition 9 — `parallel_limiter` concurrency: a simulated in-flight holder occupies the per-user lock, same request twice, on v2 and v3 → `429` (this v3 cell is one of the CP-flagged additions):**
+
+```text
+===== [RUN2] CONDITION 9 — parallel_limiter concurrency (v2); simulated in-flight holder =====
+user=user_5y7nu22id6@mailbox.test id=99
+pre-setting lock key (SIMULATED concurrent in-flight holder): cl:99:alias_creation
+----- v2 concurrency attempt 1 (identical input) -----
+redis get(lock) = b'held-by-inflight'
+2026-07-08 10:14:59,770 - SL - WARNING - 16215 - "/code/server.py:364" - rate_limited() -  - Client hit rate limit on path /api/v2/alias/custom/new, user:<User 99 Test User user_5y7nu22id6@mailbox.test>
+2026-07-08 10:14:59,770 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 429, takes 0.0030088424682617188
+STATUS-LINE: 429 TOO MANY REQUESTS | status_code: 429
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 32
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:59 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"error":"Rate limit exceeded"}
+
+
+----- v2 concurrency attempt 2 (identical input) -----
+redis get(lock) = b'held-by-inflight'
+2026-07-08 10:14:59,774 - SL - WARNING - 16215 - "/code/server.py:364" - rate_limited() -  - Client hit rate limit on path /api/v2/alias/custom/new, user:<User 99 Test User user_5y7nu22id6@mailbox.test>
+2026-07-08 10:14:59,774 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 429, takes 0.002858877182006836
+STATUS-LINE: 429 TOO MANY REQUESTS | status_code: 429
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 32
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:14:59 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"error":"Rate limit exceeded"}
+
+<<<END-BLOCK>>>
+
+===== [RUN2] CONDITION 9 — parallel_limiter concurrency (v3); simulated in-flight holder =====
+user=user_uqrd9olq5x@mailbox.test id=100
+pre-setting lock key (SIMULATED concurrent in-flight holder): cl:100:alias_creation
+----- v3 concurrency attempt 1 (identical input) -----
+redis get(lock) = b'held-by-inflight'
+2026-07-08 10:15:00,337 - SL - WARNING - 16215 - "/code/server.py:364" - rate_limited() -  - Client hit rate limit on path /api/v3/alias/custom/new, user:<User 100 Test User user_uqrd9olq5x@mailbox.test>
+2026-07-08 10:15:00,337 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 429, takes 0.002974987030029297
+STATUS-LINE: 429 TOO MANY REQUESTS | status_code: 429
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 32
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:15:00 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"error":"Rate limit exceeded"}
+
+
+----- v3 concurrency attempt 2 (identical input) -----
+redis get(lock) = b'held-by-inflight'
+2026-07-08 10:15:00,341 - SL - WARNING - 16215 - "/code/server.py:364" - rate_limited() -  - Client hit rate limit on path /api/v3/alias/custom/new, user:<User 100 Test User user_uqrd9olq5x@mailbox.test>
+2026-07-08 10:15:00,342 - SL - DEBUG - 16215 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 429, takes 0.0028159618377685547
+STATUS-LINE: 429 TOO MANY REQUESTS | status_code: 429
+RESPONSE-HEADERS:
+    Content-Type: application/json
+    Content-Length: 32
+    Access-Control-Allow-Origin: *
+    Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:15:00 GMT; HttpOnly; Path=/; SameSite=Lax
+JSON-BODY: {"error":"Rate limit exceeded"}
+
+<<<END-BLOCK>>>
+```
+
+### H.2 Condition 8 — token bucket, complete `RUN2` blocks (PAID and FREE; v2 and v3)
+
+The per-user token bucket inside `Alias.create()` (`models.py:1628-1692` → `rate_limiter.check_bucket_limit`, `rate_limiter.py:19-42`). As disclosed in §F.5, `probe_cond8.py` raises `MAX_NB_EMAIL_FREE_PLAN` to `1000` **in-process** (no file changed) so the count quota does not mask the bucket; every other setting is canonical. A fresh-trial user (`is_premium=True`) draws the **PAID** bucket `(50,900)` and breaches at custom-alias POST **#50** (`-> 51/50`); an expired-trial user (`is_premium=False`) draws the **FREE** bucket `(10,900)` and breaches at POST **#10** (`-> 11/10`) — the auto-created newsletter alias consumes the first hit at signup. The `429` carries **no** rate-limit headers and a 32-byte JSON body. The **v3** PAID and FREE blocks below are the CP-flagged additions.
+
+**8a / 8b on v2 (PAID then FREE):**
+
+```text
+===== [RUN2] CONDITION 8a (v2) — FRESH TRIAL user => is_premium True => PAID bucket (50,900) =====
+user id=119 bucket=PAID limits=[(50, 900), (200, 3600)] is_premium=True lifetime_or_active_sub=False
+NOTE: the auto-created newsletter alias already consumed 1 token-bucket hit at signup (start alias count=1),
+      so the breach value (51/50) is reached on custom-alias POST #50.
+2026-07-08 10:18:43,710 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:43,719 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04878640174865723
+  POST #1: STATUS 201 (ok)  body(id)=218
+2026-07-08 10:18:43,759 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:43,765 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.043243408203125
+2026-07-08 10:18:43,803 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:43,810 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.041327714920043945
+2026-07-08 10:18:43,847 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:43,853 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.040352821350097656
+2026-07-08 10:18:43,890 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:43,896 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04056596755981445
+2026-07-08 10:18:43,935 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:43,941 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.0415191650390625
+2026-07-08 10:18:43,977 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:43,984 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04074525833129883
+2026-07-08 10:18:44,022 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:44,028 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.040605783462524414
+2026-07-08 10:18:44,066 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:44,072 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.040662288665771484
+2026-07-08 10:18:44,109 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:44,115 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04072880744934082
+2026-07-08 10:18:44,154 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:44,160 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04176640510559082
+2026-07-08 10:18:44,198 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:44,204 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04083061218261719
+2026-07-08 10:18:44,241 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:44,247 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04060029983520508
+2026-07-08 10:18:44,284 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:44,290 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04025459289550781
+2026-07-08 10:18:44,327 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:44,333 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.03971409797668457
+2026-07-08 10:18:44,375 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:44,381 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.045651912689208984
+2026-07-08 10:18:44,418 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:44,424 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.03981804847717285
+2026-07-08 10:18:44,460 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:44,466 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.039724111557006836
+2026-07-08 10:18:44,503 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:44,509 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.039980173110961914
+2026-07-08 10:18:44,549 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:44,555 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04328298568725586
+2026-07-08 10:18:44,593 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:44,599 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04067659378051758
+2026-07-08 10:18:44,638 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:44,644 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04184865951538086
+2026-07-08 10:18:44,680 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:44,687 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.03989052772521973
+2026-07-08 10:18:44,723 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:44,734 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.044584035873413086
+2026-07-08 10:18:44,771 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:44,796 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.05861783027648926
+2026-07-08 10:18:44,833 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:44,839 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04047751426696777
+2026-07-08 10:18:44,879 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:44,885 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04190969467163086
+2026-07-08 10:18:44,921 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:44,928 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.03931713104248047
+2026-07-08 10:18:44,966 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:44,972 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.0417788028717041
+2026-07-08 10:18:45,010 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:45,016 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04096627235412598
+2026-07-08 10:18:45,053 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:45,059 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.040158987045288086
+2026-07-08 10:18:45,097 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:45,103 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.041150569915771484
+2026-07-08 10:18:45,139 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:45,145 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.0391232967376709
+2026-07-08 10:18:45,182 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:45,189 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.040831804275512695
+2026-07-08 10:18:45,225 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:45,231 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.039638519287109375
+2026-07-08 10:18:45,267 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:45,273 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.039316654205322266
+2026-07-08 10:18:45,311 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:45,317 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04126381874084473
+2026-07-08 10:18:45,353 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:45,359 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.03934979438781738
+2026-07-08 10:18:45,398 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:45,404 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04200482368469238
+2026-07-08 10:18:45,441 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:45,467 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.06035876274108887
+2026-07-08 10:18:45,505 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:45,511 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04044485092163086
+2026-07-08 10:18:45,549 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:45,555 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04097485542297363
+2026-07-08 10:18:45,592 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:45,598 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04044604301452637
+2026-07-08 10:18:45,635 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:45,641 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.0403590202331543
+2026-07-08 10:18:45,677 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:45,683 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.03961682319641113
+2026-07-08 10:18:45,720 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:45,726 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.039613962173461914
+2026-07-08 10:18:45,764 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:45,770 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04128670692443848
+2026-07-08 10:18:45,807 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:45,813 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.040163516998291016
+2026-07-08 10:18:45,849 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:45,855 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.03955888748168945
+2026-07-08 10:18:45,888 - SL - INFO - 16253 - "/code/app/rate_limiter.py:33" - check_bucket_limit() -  - Rate limit hit for alias_create_900d:119 (bucket id 1783505700) -> 51/50
+2026-07-08 10:18:45,889 - SL - WARNING - 16253 - "/code/server.py:364" - rate_limited() -  - Client hit rate limit on path /api/v2/alias/custom/new, user:<User 119 Test User user_h3yckta6il@mailbox.test>
+2026-07-08 10:18:45,889 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 429, takes 0.030905961990356445
+  POST #49: STATUS 201 (ok)  body(id)=266
+  POST #50: STATUS 429  <-- BREACH
+  FULL RESPONSE-HEADERS:
+      Content-Type: application/json
+      Content-Length: 32
+      Access-Control-Allow-Origin: *
+      Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:18:45 GMT; HttpOnly; Path=/; SameSite=Lax
+  FULL BODY [32 bytes, CT='application/json']: {"error":"Rate limit exceeded"}
+
+<<<END-BLOCK>>>
+
+===== [RUN2] CONDITION 8b (v2) — EXPIRED-TRIAL (genuine free) user => FREE bucket (10,900) =====
+user id=120 bucket=FREE limits=[(10, 900), (50, 3600)] is_premium=False lifetime_or_active_sub=False
+NOTE: the auto-created newsletter alias already consumed 1 token-bucket hit at signup (start alias count=1),
+      so the breach value (11/10) is reached on custom-alias POST #10.
+2026-07-08 10:18:46,555 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:46,565 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04522514343261719
+  POST #1: STATUS 201 (ok)  body(id)=268
+2026-07-08 10:18:46,603 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:46,609 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04092764854431152
+2026-07-08 10:18:46,647 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:46,654 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04173612594604492
+2026-07-08 10:18:46,691 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:46,701 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.0439755916595459
+2026-07-08 10:18:46,738 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:46,746 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.042313575744628906
+2026-07-08 10:18:46,784 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:46,790 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04124569892883301
+2026-07-08 10:18:46,827 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:46,834 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04058027267456055
+2026-07-08 10:18:46,873 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:46,879 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.042374610900878906
+2026-07-08 10:18:46,916 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:46,922 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.03965568542480469
+2026-07-08 10:18:46,955 - SL - INFO - 16253 - "/code/app/rate_limiter.py:33" - check_bucket_limit() -  - Rate limit hit for alias_create_900d:120 (bucket id 1783505700) -> 11/10
+2026-07-08 10:18:46,955 - SL - WARNING - 16253 - "/code/server.py:364" - rate_limited() -  - Client hit rate limit on path /api/v2/alias/custom/new, user:<User 120 Test User user_nor95pxvws@mailbox.test>
+2026-07-08 10:18:46,955 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 429, takes 0.030701398849487305
+  POST #9: STATUS 201 (ok)  body(id)=276
+  POST #10: STATUS 429  <-- BREACH
+  FULL RESPONSE-HEADERS:
+      Content-Type: application/json
+      Content-Length: 32
+      Access-Control-Allow-Origin: *
+      Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:18:46 GMT; HttpOnly; Path=/; SameSite=Lax
+  FULL BODY [32 bytes, CT='application/json']: {"error":"Rate limit exceeded"}
+
+<<<END-BLOCK>>>
+```
+
+**8a / 8b on v3 (PAID then FREE) — the CP-flagged v3 additions:**
+
+```text
+===== [RUN2] CONDITION 8a (v3) — FRESH TRIAL user => is_premium True => PAID bucket (50,900) =====
+user id=121 bucket=PAID limits=[(50, 900), (200, 3600)] is_premium=True lifetime_or_active_sub=False
+NOTE: the auto-created newsletter alias already consumed 1 token-bucket hit at signup (start alias count=1),
+      so the breach value (51/50) is reached on custom-alias POST #50.
+2026-07-08 10:18:47,556 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:47,564 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04301166534423828
+  POST #1: STATUS 201 (ok)  body(id)=278
+2026-07-08 10:18:47,602 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:47,609 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04209589958190918
+2026-07-08 10:18:47,649 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:47,656 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04458451271057129
+2026-07-08 10:18:47,696 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:47,703 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04361844062805176
+2026-07-08 10:18:47,741 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:47,748 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.042017221450805664
+2026-07-08 10:18:47,786 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:47,793 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.041522979736328125
+2026-07-08 10:18:47,831 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:47,838 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04235959053039551
+2026-07-08 10:18:47,876 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:47,883 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04147934913635254
+2026-07-08 10:18:47,924 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:47,932 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.045908212661743164
+2026-07-08 10:18:47,970 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:47,976 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04169607162475586
+2026-07-08 10:18:48,014 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:48,022 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04273676872253418
+2026-07-08 10:18:48,060 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:48,067 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04201340675354004
+2026-07-08 10:18:48,105 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:48,112 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04160308837890625
+2026-07-08 10:18:48,151 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:48,158 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04297947883605957
+2026-07-08 10:18:48,196 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:48,203 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04196810722351074
+2026-07-08 10:18:48,241 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:48,248 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.042482614517211914
+2026-07-08 10:18:48,286 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:48,293 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.041440725326538086
+2026-07-08 10:18:48,330 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:48,337 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04105877876281738
+2026-07-08 10:18:48,379 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:48,386 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04611563682556152
+2026-07-08 10:18:48,423 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:48,429 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04047083854675293
+2026-07-08 10:18:48,466 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:48,472 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04034256935119629
+2026-07-08 10:18:48,510 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:48,516 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04110574722290039
+2026-07-08 10:18:48,553 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:48,560 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.040677785873413086
+2026-07-08 10:18:48,597 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:48,603 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04012489318847656
+2026-07-08 10:18:48,641 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:48,647 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04183530807495117
+2026-07-08 10:18:48,684 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:48,691 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04049062728881836
+2026-07-08 10:18:48,730 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:48,736 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04254794120788574
+2026-07-08 10:18:48,774 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:48,780 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04148507118225098
+2026-07-08 10:18:48,819 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:48,826 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04275393486022949
+2026-07-08 10:18:48,866 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:48,873 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.043738365173339844
+2026-07-08 10:18:48,911 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:48,917 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.041835784912109375
+2026-07-08 10:18:48,956 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:48,962 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.0419774055480957
+2026-07-08 10:18:49,001 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:49,007 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.041973114013671875
+2026-07-08 10:18:49,045 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:49,052 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04200124740600586
+2026-07-08 10:18:49,093 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:49,099 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04448843002319336
+2026-07-08 10:18:49,136 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:49,142 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04017782211303711
+2026-07-08 10:18:49,179 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:49,185 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.040578365325927734
+2026-07-08 10:18:49,224 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:49,232 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.043485403060913086
+2026-07-08 10:18:49,274 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:49,282 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04642939567565918
+2026-07-08 10:18:49,323 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:49,329 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04453635215759277
+2026-07-08 10:18:49,368 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:49,375 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04241585731506348
+2026-07-08 10:18:49,415 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:49,422 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04428410530090332
+2026-07-08 10:18:49,462 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:49,469 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04346895217895508
+2026-07-08 10:18:49,510 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:49,517 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04518842697143555
+2026-07-08 10:18:49,557 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:49,563 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.043288230895996094
+2026-07-08 10:18:49,603 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:49,609 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04303145408630371
+2026-07-08 10:18:49,647 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:49,653 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.040996551513671875
+2026-07-08 10:18:49,693 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:49,699 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.043039798736572266
+2026-07-08 10:18:49,737 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:49,743 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04098153114318848
+2026-07-08 10:18:49,779 - SL - INFO - 16253 - "/code/app/rate_limiter.py:33" - check_bucket_limit() -  - Rate limit hit for alias_create_900d:121 (bucket id 1783505700) -> 51/50
+2026-07-08 10:18:49,780 - SL - WARNING - 16253 - "/code/server.py:364" - rate_limited() -  - Client hit rate limit on path /api/v3/alias/custom/new, user:<User 121 Test User user_8canmh0n84@mailbox.test>
+2026-07-08 10:18:49,780 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 429, takes 0.03426504135131836
+  POST #49: STATUS 201 (ok)  body(id)=326
+  POST #50: STATUS 429  <-- BREACH
+  FULL RESPONSE-HEADERS:
+      Content-Type: application/json
+      Content-Length: 32
+      Access-Control-Allow-Origin: *
+      Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:18:49 GMT; HttpOnly; Path=/; SameSite=Lax
+  FULL BODY [32 bytes, CT='application/json']: {"error":"Rate limit exceeded"}
+
+<<<END-BLOCK>>>
+
+===== [RUN2] CONDITION 8b (v3) — EXPIRED-TRIAL (genuine free) user => FREE bucket (10,900) =====
+user id=122 bucket=FREE limits=[(10, 900), (50, 3600)] is_premium=False lifetime_or_active_sub=False
+NOTE: the auto-created newsletter alias already consumed 1 token-bucket hit at signup (start alias count=1),
+      so the breach value (11/10) is reached on custom-alias POST #10.
+2026-07-08 10:18:50,394 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:50,401 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.0472712516784668
+  POST #1: STATUS 201 (ok)  body(id)=328
+2026-07-08 10:18:50,439 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:50,446 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04216361045837402
+2026-07-08 10:18:50,487 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:50,494 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04531097412109375
+2026-07-08 10:18:50,533 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:50,553 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.05560779571533203
+2026-07-08 10:18:50,595 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:50,601 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04557394981384277
+2026-07-08 10:18:50,642 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:50,648 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.043263912200927734
+2026-07-08 10:18:50,692 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:50,774 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.12365078926086426
+2026-07-08 10:18:50,815 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:50,822 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04383993148803711
+2026-07-08 10:18:50,860 - SL - INFO - 16253 - "/code/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 10:18:50,867 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.042031288146972656
+2026-07-08 10:18:50,904 - SL - INFO - 16253 - "/code/app/rate_limiter.py:33" - check_bucket_limit() -  - Rate limit hit for alias_create_900d:122 (bucket id 1783505700) -> 11/10
+2026-07-08 10:18:50,904 - SL - WARNING - 16253 - "/code/server.py:364" - rate_limited() -  - Client hit rate limit on path /api/v3/alias/custom/new, user:<User 122 Test User user_rgwkh0lav6@mailbox.test>
+2026-07-08 10:18:50,905 - SL - DEBUG - 16253 - "/code/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 429, takes 0.0339961051940918
+  POST #9: STATUS 201 (ok)  body(id)=336
+  POST #10: STATUS 429  <-- BREACH
+  FULL RESPONSE-HEADERS:
+      Content-Type: application/json
+      Content-Length: 32
+      Access-Control-Allow-Origin: *
+      Set-Cookie: slapp=<redacted>; Domain=.sl.test; Expires=Wed, 15-Jul-2026 10:18:50 GMT; HttpOnly; Path=/; SameSite=Lax
+  FULL BODY [32 bytes, CT='application/json']: {"error":"Rate limit exceeded"}
+
+<<<END-BLOCK>>>
+```
+
+### H.3 Condition 10 — Flask-Limiter `5/minute` burst over a REAL gunicorn server (v2 `RUN2`, v3 `RUN2`, v3 `RUN3`)
+
+Six identical real HTTP POSTs over a live `gunicorn wsgi:app -b 127.0.0.1:7788 -w 1 --timeout 60` server, captured with `curl -D -`. The first POST creates the alias (`201`), the next four are duplicates (`409`) that still consume limiter hits because `@limiter.limit` is the *outermost* decorator (it counts **before** auth and before the handler body), and the sixth crosses the `5/minute` rolling window → `429`. The `429` carries only `Server`/`Date`/`Connection` plus the same four standard keys — **no** `X-RateLimit-*`/`Retry-After`. The `SL` rate-limit log line shows `AnonymousUserMixin` because the limiter runs pre-auth, so the window is keyed by source IP (`__key_func`, `extensions.py:14-20`). The **v3** burst is the CP-flagged addition; it is shown for two independent runs (`RUN2` and `RUN3`, ~65 s apart so the rolling window fully resets) to confirm stability. `Content-Length` differs between blocks only because alias IDs / mailbox e-mails differ in length across independent runs.
+
+**Condition 10 — v2 `RUN2`:**
+
+```text
+===== [RUN2] CONDITION 10 — Flask-Limiter 5/minute burst (v2); 6 identical REAL HTTP POSTs =====
+user id=130  api_key=<redacted>  endpoint=POST /api/v2/alias/custom/new
+IDENTICAL payload (posted x6): alias_prefix='burstv2r2' signed_suffix=.dollop@sl.local.ak4maQ.j--cnrkA3Sh94zlZSQ9dEebkgzs
+=================== REAL HTTP BURST (6 identical POSTs, fresh window) ===================
+----- curl request 1 -----
+HTTP/1.1 201 CREATED
+Server: gunicorn/20.0.4
+Date: Wed, 08 Jul 2026 10:29:00 GMT
+Connection: close
+Content-Type: application/json
+Content-Length: 435
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=<redacted>; Expires=Wed, 15-Jul-2026 10:29:00 GMT; HttpOnly; Path=/; SameSite=Lax
+
+BODY: {"alias":"burstv2r2.dollop@sl.local","creation_date":"2026-07-08 10:29:00+00:00","creation_timestamp":1783506540,"disable_pgp":false,"email":"burstv2r2.dollop@sl.local","enabled":true,"id":464,"latest_activity":null,"mailbox":{"email":"burst_v2r2_demqtc@ex.test","id":131},"mailboxes":[{"email":"burst_v2r2_demqtc@ex.test","id":131}],"name":null,"nb_block":0,"nb_forward":0,"nb_reply":0,"note":null,"pinned":false,"support_pgp":false}
+
+----- curl request 2 -----
+HTTP/1.1 409 CONFLICT
+Server: gunicorn/20.0.4
+Date: Wed, 08 Jul 2026 10:29:00 GMT
+Connection: close
+Content-Type: application/json
+Content-Length: 59
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=<redacted>; Expires=Wed, 15-Jul-2026 10:29:00 GMT; HttpOnly; Path=/; SameSite=Lax
+
+BODY: {"error":"alias burstv2r2.dollop@sl.local already exists"}
+
+----- curl request 3 -----
+HTTP/1.1 409 CONFLICT
+Server: gunicorn/20.0.4
+Date: Wed, 08 Jul 2026 10:29:00 GMT
+Connection: close
+Content-Type: application/json
+Content-Length: 59
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=<redacted>; Expires=Wed, 15-Jul-2026 10:29:00 GMT; HttpOnly; Path=/; SameSite=Lax
+
+BODY: {"error":"alias burstv2r2.dollop@sl.local already exists"}
+
+----- curl request 4 -----
+HTTP/1.1 409 CONFLICT
+Server: gunicorn/20.0.4
+Date: Wed, 08 Jul 2026 10:29:00 GMT
+Connection: close
+Content-Type: application/json
+Content-Length: 59
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=<redacted>; Expires=Wed, 15-Jul-2026 10:29:00 GMT; HttpOnly; Path=/; SameSite=Lax
+
+BODY: {"error":"alias burstv2r2.dollop@sl.local already exists"}
+
+----- curl request 5 -----
+HTTP/1.1 409 CONFLICT
+Server: gunicorn/20.0.4
+Date: Wed, 08 Jul 2026 10:29:00 GMT
+Connection: close
+Content-Type: application/json
+Content-Length: 59
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=<redacted>; Expires=Wed, 15-Jul-2026 10:29:00 GMT; HttpOnly; Path=/; SameSite=Lax
+
+BODY: {"error":"alias burstv2r2.dollop@sl.local already exists"}
+
+----- curl request 6 -----
+HTTP/1.1 429 TOO MANY REQUESTS
+Server: gunicorn/20.0.4
+Date: Wed, 08 Jul 2026 10:29:00 GMT
+Connection: close
+Content-Type: application/json
+Content-Length: 32
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=<redacted>; Expires=Wed, 15-Jul-2026 10:29:00 GMT; HttpOnly; Path=/; SameSite=Lax
+
+BODY: {"error":"Rate limit exceeded"}
+
+=================== gunicorn SL rate-limit log lines ===================
+2026-07-08 10:29:00,283 - SL - WARNING - 16473 - "/code/server.py:364" - rate_limited() -  - Client hit rate limit on path /api/v2/alias/custom/new, user:<flask_login.mixins.AnonymousUserMixin object at 0x7f0d02195d20>
+=================== gunicorn 'Server' header confirm ===================
+(server header shown in curl -D - output above)
+
+<<<END-BLOCK>>>
+```
+
+**Condition 10 — v3 `RUN2` (CP-flagged addition):**
+
+```text
+===== [RUN2] CONDITION 10 — Flask-Limiter 5/minute burst (v3); 6 identical REAL HTTP POSTs =====
+user id=131  api_key=<redacted>  endpoint=POST /api/v3/alias/custom/new
+IDENTICAL payload (posted x6): alias_prefix='burstv3r2' signed_suffix=.poster@sl.local.ak4maQ.GjCGucrh2SuuwoinIm1Ej9fYIP8
+=================== REAL HTTP BURST (6 identical POSTs, fresh window) ===================
+----- curl request 1 -----
+HTTP/1.1 201 CREATED
+Server: gunicorn/20.0.4
+Date: Wed, 08 Jul 2026 10:29:00 GMT
+Connection: close
+Content-Type: application/json
+Content-Length: 435
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=<redacted>; Expires=Wed, 15-Jul-2026 10:29:00 GMT; HttpOnly; Path=/; SameSite=Lax
+
+BODY: {"alias":"burstv3r2.poster@sl.local","creation_date":"2026-07-08 10:29:00+00:00","creation_timestamp":1783506540,"disable_pgp":false,"email":"burstv3r2.poster@sl.local","enabled":true,"id":465,"latest_activity":null,"mailbox":{"email":"burst_v3r2_bbvjoo@ex.test","id":132},"mailboxes":[{"email":"burst_v3r2_bbvjoo@ex.test","id":132}],"name":null,"nb_block":0,"nb_forward":0,"nb_reply":0,"note":null,"pinned":false,"support_pgp":false}
+
+----- curl request 2 -----
+HTTP/1.1 409 CONFLICT
+Server: gunicorn/20.0.4
+Date: Wed, 08 Jul 2026 10:29:00 GMT
+Connection: close
+Content-Type: application/json
+Content-Length: 59
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=<redacted>; Expires=Wed, 15-Jul-2026 10:29:00 GMT; HttpOnly; Path=/; SameSite=Lax
+
+BODY: {"error":"alias burstv3r2.poster@sl.local already exists"}
+
+----- curl request 3 -----
+HTTP/1.1 409 CONFLICT
+Server: gunicorn/20.0.4
+Date: Wed, 08 Jul 2026 10:29:00 GMT
+Connection: close
+Content-Type: application/json
+Content-Length: 59
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=<redacted>; Expires=Wed, 15-Jul-2026 10:29:00 GMT; HttpOnly; Path=/; SameSite=Lax
+
+BODY: {"error":"alias burstv3r2.poster@sl.local already exists"}
+
+----- curl request 4 -----
+HTTP/1.1 409 CONFLICT
+Server: gunicorn/20.0.4
+Date: Wed, 08 Jul 2026 10:29:00 GMT
+Connection: close
+Content-Type: application/json
+Content-Length: 59
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=<redacted>; Expires=Wed, 15-Jul-2026 10:29:00 GMT; HttpOnly; Path=/; SameSite=Lax
+
+BODY: {"error":"alias burstv3r2.poster@sl.local already exists"}
+
+----- curl request 5 -----
+HTTP/1.1 409 CONFLICT
+Server: gunicorn/20.0.4
+Date: Wed, 08 Jul 2026 10:29:00 GMT
+Connection: close
+Content-Type: application/json
+Content-Length: 59
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=<redacted>; Expires=Wed, 15-Jul-2026 10:29:00 GMT; HttpOnly; Path=/; SameSite=Lax
+
+BODY: {"error":"alias burstv3r2.poster@sl.local already exists"}
+
+----- curl request 6 -----
+HTTP/1.1 429 TOO MANY REQUESTS
+Server: gunicorn/20.0.4
+Date: Wed, 08 Jul 2026 10:29:00 GMT
+Connection: close
+Content-Type: application/json
+Content-Length: 32
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=<redacted>; Expires=Wed, 15-Jul-2026 10:29:00 GMT; HttpOnly; Path=/; SameSite=Lax
+
+BODY: {"error":"Rate limit exceeded"}
+
+=================== gunicorn SL rate-limit log lines ===================
+2026-07-08 10:29:00,535 - SL - WARNING - 16473 - "/code/server.py:364" - rate_limited() -  - Client hit rate limit on path /api/v3/alias/custom/new, user:<flask_login.mixins.AnonymousUserMixin object at 0x7f0d0201cd30>
+=================== gunicorn 'Server' header confirm ===================
+(server header shown in curl -D - output above)
+
+<<<END-BLOCK>>>
+```
+
+**Condition 10 — v3 `RUN3` (window reset ~65 s after v3 `RUN2`; identical outcome sequence):**
+
+```text
+===== [RUN3] CONDITION 10 — Flask-Limiter 5/minute burst (v3); 6 identical REAL HTTP POSTs =====
+user id=132  api_key=<redacted>  endpoint=POST /api/v3/alias/custom/new
+IDENTICAL payload (posted x6): alias_prefix='burstv3r3' signed_suffix=.viands@sl.local.ak4maQ.-F8a-tfh_V0s5TYvUlh_Y_MIgY4
+=================== REAL HTTP BURST (6 identical POSTs, fresh window) ===================
+----- curl request 1 -----
+HTTP/1.1 201 CREATED
+Server: gunicorn/20.0.4
+Date: Wed, 08 Jul 2026 10:30:05 GMT
+Connection: close
+Content-Type: application/json
+Content-Length: 435
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=<redacted>; Expires=Wed, 15-Jul-2026 10:30:05 GMT; HttpOnly; Path=/; SameSite=Lax
+
+BODY: {"alias":"burstv3r3.viands@sl.local","creation_date":"2026-07-08 10:30:05+00:00","creation_timestamp":1783506605,"disable_pgp":false,"email":"burstv3r3.viands@sl.local","enabled":true,"id":466,"latest_activity":null,"mailbox":{"email":"burst_v3r3_cjupvm@ex.test","id":133},"mailboxes":[{"email":"burst_v3r3_cjupvm@ex.test","id":133}],"name":null,"nb_block":0,"nb_forward":0,"nb_reply":0,"note":null,"pinned":false,"support_pgp":false}
+
+----- curl request 2 -----
+HTTP/1.1 409 CONFLICT
+Server: gunicorn/20.0.4
+Date: Wed, 08 Jul 2026 10:30:05 GMT
+Connection: close
+Content-Type: application/json
+Content-Length: 59
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=<redacted>; Expires=Wed, 15-Jul-2026 10:30:05 GMT; HttpOnly; Path=/; SameSite=Lax
+
+BODY: {"error":"alias burstv3r3.viands@sl.local already exists"}
+
+----- curl request 3 -----
+HTTP/1.1 409 CONFLICT
+Server: gunicorn/20.0.4
+Date: Wed, 08 Jul 2026 10:30:05 GMT
+Connection: close
+Content-Type: application/json
+Content-Length: 59
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=<redacted>; Expires=Wed, 15-Jul-2026 10:30:05 GMT; HttpOnly; Path=/; SameSite=Lax
+
+BODY: {"error":"alias burstv3r3.viands@sl.local already exists"}
+
+----- curl request 4 -----
+HTTP/1.1 409 CONFLICT
+Server: gunicorn/20.0.4
+Date: Wed, 08 Jul 2026 10:30:05 GMT
+Connection: close
+Content-Type: application/json
+Content-Length: 59
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=<redacted>; Expires=Wed, 15-Jul-2026 10:30:05 GMT; HttpOnly; Path=/; SameSite=Lax
+
+BODY: {"error":"alias burstv3r3.viands@sl.local already exists"}
+
+----- curl request 5 -----
+HTTP/1.1 409 CONFLICT
+Server: gunicorn/20.0.4
+Date: Wed, 08 Jul 2026 10:30:05 GMT
+Connection: close
+Content-Type: application/json
+Content-Length: 59
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=<redacted>; Expires=Wed, 15-Jul-2026 10:30:05 GMT; HttpOnly; Path=/; SameSite=Lax
+
+BODY: {"error":"alias burstv3r3.viands@sl.local already exists"}
+
+----- curl request 6 -----
+HTTP/1.1 429 TOO MANY REQUESTS
+Server: gunicorn/20.0.4
+Date: Wed, 08 Jul 2026 10:30:05 GMT
+Connection: close
+Content-Type: application/json
+Content-Length: 32
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=<redacted>; Expires=Wed, 15-Jul-2026 10:30:05 GMT; HttpOnly; Path=/; SameSite=Lax
+
+BODY: {"error":"Rate limit exceeded"}
+
+=================== gunicorn SL rate-limit log lines ===================
+2026-07-08 10:30:05,788 - SL - WARNING - 16473 - "/code/server.py:364" - rate_limited() -  - Client hit rate limit on path /api/v3/alias/custom/new, user:<flask_login.mixins.AnonymousUserMixin object at 0x7f0d02071ae0>
+=================== gunicorn 'Server' header confirm ===================
+(server header shown in curl -D - output above)
+
+<<<END-BLOCK>>>
+```
+
+### H.4 Third-run confirmation (`RUN3`) — identical-input stability
+
+Every block above was re-captured a third time with the *same* unchanged inputs. The test-client conditions (1–7, 9; v2 and v3) reproduced the **byte-identical** aggregate distribution `{201:8, 400:6, 409:2, 412:16, 429:4}` across `RUN2` and `RUN3`. The token-bucket breaches (Condition 8) reproduced identically — PAID `-> 51/50` at POST #50 and FREE `-> 11/10` at POST #10, on both v2 and v3, with the same `LOG.i` at `rate_limiter.py:33` and the same 32-byte `429` body. The Flask-Limiter burst (Condition 10) reproduced the identical `201, 409, 409, 409, 409, 429` sequence on the v3 `RUN3` block embedded in §H.3. This confirms that the deterministic content faults are stable on identical input and that the *only* run-to-run variation is the timing-/concurrency-/state-sensitive intermittency characterised in §E — never a change in status code, error string, or header set for a fixed condition.
+
+---
+
 ## §G — Coverage Pass
 
 Every named/required item from the question, confirmed against observed evidence:
@@ -1184,7 +2390,7 @@ Every named/required item from the question, confirmed against observed evidence
 - [x] **O3 — successful creation: quota checks and what each logs.** Two checks enumerated in order: (1) `User.can_create_new_alias()` count quota (`models.py:867-884`) — logs **nothing** on success, only `LOG.d "... cannot create any custom alias"` + `400` on breach (`new_custom_alias.py:49`); (2) `Alias.create()` per-user token bucket via `rate_limiter.check_bucket_limit` (`models.py:1641`, `rate_limiter.py:19-42`) — logs **nothing** on success, only `LOG.i "Rate limit hit ..."` + `429` on breach (`rate_limiter.py:33`). Success emits audit `"New alias created"` (`models.py:1688-1689`), **observed as a real `AliasAuditLog` row** (`action='create'`) after a `201` (§C.3, §F.3). Observed `Alias.filter_by(user_id).count()` before/after each creation (`1→2→3`) captured in §C.1, noting the auto-created newsletter alias at signup.
 - [x] **O4 — execution-path trace.** Full ordered decorator/validation chain documented for both `POST /api/v2/alias/custom/new` and `POST /api/v3/...` (v3 differences **observed**, §D.2), the four creation-limit enforcers named, the rejection-condition table (status/message/log/`file:line`), the Mermaid flowchart, and the dashboard sibling note (§D).
 - [x] **Intermittency — reproduced on identical input with observed distribution + code-level causes.** Deterministic baseline (RUN1 vs RUN2, byte-identical distribution `6×201, 3×400, 2×409, 16×412, 2×429`) plus the four causes each with citation and evidence: 600 s suffix window, `parallel_limiter` `429`, Flask-Limiter `5/minute` rolling window (authoritative gunicorn capture), and the Redis-availability gate that silently disables the bucket + concurrency limiters (§E).
-- [x] **Canonical config + exact commands + ≥2 runs + full unedited outputs.** Effective config stated (`MAX_NB_EMAIL_FREE_PLAN=3`, `MEM_STORE_URI=redis://localhost`, `DISABLE_RATE_LIMIT`/`DISABLE_ALIAS_SUFFIX` unset); exact build/invocation commands in §F.1; every condition run twice with the distribution reported; complete unedited output blocks throughout §A–§F, with only session-cookie values redacted. The single deliberate deviation from canonical config — Condition 8's in-process `MAX_NB_EMAIL_FREE_PLAN=1000` raise, required so the count quota does not mask the token bucket in the full 49-POST run — is disclosed at its point of use (§F.5, §F.1) and explained in §C.2; every other condition ran under the canonical cap of `3`.
+- [x] **Canonical config + exact commands + ≥2 runs + full unedited outputs.** Effective config stated (`MAX_NB_EMAIL_FREE_PLAN=3`, `MEM_STORE_URI=redis://localhost`, `DISABLE_RATE_LIMIT`/`DISABLE_ALIAS_SUFFIX` unset); exact build/invocation commands in §F.1; every condition run twice with the distribution reported; complete unedited output blocks throughout §A–§F, with the full second-run (`RUN2`) blocks for **every** condition on **both** v2 and v3 — plus the previously-absent v3 blocks for Conditions 5, 7, 8, 9, 10 and a third-run (`RUN3`) confirmation — embedded in **appendix §H**; only session-cookie values are redacted. The single deliberate deviation from canonical config — Condition 8's in-process `MAX_NB_EMAIL_FREE_PLAN=1000` raise, required so the count quota does not mask the token bucket in the full 49-POST run — is disclosed at its point of use (§F.5, §F.1) and explained in §C.2; every other condition ran under the canonical cap of `3`.
 - [x] **Repo unchanged; temporary scripts removed.** Final `git status --porcelain` is empty and `git diff --name-status <baseline>..HEAD` shows only the new `blitzy/documentation/app_2cd6ee777f8c.md`; all observation scripts and evidence files lived under host `/tmp/probes/` and were deleted (§F.7).
 
 ### G.1 What "doesn't match expected behavior" actually is — one-paragraph synthesis
