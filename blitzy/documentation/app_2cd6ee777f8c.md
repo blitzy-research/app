@@ -1117,7 +1117,7 @@ docker run -d --name simplelogin-app \
   -c "sleep infinity"          # image: andrewparkscaleai/coding-agent:simple-login__app__2cd6ee772d3531559588bcfb18627ffb5d2c
 
 # 2. Inside the container: Python venv + Flask CLI + default config
-source /app/venv/bin/activate          # Python 3.10.18, 182 pkgs
+source /app/venv/bin/activate          # Python 3.10.18, 180 pkgs
 export FLASK_APP=server.py
 cp -n /app/example.env /app/.env       # default config, auto-loaded via load_dotenv
 
@@ -1155,8 +1155,8 @@ base:   2cd6ee777f8c2d3531559588bcfb18627ffb5d2c
 --- git diff 2cd6ee77 --name-status ---
 A	blitzy/documentation/app_2cd6ee777f8c.md
 --- git diff 2cd6ee77 --stat ---
- blitzy/documentation/app_2cd6ee777f8c.md | 1224 ++++++++++++++++++++++++++++
- 1 file changed, 1224 insertions(+)
+ blitzy/documentation/app_2cd6ee777f8c.md | 1255 ++++++++++++++++++++++++++++++
+ 1 file changed, 1255 insertions(+)
 ```
 
 `git status --porcelain` is empty (clean tree); the **only** file that differs from base `2cd6ee77`
