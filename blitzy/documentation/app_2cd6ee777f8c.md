@@ -32,7 +32,7 @@ docker exec sl-work bash -lc 'cd /app && echo "python:" && python --version && \
   echo "libs:" && python -c "import sqlalchemy,psycopg2,aiosmtpd;print(\"sqlalchemy\",sqlalchemy.__version__,\"psycopg2\",psycopg2.__version__.split(\" \")[0],\"aiosmtpd\",aiosmtpd.__version__)" && \
   echo ".version:" && cat .version && \
   echo "branch:" && git rev-parse --abbrev-ref HEAD && \
-  echo "base-app-commit:" && git rev-parse HEAD && \
+  echo "simplelogin-source-base:" && git rev-parse origin/app_2cd6ee777f8c && \
   echo "postgres:" && pg_lsclusters'
 ```
 
@@ -47,12 +47,14 @@ sqlalchemy 1.3.24 psycopg2 2.9.3 aiosmtpd 1.4.2
 dev
 branch:
 blitzy-fa8339d5-38ba-4a32-a6f3-20c43c289bf8
-base-app-commit:
+simplelogin-source-base:
 2cd6ee777f8c2d3531559588bcfb18627ffb5d2c
 postgres:
 Ver Cluster Port  Status Owner    Data directory              Log file
 15  main    15432 online postgres /var/lib/postgresql/15/main /var/log/postgresql/postgresql-15-main.log
 ```
+
+`simplelogin-source-base` above is the **immutable SimpleLogin commit** this investigation ran against — `git rev-parse origin/app_2cd6ee777f8c` resolves to `2cd6ee777f8c2d3531559588bcfb18627ffb5d2c`, and it does **not** change as this answer document is revised. The committed deliverable advances the branch **HEAD** *beyond* that base by exactly the commit(s) that add and refine this one document; the current HEAD hash therefore differs from the source base and is intentionally **not** hard-coded here (it would go stale on every revision). The net effect versus the source base — invariant to the exact HEAD — is shown in **Repository verification & cleanup** at the end: `git diff --name-status 2cd6ee777f8c2d3531559588bcfb18627ffb5d2c..HEAD` → `A blitzy/documentation/app_2cd6ee777f8c.md`.
 
 The reply-resolution subsystem consists of these files (all read-only reference targets; only the answer document is created):
 
@@ -724,7 +726,7 @@ Re-reading the question and confirming each named item is addressed with a concr
 | R7 | Observed values → behavior? | R7 | consolidated table; `id=207 user_id=596` wins post-flip → reply to `other@external.test` |
 | — | Every guarded exit enumerated | Guarded-exit matrix | E501/E502(×2)/E503/E504/E214 canonical + E201/E506 `[NON-CANONICAL]`, each with return string and `file:line` |
 | — | State before / intermediate / after | State-transition report | rows `595 → 595 → 596`, input unchanged |
-| — | Read-only, repository unchanged, scripts removed | Repository verification & cleanup | `git status --porcelain` shows only the answer doc; temp scripts removed |
+| — | Read-only, repository unchanged, scripts removed | Repository verification & cleanup | clean working tree (`git status --porcelain` empty); net diff `2cd6ee77..HEAD` = `A` the answer doc only; temp scripts removed |
 
 Every part of the question is answered by name, with its concrete value, `file:line` grounding, observed evidence, sibling variants, and causal reason.
 
@@ -750,28 +752,27 @@ ls: cannot access '/tmp/obs_*.txt': No such file or directory
 no such files (clean)
 ```
 
-**Command (only the answer document is modified in the repo):**
+**Command (the working tree is clean — the answer document is committed, not left as an uncommitted modification):**
 
 ```
 git status --porcelain
 ```
 
+**Complete, unedited output:** *(empty — the working tree is clean; the deliverable is committed)*
+
+```
+```
+
+**Command (net change versus the SimpleLogin source base — invariant to the exact deliverable HEAD):**
+
+```
+git diff --name-status 2cd6ee777f8c2d3531559588bcfb18627ffb5d2c..HEAD
+```
+
 **Complete, unedited output:**
 
 ```
- M blitzy/documentation/app_2cd6ee777f8c.md
-```
-
-**Command (which file changed, with status — invariant to this document's own size):**
-
-```
-git diff --name-status
-```
-
-**Complete, unedited output:**
-
-```
-M	blitzy/documentation/app_2cd6ee777f8c.md
+A	blitzy/documentation/app_2cd6ee777f8c.md
 ```
 
 **Command (no temporary observation scripts remain anywhere in the repository tree):**
@@ -785,4 +786,4 @@ find . -path ./.git -prune -o \( -name 'blitzy_adhoc_test_*' -o -name 'obs_repro
 ```
 ```
 
-The single tracked change is `M blitzy/documentation/app_2cd6ee777f8c.md`; no source file was modified, no code was added to the source repository, and no temporary artifact remains. This satisfies the read-only scope requirement.
+The single tracked change versus the SimpleLogin source base (`2cd6ee777f8c…`) is `A blitzy/documentation/app_2cd6ee777f8c.md`; the working tree is clean, no source file was modified, no code was added to the source repository, and no temporary artifact remains. This satisfies the read-only scope requirement.
