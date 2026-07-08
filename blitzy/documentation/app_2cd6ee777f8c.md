@@ -2,7 +2,7 @@
 
 **Repository:** SimpleLogin (`app`) — Flask monolith
 **Git HEAD:** `2cd6ee777f8c2d3531559588bcfb18627ffb5d2c`
-**Investigation type:** Read-only runtime observation. Every behavioral claim below is backed by **real, captured, unedited output** and the **exact command** that produced it. Anything not observed at runtime is explicitly marked **`(inferred)`**. No source file was created, modified, or deleted; the transient `.env` and all temporary scripts used for observation were removed afterward, leaving the repository byte-for-byte unchanged except for this single document.
+**Investigation type:** Read-only runtime observation. Every behavioral claim below is backed by **real, captured, unedited output** and the **exact command** that produced it. Every fenced evidence block is transcribed in full from captured bytes with **no elision** — where an ellipsis (`...`) appears it is either part of the actual emitted bytes (e.g. `swaks`'s `=== Trying 127.0.0.1:20381...` line, or the `500.html` "server issues..." text), part of a verbatim quotation of the user's question, or ordinary code shorthand in prose (e.g. `os.environ[...]`, `User.get_by(email=...)`); it is never a truncation of captured evidence. The single value not exercised at runtime is explicitly marked **`(inferred)`** (the Q1 alternate `load_user` trigger, §2.7); every other value was observed and is summarized in §5.4. No source file was created, modified, or deleted; the transient `.env` and all temporary scripts used for observation were removed afterward, leaving the repository byte-for-byte unchanged except for this single document.
 
 This document answers three questions about how the stack behaves under three deliberately different setup conditions:
 
@@ -78,16 +78,40 @@ flowchart TD
 
 ### 1.4 Migration command note (verified by reading + observed)
 
-`README.md:433` documents `flask db upgrade`, but `Migrate()` is **not** registered on the app entry points: `shell.py` imports `flask_migrate` (`shell.py:1`) and calls `flask_migrate.upgrade()` (`shell.py:20`), but that call sits inside a dead `if False:` block (`shell.py:11`), and `shell.py`'s `__main__` (`shell.py:72`) merely calls `embed()` (`shell.py:73`). Therefore **`alembic upgrade head`** (`alembic.ini:5` → `script_location = migrations`) is the reliable path, consistent with the `CONTRIBUTING.md:106` quickstart. `migrations/env.py` imports `Base` and `DB_URI` and sets `target_metadata = Base.metadata`.
+`README.md:433` documents `flask db upgrade`, but `Migrate()` is **not** registered on the app entry points: `shell.py` imports `flask_migrate` (`shell.py:1`) and calls `flask_migrate.upgrade()` (`shell.py:20`), but that call sits inside a dead `if False:` block (`shell.py:11`), and `shell.py`'s `__main__` (`shell.py:72`) merely calls `embed()` (`shell.py:73`). Therefore **`alembic upgrade head`** (`alembic.ini:5` → `script_location = migrations`) is the reliable path, consistent with the `CONTRIBUTING.md:106` quickstart. `migrations/env.py` imports `Base` (`migrations/env.py:26`) and `DB_URI` (`migrations/env.py:27`) and sets `target_metadata = Base.metadata` (`migrations/env.py:28`).
 
-Observed: `alembic upgrade head` applied exactly **255** versioned migration scripts:
+Observed: `alembic upgrade head` applied exactly **255** versioned migration scripts. The full run was captured to `/tmp/q3_alembic.log` (264 lines total = 9 preamble/context lines + 255 `Running upgrade` lines). Below are the complete env-preamble/context lines, the first three and last three `Running upgrade` lines, and the exact count proven by `grep -c` against the captured file. The intermediate 249 `Running upgrade` lines are omitted **for length only** (they are present in the captured log; the `grep -c` below counts the complete file):
 
 ```
-$ docker exec -w /app sl-app /app/venv/bin/alembic upgrade head
-...
+$ docker exec -w /app sl-app bash -c '/app/venv/bin/alembic upgrade head > /tmp/q3_alembic.log 2>&1; echo "alembic exit=$?"'
+alembic exit=0
+
+# --- complete preamble / alembic context lines (the 9 non-"Running upgrade" lines) ---
+$ docker exec sl-app grep -v "Running upgrade" /tmp/q3_alembic.log
+>>> URL: http://localhost:7777
+MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value
+Paddle param not set
+WARNING: Use a temp directory for GNUPGHOME /tmp/gctupbbwuujomluptsdg
+Upload files to local dir
+>>> init logging <<<
+2026-07-08 22:16:26,618 - SL - DEBUG - 3007 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+
+# --- first three Running-upgrade lines (base of the chain; note the empty from-revision) ---
+$ docker exec sl-app grep "Running upgrade" /tmp/q3_alembic.log | head -3
+INFO  [alembic.runtime.migration] Running upgrade  -> 5e549314e1e2, empty message
+INFO  [alembic.runtime.migration] Running upgrade 5e549314e1e2 -> 3cd10cfce8c3, empty message
+INFO  [alembic.runtime.migration] Running upgrade 3cd10cfce8c3 -> 0256244cd7c8, empty message
+
+# --- last three Running-upgrade lines (head of the chain) ---
+$ docker exec sl-app grep "Running upgrade" /tmp/q3_alembic.log | tail -3
+INFO  [alembic.runtime.migration] Running upgrade 62afa3a10010 -> 91ed7f46dc81, alias_audit_log
 INFO  [alembic.runtime.migration] Running upgrade 91ed7f46dc81 -> 7d7b84779837, user_audit_log
 INFO  [alembic.runtime.migration] Running upgrade 7d7b84779837 -> 32f25cbf12f6, alias_audit_log_index_created_at
-$ grep -c "Running upgrade" <alembic output>
+
+# --- exact count against the complete captured file ---
+$ docker exec sl-app grep -c "Running upgrade" /tmp/q3_alembic.log
 255
 ```
 
@@ -131,10 +155,93 @@ i.e. a **`sqlalchemy.exc.ProgrammingError`** wrapping **`psycopg2.errors.Undefin
 
 ### 2.2 BEFORE state — proof the schema is empty
 
+Complete, unedited output of the schema reset (all 82 cascaded objects listed by Postgres in the `DETAIL`):
+
 ```
 $ docker exec sl-postgres psql -U myuser -d simplelogin -c 'drop schema public cascade; create schema public;'
 NOTICE:  drop cascades to 82 other objects
-...
+DETAIL:  drop cascades to table alembic_version
+drop cascades to type plan_enum
+drop cascades to table file
+drop cascades to table users
+drop cascades to table activation_code
+drop cascades to table client
+drop cascades to table alias
+drop cascades to table authorization_code
+drop cascades to table client_user
+drop cascades to table oauth_token
+drop cascades to table redirect_uri
+drop cascades to table reset_password_code
+drop cascades to table contact
+drop cascades to type planenum2
+drop cascades to table subscription
+drop cascades to table email_log
+drop cascades to table deleted_alias
+drop cascades to table email_change
+drop cascades to table api_key
+drop cascades to table alias_used_on
+drop cascades to table custom_domain
+drop cascades to table lifetime_coupon
+drop cascades to table directory
+drop cascades to table job
+drop cascades to table mailbox
+drop cascades to table manual_subscription
+drop cascades to table social_auth
+drop cascades to table account_activation
+drop cascades to table refused_email
+drop cascades to table referral
+drop cascades to type planenum_apple
+drop cascades to table apple_subscription
+drop cascades to table sent_alert
+drop cascades to table alias_mailbox
+drop cascades to table recovery_code
+drop cascades to table domain_deleted_alias
+drop cascades to table notification
+drop cascades to table fido
+drop cascades to table mfa_browser
+drop cascades to table directory_mailbox
+drop cascades to table public_domain
+drop cascades to table domain_mailbox
+drop cascades to table monitoring
+drop cascades to table batch_import
+drop cascades to table authorized_address
+drop cascades to table coinbase_subscription
+drop cascades to table bounce
+drop cascades to table transactional_email
+drop cascades to table metric2
+drop cascades to table payout
+drop cascades to table hibp
+drop cascades to table alias_hibp
+drop cascades to table ignored_email
+drop cascades to table coupon
+drop cascades to table hibp_notified_alias
+drop cascades to table ignore_bounce_sender
+drop cascades to extension pg_trgm
+drop cascades to table auto_create_rule
+drop cascades to table auto_create_rule__mailbox
+drop cascades to table message_id_matching
+drop cascades to table deleted_directory
+drop cascades to table deleted_subdomain
+drop cascades to table phone_country
+drop cascades to table phone_number
+drop cascades to table phone_message
+drop cascades to table phone_reservation
+drop cascades to table invalid_mailbox_domain
+drop cascades to type block_behaviour_enum
+drop cascades to table admin_audit_log
+drop cascades to table provider_complaint
+drop cascades to table partner
+drop cascades to table partner_api_token
+drop cascades to table partner_user
+drop cascades to table partner_subscription
+drop cascades to table newsletter
+drop cascades to table newsletter_user
+drop cascades to table api_cookie_token
+drop cascades to table daily_metric
+drop cascades to table sync_event
+drop cascades to table mailbox_activation
+drop cascades to table alias_audit_log
+drop cascades to table user_audit_log
 CREATE SCHEMA
 
 $ docker exec sl-postgres psql -U myuser -d simplelogin -c '\dt'
@@ -150,6 +257,8 @@ $ docker exec sl-postgres psql -U myuser -d simplelogin -tc \
      0
 ```
 
+(This drop is run only when the schema is non-empty; on an already-empty database the `drop schema public cascade` emits no `NOTICE`/`DETAIL` and just prints `CREATE SCHEMA`. The object count depends on the prior state — here 82 objects from a fully-migrated schema.)
+
 ### 2.3 Commands — start the server and exercise the login page
 
 Start the web app through its real entry point (`server.py`'s `__main__` at `server.py:598` → `local_main()` at `server.py:572` → `app.debug = True` at `server.py:581` → `app.run(debug=True, port=7777)` at `server.py:588`; `create_app()` at `server.py:139` sets `SQLALCHEMY_DATABASE_URI = DB_URI` at `server.py:146`):
@@ -159,59 +268,71 @@ $ docker exec -w /app sl-app bash -c \
     'PYTHONUNBUFFERED=1 setsid /app/venv/bin/python server.py > /tmp/q1_server.log 2>&1 < /dev/null &'
 ```
 
-Captured startup output (`/tmp/q1_server.log`):
+Complete captured startup output (`/tmp/q1_server.log`, lines 1–19). In debug mode the Werkzeug reloader spawns two processes — the reloader parent (PID `2844`, which prints the Flask CLI banner) and the worker child (PID `2864`, which actually serves requests) — so the app-init preamble appears twice:
 
 ```
 >>> URL: http://localhost:7777
 MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value
 Paddle param not set
-WARNING: Use a temp directory for GNUPGHOME /tmp/ykiwkwlfvovlywbzprcn
+WARNING: Use a temp directory for GNUPGHOME /tmp/bpeutzaklskwivzmfulq
 Upload files to local dir
 >>> init logging <<<
+2026-07-08 22:14:35,172 - SL - DEBUG - 2844 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
  * Serving Flask app "server" (lazy loading)
  * Environment: production
    WARNING: This is a development server. Do not use it in a production deployment.
    Use a production WSGI server instead.
  * Debug mode: on
+>>> URL: http://localhost:7777
+MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value
+Paddle param not set
+WARNING: Use a temp directory for GNUPGHOME /tmp/dhpcxmerhdzodskjmxhv
+Upload files to local dir
+>>> init logging <<<
+2026-07-08 22:14:36,924 - SL - DEBUG - 2864 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
 ```
 
 **Opening the login page (GET) — works, no DB hit.** A bare `GET /auth/login` renders statically; the route is `@auth_bp.route("/login", methods=["GET", "POST"])` (`app/auth/views/login.py:21`) → `def login()` (`:25`), and the first DB access is guarded by `if form.validate_on_submit():` (`:40`), which is false for GET:
 
 ```
 $ docker exec sl-app curl -sS -c /tmp/q1_cookies.txt \
-    -w '\n[HTTP_CODE=%{http_code}]\n' http://127.0.0.1:7777/auth/login -o /tmp/q1_login_get.html
-[HTTP_CODE=200]      # body = 347597 bytes, full login page
+    -w '\n[HTTP_CODE=%{http_code}] [SIZE=%{size_download}]\n' http://127.0.0.1:7777/auth/login -o /tmp/q1_login_get.html
+[HTTP_CODE=200] [SIZE=347619]
 
-# server log confirms a clean 200 with no traceback:
-127.0.0.1 GET /auth/login ImmutableMultiDict([]) 200, takes 0.10432267189025879   # server.py:284 after_request()
+# server log confirms a clean 200 with no traceback (captured from /tmp/q1_server.log):
+2026-07-08 22:14:52,762 - SL - DEBUG - 2864 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET /auth/login ImmutableMultiDict([]) 200, takes 0.10350561141967773
 ```
 
 **Submitting the login form (POST) — triggers the first ORM query.** The POST carries the session cookie from the GET plus the CSRF token and credentials:
 
 ```
+$ CSRF=$(grep -oP 'name="csrf_token"[^>]*value="\K[^"]+' /tmp/q1_login_get.html | head -1)
 $ docker exec sl-app curl -sS -b /tmp/q1_cookies.txt -D /tmp/q1_post_headers.txt \
-    --data-urlencode 'csrf_token=<token from GET>' \
+    --data-urlencode "csrf_token=${CSRF}" \
     --data-urlencode 'email=john@wick.com' \
     --data-urlencode 'password=password' \
     http://127.0.0.1:7777/auth/login -o /tmp/q1_post_body.html
 
-# response headers:
+# complete captured response headers (/tmp/q1_post_headers.txt):
 HTTP/1.0 500 INTERNAL SERVER ERROR
 Content-Type: text/html; charset=utf-8
 Content-Length: 5749
+Vary: Cookie
+Set-Cookie: slapp=eyJfZnJlc2giOmZhbHNlLCJfcGVybWFuZW50Ijp0cnVlLCJjc3JmX3Rva2VuIjoiNWQ4NGU0MGIxMjYwNjZlOTkzNTZjNDI5YmUyODNlODM4MDA4OTZlZiJ9.ak7L3Q.6z2HQTP6KJB4tn9pB_ui6Pnqbho; Expires=Wed, 15-Jul-2026 22:14:53 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
+Date: Wed, 08 Jul 2026 22:14:53 GMT
 ```
 
 ### 2.4 The full, unedited exception + traceback
 
-Captured from the server's stderr (printed by `LOG.e(e)` inside the global error handler at `server.py:390`). This is the complete, byte-accurate traceback:
+Captured verbatim from the server's stderr (`/tmp/q1_server.log`; printed by `LOG.e(e)` inside the global error handler at `server.py:390`). This is the complete, unedited traceback — the full `SELECT` column list is shown in full (no ellipsis), exactly as emitted:
 
 ```
-2026-07-08 21:10:05,400 - SL - ERROR - 1849 - "/app/server.py:390" - error_handler() -  - (psycopg2.errors.UndefinedTable) relation "users" does not exist
+2026-07-08 22:14:53,167 - SL - ERROR - 2864 - "/app/server.py:390" - error_handler() -  - (psycopg2.errors.UndefinedTable) relation "users" does not exist
 LINE 2: FROM users 
              ^
 
-[SQL: SELECT users.directory_quota AS users_directory_quota, users.subdomain_quota AS users_subdomain_quota, users.password AS users_password, users.id AS users_id, users.created_at AS users_created_at, users.updated_at AS users_updated_at, users.email AS users_email, ... users.delete_on AS users_delete_on 
+[SQL: SELECT users.directory_quota AS users_directory_quota, users.subdomain_quota AS users_subdomain_quota, users.password AS users_password, users.id AS users_id, users.created_at AS users_created_at, users.updated_at AS users_updated_at, users.email AS users_email, users.name AS users_name, users.is_admin AS users_is_admin, users.alias_generator AS users_alias_generator, users.notification AS users_notification, users.activated AS users_activated, users.disabled AS users_disabled, users.profile_picture_id AS users_profile_picture_id, users.otp_secret AS users_otp_secret, users.enable_otp AS users_enable_otp, users.last_otp AS users_last_otp, users.fido_uuid AS users_fido_uuid, users.default_alias_custom_domain_id AS users_default_alias_custom_domain_id, users.default_alias_public_domain_id AS users_default_alias_public_domain_id, users.lifetime AS users_lifetime, users.paid_lifetime AS users_paid_lifetime, users.lifetime_coupon_id AS users_lifetime_coupon_id, users.trial_end AS users_trial_end, users.default_mailbox_id AS users_default_mailbox_id, users.sender_format AS users_sender_format, users.sender_format_updated_at AS users_sender_format_updated_at, users.replace_reverse_alias AS users_replace_reverse_alias, users.referral_id AS users_referral_id, users.intro_shown AS users_intro_shown, users.max_spam_score AS users_max_spam_score, users.newsletter_alias_id AS users_newsletter_alias_id, users.include_sender_in_reverse_alias AS users_include_sender_in_reverse_alias, users.random_alias_suffix AS users_random_alias_suffix, users.expand_alias_info AS users_expand_alias_info, users.ignore_loop_email AS users_ignore_loop_email, users.alternative_id AS users_alternative_id, users.disable_automatic_alias_note AS users_disable_automatic_alias_note, users.one_click_unsubscribe_block_sender AS users_one_click_unsubscribe_block_sender, users.include_website_in_one_click_alias AS users_include_website_in_one_click_alias, users.disable_import AS users_disable_import, users.can_use_phone AS users_can_use_phone, users.phone_quota AS users_phone_quota, users.block_behaviour AS users_block_behaviour, users.include_header_email_header AS users_include_header_email_header, users.enable_data_breach_check AS users_enable_data_breach_check, users.flags AS users_flags, users.unsub_behaviour AS users_unsub_behaviour, users.delete_on AS users_delete_on 
 FROM users 
 WHERE users.email = %(email_1)s 
  LIMIT %(param_1)s]
@@ -269,12 +390,21 @@ Traceback (most recent call last):
 sqlalchemy.exc.ProgrammingError: (psycopg2.errors.UndefinedTable) relation "users" does not exist
 LINE 2: FROM users 
              ^
-[SQL: SELECT users.directory_quota AS users_directory_quota, ... FROM users WHERE users.email = %(email_1)s LIMIT %(param_1)s]
+[SQL: SELECT users.directory_quota AS users_directory_quota, users.subdomain_quota AS users_subdomain_quota, users.password AS users_password, users.id AS users_id, users.created_at AS users_created_at, users.updated_at AS users_updated_at, users.email AS users_email, users.name AS users_name, users.is_admin AS users_is_admin, users.alias_generator AS users_alias_generator, users.notification AS users_notification, users.activated AS users_activated, users.disabled AS users_disabled, users.profile_picture_id AS users_profile_picture_id, users.otp_secret AS users_otp_secret, users.enable_otp AS users_enable_otp, users.last_otp AS users_last_otp, users.fido_uuid AS users_fido_uuid, users.default_alias_custom_domain_id AS users_default_alias_custom_domain_id, users.default_alias_public_domain_id AS users_default_alias_public_domain_id, users.lifetime AS users_lifetime, users.paid_lifetime AS users_paid_lifetime, users.lifetime_coupon_id AS users_lifetime_coupon_id, users.trial_end AS users_trial_end, users.default_mailbox_id AS users_default_mailbox_id, users.sender_format AS users_sender_format, users.sender_format_updated_at AS users_sender_format_updated_at, users.replace_reverse_alias AS users_replace_reverse_alias, users.referral_id AS users_referral_id, users.intro_shown AS users_intro_shown, users.max_spam_score AS users_max_spam_score, users.newsletter_alias_id AS users_newsletter_alias_id, users.include_sender_in_reverse_alias AS users_include_sender_in_reverse_alias, users.random_alias_suffix AS users_random_alias_suffix, users.expand_alias_info AS users_expand_alias_info, users.ignore_loop_email AS users_ignore_loop_email, users.alternative_id AS users_alternative_id, users.disable_automatic_alias_note AS users_disable_automatic_alias_note, users.one_click_unsubscribe_block_sender AS users_one_click_unsubscribe_block_sender, users.include_website_in_one_click_alias AS users_include_website_in_one_click_alias, users.disable_import AS users_disable_import, users.can_use_phone AS users_can_use_phone, users.phone_quota AS users_phone_quota, users.block_behaviour AS users_block_behaviour, users.include_header_email_header AS users_include_header_email_header, users.enable_data_breach_check AS users_enable_data_breach_check, users.flags AS users_flags, users.unsub_behaviour AS users_unsub_behaviour, users.delete_on AS users_delete_on 
+FROM users 
+WHERE users.email = %(email_1)s 
+ LIMIT %(param_1)s]
 [parameters: {'email_1': 'john@wick.com', 'param_1': 1}]
 (Background on this error at: http://sqlalche.me/e/13/f405)
 ```
 
-(The full `SELECT` lists all `User` columns; it is abbreviated with `...` above for readability but was captured in full. The two `LINE 2: FROM users` carets are emitted verbatim by Postgres.)
+The request-completion line logged immediately after (by `after_request()` at `server.py:284`) confirms the 500 response:
+
+```
+2026-07-08 22:14:53,173 - SL - DEBUG - 2864 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /auth/login ImmutableMultiDict([]) 500, takes 0.014399051666259766
+```
+
+(The `SELECT` above lists **all 49 `User` columns in full** — the earlier `...` abbreviation has been removed and the complete column list is transcribed exactly as emitted, in both the initial DBAPI error and the wrapping `sqlalchemy.exc.ProgrammingError`. The two `LINE 2: FROM users` carets are emitted verbatim by Postgres.)
 
 ### 2.5 Render-path observation (what the browser actually gets)
 
@@ -288,7 +418,26 @@ So: the login page opens fine (200); the failure surfaces on form submit as a 50
 
 ### 2.6 Repeatability
 
-The observation was repeated with three total POSTs (the initial one plus two fresh `GET → POST` cycles). All three returned **HTTP 500** with the identical `sqlalchemy.exc.ProgrammingError: (psycopg2.errors.UndefinedTable) relation "users" does not exist`, logged via `error_handler()` at `server.py:390`. The result is byte-stable.
+The observation was repeated with three fresh `GET → POST` cycles against the running server (each obtaining its own session cookie + CSRF token from the GET), capturing the HTTP status and the terminal exception-class line each POST produced in `/tmp/q1_server.log`. Exact command and captured output:
+
+```
+$ docker exec sl-app bash -c '
+for i in 1 2 3; do
+  curl -sS -c /tmp/q1_rep_cookies_$i.txt http://127.0.0.1:7777/auth/login -o /tmp/q1_rep_get_$i.html
+  CSRF=$(grep -oP "name=\"csrf_token\"[^>]*value=\"\K[^\"]+" /tmp/q1_rep_get_$i.html | head -1)
+  before=$(wc -l < /tmp/q1_server.log)
+  code=$(curl -sS -b /tmp/q1_rep_cookies_$i.txt -o /dev/null -w "%{http_code}" \
+     --data-urlencode "csrf_token=$CSRF" --data-urlencode "email=john@wick.com" \
+     --data-urlencode "password=password" http://127.0.0.1:7777/auth/login)
+  excline=$(tail -n +$((before+1)) /tmp/q1_server.log | grep -m1 "^sqlalchemy.exc")
+  echo "run $i: HTTP=$code | $excline"
+done'
+run 1: HTTP=500 | sqlalchemy.exc.ProgrammingError: (psycopg2.errors.UndefinedTable) relation "users" does not exist
+run 2: HTTP=500 | sqlalchemy.exc.ProgrammingError: (psycopg2.errors.UndefinedTable) relation "users" does not exist
+run 3: HTTP=500 | sqlalchemy.exc.ProgrammingError: (psycopg2.errors.UndefinedTable) relation "users" does not exist
+```
+
+All three cycles returned **HTTP 500** with the byte-identical `sqlalchemy.exc.ProgrammingError: (psycopg2.errors.UndefinedTable) relation "users" does not exist`, logged via `error_handler()` at `server.py:390`. The result is byte-stable across runs.
 
 ### 2.7 Reasoning
 
@@ -309,16 +458,16 @@ $ docker exec -w /app sl-app /app/venv/bin/alembic upgrade head    # 255 version
 $ docker exec -w /app sl-app /app/venv/bin/python init_app.py
 ```
 
-`init_app.py`'s `add_sl_domains()` (`init_app.py:39`) seeds the `SLDomain`/`public_domain` table from `ALIAS_DOMAINS`, logging `LOG.i("Add %s to SL domain", ...)` at `init_app.py:44`; `__main__` (`init_app.py:69`) runs it inside `create_light_app().app_context()` (`init_app.py:71`). Captured first-run output:
+`init_app.py`'s `add_sl_domains()` (`init_app.py:39`) seeds the `SLDomain`/`public_domain` table from `ALIAS_DOMAINS`, logging `LOG.i("Add %s to SL domain", ...)` at `init_app.py:44`; `__main__` (`init_app.py:69`) runs it inside `create_light_app().app_context()` (`init_app.py:71`). Captured first-run output (`init_app.py:44`, emitted via `LOG.i`):
 
 ```
-"/app/init_app.py:44" - add_sl_domains() -  - Add sl.local to SL domain
+2026-07-08 22:25:25,615 - SL - INFO - 3285 - "/app/init_app.py:44" - add_sl_domains() -  - Add sl.local to SL domain
 ```
 
-On a subsequent run it is idempotent (`init_app.py:42`):
+On a subsequent run it is idempotent (`init_app.py:42`, emitted via `LOG.d`):
 
 ```
-"/app/init_app.py:42" - add_sl_domains() -  - sl.local is already a SL domain
+2026-07-08 22:25:41,609 - SL - DEBUG - 3315 - "/app/init_app.py:42" - add_sl_domains() -  - sl.local is already a SL domain
 ```
 
 State proof (before = 0 from Q3's migrated-but-uninitialized DB; after ≥ 1):
@@ -331,7 +480,7 @@ $ docker exec sl-postgres psql -U myuser -d simplelogin -c 'SELECT id, domain FR
 (1 row)
 ```
 
-**A note on how "ready to accept connections" manifests here.** All processes log single-line records to stdout via `app/log.py` (format at `app/log.py:12-14`). SimpleLogin **intentionally disables the werkzeug logger** — `app/log.py:70-71`:
+**A note on how "ready to accept connections" manifests here.** All processes log single-line records to stdout via `app/log.py` (format at `app/log.py:12-14`). SimpleLogin **intentionally disables the werkzeug logger** — `app/log.py:69-71`:
 
 ```
 # Disable flask logs such as 127.0.0.1 - - [15/Feb/2013 10:52:22] "GET /index.html HTTP/1.1" 200
@@ -345,17 +494,32 @@ so werkzeug's usual `* Running on http://127.0.0.1:7777` line **never appears**.
 
 #### 3.2.1 Flask web app — `python server.py`, binds TCP **7777**
 
-Start command and captured stdout:
+Start command and **complete** captured stdout. Debug mode spawns a reloader parent (PID 3380) which prints the Flask CLI banner and then forks the serving worker (PID 3400), so the app-init preamble prints twice; the trailing `flask_debugtoolbar` `UserWarning` is emitted the first time a non-HTML response (the `/health` probe below) is served:
 
 ```
 $ docker exec -w /app sl-app bash -c \
     'PYTHONUNBUFFERED=1 setsid /app/venv/bin/python server.py > /tmp/q2_web.log 2>&1 < /dev/null &'
-
+>>> URL: http://localhost:7777
+MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value
+Paddle param not set
+WARNING: Use a temp directory for GNUPGHOME /tmp/xwxkylmpbstgcmzpnwdp
+Upload files to local dir
+>>> init logging <<<
+2026-07-08 22:30:10,673 - SL - DEBUG - 3380 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
  * Serving Flask app "server" (lazy loading)
  * Environment: production
    WARNING: This is a development server. Do not use it in a production deployment.
    Use a production WSGI server instead.
  * Debug mode: on
+>>> URL: http://localhost:7777
+MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value
+Paddle param not set
+WARNING: Use a temp directory for GNUPGHOME /tmp/klcwifjsaqbysobwhvhk
+Upload files to local dir
+>>> init logging <<<
+2026-07-08 22:30:12,448 - SL - DEBUG - 3400 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+/app/venv/lib/python3.10/site-packages/flask_debugtoolbar/__init__.py:213: UserWarning: Could not insert debug toolbar. </body> tag not found in response.
+  warnings.warn('Could not insert debug toolbar.'
 ```
 
 Binding proof — because the werkzeug "Running on" line is suppressed (§3.1), the authoritative proof is a live `/health` request (route wired in `create_app`, returns `"success"`):
@@ -367,18 +531,18 @@ success [code=200]
 
 (`grep -c 'Running on' /tmp/q2_web.log` → `0`, confirming the suppression.)
 
-**Production alternative:** dev uses `python server.py`; production uses Gunicorn — `gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15` (`Dockerfile:47`; `EXPOSE 7777` at `Dockerfile:44`). `wsgi.py` is simply `from server import create_app` + `app = create_app()`.
+**Production alternative:** dev uses `python server.py`; production uses Gunicorn — `gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15` (`Dockerfile:47`; `EXPOSE 7777` at `Dockerfile:44`). `wsgi.py` is simply `from server import create_app` (`wsgi.py:1`) + `app = create_app()` (`wsgi.py:3`) — the same `create_app()` factory the dev server uses, so the enumerated web service is identical under Gunicorn.
 
 #### 3.2.2 Email handler — `python email_handler.py`, binds TCP **20381** (dev)
 
-Start command and captured **readiness banner** (byte-accurate):
+Start command and captured **readiness banner** (byte-accurate). This is the single handler instance (PID 3139) used for both this Q2 enumeration and the Q3 injection in §4.3, so the banner timestamps match §4:
 
 ```
 $ docker exec -w /app sl-app bash -c \
-    'PYTHONUNBUFFERED=1 setsid /app/venv/bin/python email_handler.py > /tmp/q2_email.log 2>&1 < /dev/null &'
+    'PYTHONUNBUFFERED=1 setsid /app/venv/bin/python email_handler.py > /tmp/q3_email.log 2>&1 < /dev/null &'
 
-2026-07-08 21:13:36,875 - SL - INFO  - 2170 - "/app/email_handler.py:2403" - <module>() -  - Listen for port 20381
-2026-07-08 21:13:36,876 - SL - DEBUG - 2170 - "/app/email_handler.py:2386" - main() -  - Start mail controller 0.0.0.0 20381
+2026-07-08 22:23:28,587 - SL - INFO - 3139 - "/app/email_handler.py:2403" - <module>() -  - Listen for port 20381
+2026-07-08 22:23:28,589 - SL - DEBUG - 3139 - "/app/email_handler.py:2386" - main() -  - Start mail controller 0.0.0.0 20381
 ```
 
 These two lines correspond to `LOG.i("Listen for port %s", args.port)` at `email_handler.py:2403` and `LOG.d("Start mail controller %s %s", controller.hostname, controller.port)` at `email_handler.py:2386`. Wiring: `def main(port)` at `email_handler.py:2381`; `controller = Controller(MailHandler(), hostname="0.0.0.0", port=port)` at `email_handler.py:2383`; argparse `default=20381` at `email_handler.py:2399`; `main(port=args.port)` at `email_handler.py:2404`.
@@ -425,43 +589,124 @@ Redis is therefore listed as an essential piece of the *documented* production t
 
 ### 3.3 AUXILIARY services (background workers — bind NO TCP port)
 
-For these, "readiness" is an app-initialization log line and entry into a work loop — none binds a listening TCP socket. Proof method: count listening sockets via `/proc/net/tcp{,6}` (state `0A`). With the web app + email handler running the baseline was **7** listening sockets; starting each auxiliary process left the count unchanged at **7**, proving no new port.
+For these, "readiness" is an app-initialization log line and entry into a work loop — none binds a listening TCP socket. **Proof method:** count listening sockets (TCP state `0A`) across both IPv4 and IPv6 via `/proc/net/tcp{,6}`, before and after starting each process. Captured baseline with the two essential Python servers (web app + email handler) running:
+
+```
+$ docker exec sl-app bash -c "cat /proc/net/tcp /proc/net/tcp6 | awk '\$4==\"0A\"' | wc -l"
+7
+$ docker exec sl-app bash -c "cat /proc/net/tcp /proc/net/tcp6 | awk '\$4==\"0A\" {print \$2}' | while read a; do p=\$(echo \$a|cut -d: -f2); printf '%d ' 0x\$p; done; echo"
+15432 5432 6379 7777 20381 5432 6379
+```
+
+The 7 sockets decode to PostgreSQL `5432` and Redis `6379` (each listening on **both** IPv4 and IPv6 → 2 sockets apiece), the web app `7777`, the email handler `20381`, and the pytest-only test DB `15432` (IPv4-only). Starting each auxiliary process below left this count **unchanged at 7**, proving none binds a new port.
 
 #### 3.3.1 `job_runner.py` — `python job_runner.py` (poller; no TCP port)
 
-`__main__` at `job_runner.py:329` is a `while True:` loop (`:330`) that opens `create_light_app().app_context()` (`:332`), logs `LOG.d("Take job %s", job)` (`:334`) per job, and `time.sleep(10)` (`:347`) between passes. Captured startup is app-init stdout only (config/GNUPGHOME/logging lines); the listening-socket count stayed at 7 (no port bound). It is a poller, not a server.
-
-#### 3.3.2 `cron.py` — `python cron.py -j <job>` (one-shot; no TCP port)
-
-`cron.py` is argparse-driven (`-j/--job`) and invoked per-job by yacron (`crontab.yml`); it runs a task and **exits** (it is not a daemon and binds no port). Sample invocation:
-
-```
-$ docker exec -w /app sl-app /app/venv/bin/python cron.py -j sanity_check ; echo "exit=$?"
-...
-"/app/cron.py:1296" - <module>() -  - Check data consistency
-... (sanitize user email / alias / contact / mailbox, normalize reverse-alias, clean domain, check PGP, check RLM) ...
-"/app/cron.py:794" - check_data_consistency() -  - Finish sanity check
-exit=0
-```
-
-#### 3.3.3 `event_listener.py` — `python event_listener.py listener` (LISTEN/NOTIFY consumer; no TCP port)
-
-`def main(mode, dry_run, max_retries)` at `event_listener.py:29`; `__main__` at `event_listener.py:94`. It consumes PostgreSQL LISTEN/NOTIFY and binds no TCP port (listening-socket count stayed at 7). It uses `EVENT_LISTENER_DB_URI`, which defaults to `DB_URI` (`app/config.py:637`). Captured startup (default, non-dry-run):
-
-```
-"/app/event_listener.py:34" - main() -  - Using PostgresEventSource
-"/app/event_listener.py:43" - main() -  - Starting with HttpEventSink
-```
-
-**Honest correction vs. the inferred banner.** The default sink is **`HttpEventSink`** (`event_listener.py:43`), *not* `ConsoleEventSink`. `ConsoleEventSink` (logged at `event_listener.py:40`) is only selected under `if dry_run:` (`event_listener.py:38`). Captured with the flag:
+`__main__` at `job_runner.py:329` is a `while True:` loop (`:330`) that opens `create_light_app().app_context()` (`:332`), logs `LOG.d("Take job %s", job)` (`:334`) only when a job exists, and `time.sleep(10)` (`:347`) between passes. It is a poller, not a server. Exact start command and **complete** captured stdout (with an empty job queue the readiness output is the app-init block ending at the `load words file` line, after which it enters the poll loop):
 
 ```
 $ docker exec -w /app sl-app bash -c \
-    'PYTHONUNBUFFERED=1 setsid /app/venv/bin/python event_listener.py listener --dry-run > /tmp/q2_ev_dry.log 2>&1 < /dev/null &'
-
-"/app/event_listener.py:34" - main() -  - Using PostgresEventSource
-"/app/event_listener.py:40" - main() -  - Starting with ConsoleEventSink
+    'PYTHONUNBUFFERED=1 setsid /app/venv/bin/python job_runner.py > /tmp/q2_jr.log 2>&1 < /dev/null & echo $!'
+3892
+>>> URL: http://localhost:7777
+MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value
+Paddle param not set
+WARNING: Use a temp directory for GNUPGHOME /tmp/qpzrlieyqfrfoblciymc
+Upload files to local dir
+>>> init logging <<<
+2026-07-08 22:38:05,995 - SL - DEBUG - 3892 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
 ```
+
+No-port proof — the listening-socket count is unchanged by this start:
+
+```
+$ docker exec sl-app bash -c "cat /proc/net/tcp /proc/net/tcp6 | awk '\$4==\"0A\"' | wc -l"   # before
+7
+$ docker exec sl-app bash -c "cat /proc/net/tcp /proc/net/tcp6 | awk '\$4==\"0A\"' | wc -l"   # after starting PID 3892
+7
+```
+
+#### 3.3.2 `cron.py` — `python cron.py -j <job>` (one-shot; no TCP port)
+
+`cron.py` is argparse-driven (`-j/--job`) and invoked per-job by yacron (`crontab.yml`); it runs a task and **exits** (it is not a daemon and binds no port). Exact invocation and **complete, unedited** output for the `sanity_check` job:
+
+```
+$ docker exec -w /app sl-app bash -c \
+    'PYTHONUNBUFFERED=1 /app/venv/bin/python cron.py -j sanity_check' ; echo "exit=$?"
+>>> URL: http://localhost:7777
+MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value
+Paddle param not set
+WARNING: Use a temp directory for GNUPGHOME /tmp/giqztffvosnqbvjrodnc
+Upload files to local dir
+>>> init logging <<<
+2026-07-08 22:37:46,231 - SL - DEBUG - 3839 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+2026-07-08 22:37:47,128 - SL - DEBUG - 3839 - "/app/cron.py:1263" - <module>() -  - Start running cronjob
+2026-07-08 22:37:47,130 - SL - DEBUG - 3839 - "/app/cron.py:1296" - <module>() -  - Check data consistency
+2026-07-08 22:37:47,130 - SL - DEBUG - 3839 - "/app/cron.py:725" - sanity_check() -  - sanitize user email
+2026-07-08 22:37:47,260 - SL - DEBUG - 3839 - "/app/cron.py:730" - sanity_check() -  - sanitize alias address & name
+2026-07-08 22:37:47,263 - SL - DEBUG - 3839 - "/app/cron.py:733" - sanity_check() -  - sanity contact address
+2026-07-08 22:37:47,267 - SL - DEBUG - 3839 - "/app/cron.py:751" - sanity_check() -  - sanitize mailbox address
+2026-07-08 22:37:47,268 - SL - DEBUG - 3839 - "/app/cron.py:756" - sanity_check() -  - normalize reverse alias
+2026-07-08 22:37:47,269 - SL - DEBUG - 3839 - "/app/cron.py:765" - sanity_check() -  - clean domain name
+2026-07-08 22:37:47,271 - SL - DEBUG - 3839 - "/app/cron.py:770" - sanity_check() -  - migrate domain trash if needed
+2026-07-08 22:37:47,273 - SL - DEBUG - 3839 - "/app/cron.py:677" - migrate_domain_trash() -  - create 0 DomainDeletedAlias
+2026-07-08 22:37:47,273 - SL - DEBUG - 3839 - "/app/cron.py:680" - migrate_domain_trash() -  - delete 0 DeletedAlias
+2026-07-08 22:37:47,274 - SL - DEBUG - 3839 - "/app/cron.py:773" - sanity_check() -  - fix custom domain for alias
+2026-07-08 22:37:47,276 - SL - DEBUG - 3839 - "/app/cron.py:776" - sanity_check() -  - check mailbox valid domain
+2026-07-08 22:37:47,276 - SL - DEBUG - 3839 - "/app/cron.py:779" - sanity_check() -  - check mailbox valid PGP keys
+2026-07-08 22:37:47,277 - SL - DEBUG - 3839 - "/app/cron.py:782" - sanity_check() -  - check if there's an email that starts with "‏" (right-to-left mark (RLM))
+2026-07-08 22:37:47,278 - SL - DEBUG - 3839 - "/app/cron.py:794" - sanity_check() -  - Finish sanity check
+exit=0
+```
+
+Every line is emitted from a self-identifying `cron.py:<lineno>` `LOG` statement; `sanity_check()` walks its consistency checks (`cron.py:725`–`cron.py:782`), the `migrate_domain_trash()` helper reports `create 0`/`delete 0` (empty DB), and it finishes at `cron.py:794`. The process then exits `0` — it binds no port, so it is never counted among the 7 listening sockets. (The `cron.py:782` line contains a literal U+200F right-to-left mark between the double quotes, reproduced verbatim.)
+
+#### 3.3.3 `event_listener.py` — `python event_listener.py listener` (LISTEN/NOTIFY consumer; no TCP port)
+
+`def main(mode, dry_run, max_retries)` at `event_listener.py:29`; `__main__` at `event_listener.py:94`. It consumes PostgreSQL LISTEN/NOTIFY and binds no TCP port. It uses `EVENT_LISTENER_DB_URI`, which defaults to `DB_URI` (`app/config.py:637`). Exact start command and **complete** captured stdout (default, non-dry-run):
+
+```
+$ docker exec -w /app sl-app bash -c \
+    'PYTHONUNBUFFERED=1 setsid /app/venv/bin/python event_listener.py listener > /tmp/q2_ev.log 2>&1 < /dev/null & echo $!'
+3976
+>>> URL: http://localhost:7777
+MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value
+Paddle param not set
+WARNING: Use a temp directory for GNUPGHOME /tmp/wbpvlnctwyzvibwurqfl
+Upload files to local dir
+>>> init logging <<<
+2026-07-08 22:38:29,200 - SL - DEBUG - 3976 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+2026-07-08 22:38:29,319 - SL - INFO - 3976 - "/app/event_listener.py:34" - main() -  - Using PostgresEventSource
+2026-07-08 22:38:29,322 - SL - INFO - 3976 - "/app/event_listener.py:43" - main() -  - Starting with HttpEventSink
+2026-07-08 22:38:29,322 - SL - INFO - 3976 - "/app/events/event_source.py:49" - __listen() -  - Starting to listen to events
+```
+
+No-port proof — socket count unchanged by this start:
+
+```
+$ docker exec sl-app bash -c "cat /proc/net/tcp /proc/net/tcp6 | awk '\$4==\"0A\"' | wc -l"   # after starting PID 3976
+7
+```
+
+**Honest correction vs. the inferred banner.** The default sink is **`HttpEventSink`** (`event_listener.py:43`, assigned at `:44`), *not* `ConsoleEventSink`. `ConsoleEventSink` (logged at `event_listener.py:40`) is only selected under `if dry_run:` (`event_listener.py:39`). Exact command and **complete** captured stdout with the flag:
+
+```
+$ docker exec -w /app sl-app bash -c \
+    'PYTHONUNBUFFERED=1 setsid /app/venv/bin/python event_listener.py listener --dry-run > /tmp/q2_ev_dry.log 2>&1 < /dev/null & echo $!'
+3582
+>>> URL: http://localhost:7777
+MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value
+Paddle param not set
+WARNING: Use a temp directory for GNUPGHOME /tmp/yxxxyaqicxyiqjjuprmo
+Upload files to local dir
+>>> init logging <<<
+2026-07-08 22:31:42,084 - SL - DEBUG - 3582 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+2026-07-08 22:31:42,201 - SL - INFO - 3582 - "/app/event_listener.py:34" - main() -  - Using PostgresEventSource
+2026-07-08 22:31:42,204 - SL - INFO - 3582 - "/app/event_listener.py:40" - main() -  - Starting with ConsoleEventSink
+2026-07-08 22:31:42,205 - SL - INFO - 3582 - "/app/events/event_source.py:49" - __listen() -  - Starting to listen to events
+```
+
+Only the sink line differs between default (`HttpEventSink`, `:43`) and `--dry-run` (`ConsoleEventSink`, `:40`); both then enter `events/event_source.py:49` `__listen()` and begin listening.
 
 ### 3.4 Essential-vs-auxiliary rationale
 
@@ -471,7 +716,49 @@ The **auxiliary** processes — `job_runner.py`, `cron.py`, `event_listener.py` 
 
 ### 3.5 Repeatability
 
-Each service was started at least twice. The web app banner + `curl /health` = `success`, the email handler's two-line banner (`Listen for port 20381` / `Start mail controller 0.0.0.0 20381`), and the auxiliary startup lines were byte-stable across restarts; PostgreSQL `pg_isready` and Redis `PONG` were stable.
+Every service was started/probed **at least twice** and the readiness evidence was byte-stable — only per-process values (timestamp, PID, and the random `GNUPGHOME` temp-dir name) differ. Captured runs:
+
+**Essential services (2 probes each) — all stable:**
+
+```
+$ for r in 1 2; do \
+    docker exec sl-app curl -sS -w ' [code=%{http_code}]\n' http://127.0.0.1:7777/health; \
+    docker exec sl-postgres pg_isready -h 127.0.0.1 -p 5432 -U myuser -d simplelogin; \
+    docker exec sl-redis redis-cli ping; done
+success [code=200]
+127.0.0.1:5432 - accepting connections
+PONG
+success [code=200]
+127.0.0.1:5432 - accepting connections
+PONG
+```
+
+**Email handler startup (2 restarts, PIDs 4066 then 4099)** — both emit the identical two-line banner (modulo timestamp/PID) and both accept a TCP connection on 20381:
+
+```
+run #1 (PID 4066):
+2026-07-08 22:39:45,889 - SL - INFO - 4066 - "/app/email_handler.py:2403" - <module>() -  - Listen for port 20381
+2026-07-08 22:39:45,891 - SL - DEBUG - 4066 - "/app/email_handler.py:2386" - main() -  - Start mail controller 0.0.0.0 20381
+run #2 (PID 4099):
+2026-07-08 22:39:50,298 - SL - INFO - 4099 - "/app/email_handler.py:2403" - <module>() -  - Listen for port 20381
+2026-07-08 22:39:50,300 - SL - DEBUG - 4099 - "/app/email_handler.py:2386" - main() -  - Start mail controller 0.0.0.0 20381
+
+$ # diff of the two banners after masking timestamp+PID:
+BANNERS IDENTICAL after stripping timestamp+PID
+```
+
+**`cron.py -j sanity_check` (2 runs)** — both produced 23 lines and `exit=0`; masking timestamp+PID, the only difference is the random `GNUPGHOME` path:
+
+```
+$ strip() { sed -E 's/^[0-9-]+ [0-9:,]+ - SL - ([A-Z]+) - [0-9]+ -/TS - SL - \1 - PID -/'; }
+$ diff <(strip < run1.log) <(strip < run2.log)
+4c4
+< WARNING: Use a temp directory for GNUPGHOME /tmp/giqztffvosnqbvjrodnc
+---
+> WARNING: Use a temp directory for GNUPGHOME /tmp/jdyrudobsuqblptrbxic
+```
+
+**`job_runner.py` (2 restarts, PIDs 3892/3934) and `event_listener.py listener` (2 restarts, PIDs 3976/4014)** — each restart's listening-socket count was `before=7, after=7` (no port bound), and the app-init/readiness lines matched line-for-line (modulo timestamp/PID/GNUPGHOME).
 
 ---
 
@@ -494,12 +781,12 @@ emitted by `handle_forward()` at **`email_handler.py:551`**. The `550` string is
 Reach the migrated-but-uninitialized state (255 alembic scripts; **no** `init_app.py`, **no** `flask dummy-data`):
 
 ```
-$ docker exec -w /app sl-app /app/venv/bin/alembic upgrade head
-$ grep -c "Running upgrade" /tmp/q3_alembic.log
+# migrations applied and captured in §1.4 (alembic upgrade head > /tmp/q3_alembic.log 2>&1)
+$ docker exec sl-app grep -c "Running upgrade" /tmp/q3_alembic.log
 255
 
 $ docker exec sl-postgres psql -U myuser -d simplelogin -c 'SELECT count(*) FROM public_domain;'
- count
+ count 
 -------
      0
 (1 row)
@@ -533,11 +820,11 @@ Full, unedited `swaks` transcript (the `<**` prefix is swaks marking a non-2xx/3
 <-  250 OK
  -> DATA
 <-  354 End data with <CR><LF>.<CR><LF>
- -> Date: Wed, 08 Jul 2026 21:13:59 +0000
+ -> Date: Wed, 08 Jul 2026 22:24:15 +0000
  -> To: e1@sl.local
  -> From: hey@google.com
- -> Subject: test Wed, 08 Jul 2026 21:13:59 +0000
- -> Message-Id: <20260708211359.002214@reverse-code-generator-64e0e612-hfqqw>
+ -> Subject: test Wed, 08 Jul 2026 22:24:15 +0000
+ -> Message-Id: <20260708222415.003212@reverse-code-generator-64e0e612-hfqqw>
  -> X-Mailer: swaks v20201014.0 jetmore.org/john/code/swaks/
  -> 
  -> This is a test mailing
@@ -556,19 +843,24 @@ The **SMTP status code returned to the sender** is therefore, byte-accurate: **`
 
 ### 4.4 What the handler logs to explain the rejection
 
-Captured from the email handler's stdout for the same message (the `app/log.py:12-14` format self-identifies `pathname:lineno - funcName()`):
+Complete, unedited handler stdout for **this exact message** (`/tmp/q3_email.log`), captured as the delta produced by injection #1. Every line carries the real per-message id (a UUID, `email_handler.py:2339` `message_id = str(uuid.uuid4())`) — here `fe7348de-5653-484f-b744-2945ccdcf230` — set via `set_message_id()` (`app/log.py:22-25`); the `app/log.py:14` format self-identifies `"pathname:lineno" - funcName() - message_id - message`. No placeholders and no ellipsis; the elapsed time is the full float as emitted:
 
 ```
-"/app/email_handler.py:2343" - _handle()        - <msgid> - New message, mail from hey@google.com, rctp tos ['e1@sl.local']
-"/app/email_handler.py:2202" - handle()         - <msgid> - Forward phase hey@google.com(hey@google.com) -> e1@sl.local
-"/app/email_handler.py:545"  - handle_forward() - <msgid> - alias e1@sl.local not exist. Try to see if it can be created on the fly
-"/app/app/alias_utils.py:104" - check_if_alias_can_be_auto_created_for_custom_domain() - <msgid> - Cannot auto-create custom domain alias for e1@sl.local because there's no custom domain for sl.local
-"/app/app/alias_utils.py:165" - check_if_alias_can_be_auto_created_for_a_directory()   - <msgid> - Cannot auto-create e1@sl.local since it has no directory separator
-"/app/email_handler.py:551"  - handle_forward() - <msgid> - alias e1@sl.local cannot be created on-the-fly, return 550
-"/app/email_handler.py:2367" - _handle()        - <msgid> - Finish mail_from hey@google.com, rcpt_tos ['e1@sl.local'], takes 0.139... seconds with return code '550 SL E515 Email not exist'<<===
+2026-07-08 22:24:15,037 - SL - DEBUG - 3139 - "/app/app/log.py:24" - set_message_id() -  - set message_id fe7348de-5653-484f-b744-2945ccdcf230
+2026-07-08 22:24:15,037 - SL - DEBUG - 3139 - "/app/email_handler.py:2342" - _handle() - fe7348de-5653-484f-b744-2945ccdcf230 - ====>=====>====>====>====>====>====>====>
+2026-07-08 22:24:15,037 - SL - INFO - 3139 - "/app/email_handler.py:2343" - _handle() - fe7348de-5653-484f-b744-2945ccdcf230 - New message, mail from hey@google.com, rctp tos ['e1@sl.local'] 
+2026-07-08 22:24:15,038 - SL - INFO - 3139 - "/app/email_handler.py:1956" - handle() - fe7348de-5653-484f-b744-2945ccdcf230 - Set CONTENT_TRANSFER_ENCODING
+2026-07-08 22:24:15,038 - SL - DEBUG - 3139 - "/app/email_handler.py:1963" - handle() - fe7348de-5653-484f-b744-2945ccdcf230 - Cannot parse Postfix queue ID from None None
+2026-07-08 22:24:15,158 - SL - DEBUG - 3139 - "/app/email_handler.py:1980" - handle() - fe7348de-5653-484f-b744-2945ccdcf230 - ==>> Handle mail_from:hey@google.com, rcpt_tos:['e1@sl.local'], header_from:hey@google.com, header_to:e1@sl.local, cc:None, reply-to:None, message_id:<20260708222415.003212@reverse-code-generator-64e0e612-hfqqw>, client_ip:None, headers:[('Date', 'Wed, 08 Jul 2026 22:24:15 +0000'), ('To', 'e1@sl.local'), ('From', 'hey@google.com'), ('Subject', 'test Wed, 08 Jul 2026 22:24:15 +0000'), ('Message-Id', '<20260708222415.003212@reverse-code-generator-64e0e612-hfqqw>'), ('X-Mailer', 'swaks v20201014.0 jetmore.org/john/code/swaks/'), ('Content-Transfer-Encoding', '7bit')], mail_options:[], rcpt_options:[]
+2026-07-08 22:24:15,162 - SL - DEBUG - 3139 - "/app/email_handler.py:2202" - handle() - fe7348de-5653-484f-b744-2945ccdcf230 - Forward phase hey@google.com(hey@google.com) -> e1@sl.local
+2026-07-08 22:24:15,172 - SL - DEBUG - 3139 - "/app/email_handler.py:545" - handle_forward() - fe7348de-5653-484f-b744-2945ccdcf230 - alias e1@sl.local not exist. Try to see if it can be created on the fly
+2026-07-08 22:24:15,181 - SL - INFO - 3139 - "/app/app/alias_utils.py:104" - check_if_alias_can_be_auto_created_for_custom_domain() - fe7348de-5653-484f-b744-2945ccdcf230 - Cannot auto-create custom domain alias for e1@sl.local because there's no custom domain for sl.local
+2026-07-08 22:24:15,182 - SL - INFO - 3139 - "/app/app/alias_utils.py:165" - check_if_alias_can_be_auto_created_for_a_directory() - fe7348de-5653-484f-b744-2945ccdcf230 - Cannot auto-create e1@sl.local since it has no directory separator
+2026-07-08 22:24:15,182 - SL - DEBUG - 3139 - "/app/email_handler.py:551" - handle_forward() - fe7348de-5653-484f-b744-2945ccdcf230 - alias e1@sl.local cannot be created on-the-fly, return 550
+2026-07-08 22:24:15,183 - SL - INFO - 3139 - "/app/email_handler.py:2367" - _handle() - fe7348de-5653-484f-b744-2945ccdcf230 - Finish mail_from hey@google.com, rcpt_tos ['e1@sl.local'], takes 0.14559197425842285 seconds with return code '550 SL E515 Email not exist'<<===
 ```
 
-The primary rejection line is **`email_handler.py:551`** (`alias e1@sl.local cannot be created on-the-fly, return 550`); the corroborating final-status line at **`email_handler.py:2367`** records the return code `'550 SL E515 Email not exist'`.
+The primary rejection line is **`email_handler.py:551`** (`alias e1@sl.local cannot be created on-the-fly, return 550`); the corroborating final-status line at **`email_handler.py:2367`** records the full elapsed time (`0.14559197425842285` seconds) and the return code `'550 SL E515 Email not exist'`. The two intermediate `INFO` lines at `app/alias_utils.py:104` and `app/alias_utils.py:165` explain *why* neither on-the-fly path applies (no `CustomDomain` for `sl.local`; no directory separator in the local-part).
 
 ### 4.5 Decision chain (traced through the real code)
 
@@ -587,38 +879,96 @@ The primary rejection line is **`email_handler.py:551`** (`alias e1@sl.local can
 
 The AAP inferred that the rejection resolves through `is_valid_alias_address_domain()` (`app/email_utils.py:557`, which checks `SLDomain.get_by(domain=...)` at `:560`). **Runtime tracing shows this function is NOT on the `handle_forward` auto-create path** — it is called at `email_handler.py:1000` on an *existing* `alias.email`. The auto-create path instead checks `CustomDomain` (`app/alias_utils.py:92-104`), never `SLDomain`.
 
-To test whether the empty `SLDomain` is the direct cause, `init_app.py` was run to populate it and the same message re-injected:
+To test whether the empty `SLDomain` is the direct cause, `init_app.py` was run to populate it and the same message re-injected. Complete captured output — the `init_app.py` SL-domain log line, the `public_domain` row it created, and the full re-injection transcript:
 
 ```
-$ docker exec -w /app sl-app /app/venv/bin/python init_app.py         # -> "Add sl.local to SL domain"
+$ docker exec -w /app sl-app bash -c '/app/venv/bin/python init_app.py > /tmp/q_initapp.log 2>&1; echo "exit=$?"'
+exit=0
+$ docker exec sl-app grep "SL domain" /tmp/q_initapp.log
+2026-07-08 22:25:25,615 - SL - INFO - 3285 - "/app/init_app.py:44" - add_sl_domains() -  - Add sl.local to SL domain
+
 $ docker exec sl-postgres psql -U myuser -d simplelogin -c 'SELECT id, domain FROM public_domain;'
- id | domain
+ id |  domain  
 ----+----------
   1 | sl.local
 (1 row)
 
-$ docker exec sl-app swaks --to e1@sl.local --from hey@google.com --server 127.0.0.1:20381
-...
+$ docker exec sl-app swaks --to e1@sl.local --from hey@google.com --server 127.0.0.1:20381 ; echo "swaks exit=$?"
+swaks exit=26
+=== Trying 127.0.0.1:20381...
+=== Connected to 127.0.0.1.
+<-  220 reverse-code-generator-64e0e612-hfqqw Python SMTP 1.4.2
+ -> EHLO reverse-code-generator-64e0e612-hfqqw
+<-  250-reverse-code-generator-64e0e612-hfqqw
+<-  250-SIZE 33554432
+<-  250-8BITMIME
+<-  250-SMTPUTF8
+<-  250 HELP
+ -> MAIL FROM:<hey@google.com>
+<-  250 OK
+ -> RCPT TO:<e1@sl.local>
+<-  250 OK
+ -> DATA
+<-  354 End data with <CR><LF>.<CR><LF>
+ -> Date: Wed, 08 Jul 2026 22:25:26 +0000
+ -> To: e1@sl.local
+ -> From: hey@google.com
+ -> Subject: test Wed, 08 Jul 2026 22:25:26 +0000
+ -> Message-Id: <20260708222526.003302@reverse-code-generator-64e0e612-hfqqw>
+ -> X-Mailer: swaks v20201014.0 jetmore.org/john/code/swaks/
+ -> 
+ -> This is a test mailing
+ -> 
+ -> 
+ -> .
 <** 550 SL E515 Email not exist
+ -> QUIT
+<-  221 Bye
+=== Connection closed with remote host.
 ```
 
 **With `SLDomain` populated (`sl.local` present), the reply is still `550 SL E515 Email not exist` via the identical chain.** So a bare, non-existent public-domain address is rejected regardless of whether `sl.local` is a configured SL domain: public-domain aliases are created via the UI/API, not auto-created from inbound mail. The empty `SLDomain` is the *context the question describes*, but the direct cause of the `550` is that no `Alias` row exists and neither auto-create path (custom-domain nor directory) applies. This is reported honestly rather than forcing the inferred SLDomain-decision narrative.
 
 ### 4.8 AFTER state and repeatability
 
-After the rejection(s) in the empty-`SLDomain` state, nothing was created:
+**AFTER state** — measured immediately after the empty-`SLDomain` rejections of §4.3–§4.4 (i.e. before the §4.7 populate step). Actual `psql` output rows confirm the rejection created nothing (`public_domain` still empty because `init_app.py` was skipped; `alias` still empty because no on-the-fly alias was created):
 
 ```
-$ docker exec sl-postgres psql -U myuser -d simplelogin -c 'SELECT count(*) FROM public_domain;'  # -> 0
-$ docker exec sl-postgres psql -U myuser -d simplelogin -c 'SELECT count(*) FROM alias;'           # -> 0
+$ docker exec sl-postgres psql -U myuser -d simplelogin -c 'SELECT count(*) FROM public_domain;'
+ count 
+-------
+     0
+(1 row)
+
+$ docker exec sl-postgres psql -U myuser -d simplelogin -c 'SELECT count(*) FROM alias;'
+ count 
+-------
+     0
+(1 row)
 ```
 
-The injection was repeated three times; the SMTP reply (`550 SL E515 Email not exist`), the `email_handler.py:551` rejection log, and the `email_handler.py:2367` finish line were byte-identical each time.
+**Repeatability.** The injection was repeated three times against the same running handler; for each run the SMTP reply seen by the sender, the `email_handler.py:551` rejection log, and the `email_handler.py:2367` finish return-code were captured. Exact command and output:
+
+```
+$ docker exec sl-app bash -c '
+for i in 1 2 3; do
+  before=$(wc -l < /tmp/q3_email.log)
+  reply=$(swaks --to e1@sl.local --from hey@google.com --server 127.0.0.1:20381 2>&1 | grep -E "<\*\*" | sed "s/^[^0-9]*//")
+  rej=$(tail -n +$((before+1)) /tmp/q3_email.log | grep -m1 -oE "alias e1@sl.local cannot be created on-the-fly, return 550")
+  fin=$(tail -n +$((before+1)) /tmp/q3_email.log | grep -m1 -oE "return code .550 SL E515 Email not exist.")
+  echo "run $i: SMTP_reply=[$reply] | reject_log=[$rej] | finish=[$fin]"
+done'
+run 1: SMTP_reply=[550 SL E515 Email not exist] | reject_log=[alias e1@sl.local cannot be created on-the-fly, return 550] | finish=[return code '550 SL E515 Email not exist']
+run 2: SMTP_reply=[550 SL E515 Email not exist] | reject_log=[alias e1@sl.local cannot be created on-the-fly, return 550] | finish=[return code '550 SL E515 Email not exist']
+run 3: SMTP_reply=[550 SL E515 Email not exist] | reject_log=[alias e1@sl.local cannot be created on-the-fly, return 550] | finish=[return code '550 SL E515 Email not exist']
+```
+
+All three runs were byte-identical: SMTP reply `550 SL E515 Email not exist`, the `email_handler.py:551` rejection log, and the `email_handler.py:2367` finish line with return code `'550 SL E515 Email not exist'`.
 
 ### 4.9 Status constants for context
 
 - `E200 = "250 Message accepted for delivery"` (`app/email/status.py:2`) — the accept case.
-- `E207` (`app/email/status.py`) — returned as `[(True, status.E207)]` at `email_handler.py:553` only when `should_ignore_bounce(...)` is true.
+- `E207` (`app/email/status.py:12` → the literal string `"250 SL E207 No bounce report"`) — returned as `[(True, status.E207)]` at `email_handler.py:553` only when `should_ignore_bounce(...)` is true.
 - `E216 = "250 SL E216 Handled spf policy"` (`app/email/status.py:24`) — the SPF-override replacement (§4.6).
 - `E502 = "550 SL E502 Email not exist"` (`app/email/status.py:39`) — a sibling `550` used elsewhere; distinct from the `E515` returned here.
 - `E515 = "550 SL E515 Email not exist"` (`app/email/status.py:51`) — the observed reply.
@@ -633,8 +983,8 @@ Dev binds **20381** (`email_handler.py:2399`, argparse `default=20381`); product
 
 ### 5.2 External-tool validation (web-searched, authoritative docs)
 
-- **`swaks`** — the SMTP transaction tester. The target server is set with `-s`/`--server [host[:port]]` (used here as `--server 127.0.0.1:20381`), and swaks prints a faithful transcript of the SMTP dialog — outbound lines prefixed `->`, server replies prefixed `<-`, and unexpected (non-2xx/3xx) replies prefixed `<**` — so the server's `550 SL E515 Email not exist` reply is captured directly at the sender. (Authoritative: the swaks manpage / jetmore.org/john/code/swaks.)
-- **`aiosmtpd`** — a handler hook (e.g. `handle_DATA`) returns an SMTP status **string** that becomes the client-visible reply; if it returns `None` or raises, aiosmtpd substitutes a `451` response. (Authoritative: aiosmtpd.aio-libs.org handlers/controller docs.) This validates that the `550 SL E515 Email not exist` seen by swaks is the **authentic protocol reply** — the return value of SimpleLogin's `MailHandler` (via `handle()` → `handle_forward()` → `status.E515`) — and not merely a log artifact.
+- **`swaks`** (Swiss Army Knife SMTP — the all-purpose SMTP transaction tester) — used to inject the Q3 message. The target server is selected with the `-s`/`--server [host[:port]]` option; per the manpage this option tells swaks to "use network sockets and specify the hostname or IP address to which to connect", with the TCP port either appended as `host:port` or supplied separately via `-p`/`--port`. It is used here as `--server 127.0.0.1:20381`. By default swaks prints a faithful transcript of the SMTP dialog to STDOUT/STDERR, annotating each line with a *transaction hint*: `->` marks an expected line **sent by swaks to the target server**, `<-` marks an expected line **received from the target server**, and `<**` marks an **unexpected line received from the target server** — which is exactly how a 5xx rejection such as `550 SL E515 Email not exist` is flagged (swaks expected a 2xx/3xx greeting to `RCPT TO`/`DATA` and instead received a 5xx). The server's reply is therefore captured directly at the sender. Authoritative sources: official project page <https://jetmore.org/john/code/swaks/>; reference documentation <https://jetmore.org/john/code/swaks/latest/doc/ref.txt> (see "OUTPUT OPTIONS" → the transaction-hints table for `->`/`<-`/`<**`, and the transport/network options for `--server`); Ubuntu manpage <https://manpages.ubuntu.com/manpages/jammy/man1/swaks.1.html>.
+- **`aiosmtpd`** — the async SMTP server library that powers `email_handler.py`. Per its documented handler-hook contract, `handle_DATA(server, session, envelope) -> str` returns the "Response message to be sent to the client", and hooks "must return a string status"; the docs further state that if a hook returns `None` or raises, aiosmtpd logs an exception and returns a `451` code to the client. This validates that the `550 SL E515 Email not exist` seen by swaks is the **authentic protocol reply**, not a log artifact. The exact return path, verified at runtime: SimpleLogin's `MailHandler.handle_DATA` (`email_handler.py:2289`) calls `ret = self._handle(envelope, msg)` (`email_handler.py:2292`) and `return ret` (`email_handler.py:2293`); `_handle` (`email_handler.py:2335`) computes `return_status = handle(envelope, msg)` (`email_handler.py:2353`) and `return return_status` (`email_handler.py:2378`); the module-level `handle()` (`email_handler.py:1945`, declared `-> str`) routes to `handle_forward()`, which returns `status.E515` — the literal string `"550 SL E515 Email not exist"` (`app/email/status.py:51`). aiosmtpd transmits that exact string back as the DATA reply, which is what swaks records. (SimpleLogin's `handle_DATA` never returns `None`: its outer `except Exception` returns `status.E404` at `email_handler.py:2332`, so aiosmtpd's `451`-on-`None` fallback is never reached in this path.) Authoritative sources: handlers doc <https://aiosmtpd.aio-libs.org/en/latest/handlers.html>; controller / programmatic-usage doc <https://aiosmtpd.aio-libs.org/en/latest/controller.html>; docs source <https://github.com/aio-libs/aiosmtpd/blob/master/aiosmtpd/docs/handlers.rst>.
 - **Alembic / Flask-Migrate** — `Migrate()` is not registered on the running entry points; `shell.py`'s `flask_migrate.upgrade()` (`shell.py:20`) is dead code inside an `if False:` block (`shell.py:11`), and `__main__` (`shell.py:72`) only calls `embed()`. Therefore `alembic upgrade head` (`alembic.ini:5` `script_location = migrations`) is the reliable migration command, matching the `CONTRIBUTING.md:106` quickstart. `migrations/env.py` imports `Base` (`:26`) and `DB_URI` (`:27`) and sets `target_metadata = Base.metadata` (`:28`).
 
 ### 5.3 Named-item coverage (re-reading each question)
