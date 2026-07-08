@@ -744,8 +744,10 @@ note    | This is your first alias. It's used to receive SimpleLogin communicati
 `newsletter_alias_id=14` (first alias, prefix `simplelogin-newsletter` [`app/models.py:L636`]). Under
 `DISABLE_ONBOARDING=true` it logged `Disable onboarding emails` (seen in the Q2.1 delta) and enqueued
 **0** onboarding jobs [`app/models.py:L646-L648`]. `(inferred)` In production
-(`DISABLE_ONBOARDING` off) the same method enqueues `onboarding-1..4` jobs [`app/models.py:L650-L665`;
-`app/config.py:L301-L311`] — not reproduced here by design.
+(`DISABLE_ONBOARDING` off) the same method enqueues **three** onboarding jobs — `onboarding-1`
+[`app/models.py:L652`], `onboarding-2` [`app/models.py:L657`], and `onboarding-4` [`app/models.py:L662`]
+(enclosing span [`app/models.py:L650-L665`]); note `onboarding-3` is *defined* [`app/config.py:L303`]
+but is **not** enqueued by `User.create` — not reproduced here by design.
 
 ### Q3.2 Event pipeline — REAL entry point (canonical): dispatcher gate under default config
 
@@ -806,9 +808,15 @@ DIAGNOSTIC: PostgresDispatcher.send persisted SyncEvent id=2, content=b'blitzy-q
 The dispatcher persisted a `SyncEvent` row and issued `NOTIFY simplelogin_sync_events`; the
 independently-running listener received `Got NOTIFY: … channel=simplelogin_sync_events payload=2`
 [`events/event_source.py:L55`] and (no webhook) logged `Skipping sending event because there is no
-webhook configured` [`events/event_sink.py:L19`]. The `retry_count` advanced to 1 as the runner
-re-queued the undeliverable event [`events/runner.py`]. This proves the LISTEN/NOTIFY channel and the
-listener are active and communicating end-to-end. (The `SyncEvent id=2` row was deleted in §6.)
+webhook configured` [`events/event_sink.py:L19`]. The `retry_count` advanced to 1 because the
+`Runner.__on_event` handler [`events/runner.py:L20`] (of class `Runner` [`events/runner.py:L11`],
+which pumps source → sink) re-queued the undeliverable event via `event.retry_count =
+event.retry_count + 1` then `Session.commit()` [`events/runner.py:L42-L43`]. This proves the
+LISTEN/NOTIFY channel and the listener are active and communicating end-to-end. `(inferred)` For
+manual replay/inspection of a persisted event outside the live loop, the operator utility
+`events/event_debugger.py` provides `debug_event` [`events/event_debugger.py:L6`] and `run_event`
+[`events/event_debugger.py:L31`] (a debug/replay tool, not part of the live flow). (The `SyncEvent
+id=2` row was deleted in §6.)
 
 ### Q3.4 Email forwarding on `:20381` (external sender → alias → owning mailbox)
 
@@ -937,7 +945,11 @@ intervals 10.020–10.022s; Run 2: three intervals 10.021s), matching `time.slee
 with `attempts=1`; the `JobState` enum is `ready=0, taken=1, done=2, error=3` [`app/models.py:L253-L257`].
 When taken, each job dispatched to `send_alias_creation_events_for_user`
 [`app/jobs/event_jobs.py:L17,L44`], which itself hit the event gate
-[`app/events/event_dispatcher.py:L62`]. (Job rows 10–20 were deleted in §6.)
+[`app/events/event_dispatcher.py:L62`]. That function builds the protobuf sync-event payloads from
+the generated schema module `app/events/generated/event_pb2.py` — specifically the message types
+`AliasCreated` and `AliasCreatedList` (imported at [`app/jobs/event_jobs.py:L4`], constructed at
+[`app/jobs/event_jobs.py:L24`] and [`app/jobs/event_jobs.py:L36,L47`]); those wire-format messages are
+the schema all sync events are serialized from. (Job rows 10–20 were deleted in §6.)
 
 ### Q3.6 Job runner — REAL entry point (canonical): account deletion enqueues & drains `delete-account`
 
@@ -1024,6 +1036,13 @@ delete-account>`), deleted User 5 and cascade (aliases 14/16, mailbox 7, contact
 0 rows), and marked the job `state=2`. This real entry point also served as the deletion of temp User
 A (§6).
 
+`(inferred)` `process_job` dispatches other job types beyond those exercised above — for example the
+GDPR user-data export job: when `job.name == config.JOB_SEND_USER_REPORT` (`"send-user-report"`,
+[`app/config.py:L309`]) the runner calls `ExportUserDataJob.create_from_job(job)` then `.run()`
+[`job_runner.py:L285-L288`], where `class ExportUserDataJob` [`app/jobs/export_user_data_job.py:L41`]
+and its `run` method [`app/jobs/export_user_data_job.py:L131`] build a ZIP of the user's data and email
+it. This job is **not** triggered by the register/verify/login flow, so it was not exercised here.
+
 ### Q3.7 Cron — `send_undelivered_mails` every ~300s (`*/5` schedule)
 
 `crontab.yml` defines **15** `yacron` jobs. `send_undelivered_mails` runs on `*/5 * * * *`
@@ -1067,10 +1086,15 @@ stable, matching the 5-minute `*/5` schedule [`crontab.yml:L80`]. The 15 schedul
 ### Q3.8 Monitoring / observability `(inferred — not exercised at runtime)`
 
 `monitoring.py` runs a background task watching the Postfix queue [`monitoring.py:L1-L40`] and
-`monitor/newrelic.py` / `monitor/metric_exporter.py` export metrics to New Relic (`newrelic` 8.8.0).
-`after_request` also records a `HttpResponseStatus` custom event per request [`server.py:L285-L287`].
-These require a New Relic account/Postfix and were **not** exercised under the default local config;
-listed for completeness `(inferred from reading)`.
+`monitor/newrelic.py` / `monitor/metric_exporter.py` export metrics to New Relic (`newrelic` 8.8.0);
+the exporter is the `MetricExporter` class [`monitor/metric_exporter.py:L7`].
+`after_request` also records a `HttpResponseStatus` custom event per request [`server.py:L293-L294`].
+The register/verify/login flow itself also emits New Relic **auth telemetry**: `class RegisterEvent`
+[`app/events/auth_event.py:L28`] fires during registration and `class LoginEvent`
+[`app/events/auth_event.py:L6`] fires during login (each `.send()` calls
+`newrelic.agent.record_custom_event`). All of these require a New Relic account/Postfix and were
+**not** exercised under the default local config; listed for completeness `(inferred from reading —
+New Relic reporting is not observable under the default local config)`.
 
 ---
 
@@ -1207,14 +1231,17 @@ Every named item in Q1/Q2/Q3, with where it is evidenced and whether it was **Ob
 - [x] Edge: `DISABLE_REGISTRATION` → 302 (before/after user-count) — Observed §2.6h [`app/auth/views/register.py:L38-L40`; `app/config.py:L138`]
 
 **Q3 — behind the scenes**
-- [x] `User.create` verified mailbox + first alias + onboarding-skip (0 jobs) — Observed §3.1 [`app/models.py:L611,L636,L646-L648`]; prod onboarding enqueue — (inferred) §3.1
+- [x] `User.create` verified mailbox + first alias + onboarding-skip (0 jobs) — Observed §3.1 [`app/models.py:L611,L636,L646-L648`]; prod enqueues `onboarding-1`/`-2`/`-4` (`onboarding-3` defined but not enqueued) — (inferred) §3.1 [`app/models.py:L652,L657,L662`; `app/config.py:L303`]
 - [x] Event pipeline REAL entry point reaches dispatcher gate — Observed §3.2 [`app/events/event_dispatcher.py:L62`; `app/dashboard/views/index.py:L110`]
-- [x] Event MECHANISM (SyncEvent + NOTIFY + listener consume) — **NON-CANONICAL DIAGNOSTIC** §3.3 [`app/events/event_dispatcher.py:L14,L23-L26`; `events/event_source.py:L55`; `events/event_sink.py:L19`]
+- [x] Event MECHANISM (SyncEvent + NOTIFY + listener consume + `Runner.__on_event` re-queue) — **NON-CANONICAL DIAGNOSTIC** §3.3 [`app/events/event_dispatcher.py:L14,L23-L26`; `events/event_source.py:L55`; `events/event_sink.py:L19`; `events/runner.py:L11,L20,L42-L43`]
+- [x] Event replay/debug utility `events/event_debugger.py` (`debug_event`/`run_event`) — (inferred) §3.3 [`events/event_debugger.py:L6,L31`]
+- [x] Protobuf sync-event schema `event_pb2` (`AliasCreated`/`AliasCreatedList`) built by the dispatched `send_alias_creation_events_for_user` — §3.5 [`app/events/generated/event_pb2.py`; `app/jobs/event_jobs.py:L4,L24,L36,L47`]
 - [x] Email forward alias→mailbox on :20381 (full path + reverse-alias) — Observed §3.4 [`email_handler.py:L2343,L2202,L580,L688,L740,L867,L2367`]; `handle_reply` — (inferred) §3.4 [`email_handler.py:L966`]
 - [x] Job runner ~10.02s cadence (2 runs) + JobState done — Observed §3.5 (Job.create = labeled observation-setup) [`job_runner.py:L334,L347`; `app/models.py:L253-L257`]
 - [x] Job runner REAL entry point (account deletion enqueues + drains delete-account) — Observed §3.6 [`app/dashboard/views/delete_account.py:L42`; `job_runner.py:L226,L235`]
+- [x] GDPR export job `ExportUserDataJob` dispatched via `JOB_SEND_USER_REPORT` — (inferred, not in register/verify/login flow) §3.6 [`app/jobs/export_user_data_job.py:L41,L131`; `job_runner.py:L285-L288`; `app/config.py:L309`]
 - [x] Cron `send_undelivered_mails` every ~300s (20 runs) + 15-job schedule — Observed §3.7 [`crontab.yml:L80`; `cron.py:L1314`]
-- [x] Monitoring / New Relic — (inferred, not exercised) §3.8 [`monitoring.py:L1-L40`; `server.py:L285-L287`]
+- [x] Monitoring / New Relic — `MetricExporter`, `HttpResponseStatus` custom event, and `LoginEvent`/`RegisterEvent` auth telemetry — (inferred, not exercised) §3.8 [`monitoring.py:L1-L40`; `monitor/metric_exporter.py:L7`; `server.py:L293-L294`; `app/events/auth_event.py:L6,L28`]
 
 **Constraints**
 - [x] Default canonical configuration; exact build/run commands stated — §6.1
