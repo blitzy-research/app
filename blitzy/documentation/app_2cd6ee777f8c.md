@@ -50,10 +50,14 @@ CSRF=$(curl -sS -c "$JAR" http://localhost:7777/auth/login \
        | grep -oP 'name="csrf_token" type="hidden" value="\K[^"]+')
 ```
 
-Ephemeral session secrets (the `csrf_token` value and the `slapp=` session-cookie blob) are shown as
-captured where they appear in a raw HTTP transcript; they belong to temporary users that were
-subsequently deleted (see §6) and are inert. In command lines the token is passed as the `$CSRF`
-variable (its acquisition is documented above) — this is the actual, reproducible invocation.
+Ephemeral session secrets — the `csrf_token` value, the `slapp=` session-cookie blob, and per-user
+activation codes — are **redacted** to `<redacted-…>` placeholders wherever they appear in a raw HTTP
+transcript, a `psql` row, or a log line. Only the secret bytes themselves are replaced; the
+surrounding command, status line, headers, and output are otherwise complete and unedited, and no
+behavioral result (status code, redirect, flash, state transition) is affected. These values belonged
+to temporary users that were subsequently deleted (see §6) and are inert in any case (signed with the
+default `FLASK_SECRET=secret`, tied to now-deleted accounts). In command lines the token is passed as
+the `$CSRF` variable (its acquisition is documented above) — this is the actual, reproducible invocation.
 
 ---
 
@@ -128,7 +132,7 @@ complete captured evidence for each, with the exact command.
 
 The production launch command is `gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15`
 [`Dockerfile:L47`] with `EXPOSE 7777` [`Dockerfile:L44`]; `wsgi:app` is the WSGI entry [`wsgi.py`].
-Command: `docker exec simplelogin-app sed -n '1,20p' /app/logs/webapp.log`
+Command: `docker exec simplelogin-app sed -n '1,18p' /app/logs/webapp.log`
 
 ```
 [2026-07-08 03:56:08 +0000] [525] [INFO] Starting gunicorn 20.0.4
@@ -256,7 +260,7 @@ Connection: close
 Content-Type: text/html; charset=utf-8
 Content-Length: 7
 Vary: Cookie
-Set-Cookie: slapp=eyJfcGVybWFuZW50Ijp0cnVlfQ.ak3iDg.n1JbIQI7nNtL4N7XRVOd6JK-qPM; Expires=Wed, 15-Jul-2026 05:37:18 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=<redacted-session-cookie>; Expires=Wed, 15-Jul-2026 05:37:18 GMT; HttpOnly; Path=/; SameSite=Lax
 
 success
 ```
@@ -277,7 +281,7 @@ The relevant rendered form elements (complete lines) from `/tmp/login.html`:
 
 ```
 112:      <h1 class="card-title">Welcome back!</h1>
-114:        <input id="csrf_token" name="csrf_token" type="hidden" value="ImYxMDhhYTJmOTQ2YWUyMzlhODhkZmY1NThjNDQ3ZjllMTVmNmJjMzci.ak3iJA.46gjcKSK7UGOyw5kG-Ts32Jj1EA">
+114:        <input id="csrf_token" name="csrf_token" type="hidden" value="<redacted-csrf-token>">
 117:          <input autofocus="true" class="form-control" id="email" name="email" required type="email" value="">
 124:          <input class="form-control" id="password" name="password" required type="password" value="">
 133:          <button type="submit" class="btn btn-primary btn-block">Log in</button>
@@ -426,11 +430,11 @@ email; here no email is delivered) — it is *not* a product signal:
 
  id | user_id |              code              |          expired
 ----+---------+--------------------------------+----------------------------
-  4 |       5 | cmfiggvmsdzofhdlrqshuinnmbmewd | 2026-07-08 06:40:13.831586
+  4 |       5 | <redacted-activation-code>     | 2026-07-08 06:40:13.831586
 (1 row)
 ```
 
-User 5 is `activated=f` immediately after registration; activation code `cmfiggvmsdzofhdlrqshuinnmbmewd`
+User 5 is `activated=f` immediately after registration; activation code `<redacted-activation-code>`
 is valid for ~1 hour (`expired` one hour after creation). (This temp user was deleted in §6.)
 
 ### Q2.3 Verify email — `GET /auth/activate?code=…` (state before → during → after)
@@ -444,7 +448,7 @@ f
 **DURING** — hit the real verification endpoint (complete `curl -i`):
 
 ```
-Command: curl -sS -i -c $JAR -b $JAR "http://localhost:7777/auth/activate?code=cmfiggvmsdzofhdlrqshuinnmbmewd"
+Command: curl -sS -i -c $JAR -b $JAR "http://localhost:7777/auth/activate?code=<redacted-activation-code>"
 HTTP/1.1 302 FOUND
 Server: gunicorn/20.0.4
 Date: Wed, 08 Jul 2026 05:40:46 GMT
@@ -453,7 +457,7 @@ Content-Type: text/html; charset=utf-8
 Content-Length: 229
 Location: http://localhost:7777/dashboard/
 Vary: Cookie
-Set-Cookie: slapp=.eJw9jstqwzAURH_FaB2DrKun_6SUEO5LONA6wZK7Cfn3CgpdDMPM4nBe5la_sG3azPr5MlMfZdrJrK2Zi_l4nMeEzI9z79OGbSLVfRz9_oNdxVzf18sgHNo2s_bj1LHuYlZDFqIHzBiWoKiLLTEqhVSKWCou01JRs6CSJYsANFIhUKiS1BYJyaMjyCyAFVgDkJCPXlwWxwMaAGLynMnmxIRJfEGq6JiLaEjD_fbU4xt33fu_2tn0-PNDIbSBYNZqy-wV45xDtPOSnC7RISebzfsXhGNXLQ.ak3i3g.vgEGC0lUmipvDwTKkBXtpNvxWZ0; Expires=Wed, 15-Jul-2026 05:40:46 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=<redacted-session-cookie>; Expires=Wed, 15-Jul-2026 05:40:46 GMT; HttpOnly; Path=/; SameSite=Lax
 
 <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
 <title>Redirecting...</title>
@@ -481,7 +485,7 @@ Complete activate `webapp.log` delta:
 2026-07-08 05:40:46,439 - SL - DEBUG - 526 - "/app/app/email_utils.py:303" - send_email() -  - send email to simplelogin-newsletter.word910@sl.local, subject 'Welcome to SimpleLogin'
 2026-07-08 05:40:46,440 - SL - DEBUG - 526 - "/app/app/mail_sender.py:131" - send() -  - send email with subject 'Welcome to SimpleLogin', from '"noreply@sl.local" <noreply@sl.local>' to 'simplelogin-newsletter.word910@sl.local'
 2026-07-08 05:40:46,440 - SL - DEBUG - 526 - "/app/app/auth/views/activate.py:66" - activate() -  - redirect user to dashboard
-2026-07-08 05:40:46,441 - SL - DEBUG - 526 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET /auth/activate ImmutableMultiDict([('code', 'cmfiggvmsdzofhdlrqshuinnmbmewd')]) 302, takes 0.033589839935302734
+2026-07-08 05:40:46,441 - SL - DEBUG - 526 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET /auth/activate ImmutableMultiDict([('code', '<redacted-activation-code>')]) 302, takes 0.033589839935302734
 ```
 
 Confirmations: `HTTP/1.1 302 FOUND` → `Location: http://localhost:7777/dashboard/`; `activated`
@@ -574,7 +578,7 @@ register userB -> HTTP 200
 
  id | user_id |              code              |          expired
 ----+---------+--------------------------------+----------------------------
-  5 |       6 | inszibyotzcivlkqwucbuhjjmgpjbi | 2026-07-08 06:41:45.123282
+  5 |       6 | <redacted-activation-code>     | 2026-07-08 06:41:45.123282
 (1 row)
 ```
 ```
@@ -604,7 +608,7 @@ code (id 6); its `expired` timestamp was moved into the past to exercise the `is
 --- Current activation code for user B (resend created a fresh one) ---
  id | user_id |              code              |          expired
 ----+---------+--------------------------------+----------------------------
-  6 |       6 | veytllpwljjyfrwwxtupzfuoybfynd | 2026-07-08 06:42:01.670709
+  6 |       6 | <redacted-activation-code>     | 2026-07-08 06:42:01.670709
 (1 row)
 
 --- BEFORE: expired timestamp (in the future = still valid) ---
@@ -615,7 +619,7 @@ UPDATE 1
 --- AFTER the update: expired timestamp now in the past ---
 2020-01-01 00:00:00
 --- Hit the REAL endpoint with the (now-expired) code ---
-Command: curl -sS -o /tmp/exp.html -w "HTTP %{http_code}\n" "http://localhost:7777/auth/activate?code=veytllpwljjyfrwwxtupzfuoybfynd"
+Command: curl -sS -o /tmp/exp.html -w "HTTP %{http_code}\n" "http://localhost:7777/auth/activate?code=<redacted-activation-code>"
 HTTP 400
 Activation code was expired
 ```
