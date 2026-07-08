@@ -16,10 +16,16 @@ were asked about:
    whether anything runs beyond handling incoming HTTP requests.
 
 **Evidence conventions used throughout.** Every behavioral claim is paired with (a) the actual,
-complete, unedited output that was captured, and (b) a `file:line` (or config-key) reference to the
-code that produces it. Anything that was *not* directly observed at runtime is explicitly labeled
-**_inferred_**. Command lines that produced each block of output are shown immediately above the
-output.
+complete output that was captured, and (b) a `file:line` (or config-key) reference to the code that
+produces it. Command lines that produced each block of output are shown immediately above the
+output. Output is reproduced verbatim, with **one** deliberate exception for safety: the opaque
+signed value of the `slapp` session cookie is masked as `<SIGNED_VALUE_REDACTED>` wherever it appears
+in an HTTP response head (the masking is performed by the very command shown, so each block is
+exactly reproducible; all other bytes — status lines, every header name, real `Content-Length`
+values, and all cookie *attributes* — are verbatim). Blocks that contain no such secret (console
+startup output, server-side log lines, `psql`/version output) are shown fully unedited and are
+labeled as such. Anything that was *not* directly observed at runtime is explicitly labeled
+**_inferred_**.
 
 ## Runtime under test
 
@@ -32,10 +38,46 @@ output.
 | Redis | `localhost:6379` (replies `PONG`) | `redis-cli ping` |
 | Flask | 1.1.2 | pin in `poetry.lock`; banner + behavior in §1.4 |
 | Werkzeug | 1.0.1 | `Server:` header `Werkzeug/1.0.1` observed (see §1.5) |
-| Flask-Login | 0.5.0 | pin in `poetry.lock`; identity flow in §2 |
-| SQLAlchemy | 1.3.24 | pin in `poetry.lock` |
-| Alembic | 1.4.3 | pin in `poetry.lock`; `alembic upgrade head` used for schema |
-| python-dotenv | 0.14.0 | pin in `poetry.lock`; loads `.env` in `app/config.py:L9` |
+| Flask-Login | 0.5.0 | `importlib.metadata` probe below; identity flow in §2 |
+| SQLAlchemy | 1.3.24 | `importlib.metadata` probe below |
+| Alembic | 1.4.3 | `importlib.metadata` probe below; `alembic upgrade head` used for schema |
+| python-dotenv | 0.14.0 | `importlib.metadata` probe below; loads `.env` in `app/config.py:L9` |
+
+### How the runtime-under-test values were confirmed (commands + complete output)
+
+Each value in the table above was captured directly inside the canonical container. The exact
+commands and their complete, unedited output are below:
+
+```text
+$ git rev-parse HEAD
+2cd6ee777f8c2d3531559588bcfb18627ffb5d2c
+
+$ redis-cli ping
+PONG
+
+$ python --version
+Python 3.10.18
+
+$ PGPASSWORD=mypassword psql -h localhost -U myuser -d simplelogin -tA \
+    -c "SHOW server_version;" \
+    -c "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';"
+15.13 (Debian 15.13-0+deb12u1)
+77
+
+$ python -c "import importlib.metadata as m
+for dist in ['flask','werkzeug','flask-login','sqlalchemy','alembic','python-dotenv']:
+    print(f'{dist}=={m.version(dist)}')"
+flask==1.1.2
+werkzeug==1.0.1
+flask-login==0.5.0
+sqlalchemy==1.3.24
+alembic==1.4.3
+python-dotenv==0.14.0
+```
+
+The `Flask 1.1.2` and `Werkzeug 1.0.1` rows are additionally corroborated at runtime by the
+`Server: Werkzeug/1.0.1 Python/3.10.18` response header in §1.5; the table's `PostgreSQL 15` is the
+major version of the `15.13` shown here.
 
 ## Exact build / invocation commands used
 
@@ -186,10 +228,10 @@ prints appear twice** — see nuance C1 in the Critical Runtime Nuances section 
 >>> URL: http://localhost:7777
 MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value
 Paddle param not set
-WARNING: Use a temp directory for GNUPGHOME /tmp/usndwhlomtcugoqkwlqh
+WARNING: Use a temp directory for GNUPGHOME /tmp/warewvmhiagftxcpvfcp
 Upload files to local dir
 >>> init logging <<<
-2026-07-08 04:27:30,461 - SL - DEBUG - 14414 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+2026-07-08 05:19:16,191 - SL - DEBUG - 15160 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
  * Serving Flask app "server" (lazy loading)
  * Environment: production
    WARNING: This is a development server. Do not use it in a production deployment.
@@ -200,10 +242,10 @@ Upload files to local dir
 >>> URL: http://localhost:7777
 MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value
 Paddle param not set
-WARNING: Use a temp directory for GNUPGHOME /tmp/vuqbijmdmrxrsjxkkhvf
+WARNING: Use a temp directory for GNUPGHOME /tmp/oddxbzsvhqerfnumtlzo
 Upload files to local dir
 >>> init logging <<<
-2026-07-08 04:27:33,307 - SL - DEBUG - 14421 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+2026-07-08 05:19:18,046 - SL - DEBUG - 15181 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
 ```
 
 Line-by-line, what each observed line is and where it comes from:
@@ -214,8 +256,8 @@ Line-by-line, what each observed line is and where it comes from:
 - `>>> URL: http://localhost:7777` → `app/config.py:L80` (value from `URL` = `example.env:L6`).
 - `MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value` → `app/config.py:L123`.
 - `Paddle param not set` → `app/config.py:L217`.
-- `WARNING: Use a temp directory for GNUPGHOME /tmp/usndwhlomtcugoqkwlqh` (and, in the second block,
-  `/tmp/vuqbijmdmrxrsjxkkhvf`) → `app/config.py:L262`. The temp-dir name is random per process, so
+- `WARNING: Use a temp directory for GNUPGHOME /tmp/warewvmhiagftxcpvfcp` (and, in the second block,
+  `/tmp/oddxbzsvhqerfnumtlzo`) → `app/config.py:L262`. The temp-dir name is random per process, so
   the two blocks differ here.
 - `Upload files to local dir` → `app/config.py:L328` (taken because `LOCAL_FILE_UPLOAD=true`).
 - `>>> init logging <<<` → `app/log.py:L67`.
@@ -224,7 +266,7 @@ Line-by-line, what each observed line is and where it comes from:
 - The four-line Flask banner (`* Serving Flask app "server" (lazy loading)` … `* Debug mode: on`) is
   Flask 1.1.2's own banner, printed once (only in the first/supervisor block — see C1).
 
-**Two process IDs are visible in the output** — `14414` in the first block and `14421` in the
+**Two process IDs are visible in the output** — `15160` in the first block and `15181` in the
 second. This is the reloader parent/child split (proof in C1).
 
 ## 1.5 Ports and endpoints
@@ -233,39 +275,53 @@ second. This is the reloader parent/child split (proof in C1).
 **`server.py:L588`** (host defaults to `127.0.0.1`). It was confirmed empirically with `curl`
 (the authoritative check — see the caveat below):
 
-Command:
+Command (headers only; the `sed` masks the opaque signed session-cookie value for safety):
 
 ```bash
-curl -i http://127.0.0.1:7777/auth/login
+curl -sD - -o /dev/null http://127.0.0.1:7777/auth/login \
+  | sed -E 's/(slapp=)[^;]+/\1<SIGNED_VALUE_REDACTED>/'
 ```
 
-Observed response head (unedited):
+Complete response head as produced. Only the opaque signed `slapp` cookie value is masked (by the
+`sed` above); every other byte is verbatim. It is therefore deliberately **not** labeled "unedited":
+the single `<SIGNED_VALUE_REDACTED>` token marks the one redacted field, while all header names, the
+real `Content-Length`, and every cookie attribute (`Expires`, `HttpOnly`, `Path`, `SameSite`) are
+shown exactly as returned:
 
 ```text
 HTTP/1.0 200 OK
 Content-Type: text/html; charset=utf-8
-Content-Length: 348625
-...
-Set-Cookie: slapp=eyJfZnJlc2gi...; Expires=...; HttpOnly; Path=/; SameSite=Lax
+Content-Length: 221503
+Vary: Cookie
+Set-Cookie: slapp=<SIGNED_VALUE_REDACTED>; Expires=Wed, 15-Jul-2026 05:20:22 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
+Date: Wed, 08 Jul 2026 05:20:22 GMT
 ```
 
-The `Server: Werkzeug/1.0.1 Python/3.10.18` header is direct runtime confirmation of both the
+(The login page is rendered per request — it embeds a fresh CSRF token — so `Content-Length` varies
+by a few hundred bytes between calls; `221503` is the value from this exact capture.) The
+`Server: Werkzeug/1.0.1 Python/3.10.18` header is direct runtime confirmation of both the
 Werkzeug 1.0.1 and Python 3.10.18 pins. A bare `GET /` (no session) returns a redirect to the login
 page:
 
-Command:
+Command (same masking convention):
 
 ```bash
-curl -i http://127.0.0.1:7777/
+curl -sD - -o /dev/null http://127.0.0.1:7777/ \
+  | sed -E 's/(slapp=)[^;]+/\1<SIGNED_VALUE_REDACTED>/'
 ```
 
-Observed:
+Complete response head as produced (only the signed `slapp` value masked; all else verbatim):
 
 ```text
 HTTP/1.0 302 FOUND
+Content-Type: text/html; charset=utf-8
+Content-Length: 229
 Location: http://127.0.0.1:7777/auth/login
+Vary: Cookie
+Set-Cookie: slapp=<SIGNED_VALUE_REDACTED>; Expires=Wed, 15-Jul-2026 05:20:22 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
+Date: Wed, 08 Jul 2026 05:20:22 GMT
 ```
 
 > **Caveat (labeled).** Socket-table tools (`ss -ltnp`, `lsof`) produced **no output** for port 7777
@@ -273,9 +329,10 @@ Server: Werkzeug/1.0.1 Python/3.10.18
 > those tools, **not** evidence that nothing is listening. The successful `curl` TCP handshake above
 > is authoritative and proves the server is bound and serving on `127.0.0.1:7777`.
 
-**Endpoint surface.** The application factory registers 11 blueprints via `register_blueprints()`
-(`server.py:L233-L246`). Each URL prefix below was read from the blueprint's own definition (or, for
-`oauth_bp`, from the explicit override in `register_blueprints()`):
+**Endpoint surface.** The application factory makes 11 blueprint registrations via
+`register_blueprints()` (`server.py:L233-L246`) — 10 distinct blueprints, since `oauth_bp` is mounted
+twice. Each URL prefix below was read from the blueprint's own definition (or, for `oauth_bp`, from
+the explicit override in `register_blueprints()`):
 
 | Blueprint (registration) | URL prefix | `file:line` of the prefix |
 |--------------------------|------------|---------------------------|
@@ -298,14 +355,36 @@ Beyond the blueprints, a handful of routes are attached **directly on the app** 
 `create_app()`, most importantly the **bare root `/`** (see §2.1 — it is an app-level `index`
 endpoint, not a blueprint route) and `/health` (`server.py:L213`).
 
-Enumerated **at runtime** (temporary probe, `PYTHONPATH=/app`, reading `app.blueprints` and
-`app.url_map`), the *live* app actually exposes **25 blueprints** and **292 URL rules**. The extra
-blueprints beyond the 11 registrations above — `admin`, `adminauditlog`, `alias`, `coupon`,
-`customdomain`, `dailymetric`, `email_search`, `invalidmailboxdomain`, `mailbox`,
-`manualsubscription`, `metric2`, `newsletter`, `newsletteruser`, `providercomplaint`, `user` — are
-registered by **Flask-Admin** at runtime (the admin UI), not by `register_blueprints()`.
-Representative routes confirmed present at runtime: `/auth/login`, `/dashboard/`, `/api/user_info`,
-`/`, `/oauth/authorize`, `/oauth2/authorize`.
+The full endpoint surface was **enumerated at runtime** with a temporary probe kept **outside** the
+repository tree (`/tmp/enum_routes.py`). It builds the app via the same `create_app()` factory the
+dev server uses and reads `app.blueprints` and `app.url_map`. Command and complete captured output:
+
+```bash
+python /tmp/enum_routes.py
+```
+
+```text
+=== ENUM_RESULT_START ===
+blueprint_count: 25
+url_rule_count: 292
+blueprints: admin, adminauditlog, alias, api, auth, coupon, customdomain, dailymetric, dashboard, developer, discover, email_search, internal, invalidmailboxdomain, mailbox, manualsubscription, metric2, monitor, newsletter, newsletteruser, oauth, onboarding, phone, providercomplaint, user
+representative_route /auth/login          present=True
+representative_route /dashboard/          present=True
+representative_route /api/user_info       present=True
+representative_route /                    present=True
+representative_route /oauth/authorize     present=True
+representative_route /oauth2/authorize    present=True
+=== ENUM_RESULT_END ===
+```
+
+So the *live* app exposes **25 blueprints** and **292 URL rules**. Ten of those blueprints come from
+`register_blueprints()` (the table above lists **11 registrations** because `oauth_bp` is mounted
+twice, at `/oauth` and `/oauth2`, but it is a single blueprint named `oauth`). The remaining **15** —
+`admin`, `adminauditlog`, `alias`, `coupon`, `customdomain`, `dailymetric`, `email_search`,
+`invalidmailboxdomain`, `mailbox`, `manualsubscription`, `metric2`, `newsletter`, `newsletteruser`,
+`providercomplaint`, `user` — are registered by **Flask-Admin** at runtime (the admin UI), not by
+`register_blueprints()`. All six representative routes are confirmed present (`present=True`):
+`/auth/login`, `/dashboard/`, `/api/user_info`, `/`, `/oauth/authorize`, `/oauth2/authorize`.
 
 ---
 
@@ -344,8 +423,8 @@ That `after_request` line is the observable "a request was handled" signal. Capt
 (unedited; each self-cites `"/app/server.py:284" - after_request()`):
 
 ```text
-2026-07-08 04:28:45,031 - SL - DEBUG - 14421 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET /auth/login ImmutableMultiDict([]) 200, takes 0.10902142524719238
-2026-07-08 04:28:45,147 - SL - DEBUG - 14421 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET / ImmutableMultiDict([]) 302, takes 0.0009062290191650391
+2026-07-08 05:19:50,252 - SL - DEBUG - 15181 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET /auth/login ImmutableMultiDict([]) 200, takes 0.02341294288635254
+2026-07-08 05:19:50,262 - SL - DEBUG - 15181 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET / ImmutableMultiDict([]) 302, takes 0.0006802082061767578
 ```
 
 ## 2.2 Runtime user identity — keyed on `alternative_id` (a UUID), not the primary key
@@ -378,19 +457,27 @@ The `LoginManager` itself is created in `app/extensions.py`:
   `login_manager.session_protection = "strong"` (`app/extensions.py:L8`), and it is wired into the
   app by `login_manager.init_app(app)` (`server.py:L438`).
 
-**Runtime proof (observed).** After logging in as `john@wick.com`, the signed `slapp` session cookie
-was decoded (temporary probe, using the app's own `FLASK_SECRET` via Flask's
-`SecureCookieSessionInterface`). The database row versus the decoded cookie:
+**Runtime proof (observed).** The `alternative_id` was read straight from the database, and the
+signed `slapp` cookie was decoded with the app's own `FLASK_SECRET` via Flask's
+`SecureCookieSessionInterface` (in the same `/tmp/probe_auth.py` probe used in §2.4).
+
+The database row for `john@wick.com`:
 
 ```text
-# DB row (psql)
-id (primary key) = 1
-email            = john@wick.com
-alternative_id   = fc14048c-8214-4d7a-a559-31c0df0775cd
+$ PGPASSWORD=mypassword psql -h localhost -U myuser -d simplelogin \
+    -c "SELECT id, email, alternative_id FROM users WHERE email='john@wick.com';"
+ id |     email     |            alternative_id
+----+---------------+--------------------------------------
+  1 | john@wick.com | fc14048c-8214-4d7a-a559-31c0df0775cd
+(1 row)
+```
 
-# Decoded slapp session cookie payload
-keys    = ['_fresh', '_id', '_permanent', '_user_id', 'csrf_token', 'sudo_time']
-_user_id = fc14048c-8214-4d7a-a559-31c0df0775cd
+The decoded `slapp` payload captured by that probe (the full block is reproduced verbatim in §2.4
+under "SESSION COOKIE DECODE"):
+
+```text
+decoded payload keys: ['_fresh', '_id', '_permanent', '_user_id', 'csrf_token', 'sudo_time']
+_user_id: fc14048c-8214-4d7a-a559-31c0df0775cd
 ```
 
 The session's `_user_id` equals the **`alternative_id` UUID**, **not** the primary key `1`. That is
@@ -427,37 +514,132 @@ stronger, more direct demonstration that `_user_id == alternative_id`.
 ## 2.4 Observed authentication evidence
 
 The flow was driven by a temporary HTTP client kept **outside** the repository tree
-(`/tmp/probe_auth.py`, using `requests`). Client-side observations:
+(`/tmp/probe_auth.py`, using `requests`). It exercises the **real** `/auth/login` entry point — a
+`GET` to fetch the login form and its CSRF token, a `POST` with the seeded credentials
+`john@wick.com / password` plus that token, then authenticated and fresh-session follow-ups — all
+with `allow_redirects=False`, so each individual response (including every `302` and its `Location`)
+is observed directly. The opaque signed `slapp` value is masked by the probe for safety; every other
+byte of each response head is verbatim as returned by the server.
 
-```text
-STEP 1  GET  /auth/login                    -> 200 (HTTP/1.0); Set-Cookie: slapp=...; CSRF token parsed from form
-STEP 2  POST /auth/login (john@wick.com/password)
-                                            -> 302; Location: http://127.0.0.1:7777/dashboard/
-STEP 3  GET  /            (authenticated)   -> 302; Location: http://127.0.0.1:7777/dashboard/
-STEP 4  GET  /dashboard/  (authenticated)   -> 200
-STEP 5  GET  /            (fresh session)   -> 302; Location: http://127.0.0.1:7777/auth/login
+Command:
+
+```bash
+python /tmp/probe_auth.py
 ```
 
-Server-side, the corresponding log lines captured on the serving process (unedited; each self-cites
-its source `file:line`):
+Complete captured client-side output — all five conditions plus the session-cookie decode, exactly
+as printed:
 
 ```text
-2026-07-08 04:31:49,955 - SL - DEBUG - 14421 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET /auth/login ImmutableMultiDict([]) 200, takes 0.0240480899810791
-2026-07-08 04:31:50,292 - SL - DEBUG - 14421 - "/app/app/auth/views/login_utils.py:35" - after_login() -  - log user <User 1 John Wick john@wick.com> in
-2026-07-08 04:31:50,314 - SL - DEBUG - 14421 - "/app/app/auth/views/login_utils.py:44" - after_login() -  - redirect user to dashboard
-2026-07-08 04:31:50,315 - SL - DEBUG - 14421 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /auth/login ImmutableMultiDict([]) 302, takes 0.2719085216522217
-2026-07-08 04:31:50,326 - SL - DEBUG - 14421 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET / ImmutableMultiDict([]) 302, takes 0.005011320114135742
-2026-07-08 04:31:50,725 - SL - DEBUG - 14421 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET /dashboard/ ImmutableMultiDict([]) 200, takes 0.39488720893859863
-2026-07-08 04:31:50,744 - SL - DEBUG - 14421 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET / ImmutableMultiDict([]) 302, takes 0.0007843971252441406
+========================================================================
+CONDITION 1  GET /auth/login   (no prior session)
+------------------------------------------------------------------------
+request : GET http://127.0.0.1:7777/auth/login
+status  : HTTP/1.0 200 OK
+response headers:
+    Content-Type: text/html; charset=utf-8
+    Content-Length: 221663
+    Vary: Cookie
+    Set-Cookie: slapp=<SIGNED_VALUE_REDACTED>; Expires=Wed, 15-Jul-2026 05:21:35 GMT; HttpOnly; Path=/; SameSite=Lax
+    Server: Werkzeug/1.0.1 Python/3.10.18
+    Date: Wed, 08 Jul 2026 05:21:35 GMT
+csrf_token parsed from login form: present=True length=91
+body bytes: 221663
+
+========================================================================
+CONDITION 2  POST /auth/login  (john@wick.com / password + csrf_token)
+------------------------------------------------------------------------
+request : POST http://127.0.0.1:7777/auth/login
+status  : HTTP/1.0 302 FOUND
+response headers:
+    Content-Type: text/html; charset=utf-8
+    Content-Length: 229
+    Location: http://127.0.0.1:7777/dashboard/
+    Vary: Cookie
+    Set-Cookie: slapp=<SIGNED_VALUE_REDACTED>; Expires=Wed, 15-Jul-2026 05:21:35 GMT; HttpOnly; Path=/; SameSite=Lax
+    Server: Werkzeug/1.0.1 Python/3.10.18
+    Date: Wed, 08 Jul 2026 05:21:35 GMT
+body bytes: 229
+
+========================================================================
+CONDITION 3  GET /             (authenticated session)
+------------------------------------------------------------------------
+request : GET http://127.0.0.1:7777/
+status  : HTTP/1.0 302 FOUND
+response headers:
+    Content-Type: text/html; charset=utf-8
+    Content-Length: 229
+    Location: http://127.0.0.1:7777/dashboard/
+    Vary: Cookie
+    Set-Cookie: slapp=<SIGNED_VALUE_REDACTED>; Expires=Wed, 15-Jul-2026 05:21:35 GMT; HttpOnly; Path=/; SameSite=Lax
+    Server: Werkzeug/1.0.1 Python/3.10.18
+    Date: Wed, 08 Jul 2026 05:21:35 GMT
+body bytes: 229
+
+========================================================================
+CONDITION 4  GET /dashboard/   (authenticated session)
+------------------------------------------------------------------------
+request : GET http://127.0.0.1:7777/dashboard/
+status  : HTTP/1.0 200 OK
+response headers:
+    Content-Type: text/html; charset=utf-8
+    Content-Length: 781374
+    Vary: Cookie
+    Set-Cookie: slapp=<SIGNED_VALUE_REDACTED>; Expires=Wed, 15-Jul-2026 05:21:35 GMT; HttpOnly; Path=/; SameSite=Lax
+    Server: Werkzeug/1.0.1 Python/3.10.18
+    Date: Wed, 08 Jul 2026 05:21:35 GMT
+body bytes: 781374
+
+========================================================================
+CONDITION 5  GET /             (fresh session, no cookies)
+------------------------------------------------------------------------
+request : GET http://127.0.0.1:7777/
+status  : HTTP/1.0 302 FOUND
+response headers:
+    Content-Type: text/html; charset=utf-8
+    Content-Length: 229
+    Location: http://127.0.0.1:7777/auth/login
+    Vary: Cookie
+    Set-Cookie: slapp=<SIGNED_VALUE_REDACTED>; Expires=Wed, 15-Jul-2026 05:21:35 GMT; HttpOnly; Path=/; SameSite=Lax
+    Server: Werkzeug/1.0.1 Python/3.10.18
+    Date: Wed, 08 Jul 2026 05:21:35 GMT
+body bytes: 229
+
+========================================================================
+SESSION COOKIE DECODE  (authenticated 'slapp' cookie, decoded with FLASK_SECRET)
+------------------------------------------------------------------------
+decoded payload keys: ['_fresh', '_id', '_permanent', '_user_id', 'csrf_token', 'sudo_time']
+_user_id: fc14048c-8214-4d7a-a559-31c0df0775cd
 ```
 
-Two things are directly observable here:
+Server-side, the corresponding log lines emitted by the serving child (PID `15181`) during the same
+probe run — captured from the server's stdout, unedited, each self-citing its source `file:line`:
+
+```text
+2026-07-08 05:21:35,021 - SL - DEBUG - 15181 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET /auth/login ImmutableMultiDict([]) 200, takes 0.022771835327148438
+2026-07-08 05:21:35,273 - SL - DEBUG - 15181 - "/app/app/auth/views/login_utils.py:35" - after_login() -  - log user <User 1 John Wick john@wick.com> in
+2026-07-08 05:21:35,274 - SL - DEBUG - 15181 - "/app/app/auth/views/login_utils.py:44" - after_login() -  - redirect user to dashboard
+2026-07-08 05:21:35,274 - SL - DEBUG - 15181 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /auth/login ImmutableMultiDict([]) 302, takes 0.2491466999053955
+2026-07-08 05:21:35,283 - SL - DEBUG - 15181 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET / ImmutableMultiDict([]) 302, takes 0.004232883453369141
+2026-07-08 05:21:35,654 - SL - DEBUG - 15181 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET /dashboard/ ImmutableMultiDict([]) 200, takes 0.36823105812072754
+2026-07-08 05:21:35,662 - SL - DEBUG - 15181 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET / ImmutableMultiDict([]) 302, takes 0.0007114410400390625
+```
+
+The client-side conditions map one-to-one onto these server-side lines (same run, same serving child
+PID `15181`): CONDITION 1 → the `GET /auth/login 200`; CONDITION 2 → the two `after_login()` lines
+followed by `POST /auth/login 302`; CONDITION 3 → `GET / 302`; CONDITION 4 → `GET /dashboard/ 200`;
+CONDITION 5 → the final `GET / 302`.
+
+Three things are directly observable here:
 
 - The `after_login()` line `log user <User 1 John Wick john@wick.com> in`
   (`app/auth/views/login_utils.py:L35`) shows the resolved user object — confirming the password
   check succeeded and Flask-Login's `login_user()` was invoked.
 - The subsequent authenticated `GET /dashboard/` returns `200`, while an unauthenticated `GET /`
   returns `302` to `/auth/login` — the two branches of the identity flow (see C5).
+- The decoded `slapp` cookie's `_user_id` is the `alternative_id` UUID
+  `fc14048c-8214-4d7a-a559-31c0df0775cd` (not the primary key `1`) — the runtime identity token
+  analyzed in §2.2 and C4.
 
 ## 2.5 How the auth context is carried through the request
 
@@ -465,7 +647,7 @@ Auth context is carried by **the signed `slapp` session cookie plus the two per-
 
 1. On login, `login_user(user)` (`app/auth/views/login_utils.py:L36`) writes
    `_user_id = user.get_id()` — the `alternative_id` UUID (`app/models.py:L597`) — into the signed
-   `slapp` cookie (observed `Set-Cookie: slapp=...; HttpOnly; Path=/; SameSite=Lax`, §1.5).
+   `slapp` cookie (observed `Set-Cookie: slapp=<SIGNED_VALUE_REDACTED>; Expires=...; HttpOnly; Path=/; SameSite=Lax`, §1.5).
 2. On each subsequent request, `before_request` (`server.py:L257-L270`) seeds `g.start_time`; then
    Flask-Login reads the cookie and calls `load_user(alternative_id)` (`server.py:L220-L222`), which
    resolves `current_user` from `User.get_by(alternative_id=...)`.
@@ -474,7 +656,7 @@ Auth context is carried by **the signed `slapp` session cookie plus the two per-
 
 If no valid `slapp` cookie is present, `load_user` is not able to resolve a user and `current_user`
 is the Flask-Login anonymous user — which is why a fresh `GET /` redirects to `/auth/login`
-(observed in STEP 5 above).
+(observed in CONDITION 5 above).
 
 ## 2.6 Identity-flow diagram
 
@@ -588,20 +770,26 @@ This is confirmed by the two PIDs in the captured output and by inspecting each 
 environment:
 
 ```text
-PID 14414  PPID 1       WERKZEUG_RUN_MAIN unset   -> reloader supervisor (printed config #1 + the Flask banner, then spawned the child)
-PID 14421  PPID 14414   WERKZEUG_RUN_MAIN=true    -> serving worker      (printed config #2; actually handles requests)
+PID 15160  PPID 1       WERKZEUG_RUN_MAIN unset   -> reloader supervisor (printed config #1 + the Flask banner, then spawned the child)
+PID 15181  PPID 15160   WERKZEUG_RUN_MAIN=true    -> serving worker      (printed config #2; actually handles requests)
 ```
 
 The Flask banner (`* Serving Flask app ...` … `* Debug mode: on`) appears **only once** (in the
 supervisor block); the serving child's block ends at the `load words file` line and has no banner.
-All per-request logs in §2.4 were emitted by the serving child (PID 14421).
+All per-request logs in §2.4 were emitted by the serving child (PID 15181).
 
-This is the framework's documented reloader behavior, not a SimpleLogin quirk. Per the Plotly Dash
-DevTools documentation, code reloading is provided by Flask & Werkzeug via the `use_reloader`
-option, and a documented caveat is that **"your app code is run twice when starting"** — once for
-the parent process and once for the reloaded child
-([dash.plotly.com/devtools](https://dash.plotly.com/devtools)). It can be turned off with
-`use_reloader=False`. This matches the observed parent/child split exactly.
+This is the framework's documented reloader behavior, not a SimpleLogin quirk. The official Werkzeug
+documentation for `run_simple()` describes the `use_reloader` parameter as: *"Use a reloader process
+to restart the server process when files are changed."*
+([werkzeug.palletsprojects.com/en/stable/serving](https://werkzeug.palletsprojects.com/en/stable/serving/)).
+That "reloader process" is the observed supervisor (PID 15160) and the "server process" is the
+observed child (PID 15181); because `server.py` is executed top-to-bottom in *each* process, the
+`app/config.py` `print(...)` lines and the `>>> init logging <<<` marker run once per process — which
+is why §1.4 shows every config line twice. The same mechanism is present in the pinned Werkzeug 1.0.1:
+the reloader marks its serving subprocess with the environment variable `WERKZEUG_RUN_MAIN=true`,
+which is exactly what the captured environment above shows on the serving child (PID 15181) and not on
+the supervisor (PID 15160). The reloader can be disabled with `use_reloader=False`, which collapses
+the two processes into one and prints the config block only once.
 
 ## C2 — Werkzeug's `* Running on ...` line and per-request access logs are ABSENT
 
@@ -653,8 +841,8 @@ GET /dashboard/  -> 200
 
 The unauthenticated `GET /` → `302 /auth/login` corresponds to the `current_user = Anonymous` branch
 of the §2.6 diagram; the authenticated `GET /dashboard/` → `200` corresponds to the resolved
-`current_user` branch. Both were observed (client-side in §2.4 STEP 4 & STEP 5, and server-side in
-the §2.4 log block).
+`current_user` branch. Both were observed (client-side in §2.4 CONDITION 4 & CONDITION 5, and
+server-side in the §2.4 log block).
 
 The branch is not merely observed — it is the literal `if/else` in the root `index` view:
 `if current_user.is_authenticated:` (`server.py:L252`) redirects to `dashboard.index`
