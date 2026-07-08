@@ -174,7 +174,7 @@ Upload files to local dir
 
 Note the seed itself already exercises the event short‑circuit (`event_dispatcher.py:62`) and the onboarding‑disable path (`models.py:647` — this is why no `job` rows are seeded, §6). The seed's own random alias (`writes_magnon871@sl.local`) becomes alias id 2 (§5, §2.6 baseline).
 
-**(7) Serve with `gunicorn` (run live) + why not `python3 server.py`.** `server.py:L588` binds `127.0.0.1` only (`app.run(debug=True, ..., port=7777)`), which is not reachable from the host; the container therefore serves host‑accessible via `gunicorn wsgi:app -b 0.0.0.0:7777 -w 2`. The Flask app object is the same factory `create_app` (`server.py:L139`) imported by `wsgi.py` (`wsgi.py:L1-L3`). Captured startup:
+**(7) Serve with `gunicorn` (run live) + why not `python3 server.py`.** `server.py:L588` binds `127.0.0.1` only (`app.run(debug=True, port=7777)` — the verbatim two‑argument call, no omitted arguments), which is not reachable from the host; the container therefore serves host‑accessible via `gunicorn wsgi:app -b 0.0.0.0:7777 -w 2`. The Flask app object is the same factory `create_app` (`server.py:L139`) imported by `wsgi.py` (`wsgi.py:L1-L3`). Captured startup:
 
 ```
 $ head -5 /tmp/scratch_qna/gunicorn_full.log
@@ -231,7 +231,7 @@ These correspond to `app/config.py`: `MAX_NB_EMAIL_FREE_PLAN` default 5 (`L124`)
 
 ### 2.3 Logging
 
-`app/log.py` configures a single logger named `SL` writing to stdout, captured by gunicorn to `/tmp/gunicorn.log` inside `sl-app`. `LOG.d`=debug, `LOG.i`=info, `LOG.w`=warning, `LOG.e`=exception (shortcut assignments at `app/log.py:L74-L77`; `LOG = _get_logger("SL")` at `app/log.py:L79`). Every HTTP request is logged by `after_request()` (`server.py:L284`) in the form `<ip> <METHOD> <path> <args> <status>, takes <t>`. All log excerpts below are sliced from `/tmp/gunicorn.log` (backed up as `/tmp/scratch_qna/gunicorn_full.log`).
+`app/log.py` configures a single logger named `SL` writing to stdout, captured by gunicorn to `/tmp/gunicorn.log` inside `sl-app`. `LOG.d`=debug, `LOG.i`=info, `LOG.w`=warning, `LOG.e`=exception (shortcut assignments at `app/log.py:L74-L77`; `LOG = _get_logger("SL")` at `app/log.py:L79`). Every HTTP request is logged by `after_request()` (`server.py:L284`) in the form `<ip> <METHOD> <path> <args> <status>, takes <t>`. The leading `<ip>` is the client address as gunicorn sees it and is therefore **vantage‑dependent**: the captures below were driven by `curl` running **inside `sl-app`**, so they show `127.0.0.1`; the identical request driven from the **host** side is logged with the Docker bridge gateway address instead — observed directly: `172.18.0.1 GET / ImmutableMultiDict([]) 302`. This `<ip>` is not part of the in‑scope O7 creation line (`app/dashboard/views/index.py:110`, which carries no client IP), so it affects no claim here. All log excerpts below are sliced from `/tmp/gunicorn.log` (backed up as `/tmp/scratch_qna/gunicorn_full.log`).
 
 ### 2.4 Users, credentials, and the premium nuance
 
@@ -401,6 +401,8 @@ $ sed -n '/=> Send data, 132/,+2p' /tmp/scratch_qna/req1.trace
 0040: yZTA1NjM3MWNmNTcxOTY3NWQxYjc0NGMi.ak3i2A.wNU0E7AQRmr4NvAaF45Zuy6
 ```
 
+> **Field-order note (wire order is transport-constructed, not semantically significant).** The body order shown above (`form-name` then `csrf_token`) is the order in which the `curl --data` string was written, not the browser's. A genuine browser form submit sends **`csrf_token` first**, because the template renders `{{ csrf_form.csrf_token }}` (`templates/dashboard/index.html:L51`) *before* the `form-name` hidden input (`templates/dashboard/index.html:L52`) — the browser serializes fields in DOM order. This has **no effect** on the request: `application/x-www-form-urlencoded` is parsed into an unordered mapping, so `form-name` and `csrf_token` resolve identically regardless of order, and the byte length is the same (**132 bytes**). Every asserted property (method, path, content-type, both field names/values, length, optional `generator_scheme`) is order-independent.
+
 ### 3.2 What this shows, and the evidence
 
 - **Method + URL:** `POST /dashboard/` — **not** `POST /`. The form (`templates/dashboard/index.html:L50` `<form method="post">`) has **no `action` attribute**, so it submits to the current document URL, which is `/dashboard/` because the dashboard blueprint is mounted with `url_prefix="/dashboard"` (`app/dashboard/base.py:L3-L8`). The root `/` view redirects authenticated users to `dashboard.index` (`server.py:L251-L255`), confirmed live: `GET /` (authenticated) → `302 Location /dashboard/`. **This corrects the plain "`POST /`" reading — the real target is `/dashboard/`.**
@@ -484,25 +486,25 @@ The body has **17 keys**: 16 from `serialize_alias_info_v2` (`app/api/serializer
 
 | JSON key | Observed value (id 15) | Source line |
 |----------|------------------------|-------------|
-| `alias` | `"foxier_joined409@sl.local"` | `new_random_alias.py:L115` (top‑level, = the alias email) |
-| `id` | `15` | `serializer.py:L58` |
-| `email` | `"foxier_joined409@sl.local"` | `serializer.py:L59` |
-| `creation_date` | `"2026-07-08 05:41:46+00:00"` | `serializer.py:L60` (`created_at.format()`) |
-| `creation_timestamp` | `1783489306` | `serializer.py:L61` (`created_at.timestamp`) |
-| `enabled` | `true` | `serializer.py:L62` |
-| `note` | `null` | `serializer.py:L63` |
-| `name` | `null` | `serializer.py:L64` |
-| `nb_forward` | `0` | `serializer.py:L66` |
-| `nb_block` | `0` | `serializer.py:L67` (from `alias_info.nb_blocked`) |
-| `nb_reply` | `0` | `serializer.py:L68` |
-| `mailbox` | `{"email":"john@wick.com","id":1}` | `serializer.py:L70` |
-| `mailboxes` | `[{"email":"john@wick.com","id":1}]` | `serializer.py:L71-L74` |
-| `support_pgp` | `false` | `serializer.py:L75` (`mailbox_support_pgp()`) |
-| `disable_pgp` | `false` | `serializer.py:L76` |
-| `latest_activity` | `null` | `serializer.py:L77` (populated only if a `latest_email_log` exists, `L80-L92`) |
-| `pinned` | `false` | `serializer.py:L78` |
+| `alias` | `"foxier_joined409@sl.local"` | `app/api/views/new_random_alias.py:L115` (top‑level, = the alias email) |
+| `id` | `15` | `app/api/serializer.py:L58` |
+| `email` | `"foxier_joined409@sl.local"` | `app/api/serializer.py:L59` |
+| `creation_date` | `"2026-07-08 05:41:46+00:00"` | `app/api/serializer.py:L60` (`created_at.format()`) |
+| `creation_timestamp` | `1783489306` | `app/api/serializer.py:L61` (`created_at.timestamp`) |
+| `enabled` | `true` | `app/api/serializer.py:L62` |
+| `note` | `null` | `app/api/serializer.py:L63` |
+| `name` | `null` | `app/api/serializer.py:L64` |
+| `nb_forward` | `0` | `app/api/serializer.py:L66` |
+| `nb_block` | `0` | `app/api/serializer.py:L67` (from `alias_info.nb_blocked`) |
+| `nb_reply` | `0` | `app/api/serializer.py:L68` |
+| `mailbox` | `{"email":"john@wick.com","id":1}` | `app/api/serializer.py:L70` |
+| `mailboxes` | `[{"email":"john@wick.com","id":1}]` | `app/api/serializer.py:L71-L74` |
+| `support_pgp` | `false` | `app/api/serializer.py:L75` (`mailbox_support_pgp()`) |
+| `disable_pgp` | `false` | `app/api/serializer.py:L76` |
+| `latest_activity` | `null` | `app/api/serializer.py:L77` (populated only if a `latest_email_log` exists, `L80-L92`) |
+| `pinned` | `false` | `app/api/serializer.py:L78` |
 
-`latest_activity` is `null` for a freshly created alias because there is no email log yet — the field is populated only inside the `if alias_info.latest_email_log:` block at `serializer.py:L80-L92`, which is not reached for a new alias. (The `serialize_alias_info_v2` dict literal spans `serializer.py:L56-L79`; the comment `# Alias field` sits at `L57`, so the first key `id` is at `L58`.)
+`latest_activity` is `null` for a freshly created alias because there is no email log yet — the field is populated only inside the `if alias_info.latest_email_log:` block at `app/api/serializer.py:L80-L92`, which is not reached for a new alias. (The `serialize_alias_info_v2` dict literal spans `app/api/serializer.py:L56-L79`; the comment `# Alias field` sits at `L57`, so the first key `id` is at `L58`.)
 
 ### 4.4 Direct comparison — the responses differ, the creation effects do not
 
@@ -648,7 +650,7 @@ code|1|2026-07-08 05:41:46.505096
 
 The alias‑creation delta is identical to the web path (`alias +1`, `alias_audit_log +1`, `daily_metric` UPDATE, all else +0), **proving both entry points share `Alias.create`** (`app/models.py:L1628-L1692`).
 
-> **API‑transport‑only write (a fourth table, not part of the creation core).** API‑key authentication updates the `api_key` row's usage counters **before** creation (`app/api/base.py:L30-L32`, `times += 1` at `L31`, `last_used = arrow.now()` at `L30`, `Session.commit()` at `L32`): for key `code`, `times` went `0 → 1` and `last_used` advanced to the request time. This is auth bookkeeping on `api_key`, **distinct from** the three creation tables, and does not occur on the cookie‑authenticated web path. So: *3‑table creation core (both flows) + 1 `api_key` auth‑accounting table (API flow only).*
+> **API‑transport‑only write (a fourth table, not part of the creation core).** API‑key authentication updates the `api_key` row's usage counters **before** creation (`app/api/base.py:L30-L32`, `times += 1` at `L31`, `last_used = arrow.now()` at `L30`, `Session.commit()` at `L32`): for key `code`, `times` went `0 → 1` and `last_used` advanced to the request time. This is auth bookkeeping on `api_key`, **distinct from** the three creation tables, and does not occur on the cookie‑authenticated web path. So: *3‑table creation core (both flows) + 1 `api_key` auth‑accounting table (API flow only).* Note that this counter is **best‑effort, not concurrency‑safe**: `api_key.times += 1` (`app/api/base.py:L31`) is a non‑atomic read‑modify‑write performed *outside* the `alias_creation` parallel lock, so under truly concurrent API calls the increment can lose updates — unlike `daily_metric.nb_alias`, which is incremented inside the creation core. The single‑call value (`0 → 1`) shown above is exact; the concurrent behavior is a property of the (unchanged) application source and is not part of the alias‑creation guarantees.
 
 ### 5.5 New‑row contents
 
@@ -695,7 +697,7 @@ $ awk 'NR>=28 && NR<=31' /tmp/scratch_qna/gunicorn_full.log
 2026-07-08 05:40:40,898 - SL - DEBUG - 2160 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /dashboard/ ImmutableMultiDict([]) 302, takes 0.04178810119628906
 ```
 
-- **Creation log line:** `app/dashboard/views/index.py:110` — `LOG.d("create new random alias %s for user %s", …)`, a DEBUG line emitted on the **web path only**.
+- **Creation log line:** `app/dashboard/views/index.py:110` — `LOG.d("create new random alias %s for user %s", alias, current_user)`, a DEBUG line emitted on the **web path only**.
 - **Event short‑circuit line:** `app/events/event_dispatcher.py:62` — `LOG.i("Not sending events because webhook is not configured and allowed to be empty")`, an INFO line.
 - **Request‑completion line:** `server.py:284` — the `after_request` log showing the `302`.
 
@@ -1125,7 +1127,7 @@ $ grep -E 'rate_limited|POST /api/alias/random/new .* 429' /tmp/scratch_qna/guni
 
 | Control | Kind | Mechanism | Runtime state |
 |---------|------|-----------|---------------|
-| Rate‑limit layer 1 | **rate limit** | `flask‑limiter` `@limiter.limit(ALIAS_LIMIT)` (`config.py:L448`) | **Active**, in‑memory storage (no `MEM_STORE_URI`). Produced the observed `429`. |
+| Rate‑limit layer 1 | **rate limit** | `flask‑limiter` `@limiter.limit(ALIAS_LIMIT)` (`app/config.py:L448`) | **Active**, in‑memory storage (no `MEM_STORE_URI`). Produced the observed `429`. |
 | Rate‑limit layer 2 | **rate limit** | in‑`Alias.create` Redis token bucket `rate_limiter.check_bucket_limit` (`app/models.py:L1632-L1641`, `ALIAS_CREATE_RATE_LIMIT_{FREE,PAID}`) | **No‑op** — `rate_limiter.lock_redis is None`, so it returns immediately (`app/rate_limiter.py:L28-L29`). |
 | Concurrency lock (not a rate limit) | **mutual exclusion** | `@parallel_limiter.lock(name="alias_creation")` (`app/parallel_limiter.py`) | **No‑op** — `parallel_limiter.lock_redis is None`, so the decorator is a pass‑through (`L51-L52`). |
 
@@ -1172,6 +1174,119 @@ $ docker exec sl-db psql -U myuser -d simplelogin -tAc "select id,alias_id,hostn
 - **`users` UPDATE (partner‑created flag)** — **not hit; observed absent.** Fires only if `new_alias.flags & FLAG_PARTNER_CREATED > 0 and user.flags & FLAG_CREATED_ALIAS_FROM_PARTNER == 0` (`app/models.py:L1663-L1667`). The seeded/free users are not partner‑created, so `users` stayed at zero‑delta in every run (`users=2` for john‑only runs, `users=3` after the free user existed, never changing on a creation). **[Read‑verified + observed‑absent.]**
 
 - **`sync_event` row + `NOTIFY`** — **not hit; observed absent.** Occurs only when `EVENT_WEBHOOK` is set *and* the user is a partner user (`app/events/event_dispatcher.py:L61-L70`, write at `L24-L26`). With `EVENT_WEBHOOK` unset the second early return fires (§6), so `sync_event` stayed `0` on every creation. **[Read‑verified + observed‑absent.]**
+
+### 7.7 Malformed `hostname` (API only) → HTTP 500, `EmailSyntaxError` (a validation‑failure edge)
+
+**Direct answer:** a `?hostname=` value **whose extracted registrable domain still contains characters that are invalid in an email local‑part** (e.g. `<`, `>`, `(`, `)`) does **not** produce a controlled `4xx` on the API endpoint — it returns **HTTP `500`** `{"error":"Internal error"}` and writes **nothing** to the database. This is a genuine **validation‑failure** edge of the O8 surface: the hostname is turned into an invalid alias local‑part, and the resulting `email_validator.EmailSyntaxError` raised deep inside `Alias.create` is **not caught** by the endpoint — its `try/except` (`app/api/views/new_random_alias.py:L83-L90`) catches only `AliasInTrashError` (`L91-L93`), so the exception escapes and the global handler converts it to a `500`. It affects only the API path *and* only when the user has one‑click website aliases enabled (`user.include_website_in_one_click_alias`, `app/api/views/new_random_alias.py:L54`) — as `john` does (he owns custom domain `old.com`).
+
+**Why only *this* class of malformed hostname (exhaustive, not every malformed value).** The endpoint derives the alias prefix by taking `tldextract.extract(hostname).domain` and passing it through `convert_to_id(...)` (`app/api/views/new_random_alias.py:L58-L60`), and `convert_to_id` (`app/utils.py:L50-L56`) only lowercases, unidecodes, and strips spaces — it does **not** remove `<`, `>`, `(`, `)`. So the `500` occurs precisely when those invalid characters land in the *domain* part that `tldextract` extracts. Observed directly:
+
+```
+$ docker exec sl-app bash -lc "cd /app && venv/bin/python -c \"
+import tldextract; from app.utils import convert_to_id
+for h in ['<script>alert(1)</script>\' OR 1=1--.example', '<script>bad<.evil']:
+    d = tldextract.extract(h).domain
+    print(repr(h), '-> domain=', repr(d), '-> convert_to_id=', repr(convert_to_id(d)))\""
+"<script>alert(1)</script>' OR 1=1--.example" -> domain= '<script>alert(1)<' -> convert_to_id= '<script>alert(1)<'
+'<script>bad<.evil' -> domain= 'evil' -> convert_to_id= 'evil'
+```
+
+The first keeps the invalid chars in the domain → invalid local‑part `<script>alert(1)<@old.com` → `EmailSyntaxError` → `500`. The second's bad chars fall in the *subdomain* (discarded), so `tldextract` yields a clean domain `evil`, the alias `evil@old.com` is valid, and the request **succeeds with `201`** — **not** a `500`. So this is *not* "any malformed hostname → 500"; it is specifically the class whose extracted domain retains email‑invalid characters.
+
+For the `201` (clean‑domain) class, note the endpoint is **idempotent by hostname**: it computes a deterministic `suggested_alias` and only calls `Alias.create` when that alias does not already exist for the user; if it exists and has a matching `AliasUsedOn` row it is *reused* (`app/api/views/new_random_alias.py:L66-L80`, reuse logged at `L77`). Both sub‑cases observed through the real endpoint — a **first** call for a fresh registrable domain **creates** a row (`+1` on `alias`), while a **repeat** call for the same hostname **reuses** it (no new row), both returning `201`:
+
+```
+# First call — fresh registrable domain (bad char in subdomain, discarded): CREATES a row
+$ docker exec sl-db psql -U myuser -d simplelogin -tAc "select count(*) from alias;"   # BEFORE
+124
+$ docker exec sl-app bash -lc "curl -sS -X POST \
+    'http://localhost:7777/api/alias/random/new?hostname=%3Cbad%3E.qafreshcp5.com' -H 'Authentication: code'"
+{"alias":"qafreshcp5@old.com","creation_date":"2026-07-08 10:26:46+00:00","creation_timestamp":1783506406,"disable_pgp":false,"email":"qafreshcp5@old.com","enabled":true,"id":127,"latest_activity":null,"mailbox":{"email":"john@wick.com","id":1},"mailboxes":[{"email":"john@wick.com","id":1}],"name":null,"nb_block":0,"nb_forward":0,"nb_reply":0,"note":null,"pinned":false,"support_pgp":false}
+$ docker exec sl-db psql -U myuser -d simplelogin -tAc "select count(*) from alias;"   # AFTER  (+1)
+125
+
+# Repeat call — same hostname whose alias already exists: REUSES it (no new row)
+$ docker exec sl-db psql -U myuser -d simplelogin -tAc \
+    "select id||'|'||alias_id||'|'||hostname from alias_used_on where alias_id=(select id from alias where email='evil@old.com');"
+11|123|<script>bad<.evil                                   # existing AliasUsedOn for this hostname
+$ docker exec sl-app bash -lc "curl -sS -X POST \
+    'http://localhost:7777/api/alias/random/new?hostname=%3Cscript%3Ebad%3C.evil' -H 'Authentication: code'"
+{"alias":"evil@old.com","creation_date":"2026-07-08 10:20:20+00:00","creation_timestamp":1783506020,"disable_pgp":false,"email":"evil@old.com","enabled":true,"id":123,"latest_activity":null,"mailbox":{"email":"john@wick.com","id":1},"mailboxes":[{"email":"john@wick.com","id":1}],"name":null,"nb_block":0,"nb_forward":0,"nb_reply":0,"note":null,"pinned":false,"support_pgp":false}
+$ docker exec sl-db psql -U myuser -d simplelogin -tAc "select count(*) from alias;"   # AFTER (unchanged — reuse; note creation_date 10:20:20 predates this call)
+125
+```
+
+Observed through the real HTTP endpoint (client `127.0.0.1`, inside `sl-app`; `slapp` cookie payload redacted per §2.7 convention):
+
+```
+$ docker exec sl-db psql -U myuser -d simplelogin -tAc \
+  "select 'alias='||count(*) from alias union all select 'alias_audit_log='||count(*) from alias_audit_log \
+   union all select 'alias_used_on='||count(*) from alias_used_on union all select 'sync_event='||count(*) from sync_event order by 1;"   # BEFORE
+alias=120
+alias_audit_log=124
+alias_used_on=8
+sync_event=0
+
+$ docker exec sl-app bash -lc "curl -sS -i -X POST \
+    'http://localhost:7777/api/alias/random/new?hostname=%3Cscript%3Ealert(1)%3C%2Fscript%3E%27%20OR%201%3D1--.example' \
+    -H 'Authentication: code'"
+HTTP/1.1 500 INTERNAL SERVER ERROR
+Server: gunicorn/20.0.4
+Date: Wed, 08 Jul 2026 10:18:53 GMT
+Connection: close
+Content-Type: application/json
+Content-Length: 27
+Access-Control-Allow-Origin: *
+Vary: Cookie
+Set-Cookie: slapp=<redacted anonymous session cookie>
+
+{"error":"Internal error"}
+
+$ docker exec sl-db psql -U myuser -d simplelogin -tAc \
+  "select 'alias='||count(*) from alias union all select 'alias_audit_log='||count(*) from alias_audit_log \
+   union all select 'alias_used_on='||count(*) from alias_used_on union all select 'sync_event='||count(*) from sync_event order by 1;"   # AFTER (identical — zero write)
+alias=120
+alias_audit_log=124
+alias_used_on=8
+sync_event=0
+```
+
+The `500` body is produced by the global API error handler `@app.errorhandler(Exception)`, which logs the exception and returns `jsonify(error="Internal error"), 500` for any `/api/` path (`server.py:L389-L392`). The verbatim server log for this request shows the full chain — the hostname is accepted (`app/api/views/new_random_alias.py:L55`), an invalid `suggested_alias` (`<script>alert(1)<@old.com`) is built and passed to `Alias.create` (`L82`, call at `L84`), and `Alias.get_custom_domain` → `validate_email` raises:
+
+```
+$ docker exec sl-app bash -lc "awk '/10:18:53,703/,/POST \/api\/alias\/random\/new.*500/' /tmp/gunicorn.log"   # exact lines emitted by the request above
+2026-07-08 10:18:53,703 - SL - DEBUG - 2159 - "/app/app/api/views/new_random_alias.py:55" - new_random_alias() -  - Use <script>alert(1)</script>' OR 1=1--.example to create new alias
+2026-07-08 10:18:53,715 - SL - DEBUG - 2159 - "/app/app/api/views/new_random_alias.py:82" - new_random_alias() -  - create new alias <script>alert(1)<@old.com
+2026-07-08 10:18:53,717 - SL - ERROR - 2159 - "/app/server.py:390" - error_handler() -  - The email address contains invalid characters before the @-sign: (, ), <, >.
+Traceback (most recent call last):
+  File "/app/venv/lib/python3.10/site-packages/flask/app.py", line 1950, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "/app/venv/lib/python3.10/site-packages/flask/app.py", line 1936, in dispatch_request
+    return self.view_functions[rule.endpoint](**req.view_args)
+  File "/app/venv/lib/python3.10/site-packages/flask_limiter/extension.py", line 702, in __inner
+    return obj(*a, **k)
+  File "/app/app/api/base.py", line 58, in decorated
+    return f(*args, **kwargs)
+  File "/app/app/parallel_limiter.py", line 52, in decorated
+    return f(*args, **kwargs)
+  File "/app/app/api/views/new_random_alias.py", line 84, in new_random_alias
+    alias = Alias.create(
+  File "/app/app/models.py", line 1656, in create
+    custom_domain = Alias.get_custom_domain(email)
+  File "/app/app/models.py", line 1617, in get_custom_domain
+    alias_domain = validate_email(
+  File "/app/venv/lib/python3.10/site-packages/email_validator/__init__.py", line 223, in validate_email
+    local_part_info = validate_email_local_part(parts[0],
+  File "/app/venv/lib/python3.10/site-packages/email_validator/__init__.py", line 337, in validate_email_local_part
+    raise EmailSyntaxError("The email address contains invalid characters before the @-sign: %s." % bad_chars)
+email_validator.EmailSyntaxError: The email address contains invalid characters before the @-sign: (, ), <, >.
+2026-07-08 10:18:53,718 - SL - DEBUG - 2159 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/alias/random/new ImmutableMultiDict([('hostname', "<script>alert(1)</script>' OR 1=1--.example")]) 500, takes 0.027210474014282227
+```
+
+- **Magnitude stability.** Reproduced identically across **≥2 runs** — `HTTP 500`, `Content-Length: 27`, body `{"error":"Internal error"}` every time, and the before/after DB probe is unchanged on every run (zero write to `alias`, `alias_audit_log`, `alias_used_on`, `sync_event`).
+- **Contrast (this is the malformed input, not the `hostname` parameter in general).** A *valid* hostname on the same call succeeds: `?hostname=qafresh-cp5verify.com` → `HTTP 201` (and writes one `alias_used_on` row, per §7.6). So the `500` is specific to the malformed value, not to using `hostname`.
+- **Root cause (read‑verified chain, corroborated by the traceback above):** `app/api/views/new_random_alias.py:L84` (`Alias.create`) → `app/models.py:L1656` (`custom_domain = Alias.get_custom_domain(email)`) → `app/models.py:L1617` (`validate_email(...)`, imported at `app/models.py:L17`) raises `EmailSyntaxError`; because the endpoint's `except` only handles `AliasInTrashError` (`app/api/views/new_random_alias.py:L91-L93`), the exception propagates to the global handler (`server.py:L389-L392`).
+- **Read‑only note.** This is an observed property of the **unchanged** SimpleLogin source. Per this investigation's read‑only mandate, no source file was modified to "fix" it — the behavior is reported exactly as the running system exhibits it. (A production hardening would validate/normalize `hostname`, or catch `EmailSyntaxError` and return `400`; that is a source change outside this investigation's scope.)
 
 ---
 
@@ -1231,7 +1346,7 @@ Re‑reading the original question and confirming each named item is addressed:
 | — are related entities created | §5.6, §7.6 | not in default flow (`alias_mailbox`/`users`/`sync_event`/`alias_used_on` all +0); `alias_used_on` only for API `hostname` |
 | **Background tasks / follow‑up events / additional work** | §6 | none in default config; creation `LOG.d` + event short‑circuit `LOG.i`; no `NOTIFY`, no job; both workers run and idle |
 | — inspect logs | §6.1, throughout | raw log slices shown for creation and every error branch |
-| **Failure — validation** | §7.3, §7.4 | invalid CSRF → `302` + "Invalid request"; invalid `mode` → `400` |
+| **Failure — validation** | §7.3, §7.4, §7.7 | invalid CSRF → `302` + "Invalid request"; invalid `mode` → `400`; malformed API `?hostname=` whose extracted domain keeps email‑invalid chars → `500` (uncaught `EmailSyntaxError`), zero write |
 | **Failure — DB** | §7.2 | trashed‑alias reuse → `AliasInTrashError` (caught → `201` random fallback / custom → `409`) |
 | **Failure — network** | §7.5 | rate limit → `429` (observed); true socket failure **not run** (no outbound dependency on the commit path — evidenced) |
 | — free‑plan limit (an implied failure) | §7.1 | API `400`, web `302` + upgrade flash; zero DB write; free‑user setup shown |
