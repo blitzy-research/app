@@ -70,7 +70,7 @@ runner prints its init banner then idles silently, and `yacron` logs each schedu
 readiness confirmation is `GET /health` → `HTTP/1.1 200 OK` body `success`
 [`server.py:L213-L215`]. In the **UI**, `GET /auth/login` returns `HTTP 200` rendering the
 `Welcome back!` login card with the `email`/`password`/`csrf_token` form. Each handled request (except
-`/health`, which is excluded [`server.py:L282`]) is logged by `after_request` [`server.py:L284`].
+`/health`, which is excluded [`server.py:L281`]) is logged by `after_request` [`server.py:L284`].
 
 **Q2 (walkthrough).** `POST /auth/register` creates the user (`create user …`
 [`app/auth/views/register.py:L85`]) and renders the `register_waiting_activation.html`
@@ -159,7 +159,7 @@ Readiness markers: `Listening at: http://0.0.0.0:7777` and one `Booting worker w
 ### Q1.2 Email handler — `Listen for port 20381` / `Start mail controller`
 
 The `aiosmtpd` controller entry point is `python email_handler.py`.
-Command: `docker exec simplelogin-app sed -n '1,8p' /app/logs/email_handler.log`
+Command: `docker exec simplelogin-app sed -n '1,9p' /app/logs/email_handler.log`
 
 ```
 >>> URL: http://localhost:7777
@@ -300,7 +300,7 @@ but skips `/static`, `/admin/static`, `/_debug_toolbar`, `/git`, `/favicon.ico`,
 ```
 
 Only the `/auth/login` request produced an access-log line; both `/health` probes were excluded
-[`server.py:L282`]. The line format is `remote_addr method path args status, takes <seconds>`.
+[`server.py:L281`]. The line format is `remote_addr method path args status, takes <seconds>`.
 
 ### Q1.9 Route resolution + blueprint registration
 
@@ -1187,7 +1187,7 @@ Every named item in Q1/Q2/Q3, with where it is evidenced and whether it was **Ob
 - [x] `yacron` scheduled-spawn lines — Observed §1.5 (full schedule §5.7)
 - [x] `GET /health` → `200 success` — Observed §1.6 [`server.py:L213-L215`]
 - [x] Login UI renders (`Welcome back!` + form) — Observed §1.7
-- [x] Per-request access log + `/health` exclusion — Observed §1.8 [`server.py:L284,L282`]
+- [x] Per-request access log + `/health` exclusion — Observed §1.8 [`server.py:L284,L281`]
 - [x] Route resolution + blueprint registration — Observed §1.9 [`server.py:L234-L246`]
 - [x] Boot seeding: SL domains + PGP keys — Observed §1.10 [`init_app.py:L16,L36,L42/L44`]
 
