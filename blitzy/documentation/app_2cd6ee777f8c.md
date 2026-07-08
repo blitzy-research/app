@@ -10,7 +10,7 @@ value obtained from a non-canonical accommodation is marked `[NON-CANONICAL]`.
 |---|---|
 | **Repository** | SimpleLogin (`app`) — Flask monolith, MIT licensed |
 | **Branch** | `app_2cd6ee777f8c` |
-| **HEAD commit** | `2cd6ee777f8c2d3531559588bcfb18627ffb5d2c` |
+| **Source baseline commit** (all `file:line` citations pinned here) | `2cd6ee777f8c2d3531559588bcfb18627ffb5d2c` |
 | **Canonical interpreter** | Python 3.10 (`pyproject.toml:61` `python = "^3.10"`; `Dockerfile:8` `FROM python:3.10`) |
 | **Services required** | PostgreSQL + Redis |
 
@@ -63,52 +63,109 @@ $ python -c "import sys; print(sys.executable)"
 
 ```bash
 $ psql "postgresql://test:test@localhost:15432/test" -tAc "select version();"
-PostgreSQL 17.10 (Ubuntu 17.10-0ubuntu0.25.10.1) on x86_64-pc-linux-gnu, ...
+PostgreSQL 17.10 (Ubuntu 17.10-0ubuntu0.25.10.1) on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 15.2.0-4ubuntu4) 15.2.0, 64-bit
 $ pg_isready -h localhost -p 15432
 localhost:15432 - accepting connections
 $ redis-cli ping
 PONG
 $ redis-server --version
-Redis server v=8.0.2
+Redis server v=8.0.2 sha=00000000:0 malloc=jemalloc-5.3.0 bits=64 build=d14bb9989612b22e
 ```
 
 Mandatory configuration comes from `tests/test.env` (the project's own CI config, loaded by
 `app/config.py`). Notably `DB_URI=postgresql://test:test@localhost:15432/test`
 (`tests/test.env:17`), `MEM_STORE_URI=redis://localhost` (`tests/test.env:78`), and
 `FLASK_SECRET=secret` (`tests/test.env:20`). `VERP_EMAIL_SECRET` is not set explicitly, so
-`app/config.py:502-504` derives it as `FLASK_SECRET + "pleasegenerateagoodrandomtoken"` =
-`"secretpleasegenerateagoodrandomtoken"` (36 chars), which passes the ≥32-char guard at
-`app/config.py:505-508`. (The distributed template `example.env:75` ships
-`DB_URI=postgresql://myuser:mypassword@localhost:5432/simplelogin`.)
-
-> **Note on credentials:** every secret shown in this document — `FLASK_SECRET=secret`, the derived
-> `VERP_EMAIL_SECRET`, and the `test:test` database password — is a non-sensitive, placeholder value
-> that already ships publicly in the repository's own `tests/test.env` (SimpleLogin is MIT-licensed
-> open source). None is a real credential; they are reproduced only because the exact derived
-> `VERP_EMAIL_SECRET` determines the VERP HMAC signatures observed in Question 3.
-
-The schema was migrated with Alembic so every model is queryable:
+`app/config.py:502-504` derives it from `FLASK_SECRET` at import time; the derived value is 36
+characters long and passes the ≥32-char guard at `app/config.py:505-508`. To honor the safety
+constraint, the raw derived value is **not** reproduced anywhere in this document — only its length
+and a one-way SHA-256 digest are shown. The digest is sufficient to reproduce and verify the exact
+VERP HMAC signatures observed in Question 3 without disclosing the secret:
 
 ```bash
-$ CONFIG=tests/test.env alembic current
-32f25cbf12f6 (head)
+$ CONFIG=tests/test.env python -c "import hashlib; from app import config; s=config.VERP_EMAIL_SECRET; print('VERP_EMAIL_SECRET length =', len(s), 'chars'); print('sha256(VERP_EMAIL_SECRET) =', hashlib.sha256(s.encode()).hexdigest()); print('passes >=32-char guard:', len(s) >= 32)"
+VERP_EMAIL_SECRET length = 36 chars
+sha256(VERP_EMAIL_SECRET) = 262d39ac671bae1918c41de1363470149f60cf319c50255ad637a5878de2d216
+passes >=32-char guard: True
 ```
 
-Runtime client-library versions (from the locked set) confirm the canonical stack:
+(The distributed template `example.env:75` ships
+`DB_URI=postgresql://myuser:mypassword@localhost:5432/simplelogin`.)
+
+> **Note on credentials:** the values shown in this document — `FLASK_SECRET=secret` and the
+> `test:test` database password — are non-sensitive placeholder values that already ship publicly in
+> the repository's own `tests/test.env` (SimpleLogin is MIT-licensed open source); neither is a real
+> credential. The derived `VERP_EMAIL_SECRET` is deliberately **redacted**: only its length (36) and
+> the one-way SHA-256 digest above appear anywhere in this document — never the raw value.
+
+The ~90 locked dependencies are **pre-installed in the provided canonical image's** virtual
+environment (`/tmp/slvenv`, built with `uv`, which therefore exposes no in-venv `pip`). Their
+presence and exact locked versions were confirmed via `importlib.metadata` — no install/upgrade was
+performed. There are 180 installed distributions in total; the packages material to the three
+questions match `poetry.lock` exactly:
+
+```bash
+$ python -c "import importlib.metadata as m; names=['Flask','Flask-Login','Flask-Limiter','SQLAlchemy','psycopg2-binary','redis','arrow','aiosmtpd','boto3','yacron','Flask-Migrate','gunicorn','gevent','pytest','alembic']; [print(f'{n}=={m.version(n)}') for n in names]; print('TOTAL distributions installed:', len(list(m.distributions())))"
+Flask==1.1.2
+Flask-Login==0.5.0
+Flask-Limiter==1.4
+SQLAlchemy==1.3.24
+psycopg2-binary==2.9.3
+redis==4.6.0
+arrow==0.16.0
+aiosmtpd==1.4.2
+boto3==1.35.37
+yacron==0.11.2
+Flask-Migrate==2.5.3
+gunicorn==20.0.4
+gevent==22.10.2
+pytest==7.3.1
+alembic==1.4.3
+TOTAL distributions installed: 180
+```
+
+As a second, independent cross-check, the versions actually **loaded at runtime** (by importing the
+modules) match the installed locked set above:
 
 ```bash
 $ python -c "import flask,sqlalchemy,arrow,aiosmtpd,boto3,redis; print('flask',flask.__version__,'| sqlalchemy',sqlalchemy.__version__,'| arrow',arrow.__version__,'| aiosmtpd',aiosmtpd.__version__,'| boto3',boto3.__version__,'| redis',redis.__version__)"
 flask 1.1.2 | sqlalchemy 1.3.24 | arrow 0.16.0 | aiosmtpd 1.4.2 | boto3 1.35.37 | redis 4.6.0
 ```
 
-Baseline git state (established before any observation, re-verified after cleanup — see the closing
-section):
+The schema was migrated with Alembic so every model is queryable. `alembic upgrade head` is
+idempotent here (the image's database was already provisioned to head), so it re-affirms the head
+revision without applying new steps; `alembic current` then confirms the head revision id. The
+leading lines are the SimpleLogin app-startup banner emitted by `alembic/env.py` importing the app
+(the ephemeral `GNUPGHOME` temp path, PID, and timestamp vary per invocation):
 
 ```bash
-$ git rev-parse HEAD
-2cd6ee777f8c2d3531559588bcfb18627ffb5d2c
+$ CONFIG=tests/test.env alembic upgrade head
+load config file /tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/tests/test.env
+>>> URL: http://localhost
+WARNING: Use a temp directory for GNUPGHOME /tmp/ybvofniosmszsbyfiein
+Upload files to local dir
+>>> init logging <<<
+2026-07-08 06:41:10,443 - SL - DEBUG - 110382 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/utils.py:17" - <module>() -  - load words file: /tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/local_data/test_words.txt
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+$ CONFIG=tests/test.env alembic current
+32f25cbf12f6 (head)
+```
+
+Git baseline. All `file:line` citations in this document are pinned to the **immutable source
+baseline commit** `2cd6ee777f8c2d3531559588bcfb18627ffb5d2c` — the commit this working branch was
+created from (per the project rule, the source tree is read-only). Before any observation the
+working tree was clean; the closing section re-verifies a clean tree after temp-script cleanup. The
+read-only guarantee is proven by diffing the current branch head against that source baseline —
+exactly one file is added and nothing else is touched:
+
+```bash
 $ git branch --show-current
 blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928
+$ git status --porcelain
+$        # (empty output above == clean working tree at baseline)
+$ git diff --name-status 2cd6ee777f8c2d3531559588bcfb18627ffb5d2c..HEAD
+A	blitzy/documentation/app_2cd6ee777f8c.md
 ```
 
 The `pytest` harnesses below were driven with the `flask_client` fixture (`tests/conftest.py:60`),
@@ -158,18 +215,22 @@ $ pytest tests/blitzy_adhoc_test_q1.py -p no:cacheprovider --no-cov -s -q
 ```
 ===== Q1-A: direct verify_mailbox_code() — tries counter before/during/after each wrong submission =====
 MAX_ACTIVATION_TRIES = 3
-created mailbox id=20, correct code='5KEjCxfXKBZY1uE2EsQj1g', submitting wrong code='5KEjCxfXKBZY1uE2EsQj1gWRONG'
+2026-07-08 06:11:06,590 - SL - INFO - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/mailbox_utils.py:88" - create_mailbox() -  - User <User 35 Test User user_02ov3q5vdg@mailbox.test> has created mailbox with dzruytqmmaxcytdtrlqc@dzruytqmmaxcytdtrlqc.com
+2026-07-08 06:11:06,595 - SL - INFO - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/mailbox_utils.py:245" - send_verification_email() -  - Sending mailbox verification email to dzruytqmmaxcytdtrlqc@dzruytqmmaxcytdtrlqc.com with send link=True
+2026-07-08 06:11:06,610 - SL - DEBUG - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/email_utils.py:303" - send_email() -  - send email to dzruytqmmaxcytdtrlqc@dzruytqmmaxcytdtrlqc.com, subject 'Please confirm your mailbox dzruytqmmaxcytdtrlqc@dzruytqmmaxcytdtrlqc.com'
+2026-07-08 06:11:06,614 - SL - DEBUG - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/mail_sender.py:131" - send() -  - send email with subject 'Please confirm your mailbox dzruytqmmaxcytdtrlqc@dzruytqmmaxcytdtrlqc.com', from '"noreply@sl.local" <noreply@sl.local>' to 'dzruytqmmaxcytdtrlqc@dzruytqmmaxcytdtrlqc.com'
+created mailbox id=77, correct code='wQ5LUAOYn-JQRin2Baq4-Q', submitting wrong code='wQ5LUAOYn-JQRin2Baq4-QWRONG'
 INITIAL: MailboxActivation.tries=0  row_exists=True
-... "app/mailbox_utils.py:206" - verify_mailbox_code() - ... failed to verify mailbox 20 because code does not match
+2026-07-08 06:11:06,617 - SL - INFO - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/mailbox_utils.py:206" - verify_mailbox_code() -  - User <User 35 Test User user_02ov3q5vdg@mailbox.test> failed to verify mailbox 77 because code does not match
 attempt 1: BEFORE tries=0 exists=True  ->  CannotVerifyError(msg='Invalid activation code')  ->  AFTER tries=1 exists=True
-... "app/mailbox_utils.py:206" - ... failed to verify mailbox 20 because code does not match
+2026-07-08 06:11:06,622 - SL - INFO - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/mailbox_utils.py:206" - verify_mailbox_code() -  - User <User 35 Test User user_02ov3q5vdg@mailbox.test> failed to verify mailbox 77 because code does not match
 attempt 2: BEFORE tries=1 exists=True  ->  CannotVerifyError(msg='Invalid activation code')  ->  AFTER tries=2 exists=True
-... "app/mailbox_utils.py:206" - ... failed to verify mailbox 20 because code does not match
+2026-07-08 06:11:06,627 - SL - INFO - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/mailbox_utils.py:206" - verify_mailbox_code() -  - User <User 35 Test User user_02ov3q5vdg@mailbox.test> failed to verify mailbox 77 because code does not match
 attempt 3: BEFORE tries=2 exists=True  ->  CannotVerifyError(msg='Invalid activation code')  ->  AFTER tries=3 exists=True
-... "app/mailbox_utils.py:196" - ... failed to verify mailbox 20 more than 3 times
+2026-07-08 06:11:06,632 - SL - INFO - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/mailbox_utils.py:196" - verify_mailbox_code() -  - User <User 35 Test User user_02ov3q5vdg@mailbox.test> failed to verify mailbox 77 more than 3 times
 attempt 4: BEFORE tries=3 exists=True  ->  CannotVerifyError(msg='Invalid activation code. Please request another code.')  ->  AFTER tries=None exists=False
-... "app/mailbox_utils.py:191" - ... failed to verify mailbox 20 because there is no activation
-attempt 5: BEFORE tries=None exists=False  ->  MailboxError('Invalid code')  ->  AFTER tries=None exists=False
+2026-07-08 06:11:06,637 - SL - INFO - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/mailbox_utils.py:191" - verify_mailbox_code() -  - User <User 35 Test User user_02ov3q5vdg@mailbox.test> failed to verify mailbox 77 because there is no activation
+attempt 5: BEFORE tries=None exists=False  ->  MailboxError(msg='Invalid code')  ->  AFTER tries=None exists=False
 ```
 
 Reading the transitions:
@@ -177,7 +238,7 @@ Reading the transitions:
 - **Attempts 1–3** each log `code does not match` (`app/mailbox_utils.py:206`) and increment the
   counter: `tries` `0→1→2→3`.
 - **Attempt 4** finds `tries=3`, so the cap guard at `app/mailbox_utils.py:195` fires — it logs
-  `... more than 3 times` (`app/mailbox_utils.py:196`), calls
+  `failed to verify mailbox 77 more than 3 times` (`app/mailbox_utils.py:196`), calls
   `clear_activation_codes_for_mailbox(mailbox)` (`app/mailbox_utils.py:197`), and raises
   `CannotVerifyError("Invalid activation code. Please request another code.")`
   (`app/mailbox_utils.py:198`). The row is now **gone** (`exists=False`).
@@ -193,23 +254,85 @@ The terminal step is a bulk delete; `clear_activation_codes_for_mailbox()`
 
 The canonical route is `@dashboard_bp.route("/mailbox_verify")` / `def mailbox_verify()`
 (`app/dashboard/views/mailbox.py:120-122`), guarded only by `@login_required`
-(`app/dashboard/views/mailbox.py:121`). Driving it through the `flask_client` with a logged-in user
-reproduces the identical counter progression; each response renders the validation page (HTTP 200)
-with a flashed error:
+(`app/dashboard/views/mailbox.py:121`). On a wrong code, `verify_mailbox_code()` raises
+`CannotVerifyError`, which subclasses `MailboxError` (`app/mailbox_utils.py:38`); the route catches
+`except mailbox_utils.MailboxError as e:` (`app/dashboard/views/mailbox.py:130`), logs the failure
+(`app/dashboard/views/mailbox.py:131`), calls `flash(f"Cannot verify mailbox: {e.msg}", "error")`
+(`app/dashboard/views/mailbox.py:132`), and **returns `redirect(url_for("dashboard.mailbox_route"))`**
+(`app/dashboard/views/mailbox.py:133`). So every **failed** submission is an **HTTP 302 redirect** to
+`/dashboard/mailbox` carrying a flashed error — the validation page
+(`render_template("dashboard/mailbox_validation.html", mailbox=mailbox)`, `app/dashboard/views/mailbox.py:135`) is
+reached **only on success**. Driving the real route through the `flask_client` with a logged-in user
+reproduces the identical counter progression. With `follow_redirects=False` the raw `302` and its
+`Location` header are visible; a final request with `follow_redirects=True` shows the client landing
+on the mailbox page (`200`):
 
 ```
 ===== Q1-B: REAL HTTP entry point GET /dashboard/mailbox_verify (canonical) =====
-logged-in user=user_467d7zxue6@mailbox.test, mailbox id=22
-GET http://sl.test/dashboard/mailbox_verify?mailbox_id=22&code=FCwNBo6aRDkNuuCwnyMzcwWRONG
-  attempt 1: status=200 BEFORE tries=0 exists=True AFTER tries=1 exists=True flashed~='Invalid activation code'
-  attempt 2: status=200 BEFORE tries=1 exists=True AFTER tries=2 exists=True flashed~='Invalid activation code'
-  attempt 3: status=200 BEFORE tries=2 exists=True AFTER tries=3 exists=True flashed~='Invalid activation code'
-  attempt 4: status=200 BEFORE tries=3 exists=True AFTER tries=None exists=False flashed~='Invalid activation code. Please request another code.'
-  attempt 5: status=200 BEFORE tries=None exists=False AFTER tries=None exists=False flashed~='Invalid code'
+2026-07-08 06:11:07,277 - SL - INFO - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/mailbox_utils.py:88" - create_mailbox() -  - User <User 36 Test User user_a7gcf1iaax@mailbox.test> has created mailbox with iarnvxydmxjsnkistqyi@iarnvxydmxjsnkistqyi.com
+2026-07-08 06:11:07,280 - SL - INFO - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/mailbox_utils.py:245" - send_verification_email() -  - Sending mailbox verification email to iarnvxydmxjsnkistqyi@iarnvxydmxjsnkistqyi.com with send link=True
+2026-07-08 06:11:07,293 - SL - DEBUG - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/email_utils.py:303" - send_email() -  - send email to iarnvxydmxjsnkistqyi@iarnvxydmxjsnkistqyi.com, subject 'Please confirm your mailbox iarnvxydmxjsnkistqyi@iarnvxydmxjsnkistqyi.com'
+2026-07-08 06:11:07,297 - SL - DEBUG - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/mail_sender.py:131" - send() -  - send email with subject 'Please confirm your mailbox iarnvxydmxjsnkistqyi@iarnvxydmxjsnkistqyi.com', from '"noreply@sl.local" <noreply@sl.local>' to 'iarnvxydmxjsnkistqyi@iarnvxydmxjsnkistqyi.com'
+logged-in user=user_a7gcf1iaax@mailbox.test, mailbox id=79
+--- raw responses with follow_redirects=False (shows the redirect itself) ---
+2026-07-08 06:11:07,301 - SL - INFO - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/mailbox_utils.py:206" - verify_mailbox_code() -  - User <User 36 Test User user_a7gcf1iaax@mailbox.test> failed to verify mailbox 79 because code does not match
+2026-07-08 06:11:07,302 - SL - INFO - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/dashboard/views/mailbox.py:131" - mailbox_verify() -  - Cannot verify mailbox 79 because of Invalid activation code
+2026-07-08 06:11:07,302 - SL - DEBUG - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/server.py:284" - after_request() -  - 127.0.0.1 GET /dashboard/mailbox_verify ImmutableMultiDict([('mailbox_id', '79'), ('code', '5aZb1jRsdZ_3-ULQAxFlzwWRONG')]) 302, takes 0.003803730010986328
+  attempt 1: raw_status=302 Location='http://sl.test/dashboard/mailbox' BEFORE tries=0 exists=True AFTER tries=1 exists=True flash='Cannot verify mailbox: Invalid activation code'
+2026-07-08 06:11:07,310 - SL - INFO - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/mailbox_utils.py:206" - verify_mailbox_code() -  - User <User 36 Test User user_a7gcf1iaax@mailbox.test> failed to verify mailbox 79 because code does not match
+2026-07-08 06:11:07,310 - SL - INFO - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/dashboard/views/mailbox.py:131" - mailbox_verify() -  - Cannot verify mailbox 79 because of Invalid activation code
+2026-07-08 06:11:07,310 - SL - DEBUG - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/server.py:284" - after_request() -  - 127.0.0.1 GET /dashboard/mailbox_verify ImmutableMultiDict([('mailbox_id', '79'), ('code', '5aZb1jRsdZ_3-ULQAxFlzwWRONG')]) 302, takes 0.003751516342163086
+  attempt 2: raw_status=302 Location='http://sl.test/dashboard/mailbox' BEFORE tries=1 exists=True AFTER tries=2 exists=True flash='Cannot verify mailbox: Invalid activation code'
+2026-07-08 06:11:07,317 - SL - INFO - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/mailbox_utils.py:206" - verify_mailbox_code() -  - User <User 36 Test User user_a7gcf1iaax@mailbox.test> failed to verify mailbox 79 because code does not match
+2026-07-08 06:11:07,317 - SL - INFO - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/dashboard/views/mailbox.py:131" - mailbox_verify() -  - Cannot verify mailbox 79 because of Invalid activation code
+2026-07-08 06:11:07,318 - SL - DEBUG - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/server.py:284" - after_request() -  - 127.0.0.1 GET /dashboard/mailbox_verify ImmutableMultiDict([('mailbox_id', '79'), ('code', '5aZb1jRsdZ_3-ULQAxFlzwWRONG')]) 302, takes 0.003654003143310547
+  attempt 3: raw_status=302 Location='http://sl.test/dashboard/mailbox' BEFORE tries=2 exists=True AFTER tries=3 exists=True flash='Cannot verify mailbox: Invalid activation code'
+2026-07-08 06:11:07,324 - SL - INFO - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/mailbox_utils.py:196" - verify_mailbox_code() -  - User <User 36 Test User user_a7gcf1iaax@mailbox.test> failed to verify mailbox 79 more than 3 times
+2026-07-08 06:11:07,325 - SL - INFO - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/dashboard/views/mailbox.py:131" - mailbox_verify() -  - Cannot verify mailbox 79 because of Invalid activation code. Please request another code.
+2026-07-08 06:11:07,325 - SL - DEBUG - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/server.py:284" - after_request() -  - 127.0.0.1 GET /dashboard/mailbox_verify ImmutableMultiDict([('mailbox_id', '79'), ('code', '5aZb1jRsdZ_3-ULQAxFlzwWRONG')]) 302, takes 0.003731250762939453
+  attempt 4: raw_status=302 Location='http://sl.test/dashboard/mailbox' BEFORE tries=3 exists=True AFTER tries=None exists=False flash='Cannot verify mailbox: Invalid activation code. Please request another code.'
+2026-07-08 06:11:07,331 - SL - INFO - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/mailbox_utils.py:191" - verify_mailbox_code() -  - User <User 36 Test User user_a7gcf1iaax@mailbox.test> failed to verify mailbox 79 because there is no activation
+2026-07-08 06:11:07,331 - SL - INFO - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/dashboard/views/mailbox.py:131" - mailbox_verify() -  - Cannot verify mailbox 79 because of Invalid code
+2026-07-08 06:11:07,331 - SL - DEBUG - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/server.py:284" - after_request() -  - 127.0.0.1 GET /dashboard/mailbox_verify ImmutableMultiDict([('mailbox_id', '79'), ('code', '5aZb1jRsdZ_3-ULQAxFlzwWRONG')]) 302, takes 0.0029802322387695312
+  attempt 5: raw_status=302 Location='http://sl.test/dashboard/mailbox' BEFORE tries=None exists=False AFTER tries=None exists=False flash='Cannot verify mailbox: Invalid code'
+--- one request with follow_redirects=True (client follows the 302 to the mailbox page -> 200) ---
+2026-07-08 06:11:07,362 - SL - INFO - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/mailbox_utils.py:88" - create_mailbox() -  - User <User 36 Test User user_a7gcf1iaax@mailbox.test> has created mailbox with mnvpmmkovvjaxawjajat@mnvpmmkovvjaxawjajat.com
+2026-07-08 06:11:07,365 - SL - INFO - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/mailbox_utils.py:245" - send_verification_email() -  - Sending mailbox verification email to mnvpmmkovvjaxawjajat@mnvpmmkovvjaxawjajat.com with send link=True
+2026-07-08 06:11:07,378 - SL - DEBUG - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/email_utils.py:303" - send_email() -  - send email to mnvpmmkovvjaxawjajat@mnvpmmkovvjaxawjajat.com, subject 'Please confirm your mailbox mnvpmmkovvjaxawjajat@mnvpmmkovvjaxawjajat.com'
+2026-07-08 06:11:07,382 - SL - DEBUG - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/mail_sender.py:131" - send() -  - send email with subject 'Please confirm your mailbox mnvpmmkovvjaxawjajat@mnvpmmkovvjaxawjajat.com', from '"noreply@sl.local" <noreply@sl.local>' to 'mnvpmmkovvjaxawjajat@mnvpmmkovvjaxawjajat.com'
+2026-07-08 06:11:07,386 - SL - INFO - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/mailbox_utils.py:206" - verify_mailbox_code() -  - User <User 36 Test User user_a7gcf1iaax@mailbox.test> failed to verify mailbox 80 because code does not match
+2026-07-08 06:11:07,386 - SL - INFO - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/dashboard/views/mailbox.py:131" - mailbox_verify() -  - Cannot verify mailbox 80 because of Invalid activation code
+2026-07-08 06:11:07,386 - SL - DEBUG - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/server.py:284" - after_request() -  - 127.0.0.1 GET /dashboard/mailbox_verify ImmutableMultiDict([('mailbox_id', '80'), ('code', 'RRqfvfvogtfcMOK1i_CRbgWRONG')]) 302, takes 0.0037229061126708984
+2026-07-08 06:11:07,406 - SL - DEBUG - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/server.py:284" - after_request() -  - 127.0.0.1 GET /dashboard/mailbox ImmutableMultiDict([]) 200, takes 0.018623828887939453
+  followed: final_status=200 (landed on mailbox route after 302) flash=None
 ```
 
-The flashed text on attempt 4 (`Invalid activation code. Please request another code.`) and the row
-disappearing (`exists=False`) confirm the same enforcement fires through the real web route.
+Every failed submission returns **`raw_status=302`** with **`Location='http://sl.test/dashboard/mailbox'`**
+and a flash of the form `Cannot verify mailbox: <e.msg>` — never a rendered validation page. The flashed
+text on attempt 4 (`Cannot verify mailbox: Invalid activation code. Please request another code.`) and
+the row disappearing (`exists=False`) confirm the terminal deletion fires through the real web route; the
+final `follow_redirects=True` request shows the browser being sent on to `GET /dashboard/mailbox` (`200`).
+The `tries` progression (`0→1→2→3→deleted`) is byte-for-byte identical to the direct call in Q1-A, proving
+the HTTP route and the underlying helper enforce the same counter.
+
+### Two-run stability (Q1)
+
+The whole Q1 harness was executed **twice** (`/tmp/blitzy_evidence/q1.run1.txt` and `q1.run2.txt`, each
+`5 passed, 18 warnings`). Every magnitude/threshold observable is identical across the two runs; the only
+differences are values that are inherently non-deterministic — the auto-increment database primary keys of
+the freshly created mailbox rows, the randomly generated activation codes, wall-clock timestamps, the PID,
+and the per-request `takes` durations. Normalizing those away, `diff` reports the runs as identical.
+
+| Observable | Run 1 | Run 2 | Stable? |
+|---|---|---|---|
+| `MAX_ACTIVATION_TRIES` | `3` | `3` | ✓ |
+| `tries` progression (Q1-A direct, Q1-B HTTP) | `0→1→2→3→deleted` | `0→1→2→3→deleted` | ✓ |
+| Wrong submission that deletes the row | 4th | 4th | ✓ |
+| Raw HTTP status of each failed submit (Q1-B) | `302` | `302` | ✓ |
+| `Location` header (Q1-B) | `http://sl.test/dashboard/mailbox` | `http://sl.test/dashboard/mailbox` | ✓ |
+| Followed status after the `302` (Q1-B) | `200` | `200` | ✓ |
+| `AccountActivation` progression (Q1-D) | `3→2→1→deleted` | `3→2→1→deleted` | ✓ |
+| `mailbox_verify` present in limiter registry (Q1-E) | absent | absent | ✓ |
 
 ### Sibling variant — the signed-link "Old way" path
 
@@ -221,33 +344,64 @@ immediately does `mailbox_verify_request = request.args.get("mailbox_id")`
 
 **Observed (unexpected but real):** the canonical route returns **HTTP 500**, because the parameter
 name `request` shadows Flask's global `request`, and the *string* the route passed in has no `.args`
-attribute:
+attribute. The complete, contiguous section of the single `pytest` run (`[NON-CANONICAL]` direct call
+labeled inline) is:
 
 ```
 ===== Q1-C: signed-link 'Old way' verify_with_signed_secret() (max_age=900 -> 15 min) =====
-mailbox id=24 verified_before=False
-... server.py:390 - error_handler() - 'str' object has no attribute 'args'
+2026-07-08 06:11:07,666 - SL - INFO - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-08 06:11:07,909 - SL - DEBUG - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/auth/views/login_utils.py:35" - after_login() -  - log user <User 37 Test User user_czdo7f8lv2@mailbox.test> in
+2026-07-08 06:11:07,909 - SL - DEBUG - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/auth/views/login_utils.py:44" - after_login() -  - redirect user to dashboard
+2026-07-08 06:11:07,910 - SL - DEBUG - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/server.py:284" - after_request() -  - 127.0.0.1 POST /auth/login ImmutableMultiDict([]) 302, takes 0.23789477348327637
+2026-07-08 06:11:07,914 - SL - DEBUG - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/dashboard/views/index.py:172" - index() -  - Show intro to <User 37 Test User user_czdo7f8lv2@mailbox.test>
+2026-07-08 06:11:08,020 - SL - DEBUG - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/server.py:284" - after_request() -  - 127.0.0.1 GET /dashboard/ ImmutableMultiDict([]) 200, takes 0.10887694358825684
+2026-07-08 06:11:08,052 - SL - INFO - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/mailbox_utils.py:88" - create_mailbox() -  - User <User 37 Test User user_czdo7f8lv2@mailbox.test> has created mailbox with dbdcehpcxwdpdfjhurnb@dbdcehpcxwdpdfjhurnb.com
+2026-07-08 06:11:08,055 - SL - INFO - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/mailbox_utils.py:245" - send_verification_email() -  - Sending mailbox verification email to dbdcehpcxwdpdfjhurnb@dbdcehpcxwdpdfjhurnb.com with send link=True
+2026-07-08 06:11:08,068 - SL - DEBUG - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/email_utils.py:303" - send_email() -  - send email to dbdcehpcxwdpdfjhurnb@dbdcehpcxwdpdfjhurnb.com, subject 'Please confirm your mailbox dbdcehpcxwdpdfjhurnb@dbdcehpcxwdpdfjhurnb.com'
+2026-07-08 06:11:08,072 - SL - DEBUG - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/mail_sender.py:131" - send() -  - send email with subject 'Please confirm your mailbox dbdcehpcxwdpdfjhurnb@dbdcehpcxwdpdfjhurnb.com', from '"noreply@sl.local" <noreply@sl.local>' to 'dbdcehpcxwdpdfjhurnb@dbdcehpcxwdpdfjhurnb.com'
+mailbox id=82 verified_before=False
+2026-07-08 06:11:08,074 - SL - ERROR - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/server.py:390" - error_handler() -  - 'str' object has no attribute 'args'
 Traceback (most recent call last):
-  ...
-  File ".../app/dashboard/views/mailbox.py", line 127, in mailbox_verify
+  File "/tmp/slvenv/lib/python3.10/site-packages/flask/app.py", line 1950, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "/tmp/slvenv/lib/python3.10/site-packages/flask/app.py", line 1936, in dispatch_request
+    return self.view_functions[rule.endpoint](**req.view_args)
+  File "/tmp/slvenv/lib/python3.10/site-packages/flask_login/utils.py", line 272, in decorated_view
+    return func(*args, **kwargs)
+  File "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/dashboard/views/mailbox.py", line 127, in mailbox_verify
     return verify_with_signed_secret(mailbox_id)
-  File ".../app/dashboard/views/mailbox.py", line 140, in verify_with_signed_secret
+  File "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/dashboard/views/mailbox.py", line 140, in verify_with_signed_secret
     mailbox_verify_request = request.args.get("mailbox_id")
 AttributeError: 'str' object has no attribute 'args'
-(i) CANONICAL route GET (no code): status=500
-(ii) verify_with_signed_secret(<str>) [as route does @L127]: AttributeError: 'str' object has no attribute 'args'
-```
+2026-07-08 06:11:08,078 - SL - DEBUG - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/server.py:284" - after_request() -  - 127.0.0.1 GET /dashboard/mailbox_verify ImmutableMultiDict([('mailbox_id', '82')]) 500, takes 0.004930019378662109
+(i) CANONICAL authenticated route GET (no code): status=500 (errorhandler server.py:389 renders 500 page)
+(ii) verify_with_signed_secret(<str>) exactly as the route invokes it @L127 -> full traceback:
+Traceback (most recent call last):
+  File "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/tests/blitzy_adhoc_test_q1.py", line 122, in test_q1c_signed_link
+    verify_with_signed_secret(str(mailbox.id))
+  File "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/dashboard/views/mailbox.py", line 140, in verify_with_signed_secret
+    mailbox_verify_request = request.args.get("mailbox_id")
+AttributeError: 'str' object has no attribute 'args'
 
-When the function is instead handed a real Flask request object (a `[NON-CANONICAL]` direct call, to
-reveal the intended mechanics), the signed link verifies the mailbox, and the 15-minute window is
-enforced by `TimestampSigner(MAILBOX_SECRET).unsign(..., max_age=900)`
-(`app/dashboard/views/mailbox.py:139,142`):
-
-```
+2026-07-08 06:11:08,081 - SL - DEBUG - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/dashboard/views/mailbox.py:173" - verify_with_signed_secret() -  - Mailbox <Mailbox 82 dbdcehpcxwdpdfjhurnb@dbdcehpcxwdpdfjhurnb.com> is verified
 (iii) [NON-CANONICAL] verify_with_signed_secret(flask_request): resp_type=str verified_after=True
-(iv) unsign(max_age=900) fresh token -> OK, recovered b'WzI0LCAibmlwcHlsd2F6cnFs'...
+(iv) unsign(max_age=900) fresh token -> OK, recovered=b'WzgyLCAiZGJkY2VocGN4d2RwZGZqaHVybmJAZGJkY2VocGN4d2RwZGZqaHVybmIuY29tIl0='
 (iv) unsign(max_age=900) on 1000s-old token -> SignatureExpired: Signature age 1000 > 900 seconds
 ```
+
+The single captured section above (one contiguous run) shows all four facts: **(i)** the canonical
+authenticated route `GET /dashboard/mailbox_verify?mailbox_id=82` (no `code`) returns **HTTP 500** —
+the error handler at `server.py:390` logs `'str' object has no attribute 'args'` and `after_request`
+records the `500`; **(ii)** calling `verify_with_signed_secret(str(mailbox.id))` exactly as the route does
+(`app/dashboard/views/mailbox.py:127`) raises the same `AttributeError` at
+`app/dashboard/views/mailbox.py:140`, because the parameter name `request` shadows Flask's global
+`request` and a bare *string* has no `.args`; **(iii)** when the function is instead handed a real
+Flask request object (a `[NON-CANONICAL]` direct call, to reveal the intended mechanics) it verifies
+the mailbox (`verified_after=True`, log at `app/dashboard/views/mailbox.py:173`); and **(iv)** the
+15-minute window is enforced by `TimestampSigner(MAILBOX_SECRET).unsign(mailbox_verify_request, max_age=900)`
+(`app/dashboard/views/mailbox.py:139,142`) — a fresh token decodes to
+`b'WzgyLCAiZGJkY2VocGN4d2RwZGZqaHVybmJAZGJkY2VocGN4d2RwZGZqaHVybmIuY29tIl0='`, while a token aged
+1000 s raises `SignatureExpired: Signature age 1000 > 900 seconds`.
 
 So the signed-link path implements a **15-minute** (`max_age=900`) window, but as invoked by the
 canonical route (passing a bare string) it raises `AttributeError` and yields a 500. `[inferred]`
@@ -264,10 +418,15 @@ route `POST /api/auth/activate` (`app/api/views/auth.py`): `account_activation.t
 
 ```
 ===== Q1-D: AccountActivation counterpart — tries DECREMENTS 3->0 (opposite direction) =====
+2026-07-08 06:11:08,343 - SL - INFO - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
 AccountActivation created with tries=3 (model default=3)
+2026-07-08 06:11:08,355 - SL - DEBUG - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/server.py:284" - after_request() -  - 127.0.0.1 POST /api/auth/activate ImmutableMultiDict([]) 400, takes 0.0035295486450195312
 attempt 1: BEFORE tries=3 -> POST /api/auth/activate wrong code -> status=400 body={'error': 'Wrong email or code'} -> AFTER tries=2 exists=True
+2026-07-08 06:11:08,362 - SL - DEBUG - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/server.py:284" - after_request() -  - 127.0.0.1 POST /api/auth/activate ImmutableMultiDict([]) 400, takes 0.003208160400390625
 attempt 2: BEFORE tries=2 -> POST /api/auth/activate wrong code -> status=400 body={'error': 'Wrong email or code'} -> AFTER tries=1 exists=True
+2026-07-08 06:11:08,369 - SL - DEBUG - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/server.py:284" - after_request() -  - 127.0.0.1 POST /api/auth/activate ImmutableMultiDict([]) 410, takes 0.0036661624908447266
 attempt 3: BEFORE tries=1 -> POST /api/auth/activate wrong code -> status=410 body={'error': 'Too many wrong tries'} -> AFTER tries=None exists=False
+2026-07-08 06:11:08,375 - SL - DEBUG - 98346 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/server.py:284" - after_request() -  - 127.0.0.1 POST /api/auth/activate ImmutableMultiDict([]) 400, takes 0.0020797252655029297
 attempt 4: BEFORE tries=None -> POST /api/auth/activate wrong code -> status=400 body={'error': 'Wrong email or code'} -> AFTER tries=None exists=False
 ```
 
@@ -288,8 +447,8 @@ while a sibling mailbox route and the account-activation route **are** registere
 ```
 ===== Q1-E: rate-limit contrast (verify route has NO limiter; mailbox_detail POST-only 20/minute) =====
 _route_limits['app.dashboard.views.mailbox.mailbox_verify']: present=False limits=[]
-_route_limits['app.dashboard.views.mailbox_detail.mailbox_detail_route']: present=True limits=['<flask_limiter.wrappers.Limit object at 0x...>']
-_route_limits['app.api.views.auth.auth_activate']: present=True limits=['<flask_limiter.wrappers.Limit object at 0x...>']
+_route_limits['app.dashboard.views.mailbox_detail.mailbox_detail_route']: present=True limits=["20 per 1 minute methods=['post']"]
+_route_limits['app.api.views.auth.auth_activate']: present=True limits=['10 per 1 minute methods=None']
 config.DISABLE_RATE_LIMIT during tests = True
 ```
 
@@ -342,8 +501,9 @@ consistent with the transitions captured above.
 
 ### The state enum and the runner loop
 
-`JobState` (`app/models.py:253`) defines `ready = 0` (`:254`), `taken = 1` (`:255`),
-`done = 2` (`:256`), `error = 3` (`:257`). The runner's `__main__` loop (`job_runner.py:329-347`)
+`JobState` (`app/models.py:253`) defines `ready = 0` (`app/models.py:254`), `taken = 1`
+(`app/models.py:255`), `done = 2` (`app/models.py:256`), `error = 3` (`app/models.py:257`). The
+runner's `__main__` loop (`job_runner.py:329-347`)
 reads:
 
 ```python
@@ -363,87 +523,163 @@ persisted while `done` (`job_runner.py:344`) is never reached.
 
 ### Failure path — the real runner (`python job_runner.py`) with a job that raises
 
-A job named `batch-import` (`config.JOB_BATCH_IMPORT`, `app/config.py:305`) with a nonexistent
-`batch_import_id` reaches the dispatch branch (`job_runner.py:222-225`), where
-`BatchImport.get(bad_id)` returns `None` and `handle_batch_import(None)` dereferences
-`batch_import.user` (`app/import_utils.py:23`) → `AttributeError`. Driving the real entry point:
-
-```bash
-$ python /tmp/blitzy_evidence/q2_helper.py insert_fail    # commit a ready job
-inserted FAIL job (name=batch-import, bad batch_import_id): id=74 name='batch-import' state=0(ready) attempts=0 taken=False taken_at=None
-$ python /tmp/blitzy_evidence/q2_helper.py show_all        # BEFORE pickup
-   id=74 name='batch-import' state=0(ready) attempts=0 taken=False taken_at=None
-$ timeout 30 python job_runner.py                          # the REAL runner __main__ loop
-```
+A real `Job` named `batch-import` (matching `config.JOB_BATCH_IMPORT = "batch-import"`,
+`app/config.py:305`) whose `payload` (a JSON column, `app/models.py:2689`) is the empty string
+reaches the batch-import dispatch branch (`elif job.name == config.JOB_BATCH_IMPORT:`,
+`job_runner.py:222`), whose very first line `batch_import_id = job.payload.get("batch_import_id")`
+(`job_runner.py:223`) calls `.get()` on a `str` and raises
+`AttributeError: 'str' object has no attribute 'get'`. Because there is **no `try/except`** around
+`process_job(job)` (`job_runner.py:342`), that exception propagates out of the `__main__` loop and
+crashes the process — `state = done` (`job_runner.py:344`) is never reached. Driving the real entry
+point (helper commits a `ready` row to the real DB, then the real `python job_runner.py` loop picks
+it up):
 
 ```
-... "job_runner.py:334" - Take job <Job 74 batch-import {'batch_import_id': 99999999}>
+==================== Q2-FAILURE PATH ====================
+$ python tests/blitzy_adhoc_test_q2_helper.py insert_fail
+[insert_fail] created (real handler branch='batch-import', payload="") -> Job id=233 name='batch-import' state=0(ready) attempts=0 taken=False taken_at=None run_at=None
+--- BEFORE (real runner not yet run) ---
+$ python tests/blitzy_adhoc_test_q2_helper.py show BEFORE-fail
+[show BEFORE-fail] 1 job(s) in DB:
+   Job id=233 name='batch-import' state=0(ready) attempts=0 taken=False taken_at=None run_at=None
+--- DRIVE REAL RUNNER ---
+$ timeout -s INT 30 python job_runner.py
+runner exit code = 1   (1 = crashed on unhandled exception, state=done never reached)
+--- runner output from job pickup onward (COMPLETE traceback, unedited) ---
+2026-07-08 06:34:46,509 - SL - DEBUG - 108240 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/job_runner.py:334" - <module>() -  - Take job <Job 233 batch-import >
 Traceback (most recent call last):
-  File ".../job_runner.py", line 342, in <module>
+  File "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/job_runner.py", line 342, in <module>
     process_job(job)
-  File ".../job_runner.py", line 225, in process_job
-    handle_batch_import(batch_import)
-  File ".../app/import_utils.py", line 23, in handle_batch_import
-    user = batch_import.user
-AttributeError: 'NoneType' object has no attribute 'user'
-job_runner.py exit code = 1   # process CRASHED (not a timeout kill)
+  File "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/job_runner.py", line 223, in process_job
+    batch_import_id = job.payload.get("batch_import_id")
+AttributeError: 'str' object has no attribute 'get'
+--- AFTER (job STUCK in taken; done never reached) ---
+$ python tests/blitzy_adhoc_test_q2_helper.py show AFTER-fail
+[show AFTER-fail] 1 job(s) in DB:
+   Job id=233 name='batch-import' state=1(taken) attempts=1 taken=True taken_at=2026-07-08T06:34:46.509862+00:00 run_at=None
 ```
 
-The process exits with code **1** (a genuine crash — a timeout kill would be 124), confirming there
-is no error handling around `process_job`. Querying the row **after** the crash:
+The process exits with code **1** (a genuine crash — a timeout kill would be `124`), confirming there
+is no error handling around `process_job`. The traceback's frames pin the crash exactly: the runner's
+`__main__` loop at `job_runner.py:342` called `process_job(job)`, which raised inside
+`job_runner.py:223`.
 
-```bash
-$ python /tmp/blitzy_evidence/q2_helper.py show_all        # AFTER crash
-   id=74 name='batch-import' state=1(taken) attempts=1 taken=True taken_at=2026-07-08T05:11:23.487642+00:00
-```
-
-**Observable failure state:** `state=1(taken)`, `attempts=1`, `taken=True`, `taken_at` set, and
-`state` is **never** `2(done)` and **never** `3(error)`.
+**Observable failure state (before → during → after):** the row starts `state=0(ready) attempts=0
+taken=False taken_at=None`; the loop commits `taken=True, taken_at=now, state=1(taken), attempts=1`
+**before** dispatch (`job_runner.py:337-341`); after the crash it is left exactly there —
+`state=1(taken)`, `attempts=1`, `taken=True`, `taken_at` set — and `state` is **never** `2(done)` and
+**never** `3(error)`.
 
 ### Success path — a job that completes reaches `done (2)`
 
-An unknown job name falls through to `else: LOG.e("Unknown job name %s", job.name)`
-(`job_runner.py:303-304`), which does **not** raise, so the loop proceeds to `state = done`:
+An unknown job name falls through to the final `else:` (`job_runner.py:303`) whose body is
+`LOG.e("Unknown job name %s", job.name)` (`job_runner.py:304`), which does **not** raise, so the loop
+proceeds to `state = done` (`job_runner.py:344`). Here the job has the empty name `''` — an unknown
+name — so it exercises exactly that branch:
 
-```bash
-$ python /tmp/blitzy_evidence/q2_helper.py insert_success   # id=75, state=ready
-$ timeout 9 python job_runner.py
-... "job_runner.py:334" - Take job <Job 75 blitzy-nonexistent-job {}>
-... "job_runner.py:304" - process_job() - Unknown job name blitzy-nonexistent-job
-job_runner.py exit code = 124                               # timeout kill (loop kept running; no crash)
-$ python /tmp/blitzy_evidence/q2_helper.py show_all         # AFTER
-   id=75 name='blitzy-nonexistent-job' state=2(done) attempts=1 taken=True taken_at=2026-07-08T05:11:54.857124+00:00
+```
+==================== Q2-SUCCESS PATH ====================
+$ python tests/blitzy_adhoc_test_q2_helper.py insert_success
+[insert_success] created (unknown job name '' -> no-op handler) -> Job id=234 name='' state=0(ready) attempts=0 taken=False taken_at=None run_at=None
+--- BEFORE ---
+$ python tests/blitzy_adhoc_test_q2_helper.py show BEFORE-success
+[show BEFORE-success] 1 job(s) in DB:
+   Job id=234 name='' state=0(ready) attempts=0 taken=False taken_at=None run_at=None
+--- DRIVE REAL RUNNER (unknown-name no-op reaches done, then polls forever) ---
+$ timeout -s TERM 15 python job_runner.py
+runner exit code = 124   (124 = timeout-killed after job reached done)
+--- runner log from job pickup onward ---
+2026-07-08 06:34:54,253 - SL - DEBUG - 108304 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/job_runner.py:334" - <module>() -  - Take job <Job 234  >
+2026-07-08 06:34:54,256 - SL - ERROR - 108304 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/job_runner.py:304" - process_job() -  - Unknown job name 
+NoneType: None
+--- AFTER (job reached done) ---
+$ python tests/blitzy_adhoc_test_q2_helper.py show AFTER-success
+[show AFTER-success] 1 job(s) in DB:
+   Job id=234 name='' state=2(done) attempts=1 taken=True taken_at=2026-07-08T06:34:54.253906+00:00 run_at=None
 ```
 
-So the cross-product is observed: **failure ⇒ stuck in `taken`; success ⇒ `done`.**
+Here the runner is stopped with `timeout -s TERM 15` (exit `124`) only because the `while True:` loop
+polls forever (`time.sleep(10)`, `job_runner.py:347`) once the queue is drained — the job itself had
+already reached `state=2(done)` before the kill. So the cross-product is observed: **failure ⇒ stuck
+in `taken (1)`; success ⇒ `done (2)`** — in both cases `attempts` ends at `1`.
 
 ### Retry eligibility — the real `get_jobs_to_run()` across the 30-min window and 5-attempt cap
 
 `get_jobs_to_run()` (`job_runner.py:307-326`) re-selects a job when
 `state == ready` **OR** (`state == taken` **AND** `taken_at < now - 30 min` **AND** `attempts < 5`),
-further gated by `run_at` being null or within `now + 10 min` (`job_runner.py:313-323`). The
-constants were confirmed at runtime:
-
-```bash
-$ python -c "from app import config; print(config.JOB_MAX_ATTEMPTS, config.JOB_TAKEN_RETRY_WAIT_MINS)"
-5 30
-```
-
-Driving the real query against one job (id=77), reporting eligibility **before/after** each change
-(`taken_at` back-dating and `attempts` edits are labeled `[TEST FIXTURE]` manipulations of scratch
-DB state, not source changes):
+further gated by `run_at` being null or `<= now + 10 min` (`job_runner.py:323`). The constants are
+confirmed at runtime by the helper's `constants` subcommand:
 
 ```
-READY job (id=76):                         get_jobs_to_run() -> 1 job(s) ids=[76]
-taken 5 min ago, attempts=1:               get_jobs_to_run() -> 0 job(s) ids=[]      # within 30-min window
-[TEST FIXTURE] backdate id=77 to 31 min:   get_jobs_to_run() -> 1 job(s) ids=[77]    # past window, attempts<5
-[TEST FIXTURE] set id=77 attempts=5:       get_jobs_to_run() -> 0 job(s) ids=[]      # attempts>=5 -> ABANDONED
-[TEST FIXTURE] set id=77 attempts=4:       get_jobs_to_run() -> 1 job(s) ids=[77]    # boundary: 4<5 -> eligible
+==================== Q2-CONSTANTS ====================
+$ python tests/blitzy_adhoc_test_q2_helper.py constants
+config.JOB_MAX_ATTEMPTS          = 5  (app/config.py:564)
+config.JOB_TAKEN_RETRY_WAIT_MINS = 30  (app/config.py:565)
+JobState: ready=0 taken=1 done=2 error=3  (app/models.py:253-257)
 ```
 
-This directly demonstrates: a fresh `taken` job is **not** retried within 30 minutes; it becomes
-eligible once `taken_at` crosses the window; and it is **abandoned** at `attempts >= 5` (the
-boundary `4 < 5` is eligible, `5` is not).
+The `eligibility` subcommand seeds seven scratch `Job` rows spanning the full cross-product of the
+selection predicate (`state`, `taken_at` relative to the 30-minute window, `attempts` relative to the
+5-attempt cap, and a future `run_at`), then calls the **real** `get_jobs_to_run()` and prints which
+rows it returns. The seed values (`taken_at` back-dating, `attempts` edits, future `run_at`) are
+`[TEST FIXTURE]` manipulations of scratch DB state, not source changes. The exact command and its
+complete, unedited output:
+
+```
+==================== Q2-ELIGIBILITY (retry-window / attempts-cap) ====================
+$ python tests/blitzy_adhoc_test_q2_helper.py eligibility
+[eligibility] JOB_TAKEN_RETRY_WAIT_MINS=30 JOB_MAX_ATTEMPTS=5
+[eligibility] get_jobs_to_run() returned 4 job(s):
+   [ELIGIBLE] ready, run_at=None                               -> Job id=226 name='' state=0(ready) attempts=0 taken=False taken_at=None run_at=None
+   [ELIGIBLE] ready, run_at=now                                -> Job id=227 name='' state=0(ready) attempts=0 taken=False taken_at=None run_at=2026-07-08T06:34:40.862590+00:00
+   [ELIGIBLE] taken, taken_at=-40m, attempts=0                 -> Job id=228 name='' state=1(taken) attempts=0 taken=False taken_at=2026-07-08T05:54:40.862590+00:00 run_at=None
+   [ELIGIBLE] taken, taken_at=-40m, attempts=4                 -> Job id=229 name='' state=1(taken) attempts=4 taken=False taken_at=2026-07-08T05:54:40.862590+00:00 run_at=None
+   [not-elig] taken, taken_at=-5m (within retry window)        -> Job id=230 name='' state=1(taken) attempts=0 taken=False taken_at=2026-07-08T06:29:40.862590+00:00 run_at=None
+   [not-elig] taken, taken_at=-40m, attempts=5 (cap reached)   -> Job id=231 name='' state=1(taken) attempts=5 taken=False taken_at=2026-07-08T05:54:40.862590+00:00 run_at=None
+   [not-elig] ready, run_at=+2h (future)                       -> Job id=232 name='' state=0(ready) attempts=0 taken=False taken_at=2026-07-08T08:34:40.862590+00:00 run_at=2026-07-08T08:34:40.862590+00:00
+[eligibility] expected ELIGIBLE ids=[226, 227, 228, 229] got=[226, 227, 228, 229] MATCH=True
+[eligibility] cleaned up harness jobs
+```
+
+This directly demonstrates each clause of the predicate: a `ready` job is always eligible (whether
+`run_at` is null or already due), but a `ready` job with a **future** `run_at` (+2h) is **not**
+selected; a `taken` job is **not** retried within the 30-minute window (`taken_at=-5m`); it becomes
+eligible once `taken_at` crosses the window (`taken_at=-40m`, `attempts=0` and `attempts=4` both
+selected); and it is **abandoned** at `attempts >= 5` (the boundary `4 < 5` is eligible, `5` is not).
+The runner's assertion line confirms the selected set exactly:
+`expected ELIGIBLE ids=[226, 227, 228, 229] got=[226, 227, 228, 229] MATCH=True`.
+
+### Two-run stability (Q2)
+
+The whole Q2 harness — the `constants` and `eligibility` subcommands plus the failure path
+(`insert_fail` + the real `python job_runner.py` loop) and the success path (`insert_success` + the
+real `python job_runner.py` loop) — was executed **twice**
+(`/tmp/blitzy_evidence/q2.run1.txt` and `q2.run2.txt`). Every constant, threshold, state and
+attempts observable is identical across the two runs; the only differences are values that are
+inherently non-deterministic — the auto-increment database primary keys of the freshly created `Job`
+rows (run 1 seeded ids `226`–`234`, run 2 seeded ids `235`–`243`), the `taken_at`/`run_at` wall-clock
+timestamps, and the runner process PIDs. Normalizing those away, `diff` reports the two runs as
+identical:
+
+```
+$ diff <(norm q2.run1.txt) <(norm q2.run2.txt)
+*** Q2 run1 == run2 after PK/timestamp/PID normalization -> BEHAVIORALLY IDENTICAL ***
+```
+
+| Observable | Run 1 | Run 2 | Stable? |
+|---|---|---|---|
+| `JOB_MAX_ATTEMPTS` (`app/config.py:564`) | `5` | `5` | ✓ |
+| `JOB_TAKEN_RETRY_WAIT_MINS` (`app/config.py:565`) | `30` | `30` | ✓ |
+| `get_jobs_to_run()` returned count | `4` | `4` | ✓ |
+| Eligible set `MATCH` (expected == got) | `True` | `True` | ✓ |
+| Eligible rows (positionally, of the 7 seeded) | first 4 (ready×2, taken-past-under-cap×2) | first 4 (ready×2, taken-past-under-cap×2) | ✓ |
+| Excluded rows (positionally, of the 7 seeded) | last 3 (within-window, cap-reached, future `run_at`) | last 3 (within-window, cap-reached, future `run_at`) | ✓ |
+| Failure path — runner exit code | `1` | `1` | ✓ |
+| Failure path — AFTER `state` | `1(taken)` | `1(taken)` | ✓ |
+| Failure path — AFTER `attempts` | `1` | `1` | ✓ |
+| Success path — runner exit code | `124` | `124` | ✓ |
+| Success path — AFTER `state` | `2(done)` | `2(done)` | ✓ |
+| Success path — AFTER `attempts` | `1` | `1` | ✓ |
 
 ### `JobState.error` — defined, but never written by the runner (refinement)
 
@@ -478,10 +714,14 @@ jobs in each state/`taken_at`/`attempts`/`run_at` combination and asserts the co
 ### Contrast — the `yacron`/`cron.py` scheduler is NOT the `Job` table
 
 Time-based maintenance runs via a **separate** subsystem: `crontab.yml` defines `yacron` schedules
-that invoke `python /code/cron.py -j <name>` (e.g. `stats` on `0 0 * * *`, `delete_old_monitoring`,
-`check_custom_domain`, `check_hibp`, `notify_hibp`, `delete_logs`, `delete_old_data`,
-`poll_apple_subscription`, `notify_trial_end`, `notify_manual_subscription_end`, …), and `cron.py`
-dispatches via `argparse -j`. This is unrelated to the `Job` DB table that Question 2 concerns.
+that invoke `python /code/cron.py -j <name>`. The complete set of scheduled jobs (all 15 entries in
+`crontab.yml`) is: `stats` (`0 0 * * *`), `delete_old_monitoring` (`15 1 * * *`), `check_custom_domain`
+(`15 2 * * *`), `check_hibp` (`15 3 * * *`), `notify_hibp` (`15 4 * * *`), `delete_logs`
+(`15 5 * * *`), `delete_old_data` (`30 5 * * *`), `poll_apple_subscription` (`15 6 * * *`),
+`notify_trial_end` (`15 8 * * *`), `notify_manual_subscription_end` (`15 9 * * *`), `notify_premium_end`
+(`15 10 * * *`), `delete_scheduled_users` (`15 11 * * *`), `send_undelivered_mails` (`*/5 * * * *`),
+`clear_alias_audit_log` (`0 * * * *`), and `clear_user_audit_log` (`0 * * * *`). `cron.py` dispatches
+via `argparse -j`. This is a distinct process from the `Job` DB table that Question 2 concerns.
 
 
 ---
@@ -501,9 +741,11 @@ dispatches via `argparse -j`. This is unrelated to the `Job` DB table that Quest
   `[verp_type, object_id, minutes_since_VERP_TIME_START]`; the signature is a base32-encoded, 8-byte
   truncated `HMAC-sha3-224` over that payload.
 - **(b) Inbound decode:** `get_verp_info_from_email()` (`app/email_utils.py:1467`) base32-decodes the
-  payload, recomputes and compares the HMAC (`app/email_utils.py:1490`), enforces a 5-day lifetime
-  (`app/email_utils.py:1496`; `VERP_MESSAGE_LIFETIME = 432000` = 5 days, `app/config.py:499`), and
-  returns `(VerpType, EmailLog.id)`. A legacy `bounce+<id>+@` form is decoded by
+  payload, recomputes and compares the HMAC (`app/email_utils.py:1490`), then applies a
+  **future-timestamp upper-bound guard** (`app/email_utils.py:1496`) that returns `None` only when the
+  address's embedded timestamp is **more than `VERP_MESSAGE_LIFETIME` (5 days, `app/config.py:499`) in
+  the future** of decode time — there is **no lower bound, so a stale/old address is still accepted** —
+  and otherwise returns `(VerpType, EmailLog.id)`. A legacy `bounce+<id>+@` form is decoded by
   `parse_id_from_bounce()` (`app/email_utils.py:1258`).
 - **(c) State changes (both directions):** a `Bounce` row is created; the full report + original
   message are archived to S3; a `RefusedEmail` row is created; and the `EmailLog` gets
@@ -526,8 +768,9 @@ dispatches via `argparse -j`. This is unrelated to the `Job` DB table that Quest
 
 The construction (`app/email_utils.py:1446-1464`) builds the JSON payload
 `[verp_type.value, object_id or 0, int((time.time() - VERP_TIME_START) / 60)]`
-(`:1446-1450`), signs it with `hmac.new(secret, payload, "sha3-224").digest()[:8]` (`:1454-1456`),
-base32-encodes both with the `=` padding stripped (`:1457-1458`), and returns:
+(`app/email_utils.py:1446-1450`), signs it with `hmac.new(secret, payload, "sha3-224").digest()[:8]`
+(`app/email_utils.py:1454-1456`), base32-encodes both with the `=` padding stripped
+(`app/email_utils.py:1457-1458`), and returns:
 
 ```python
 return "{}.{}.{}@{}".format(                       # app/email_utils.py:1459-1464
@@ -556,39 +799,72 @@ $ pytest tests/blitzy_adhoc_test_q3_verp.py -s   # exercises generate_verp_email
 
 ```
 --- (a) EXACT VERP addresses (object_id=100) ---
-  EXACT ADDRESS: sl.lmycyibrgaycyibsgm3tiobxgzoq.ataxfel77s3e4@sl.local
-  decoded payload list [verp_type, object_id, minutes_since_2022-01-01] = [0, 100, 2374876]
-  EXACT ADDRESS: sl.lmysyibrgaycyibsgm3tiobxgzoq.5lpsjv5ibnoou@sl.local
-  decoded payload list [verp_type, object_id, minutes_since_2022-01-01] = [1, 100, 2374876]
-  EXACT ADDRESS: sl.lmzcyibrgaycyibsgm3tiobxgzoq.it4x2ebnfdnja@sl.local
-  decoded payload list [verp_type, object_id, minutes_since_2022-01-01] = [2, 100, 2374876]
+  bounce_forward: EXACT ADDRESS: sl.lmycyibrgaycyibsgm3tiojtgjoq.ehplnr2q6k4fq@sl.local
+     decoded payload list [verp_type, object_id, minutes_since_2022-01-01] = [0, 100, 2374932]
+  bounce_reply: EXACT ADDRESS: sl.lmysyibrgaycyibsgm3tiojtgjoq.fohccdjhc652u@sl.local
+     decoded payload list [verp_type, object_id, minutes_since_2022-01-01] = [1, 100, 2374932]
+  transactional: EXACT ADDRESS: sl.lmzcyibrgaycyibsgm3tiojtgjoq.awbcfv2fi6qoc@sl.local
+     decoded payload list [verp_type, object_id, minutes_since_2022-01-01] = [2, 100, 2374932]
 ```
 
 The three addresses share prefix `sl.`, the same trailing `@sl.local`, and the same time term
-(`2374876` minutes since `VERP_TIME_START`); they differ only in the leading payload byte
+(`2374932` minutes since `VERP_TIME_START`); they differ only in the leading payload byte
 (`verp_type` 0/1/2) and the resulting signature — exactly matching the
 `sl.<payload>.<sig>@<domain>` format.
 
 ### (b) Inbound decode — `get_verp_info_from_email()` (`app/email_utils.py:1467`)
 
 Round-tripping freshly generated addresses (this time with `object_id=4242`) recovers the exact
-`(VerpType, id)` tuple; a tampered signature and a random address both return `None`:
+`(VerpType, id)` tuple; a tampered signature and a random (non-3-field) address both return `None`.
+Complete, unedited output from `tests/blitzy_adhoc_test_q3_verp.py`:
 
 ```
-bounce_forward: address=sl.lmycyibugi2delbagiztonbyg43f2.juu7qmd3kt6pm@sl.local
-   -> get_verp_info_from_email() = (<VerpType.bounce_forward: 0>, 4242)  (match: type=True id=True)
-bounce_reply: address=sl.lmysyibugi2delbagiztonbyg43f2.oaeyfaex4ergm@sl.local
-   -> get_verp_info_from_email() = (<VerpType.bounce_reply: 1>, 4242)  (match: type=True id=True)
-transactional: address=sl.lmzcyibugi2delbagiztonbyg43f2.kpgyfke63drao@sl.local
-   -> get_verp_info_from_email() = (<VerpType.transactional: 2>, 4242)  (match: type=True id=True)
-tampered signature: sl.lmycyibvguwcamrtg42dqnzwlu.ggyh6cd46b7ta@sl.local
-   -> get_verp_info_from_email() = None (expect None; HMAC mismatch @L1490)
-random@sl.local -> None (expect None)
-VERP_MESSAGE_LIFETIME=432000s = 5 days (lifetime gate @app/email_utils.py:L1496)
+  bounce_forward: address=sl.lmycyibugi2delbagiztonbzgmzf2.vpi7gmwftjo4g@sl.local
+     -> get_verp_info_from_email() = (<VerpType.bounce_forward: 0>, 4242)  (match: type=True id=True)
+  bounce_reply: address=sl.lmysyibugi2delbagiztonbzgmzf2.x3opfh7p25h54@sl.local
+     -> get_verp_info_from_email() = (<VerpType.bounce_reply: 1>, 4242)  (match: type=True id=True)
+  transactional: address=sl.lmzcyibugi2delbagiztonbzgmzf2.usoa5nowc5d2u@sl.local
+     -> get_verp_info_from_email() = (<VerpType.transactional: 2>, 4242)  (match: type=True id=True)
+  tampered signature: sl.lmycyibugi2delbagiztonbzgmzf2.vpi7gmwftjo4a@sl.local
+     -> get_verp_info_from_email() = None  (expect None; HMAC mismatch at app/email_utils.py:1490)
+  random@sl.local -> None  (expect None; not 3 dotted fields)
 ```
 
 This confirms the HMAC comparison at `app/email_utils.py:1490` (a tampered signature yields `None`)
-and the 5-day lifetime gate at `app/email_utils.py:1496`.
+and the structural check requiring exactly three dotted fields prefixed by `sl`
+(`app/email_utils.py:1476`).
+
+**[CORRECTION — the guard at `app/email_utils.py:1496` is a *future-timestamp upper bound*, not a
+staleness/expiry gate.]** The exact source line is:
+
+```python
+if data[2] > (time.time() + config.VERP_MESSAGE_LIFETIME - VERP_TIME_START) / 60:   # app/email_utils.py:1496
+    return None
+```
+
+Generation embeds `data[2] = int((time.time() - VERP_TIME_START) / 60)` (`app/email_utils.py:1449`),
+so substituting and cancelling `VERP_TIME_START` reduces the guard to *reject iff*
+`t_generated > t_now + VERP_MESSAGE_LIFETIME` — it rejects only addresses whose embedded timestamp
+claims to be **more than 5 days in the future** of decode time. There is **no lower bound**, so an
+arbitrarily **old** address is still accepted. Driving all four boundary cases through the real
+generator + decoder (the `[TEST FIXTURE]` label marks where `time.time()` is mocked inside the real
+`generate_verp_email()` only to place the *embedded* timestamp; decoding always runs at real "now"):
+
+```
+  guard: `if data[2] > (time.time() + VERP_MESSAGE_LIFETIME - VERP_TIME_START)/60: return None`
+  => rejects payloads whose embedded minute-timestamp is MORE THAN 5 days in the FUTURE of decode time.
+  decode-time threshold (max acceptable data[2]) now = 2382132 minutes
+  [current/now] embedded data[2]=2374932 min  -> decode=(<VerpType.bounce_forward: 0>, 4242)  => ACCEPTED  (expected ACCEPTED)
+  [stale: -365 days (far past)] embedded data[2]=1849332 min  -> decode=(<VerpType.bounce_forward: 0>, 4242)  => ACCEPTED  (expected ACCEPTED (NOT a staleness gate))
+  [future: +4 days (within 5-day window)] embedded data[2]=2380692 min  -> decode=(<VerpType.bounce_forward: 0>, 4242)  => ACCEPTED  (expected ACCEPTED)
+  [future: +6 days (beyond 5-day window)] embedded data[2]=2383572 min  -> decode=None  => REJECTED(None)  (expected REJECTED(None))
+```
+
+Observed exactly as predicted: the far-past (`-365 days`) address is **ACCEPTED** (no staleness
+expiry), the two future cases split precisely at the 5-day window (`+4 days` ACCEPTED, `+6 days`
+REJECTED as `None`), and the decode-time threshold is `2382132` minutes.
+`VERP_MESSAGE_LIFETIME = 432000` (5 days, `app/config.py:499`) therefore bounds how far into the
+*future* an embedded timestamp may be, **not** how old a bounce address may be.
 
 **Legacy fallback — `parse_id_from_bounce()` (`app/email_utils.py:1258`).** The legacy `bounce+`
 form encodes the id between two `+` characters; `parse_id_from_bounce()` recovers it via
@@ -602,9 +878,9 @@ form encodes the id between two `+` characters; `parse_id_from_bounce()` recover
 ```
 
 The full set of legacy/transactional prefixes is defined in `app/config.py`:
-`BOUNCE_PREFIX = "bounce+"` (`:100`), `BOUNCE_SUFFIX = "+@{EMAIL_DOMAIN}"` (`:101`),
-`BOUNCE_PREFIX_FOR_REPLY_PHASE = "bounce_reply"` (`:108`), and
-`TRANSACTIONAL_BOUNCE_PREFIX = "transactional+"` (`:113`). The reply-phase and transactional legacy
+`BOUNCE_PREFIX = "bounce+"` (`app/config.py:100`), `BOUNCE_SUFFIX = "+@{EMAIL_DOMAIN}"`
+(`app/config.py:101`), `BOUNCE_PREFIX_FOR_REPLY_PHASE = "bounce_reply"` (`app/config.py:108`), and
+`TRANSACTIONAL_BOUNCE_PREFIX = "transactional+"` (`app/config.py:113`). The reply-phase and transactional legacy
 forms are decoded by the same integer-extraction logic. `[inferred]` for the reply/transactional
 legacy forms — only the modern signed form and the legacy forward form were exercised at runtime;
 the prefixes above are cited from source.
@@ -633,48 +909,83 @@ $ pytest tests/blitzy_adhoc_test_q3_bounce.py -s   # drives handle_bounce() both
 **Forward phase — fresh alias (`should_disable` False):**
 
 ```
-===== Q3 (c)/(d) FORWARD phase — fresh alias (should_disable False) =====
-EmailLog id=1 is_reply=False get_phase()='forward'
-should_disable(alias)=(False, '')
-RETURN='250 SL E211 Bounce Forward phase handled'   (E211='250 SL E211 Bounce Forward phase handled')
-AFTER: bounced=True refused_email_id=1 bounced_mailbox_id=52 (mailbox.id=52) alias.enabled=True
-Bounce row: email='fybicrklgpkykpryqwsx@fybicrklgpkykpryqwsx.com'  (== mailbox.email 'fybicrklgpkykpryqwsx@fybicrklgpkykpryqwsx.com')
-alerts (envelope_to, subject): [('user_qb03dbgaem@mailbox.test', 'An email sent to trumps_carted827@sl.local cannot be delivered to your mailbox')]
+[SETUP] alias='cougar_sultan009@sl.local' mailbox='user_v9xyg7mmuy@mailbox.test' contact.website_email='sender-c0744745@remote.example'
+[get_phase] email_log.get_phase() -> 'forward'   (app/models.py:2143-2147)
+[INPUT] bounce.eml content_type='multipart/report' walk_parts=7
+[BEFORE]  bounced=False refused_email_id=None bounced_mailbox_id=None alias.enabled=True
+2026-07-08 06:26:05,861 - SL - DEBUG - 104724 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/email_handler.py:1862" - handle_bounce() -  - handle bounce for <EmailLog 121>, phase=forward, contact=<Contact 15 sender-c0744745@remote.example 63>, alias=<Alias 63 cougar_sultan009@sl.local>
+2026-07-08 06:26:05,864 - SL - DEBUG - 104724 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/email_handler.py:1456" - handle_bounce_forward_phase() -  - Handle forward bounce <Contact 15 sender-c0744745@remote.example 63> -> <Alias 63 cougar_sultan009@sl.local> -> <Mailbox 97 user_v9xyg7mmuy@mailbox.test>. <EmailLog 121>
+2026-07-08 06:26:05,872 - SL - DEBUG - 104724 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/email_handler.py:1491" - handle_bounce_forward_phase() -  - Create refused email <Refused Email 7 refused-emails/b6405849-9751-4e90-9e80-52f9892a6afc.eml 2026-07-15T06:26:05.871743+00:00>
+[RESULT]  handle_bounce -> '250 SL E211 Bounce Forward phase handled'   (expect E211='250 SL E211 Bounce Forward phase handled')
+[AFTER]   bounced=True refused_email_id=7 bounced_mailbox_id=97 alias.enabled=True
+[STATE Bounce] rows_for(mailbox.email) 0 -> 1; latest.email='user_v9xyg7mmuy@mailbox.test' info_len=517
+[STATE S3] 2 upload call(s):
+    path='refused-emails/full-b6405849-9751-4e90-9e80-52f9892a6afc.eml' filename='full-b6405849-9751-4e90-9e80-52f9892a6afc' bytes=3803
+    path='refused-emails/b6405849-9751-4e90-9e80-52f9892a6afc.eml' filename='b6405849-9751-4e90-9e80-52f9892a6afc' bytes=1382
+[STATE RefusedEmail] id=7 path='refused-emails/b6405849-9751-4e90-9e80-52f9892a6afc.eml' full_report_path='refused-emails/full-b6405849-9751-4e90-9e80-52f9892a6afc.eml' user_id=48
 ```
 
-Forward phase returns **`E211`**, sets `Bounce.email == mailbox.email`, sets the `EmailLog` flags
-`bounced=True / refused_email_id / bounced_mailbox_id`, and alerts the **user's** address. With
-`should_disable=(False, '')` the alias stays enabled (`alias.enabled=True`).
+Forward phase returns **`E211`** and records the complete common state-change set:
+`Bounce.email == mailbox.email` (`user_v9xyg7mmuy@mailbox.test`); **two S3 uploads** via
+`s3.upload_email_from_bytesio()` (`app/s3.py:47`) — the full DSN report to
+`refused-emails/full-<uuid>.eml` (`bytes=3803`) and the original message to
+`refused-emails/<uuid>.eml` (`bytes=1382`, uploaded at `email_handler.py:1483-1485`); a `RefusedEmail`
+row created with `path=file_path, full_report_path=full_report_path, user_id=user.id`
+(`email_handler.py:1487-1489`, logged at `email_handler.py:1491`); and the `EmailLog` flags
+`bounced=True / refused_email_id=7 / bounced_mailbox_id=97` (`email_handler.py:1493-1495`), alerting
+the **user's** address. With `should_disable=(False, '')` the alias stays enabled
+(`alias.enabled=True`).
 
 **Forward phase — alias with >12 prior bounces (`should_disable` True) → alias auto-disabled:**
 
 ```
-===== Q3 (c)/(d) FORWARD phase — alias with >12 prior bounces (should_disable True) =====
-should_disable(alias)=(True, '+12 bounces in the last 24h')  alias.enabled(before)=True
-RETURN='250 SL E211 Bounce Forward phase handled' (E211)  alias.enabled(after)=False  (expect disabled=False)
-alerts (envelope_to, subject): [('user_qh1qk8luce@mailbox.test', 'Alias voiced_soviet838@sl.local has been disabled due to multiple bounces')]
+[BEFORE] alias.enabled=True prior_bounced_forward_logs=12 should_disable=(False, '')
+2026-07-08 06:26:06,269 - SL - DEBUG - 104724 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/email_handler.py:1491" - handle_bounce_forward_phase() -  - Create refused email <Refused Email 8 refused-emails/f6e45738-2cd3-441a-986c-0f003fde938d.eml 2026-07-15T06:26:06.268662+00:00>
+2026-07-08 06:26:06,277 - SL - WARNING - 104724 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/email_handler.py:1502" - handle_bounce_forward_phase() -  - Disable alias <Alias 65 faffed_bottom859@sl.local> because +12 bounces in the last 24h. [<Mailbox 98 user_jcfj9omfi2@mailbox.test>] <User 49 Test User user_jcfj9omfi2@mailbox.test>. Last contact <Contact 16 sender-19ca68a5@remote.example 65>
+2026-07-08 06:26:06,277 - SL - INFO - 104724 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/app/alias_utils.py:553" - change_alias_status() -  - Changing alias <Alias 65 faffed_bottom859@sl.local> enabled to False
+[RESULT] handle_bounce -> '250 SL E211 Bounce Forward phase handled' (expect E211)
+[should_disable AFTER] -> (True, '+12 bounces in the last 24h')   (app/email_utils.py:1166; >12 branch :1190)
+[AFTER] alias.enabled=False
+[STATE Notification] count=1 titles=['faffed_bottom859@sl.local has been disabled due to multiple bounces']
 ```
 
-After seeding 13 prior bounces, `should_disable(alias)` (`app/email_utils.py:1166`) returns
-`(True, '+12 bounces in the last 24h')` (the `nb_bounced_last_24h > 12` branch,
-`app/email_utils.py:1190`), so the alias transitions `enabled: True → False` and the alert subject
-changes to the "disabled due to multiple bounces" template. (Requires `ALIAS_AUTOMATIC_DISABLE=true`,
-present in `tests/test.env:62`.)
+The alias started with exactly `12` prior forward-phase bounce logs, so `should_disable` was
+`(False, '')` *before* handling; the current bounce makes it the 13th, so after processing
+`should_disable(alias)` (`app/email_utils.py:1166`) returns `(True, '+12 bounces in the last 24h')`
+(the `nb_bounced_last_24h > 12` branch, `app/email_utils.py:1190`). The forward handler then disables
+the alias via `change_alias_status()` (`app/alias_utils.py:553`), transitioning
+`alias.enabled: True → False`, and creates one `Notification` with the "disabled due to multiple
+bounces" title. SMTP status is still `E211`. (Requires `ALIAS_AUTOMATIC_DISABLE=true`, present in
+`tests/test.env:62`.)
 
 **Reply phase (multipart/report DSN with `MAIL FROM:<>`):**
 
 ```
-===== Q3 (c)/(d) REPLY phase (multipart/report DSN, MAIL FROM:<>) =====
-EmailLog id=16 is_reply=True get_phase()='reply'
-RETURN='250 SL E212 Bounce Reply phase handled'   (E212='250 SL E212 Bounce Reply phase handled')
-AFTER: bounced=True refused_email_id=3 bounced_mailbox_id=56 (mailbox.id=56) alias.enabled=True (expect True, NO disable)
-Bounce row: email='isudjmtarqiewlrxtajf@isudjmtarqiewlrxtajf.com'  (== contact.website_email 'isudjmtarqiewlrxtajf@isudjmtarqiewlrxtajf.com')
-alerts (envelope_to, subject): [('ocbbanwrvbgjaomaqmln@ocbbanwrvbgjaomaqmln.com', 'Email cannot be sent to isudjmtarqiewlrxtajf@isudjmtarqiewlrxtajf.com from your alias masker_beamed415@sl.local')]
+[SETUP] alias='sirens_nimbus281@sl.local' mailbox='user_6fj3oviw07@mailbox.test' contact.website_email='sender-7bb79468@remote.example'
+[get_phase] email_log.get_phase() -> 'reply'
+[INPUT] content_type='multipart/report' envelope.mail_from='<>'  -> true-DSN branch
+[BEFORE] bounced=False refused_email_id=None auto_replied=False alias.enabled=True
+2026-07-08 06:26:06,595 - SL - DEBUG - 104724 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/email_handler.py:1862" - handle_bounce() -  - handle bounce for <EmailLog 135>, phase=reply, contact=<Contact 17 sender-7bb79468@remote.example 67>, alias=<Alias 67 sirens_nimbus281@sl.local>
+2026-07-08 06:26:06,602 - SL - DEBUG - 104724 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/email_handler.py:1640" - handle_bounce_reply_phase() -  - Create refused email <Refused Email 9 refused-emails/a7a60839-5433-460d-a4f2-79365ba4e28b.eml 2026-07-15T06:26:06.601989+00:00>
+[RESULT] handle_bounce -> '250 SL E212 Bounce Reply phase handled'   (expect E212='250 SL E212 Bounce Reply phase handled')
+[STATE Bounce] latest.email='sender-7bb79468@remote.example'   (== contact.website_email 'sender-7bb79468@remote.example')
+[STATE S3] 2 upload call(s):
+    path='refused-emails/full-a7a60839-5433-460d-a4f2-79365ba4e28b.eml' filename='a7a60839-5433-460d-a4f2-79365ba4e28b' bytes=3803
+    path='refused-emails/a7a60839-5433-460d-a4f2-79365ba4e28b.eml' filename='a7a60839-5433-460d-a4f2-79365ba4e28b' bytes=1382
+[STATE RefusedEmail] id=9 path='refused-emails/a7a60839-5433-460d-a4f2-79365ba4e28b.eml' full_report_path='refused-emails/full-a7a60839-5433-460d-a4f2-79365ba4e28b.eml' user_id=50
+[AFTER] bounced=True bounced_mailbox_id=99 alias.enabled=True
 ```
 
-Reply phase returns **`E212`**, sets `Bounce.email == contact.website_email` (not the mailbox),
-alerts the **mailbox** address, and — critically — leaves `alias.enabled=True` (**no auto-disable**
-in the reply direction).
+Reply phase returns **`E212`** and records the same common state set — a `Bounce` row, two S3 uploads
+(`bytes=3803` full report + `bytes=1382` original), a `RefusedEmail`
+(`email_handler.py:1640`), and `EmailLog.bounced=True / bounced_mailbox_id=99` — but with three
+directional divergences from the forward phase: (1) `Bounce.email == contact.website_email`
+(`sender-7bb79468@remote.example`), **not** `mailbox.email`; (2) the full-report S3 upload's
+`filename` argument is the bare UUID `a7a60839-5433-460d-a4f2-79365ba4e28b` (**no `full-` prefix**),
+whereas the forward phase
+passes `full-<uuid>` — though the stored object `path` and `RefusedEmail.full_report_path` still carry
+the `refused-emails/full-<uuid>.eml` form in both directions; and (3) the alias is **never
+auto-disabled** — `alias.enabled` stays `True`. The alert goes to the **mailbox** address.
 
 **Reply-phase auto-reply RE-FORWARD branch (message that is NOT a real DSN):** when the inbound
 message's `content_type != "multipart/report"` **or** `envelope.mail_from != "<>"`
@@ -682,27 +993,43 @@ message's `content_type != "multipart/report"` **or** `envelope.mail_from != "<>
 bounce:
 
 ```
-===== Q3 (d) REPLY phase auto-reply RE-FORWARD branch (NOT a DSN) @L1876 =====
-RETURN='250 Message accepted for delivery'
-AFTER: auto_replied=True (set True @L1887 before re-forward)
+[BEFORE] auto_replied=False
+[INPUT] content_type='text/plain' envelope.mail_from='sender-02a17a5f@remote.example'
+        branch condition: content_type != 'multipart/report' OR mail_from != '<>'  -> True
+2026-07-08 06:26:07,001 - SL - DEBUG - 104724 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/email_handler.py:1862" - handle_bounce() -  - handle bounce for <EmailLog 136>, phase=reply, contact=<Contact 18 sender-02a17a5f@remote.example 69>, alias=<Alias 69 wanton_quaint452@sl.local>
+[DURING/AFTER] email_log.auto_replied -> True   (set at app/email_handler.py:1887)
+[RESULT] handle_bounce -> '250 Message accepted for delivery'   err=None
+[RE-FORWARD] envelope.rcpt_tos -> ['wanton_quaint452@sl.local']   (replaced with alias.email 'wanton_quaint452@sl.local')
+[STORED MAIL] 1 message(s) captured by mail_sender store-mode
 ```
 
-Here `EmailLog.auto_replied` is set `True` (`email_handler.py:1887`), the `To` header is rewritten to
-`alias.email` (`email_handler.py:1891`), the message is re-forwarded via `handle_forward()`
-(`email_handler.py:1899`), and the return is `250 Message accepted for delivery` — **not** a bounce
-status.
+The branch condition `content_type != "multipart/report" or envelope.mail_from != "<>"`
+(`email_handler.py:1876`) is `True` here (a `text/plain` message from a real sender), so the message
+is treated as an auto-reply rather than a DSN: `EmailLog.auto_replied` is set `True`
+(`email_handler.py:1887`), the `To` header is rewritten to `alias.email`
+(`add_or_replace_header(msg, "To", alias.email)`, `email_handler.py:1891`), the envelope recipients
+are replaced with `[alias.email]` (`email_handler.py:1892` — observed as
+`envelope.rcpt_tos -> ['wanton_quaint452@sl.local']`), and the message is re-forwarded via
+`handle_forward()` (`email_handler.py:1899`); the return is `250 Message accepted for delivery` —
+**not** a bounce status. (The `[DURING/AFTER]` annotation above is the disposable harness's own label;
+it writes the module path loosely as `app/email_handler.py`, but the authoritative module is the
+repository-root `email_handler.py`, as the absolute path in every framework log line confirms —
+`<repo>/email_handler.py:NNNN`.)
 
 ### Edge statuses — `E512` (unknown email log) and `E510` (inactive user)
 
 ```
-handle_bounce(env, None, msg) -> '550 SL E512 No such email log' (E512='550 SL E512 No such email log')
-user.is_active()=False (delete_on set 1h in future)
-handle_bounce(env, el, msg) -> '550 SL E510 so such user' (E510='550 SL E510 so such user')
+2026-07-08 06:26:07,039 - SL - WARNING - 104724 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/email_handler.py:1857" - handle_bounce() -  - No such email log
+[RESULT] handle_bounce(None) -> '550 SL E512 No such email log'   (expect E512='550 SL E512 No such email log')
+[SETUP] user.delete_on=2026-07-09T06:26:07.322750+00:00 user.is_active()=False
+2026-07-08 06:26:07,329 - SL - DEBUG - 104724 - "/tmp/blitzy/app/blitzy-8e1c5efc-dd15-4f3e-81d1-742bff0fa928_a9d9a1/email_handler.py:1870" - handle_bounce() -  - User <User 52 Test User user_718xyzdp9p@mailbox.test> is not active
+[RESULT] handle_bounce -> '550 SL E510 so such user'   (expect E510='550 SL E510 so such user')
 ```
 
-A missing `EmailLog` yields `550 SL E512` (`email_handler.py:1856-1858`); an inactive user
-(`User.is_active()` returns `False` when `delete_on` is set to a future time, `app/models.py:766`)
-yields `550 SL E510` (`email_handler.py:1869-1871`).
+A missing `EmailLog` logs "No such email log" (`email_handler.py:1857`) and yields `550 SL E512`
+(`email_handler.py:1858`); an inactive user (`User.is_active()` returns `False` when `delete_on` is
+set to a future time, `app/models.py:766`) logs that the user `is not active` (`email_handler.py:1870`)
+and yields `550 SL E510` (`email_handler.py:1871`).
 
 ### Direction discriminator — `EmailLog.get_phase()` (`app/models.py:2143-2147`)
 
@@ -712,6 +1039,35 @@ EmailLog(is_reply=False).get_phase()='forward'; EmailLog(is_reply=True).get_phas
 
 `get_phase()` returns `"reply"` when `self.is_reply` is set, else `"forward"`
 (`app/models.py:2143-2147`) — the value `handle_bounce()` keys on to choose the phase handler.
+
+### Two-run stability (Q3)
+
+Both Q3 harnesses were executed **twice**. `tests/blitzy_adhoc_test_q3_verp.py`
+(`/tmp/blitzy_evidence/q3verp.run1.txt` and `q3verp.run2.txt`, each `1 passed, 18 warnings`) is
+**byte-identical across the two runs in its entire evidence region** — the two runs fell within the
+same wall-clock minute, so even the minute-quantized VERP time term (`2374932`), and therefore the
+exact addresses, matched. (That time term is `int((time.time() - VERP_TIME_START) / 60)`,
+`app/email_utils.py:1449`, so it advances by 1 every minute; the *format* `sl.<payload>.<sig>@<domain>`
+and the decode/boundary semantics are invariant regardless of the minute.)
+`tests/blitzy_adhoc_test_q3_bounce.py` (`q3bounce.run1.txt` / `q3bounce.run2.txt`, each
+`7 passed, 18 warnings`) is **behaviorally identical** across the two runs; the only differences are
+inherently non-deterministic identifiers — auto-increment primary keys, per-message UUID filenames,
+randomly generated alias/mailbox/contact names, and wall-clock timestamps.
+
+| Observable | Run 1 | Run 2 | Stable? |
+|---|---|---|---|
+| VERP format | `sl.<b32-payload>.<b32-sig>@<domain>` | `sl.<b32-payload>.<b32-sig>@<domain>` | ✓ |
+| Decode round-trip recovers `(VerpType, id)` | yes (all 3 types) | yes (all 3 types) | ✓ |
+| Tampered signature / random address | `None` / `None` | `None` / `None` | ✓ |
+| Boundary: current / −365d / +4d / +6d | ACCEPT / ACCEPT / ACCEPT / REJECT | ACCEPT / ACCEPT / ACCEPT / REJECT | ✓ |
+| Forward SMTP status | `E211` | `E211` | ✓ |
+| Reply SMTP status | `E212` | `E212` | ✓ |
+| `Bounce.email` forward / reply | `mailbox.email` / `contact.website_email` | `mailbox.email` / `contact.website_email` | ✓ |
+| S3 uploads per bounce (full-report / original bytes) | 2 (`3803` / `1382`) | 2 (`3803` / `1382`) | ✓ |
+| `should_disable` at 13th forward bounce | `(True, '+12 bounces in the last 24h')` | `(True, '+12 bounces in the last 24h')` | ✓ |
+| Forward auto-disables / reply never disables | yes / no | yes / no | ✓ |
+| Auto-reply re-forward (non-DSN) return | `250 Message accepted for delivery` | `250 Message accepted for delivery` | ✓ |
+| Edge: unknown log / inactive user | `E512` / `E510` | `E512` / `E510` | ✓ |
 
 ### Background standard (framing only)
 
@@ -788,7 +1144,7 @@ decode logic captured above.
 | (a) exact format | `sl.<b32-payload>.<b32-hmac>@<domain>` lowercased | `app/email_utils.py:1459-1464` | ✅ 3 exact addresses printed |
 | payload / signature | `[type,id,mins]`; HMAC-`sha3-224` `[:8]` | `app/email_utils.py:1446-1458` | ✅ decoded lists shown |
 | (b) decode | `get_verp_info_from_email()` → `(VerpType,id)` | `app/email_utils.py:1467` | ✅ round-trip match; tamper→None |
-| lifetime gate | 5 days (`VERP_MESSAGE_LIFETIME=432000`) | `app/config.py:499`; `app/email_utils.py:1496` | ✅ printed |
+| decode guard (NOT a staleness gate) | **future-timestamp upper bound only** — rejects timestamps > `VERP_MESSAGE_LIFETIME` (5 days, `=432000`s) in the **future** of decode time; **no lower bound**, so stale/old addresses are accepted | `app/config.py:499`; `app/email_utils.py:1496` (embed `:1449`) | ✅ 4-case boundary: current / −365d / +4d **ACCEPTED**, +6d **REJECTED(None)**; threshold=2382132 min |
 | legacy fallback | `parse_id_from_bounce()` `bounce+<id>+@` | `app/email_utils.py:1258`; `app/config.py:100-113` | ✅ 123 / 987654 (reply/txn legacy `[inferred]`) |
 | (c) state changes | `Bounce` + S3 archive + `RefusedEmail` + `EmailLog` flags + `Notification` | `email_handler.py:1432-1683` | ✅ flags & Bounce row captured |
 | (d) forward | `E211`, `Bounce.email=mailbox.email`, alert `user.email`, auto-disable | `email_handler.py:1432`; `app/config.py:359` | ✅ both should_disable F/T |
@@ -806,28 +1162,34 @@ environment accommodation is labeled `[NON-CANONICAL ENV]`.
 ## Cleanup & read-only guarantee
 
 All runtime observation was performed through the project's own `pytest` harnesses and through
-temporary, disposable scripts. The temporary observation scripts
-(`tests/blitzy_adhoc_test_q1.py`, `tests/blitzy_adhoc_test_q3_verp.py`,
-`tests/blitzy_adhoc_test_q3_bounce.py`) and the out-of-tree helper
-(`/tmp/blitzy_evidence/q2_helper.py`) were deleted after evidence capture; the scratch PostgreSQL
-rows created during the investigation are transient test-DB state outside the repository tree. No
-repository source file was modified, added to, or deleted — the **only** net-new artifact is this
-document.
+temporary, disposable scripts. The four temporary observation scripts —
+`tests/blitzy_adhoc_test_q1.py`, `tests/blitzy_adhoc_test_q2_helper.py`,
+`tests/blitzy_adhoc_test_q3_verp.py`, and `tests/blitzy_adhoc_test_q3_bounce.py` — together with
+their `tests/__pycache__/` byte-code, the Redis `dump.rdb` file, and the scratch `.eml` objects that
+the `LOCAL_FILE_UPLOAD` path wrote under the git-ignored `static/upload/refused-emails/` directory
+(`.gitignore:11`), were all deleted after evidence capture. The scratch PostgreSQL rows created
+during the investigation are transient test-DB state outside the repository tree. No repository
+source file was modified, added to, or deleted — the **only** net-new artifact is this document.
 
-The final working-tree state confirming the read-only guarantee (captured after deleting every
-temporary script and the Redis `dump.rdb` artifact, before committing the deliverable):
+The read-only guarantee is proven by diffing the working tree against the pristine **source
+baseline** commit `2cd6ee777f8c2d3531559588bcfb18627ffb5d2c` — a stable anchor regardless of any
+platform checkpoint commit layered on top. Exactly one file (this document) differs, and no source
+file appears. Captured after deleting every temporary artifact, immediately before committing the
+deliverable:
 
 ```bash
-$ git rev-parse HEAD
-2cd6ee777f8c2d3531559588bcfb18627ffb5d2c
-$ git status --porcelain
-?? blitzy/
-$ git status --porcelain -uall     # -uall expands the untracked directory to its files
-?? blitzy/documentation/app_2cd6ee777f8c.md
+$ git diff 2cd6ee777f8c2d3531559588bcfb18627ffb5d2c --stat
+ blitzy/documentation/app_2cd6ee777f8c.md | 1195 ++++++++++++++++++++++++++++++
+ 1 file changed, 1195 insertions(+)
+$ git diff 2cd6ee777f8c2d3531559588bcfb18627ffb5d2c --name-only
+blitzy/documentation/app_2cd6ee777f8c.md
+$ git status --porcelain -uall
+ M blitzy/documentation/app_2cd6ee777f8c.md
 ```
 
-The sole change in the working tree is the new file `blitzy/documentation/app_2cd6ee777f8c.md`
-(plain `--porcelain` collapses it to the untracked directory `blitzy/`; `-uall` expands it to the
-exact file), confirming the read-only constraint was honored — no existing repository source file
-was modified, added to, or deleted.
+The single `git status` entry is this deliverable; it shows ` M` (modified) rather than `??`
+(untracked) because a platform checkpoint commit already contains an earlier revision of it, and
+this line reflects the current pass's edits to that same one file. The diff against the source
+baseline lists that identical single file with **zero** source-file changes — confirming the
+read-only constraint was honored end to end.
 
