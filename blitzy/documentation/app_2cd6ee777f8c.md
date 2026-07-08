@@ -266,12 +266,17 @@ $ python dash.py     # logs in as john@wick.com, GETs /dashboard/
   'placeholder="Enter to search for alias"'          -> True
 
 [stats <div class="h1 m-0"> numbers] (nb_alias is the alias-count stat) = ['10', '1', '0', '0']
-[distinct alias addresses rendered in list] count=5
-   - e0@sl.local
-   - e1@sl.local
-   - e2@sl.local
-   - newsletter.foible812@sl.local
+[distinct alias addresses rendered in list] count=10
    - tonics_helots826@sl.local
+   - wick@example.com
+   - john@example.com
+   - second@ab.cd
+   - first@ab.cd
+   - e2@sl.local
+   - e1@sl.local
+   - e0@sl.local
+   - example@example.com
+   - simplelogin-newsletter.foible812@sl.local
 ```
 
 The exact rendered lines carrying those markers (OBSERVED):
@@ -946,8 +951,8 @@ $ git status --porcelain
                        # (empty output — working tree is clean)
 
 $ git diff --stat 2cd6ee777f8c2d3531559588bcfb18627ffb5d2c HEAD
- blitzy/documentation/app_2cd6ee777f8c.md | 961 +++++++++++++++++++++++++++++++
- 1 file changed, 961 insertions(+)
+ blitzy/documentation/app_2cd6ee777f8c.md | 966 +++++++++++++++++++++++++++++++
+ 1 file changed, 966 insertions(+)
 ```
 
 All observation scripts were removed (0 remaining). `git status --porcelain` produces **no output** (clean tree): the runtime investigation touched **zero** repository files — temp data lived only in the throwaway Postgres database and temp scripts only under `/tmp`, both outside the repo. The single change introduced on this branch versus the source parent is this documentation file.
