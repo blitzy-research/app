@@ -51,12 +51,12 @@ eval "$(grep '^export ' /build.sh)"
 ```
 $ docker exec -d sl bash -c 'cd /app && . venv/bin/activate && eval "$(grep "^export " /build.sh)" \
     && exec gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15 > /tmp/gunicorn_7777.log 2>&1'
-$ tail -6 /tmp/gunicorn_7777.log
-[2026-07-08 04:19:20 +0000] [1691] [INFO] Starting gunicorn 20.0.4
-[2026-07-08 04:19:20 +0000] [1691] [INFO] Listening at: http://0.0.0.0:7777 (1691)
-[2026-07-08 04:19:20 +0000] [1691] [INFO] Using worker: sync
-[2026-07-08 04:19:20 +0000] [1698] [INFO] Booting worker with pid: 1698
-[2026-07-08 04:19:20 +0000] [1699] [INFO] Booting worker with pid: 1699
+$ grep -E 'Starting gunicorn|Listening at|Using worker|Booting worker' /tmp/gunicorn_7777.log
+[2026-07-08 05:10:27 +0000] [2587] [INFO] Starting gunicorn 20.0.4
+[2026-07-08 05:10:28 +0000] [2587] [INFO] Listening at: http://0.0.0.0:7777 (2587)
+[2026-07-08 05:10:28 +0000] [2587] [INFO] Using worker: sync
+[2026-07-08 05:10:28 +0000] [2594] [INFO] Booting worker with pid: 2594
+[2026-07-08 05:10:28 +0000] [2595] [INFO] Booting worker with pid: 2595
 $ curl -s -o /dev/null -w "HTTP %{http_code} -> redirect: %{redirect_url}\n" http://localhost:7777/
 HTTP 302 -> redirect: http://localhost:7777/auth/login
 ```
@@ -172,36 +172,47 @@ that has no active sudo** it returns the non‑standard **HTTP 440** `{"error":"
 **(b) Exact commands.**
 
 ```bash
-# (a) browser session ONLY (john's authenticated cookie jar from Q1), NO Authentication header
-curl -s -i -b /tmp/q1_cookies.txt -X DELETE http://localhost:7777/api/user
-# capture the server-side traceback for case (a)
-tail -n +<mark> /tmp/gunicorn_7777.log
+# (a) browser session ONLY: first establish john's authenticated cookie jar (web login),
+#     then DELETE /api/user with ONLY that cookie (NO Authentication header).
+BASE=http://localhost:7777 ; JAR=/tmp/q1_cookies.txt ; rm -f "$JAR"
+CSRF=$(curl -s -c "$JAR" "$BASE/auth/login" | grep -oP 'name="csrf_token"[^>]*value="\K[^"]+' | head -1)
+curl -s -o /dev/null -b "$JAR" -c "$JAR" \
+  --data-urlencode "email=john@wick.com" --data-urlencode "password=password" \
+  --data-urlencode "csrf_token=$CSRF" "$BASE/auth/login"
+# record the log length BEFORE the request, then capture EXACTLY the new lines it appends
+mark=$(wc -l < /tmp/gunicorn_7777.log)
+curl -s -i -b "$JAR" -X DELETE "$BASE/api/user"          # session fallback -> g.api_key=None -> 500
+tail -n +$((mark+1)) /tmp/gunicorn_7777.log              # the server-side traceback for case (a)
 # (b) real API key (id=134) with sudo_mode_at = NULL, via Authentication header
-curl -s -i -H 'Authentication: <Q2_API_KEY_REDACTED>' \
-     -X DELETE http://localhost:7777/api/user
-# NOTE: <Q2_API_KEY_REDACTED> is the 60-char code of ApiKey id=134 (created via
-# ApiKey.create for john@wick.com). Redacted here — it is a throwaway credential
-# scoped to the disposable investigation container and its fake FLASK_SECRET=secret.
+KEY134=$(psql "$DB_URI" -t -A -c "select code from api_key where id=134;")   # 60-char throwaway code
+curl -s -i -H "Authentication: $KEY134" -X DELETE "$BASE/api/user"           # -> 440 {"error":"Need sudo"}
+# NOTE: the id=134 code (created via ApiKey.create for john@wick.com) is a throwaway credential
+# scoped to the disposable investigation container and its fake FLASK_SECRET=secret; it is shown
+# REDACTED as <Q2_API_KEY_REDACTED> in the output below.
 ```
 
 **(c) Complete unedited output.**
 
 ```
 ========== Q2 (a): browser session ONLY (john cookie, NO Authentication header) → DELETE /api/user ==========
+$ mark=$(wc -l < /tmp/gunicorn_7777.log)   # record log length BEFORE the request
+mark=41
 $ curl -s -i -b /tmp/q1_cookies.txt -X DELETE http://localhost:7777/api/user
 HTTP/1.1 500 INTERNAL SERVER ERROR
 Server: gunicorn/20.0.4
-Date: Wed, 08 Jul 2026 04:22:31 GMT
+Date: Wed, 08 Jul 2026 05:16:03 GMT
 Connection: close
 Content-Type: application/json
 Content-Length: 27
 Access-Control-Allow-Origin: *
-Set-Cookie: slapp=e2274242-78a0-4e87-8621-5c88f68c10f2.eQFzxwhw0XcLLAILGX62g9-S3rs; Expires=Wed, 15-Jul-2026 04:22:31 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=040cc8b9-3c48-4ae9-9263-7bafee8ec84a.fTwS48F-c6v9UcurEmdwzY3WjMw; Expires=Wed, 15-Jul-2026 05:16:03 GMT; HttpOnly; Path=/; SameSite=Lax
 
 {"error":"Internal error"}
 
+
 ========== gunicorn log NEW lines after Q2(a) — the traceback ==========
-2026-07-08 04:22:31,184 - SL - ERROR - 1699 - "/app/server.py:390" - error_handler() -  - 'NoneType' object has no attribute 'sudo_mode_at'
+$ tail -n +$((mark+1)) /tmp/gunicorn_7777.log
+2026-07-08 05:16:03,738 - SL - ERROR - 2595 - "/app/server.py:390" - error_handler() -  - 'NoneType' object has no attribute 'sudo_mode_at'
 Traceback (most recent call last):
   File "/app/venv/lib/python3.10/site-packages/flask/app.py", line 1950, in full_dispatch_request
     rv = self.dispatch_request()
@@ -212,18 +223,18 @@ Traceback (most recent call last):
   File "/app/app/api/base.py", line 47, in check_sudo_mode_is_active
     return api_key.sudo_mode_at and g.api_key.sudo_mode_at >= arrow.now().shift(
 AttributeError: 'NoneType' object has no attribute 'sudo_mode_at'
-2026-07-08 04:22:31,185 - SL - DEBUG - 1699 - "/app/server.py:284" - after_request() -  - 127.0.0.1 DELETE /api/user ImmutableMultiDict([]) 500, takes 0.006153106689453125
+2026-07-08 05:16:03,738 - SL - DEBUG - 2595 - "/app/server.py:284" - after_request() -  - 127.0.0.1 DELETE /api/user ImmutableMultiDict([]) 500, takes 0.0034606456756591797
 
 ========== Q2 (b): real API key WITHOUT active sudo (Authentication header, sudo_mode_at=NULL) → DELETE /api/user ==========
-$ curl -s -i -H 'Authentication: <Q2KEY>' -X DELETE http://localhost:7777/api/user
+$ curl -s -i -H 'Authentication: <Q2_API_KEY_REDACTED>' -X DELETE http://localhost:7777/api/user
 HTTP/1.1 440 UNKNOWN
 Server: gunicorn/20.0.4
-Date: Wed, 08 Jul 2026 04:22:34 GMT
+Date: Wed, 08 Jul 2026 05:16:03 GMT
 Connection: close
 Content-Type: application/json
 Content-Length: 22
 Access-Control-Allow-Origin: *
-Set-Cookie: slapp=7d581359-dc1f-46a1-bf09-b69cc377a428.I17WBQ1ZHqJMMXkps0Lgi_ezNC4; Expires=Wed, 15-Jul-2026 04:22:34 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=f3dfe085-9b65-4811-b8dc-27372f1d8dcf.e-EYBjWbKVwtHIToJnumaJIMNB8; Expires=Wed, 15-Jul-2026 05:16:03 GMT; HttpOnly; Path=/; SameSite=Lax
 
 {"error":"Need sudo"}
 ```
@@ -451,22 +462,56 @@ the `headers_to_keep` allow‑list survive.
 **(b) Exact commands.** A raw `.eml` carrying the three headers is parsed and driven through the
 real `email_handler.handle_forward(...)` path against a freshly seeded alias; the outbound
 `sl_sendmail` call is intercepted at runtime (no source modification) to capture the exact
-forwarded message.
+forwarded message. The complete self‑contained observation script `/tmp/q5_probe.py` is run
+inside the container and its **entire** stdout+stderr is captured with **no** filtering:
+
+```bash
+docker exec sl bash -c 'cd /app && . venv/bin/activate \
+  && eval "$(grep "^export " /build.sh)" \
+  && python /tmp/q5_probe.py' 2>&1
+```
+
+The observation script, run verbatim:
 
 ```python
+#!/usr/bin/env python3
+"""Q5 - empirical header-handling probe for the email-forwarding path.
+
+Drives a crafted incoming message (custom X-* header + Received + Reply-To)
+through the REAL email_handler.handle_forward(...) path against a freshly
+seeded alias, intercepts the outbound sl_sendmail call at runtime (no source
+modification), and dumps the forwarded message's complete header set so we can
+observe which of the three sibling headers survive and which are stripped.
+
+Usage:  python /tmp/q5_probe.py
+"""
 import email
 from aiosmtpd.smtp import Envelope
-import email_handler
-from app.models import User, Alias
 
-# intercept the outbound forwarded message (runtime monkeypatch, source untouched)
+import email_handler
+from app.models import User, Alias, DeletedAlias
+
+PROBE_EMAIL = "q5-forward-probe@sl.local"
+
+# --- ensure the probe alias is free (idempotent re-run guard) -------------
+_existing = Alias.get_by(email=PROBE_EMAIL)
+if _existing is not None:
+    from app.alias_utils import delete_alias
+    delete_alias(_existing, _existing.user, commit=True)
+_trash = DeletedAlias.get_by(email=PROBE_EMAIL)
+if _trash is not None:
+    DeletedAlias.delete(_trash.id, commit=True)
+
+# --- intercept the outbound forwarded message (runtime monkeypatch) -------
 captured = {}
-def _capture(from_addr, to_addr, msg, mail_options, rcpt_options, is_forward=False, **kw):
+def _capture(from_addr, to_addr, msg, mail_options=(), rcpt_options=(),
+             is_forward=False, **kw):
     captured["from_addr"], captured["to_addr"], captured["msg"] = from_addr, to_addr, msg
 email_handler.sl_sendmail = _capture
 
 u = User.get_by(email="john@wick.com")
-alias = Alias.create(user_id=u.id, email="q5-forward-probe@sl.local", mailbox_id=1, commit=True)
+alias = Alias.create(user_id=u.id, email=PROBE_EMAIL, mailbox_id=1, commit=True)
+print("Seeded alias: %s -> mailbox_id= %s enabled= %s" % (alias.email, alias.mailbox_id, alias.enabled))
 
 raw_eml = (
  "From: External Sender <sender@external.com>\n"
@@ -482,19 +527,53 @@ raw_eml = (
  "Content-Transfer-Encoding: 7bit\nMIME-Version: 1.0\n\nbody\n")
 msg = email.message_from_string(raw_eml)
 
-env = Envelope(); env.mail_from = "sender@external.com"; env.rcpt_tos = ["q5-forward-probe@sl.local"]
-env.mail_options = []; env.rcpt_options = []
-res = email_handler.handle_forward(env, msg, "q5-forward-probe@sl.local")
-for k, v in captured["msg"].items():      # dump forwarded headers verbatim
+print("")
+print("===== ORIGINAL (incoming) message headers \u2014 BEFORE forwarding =====")
+for k, v in msg.items():
     print("  %-28s: %s" % (k, v))
+
+print("")
+print("===== Driving email_handler.handle_forward(envelope, msg, rcpt_to='q5-forward-probe@sl.local') =====")
+env = Envelope()
+env.mail_from = "sender@external.com"
+env.rcpt_tos = ["q5-forward-probe@sl.local"]
+env.mail_options = []
+env.rcpt_options = []
+res = email_handler.handle_forward(env, msg, "q5-forward-probe@sl.local")
+print("handle_forward returned: %r" % (res,))
+
+print("")
+print("===== FORWARDED message \u2014 COMPLETE header set (verbatim, AFTER forwarding) =====")
+print("sl_sendmail from_addr: %s" % captured["from_addr"])
+print("sl_sendmail to_addr  : %s" % captured["to_addr"])
+print("---- forwarded headers ----")
+fwd = captured["msg"]
+for k, v in fwd.items():
+    print("  %-28s: %s" % (k, v))
+
+print("")
+print("===== PER-HEADER VERDICT (Q5 three siblings) =====")
+def verdict(name):
+    vals = fwd.get_all(name)
+    if vals is None:
+        return "<STRIPPED / absent>"
+    return repr(vals)
+print("  %-16s AFTER-forward -> %s" % ("X-Custom-Test", verdict("X-Custom-Test")))
+print("  %-16s AFTER-forward -> %s" % ("Received", verdict("Received")))
+print("  %-16s AFTER-forward -> %s" % ("Reply-To", verdict("Reply-To")))
+print("  %-16s AFTER-forward -> %s" % ("From", verdict("From")))
 ```
 
-**(c) Complete unedited output.** (SL init‑logging lines filtered via
-`| grep -v -E "load words file|>>> URL|Upload files|init logging"`; all forwarding logic and
-headers are shown complete.)
+**(c) Complete unedited output.** The full, unfiltered stdout+stderr of the command above
+(including the SimpleLogin import/init‑logging lines `>>> URL`, `Upload files to local dir`,
+`>>> init logging <<<`, and `load words file`) is reproduced below in its entirety.
 
 ```
-2026-07-08 04:28:05,375 - SL - INFO - 2208 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
+>>> URL: http://localhost
+Upload files to local dir
+>>> init logging <<<
+2026-07-08 05:32:36,517 - SL - DEBUG - 3106 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+2026-07-08 05:32:37,251 - SL - INFO - 3106 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
 Seeded alias: q5-forward-probe@sl.local -> mailbox_id= 1 enabled= True
 
 ===== ORIGINAL (incoming) message headers — BEFORE forwarding =====
@@ -511,23 +590,23 @@ Seeded alias: q5-forward-probe@sl.local -> mailbox_id= 1 enabled= True
   MIME-Version                : 1.0
 
 ===== Driving email_handler.handle_forward(envelope, msg, rcpt_to='q5-forward-probe@sl.local') =====
-2026-07-08 04:28:05,391 - SL - DEBUG - 2208 - "/app/email_handler.py:580" - handle_forward() -  - Create or get contact for from_header:External Sender <sender@external.com>
-2026-07-08 04:28:05,415 - SL - DEBUG - 2208 - "/app/app/contact_utils.py:110" - create_contact() -  - Created contact <Contact 297 sender@external.com 1572> for alias <Alias 1572 q5-forward-probe@sl.local> with email sender@external.com invalid_email=False
-2026-07-08 04:28:05,416 - SL - DEBUG - 2208 - "/app/email_handler.py:589" - handle_forward() -  - Create or get contact for reply_to_header:Reply Sender <replyto-sender@external.com>
-2026-07-08 04:28:05,441 - SL - DEBUG - 2208 - "/app/app/contact_utils.py:110" - create_contact() -  - Created contact <Contact 298 replyto-sender@external.com 1572> for alias <Alias 1572 q5-forward-probe@sl.local> with email replyto-sender@external.com invalid_email=False
-2026-07-08 04:28:05,442 - SL - INFO - 2208 - "/app/app/handler/dmarc.py:33" - apply_dmarc_policy_for_forward_phase() -  - DMARC check disabled
-2026-07-08 04:28:05,452 - SL - DEBUG - 2208 - "/app/email_handler.py:688" - forward_email_to_mailbox() -  - Forward <Contact 297 sender@external.com 1572> -> <Alias 1572 q5-forward-probe@sl.local> -> <Mailbox 1 john@wick.com>
-2026-07-08 04:28:05,457 - SL - DEBUG - 2208 - "/app/email_handler.py:740" - forward_email_to_mailbox() -  - Create <EmailLog 621> for <Contact 297 sender@external.com 1572>, <User 1 John Wick john@wick.com>, <Mailbox 1 john@wick.com>
-2026-07-08 04:28:05,464 - SL - DEBUG - 2208 - "/app/email_handler.py:867" - forward_email_to_mailbox() -  - From header, new:"External Sender - sender at external.com" <sender_at_external_com_iugclqyea@sl.local>, old:External Sender <sender@external.com>
-2026-07-08 04:28:05,465 - SL - DEBUG - 2208 - "/app/email_handler.py:873" - forward_email_to_mailbox() -  - Reply-To header, new:"Reply Sender - replyto-sender at external.com" <replyto-sender_at_external_com_kvusdmq@sl.local>, old:None
-2026-07-08 04:28:05,465 - SL - DEBUG - 2208 - "/app/email_handler.py:316" - replace_header_when_forward() -  - Delete Cc header, old value None
-2026-07-08 04:28:05,466 - SL - DEBUG - 2208 - "/app/email_handler.py:313" - replace_header_when_forward() -  - Replace To header, old: q5-forward-probe@sl.local, new: q5-forward-probe@sl.local
-2026-07-08 04:28:05,466 - SL - INFO - 2208 - "/app/app/handler/unsubscribe_generator.py:36" - _generate_header_with_original_behaviour() -  - Email has no unsubscribe header
-2026-07-08 04:28:05,468 - SL - DEBUG - 2208 - "/app/email_handler.py:893" - forward_email_to_mailbox() -  - Forward mail from sender@external.com to john@wick.com, mail_options:[], rcpt_options:[]
+2026-07-08 05:32:37,263 - SL - DEBUG - 3106 - "/app/email_handler.py:580" - handle_forward() -  - Create or get contact for from_header:External Sender <sender@external.com>
+2026-07-08 05:32:37,287 - SL - DEBUG - 3106 - "/app/app/contact_utils.py:110" - create_contact() -  - Created contact <Contact 299 sender@external.com 1574> for alias <Alias 1574 q5-forward-probe@sl.local> with email sender@external.com invalid_email=False
+2026-07-08 05:32:37,287 - SL - DEBUG - 3106 - "/app/email_handler.py:589" - handle_forward() -  - Create or get contact for reply_to_header:Reply Sender <replyto-sender@external.com>
+2026-07-08 05:32:37,308 - SL - DEBUG - 3106 - "/app/app/contact_utils.py:110" - create_contact() -  - Created contact <Contact 300 replyto-sender@external.com 1574> for alias <Alias 1574 q5-forward-probe@sl.local> with email replyto-sender@external.com invalid_email=False
+2026-07-08 05:32:37,309 - SL - INFO - 3106 - "/app/app/handler/dmarc.py:33" - apply_dmarc_policy_for_forward_phase() -  - DMARC check disabled
+2026-07-08 05:32:37,316 - SL - DEBUG - 3106 - "/app/email_handler.py:688" - forward_email_to_mailbox() -  - Forward <Contact 299 sender@external.com 1574> -> <Alias 1574 q5-forward-probe@sl.local> -> <Mailbox 1 john@wick.com>
+2026-07-08 05:32:37,323 - SL - DEBUG - 3106 - "/app/email_handler.py:740" - forward_email_to_mailbox() -  - Create <EmailLog 622> for <Contact 299 sender@external.com 1574>, <User 1 John Wick john@wick.com>, <Mailbox 1 john@wick.com>
+2026-07-08 05:32:37,329 - SL - DEBUG - 3106 - "/app/email_handler.py:867" - forward_email_to_mailbox() -  - From header, new:"External Sender - sender at external.com" <sender_at_external_com_mbciholwr@sl.local>, old:External Sender <sender@external.com>
+2026-07-08 05:32:37,330 - SL - DEBUG - 3106 - "/app/email_handler.py:873" - forward_email_to_mailbox() -  - Reply-To header, new:"Reply Sender - replyto-sender at external.com" <replyto-sender_at_external_com_bopmfldug@sl.local>, old:None
+2026-07-08 05:32:37,330 - SL - DEBUG - 3106 - "/app/email_handler.py:316" - replace_header_when_forward() -  - Delete Cc header, old value None
+2026-07-08 05:32:37,330 - SL - DEBUG - 3106 - "/app/email_handler.py:313" - replace_header_when_forward() -  - Replace To header, old: q5-forward-probe@sl.local, new: q5-forward-probe@sl.local
+2026-07-08 05:32:37,330 - SL - INFO - 3106 - "/app/app/handler/unsubscribe_generator.py:36" - _generate_header_with_original_behaviour() -  - Email has no unsubscribe header
+2026-07-08 05:32:37,333 - SL - DEBUG - 3106 - "/app/email_handler.py:893" - forward_email_to_mailbox() -  - Forward mail from sender@external.com to john@wick.com, mail_options:[], rcpt_options:[]
 handle_forward returned: [(True, '250 Message accepted for delivery')]
 
 ===== FORWARDED message — COMPLETE header set (verbatim, AFTER forwarding) =====
-sl_sendmail from_addr: sl.lmycyibwgiysyibsgm3tiobshboq.4nvcebd33gwiu@sl.local
+sl_sendmail from_addr: sl.lmycyibwgizcyibsgm3tiobzgjoq.stjwcxvgwxhze@sl.local
 sl_sendmail to_addr  : john@wick.com
 ---- forwarded headers ----
   Subject                     : Q5 header-handling probe
@@ -537,20 +616,20 @@ sl_sendmail to_addr  : john@wick.com
   Content-Transfer-Encoding   : 7bit
   MIME-Version                : 1.0
   X-SimpleLogin-Type          : Forward
-  X-SimpleLogin-EmailLog-ID   : 621
+  X-SimpleLogin-EmailLog-ID   : 622
   X-SimpleLogin-Envelope-From : sender@external.com
   X-SimpleLogin-Original-From : External Sender <sender@external.com>
   X-SimpleLogin-Envelope-To   : q5-forward-probe@sl.local
-  From                        : "External Sender - sender at external.com" <sender_at_external_com_iugclqyea@sl.local>
-  Reply-To                    : "Reply Sender - replyto-sender at external.com" <replyto-sender_at_external_com_kvusdmq@sl.local>
+  From                        : "External Sender - sender at external.com" <sender_at_external_com_mbciholwr@sl.local>
+  Reply-To                    : "Reply Sender - replyto-sender at external.com" <replyto-sender_at_external_com_bopmfldug@sl.local>
   To                          : q5-forward-probe@sl.local
-  DKIM-Signature              : v=1; a=rsa-sha256; c=relaxed/simple; d=sl.local;  i=@sl.local; q=dns/txt; s=dkim; t=1783484885; h=message-id : date :  subject : from : to; bh=u28oeqXN5gyghdpfKG0KBVa10XfcJzyUhzv7W17ZshE=;  b=SiGxjf1HfKXzxtz2nKGwy/k7JWa+sUDPvyyXCkbrpfBggulTT3+sQvaa1NYtW4qGL9Hvb  pS5ZEaBStIe3F6LAWzcCRdNnf4nlMlS4MqG5EUDfgzyvJek4z88O7JScJVgsiv+7u32mZnK  gHulHH5wtTUzYUablkVzU7bkmb+KTnM=
+  DKIM-Signature              : v=1; a=rsa-sha256; c=relaxed/simple; d=sl.local;  i=@sl.local; q=dns/txt; s=dkim; t=1783488757; h=message-id : date :  subject : from : to; bh=Ck5SoRNWUpSR4X0COv7R5ub2pUTtl6xz4dTFz++ji4M=;  b=Hc6cE9Hhtv22rrDoQsoTgx70ITkHnnYCD6iUKgRGknrhBYzz5JD0sXKWk/kLxGfjDKnej  8/YuHwPKR+UQUqfbzfBCj0ALku/DTz69qCg3jxL0wtXZK7TWHNnb9PJQFz5aKSnX5Km2onN  ypt7LGhfryJon9woYVF4n0/P+5o1hE4=
 
 ===== PER-HEADER VERDICT (Q5 three siblings) =====
   X-Custom-Test    AFTER-forward -> <STRIPPED / absent>
   Received         AFTER-forward -> <STRIPPED / absent>
-  Reply-To         AFTER-forward -> ['"Reply Sender - replyto-sender at external.com" <replyto-sender_at_external_com_kvusdmq@sl.local>']
-  From             AFTER-forward -> ['"External Sender - sender at external.com" <sender_at_external_com_iugclqyea@sl.local>']
+  Reply-To         AFTER-forward -> ['"Reply Sender - replyto-sender at external.com" <replyto-sender_at_external_com_bopmfldug@sl.local>']
+  From             AFTER-forward -> ['"External Sender - sender at external.com" <sender_at_external_com_mbciholwr@sl.local>']
 ```
 
 **(d) Concrete observed values (all three sibling items).**
@@ -558,10 +637,10 @@ sl_sendmail to_addr  : john@wick.com
 - **`Received: from mail.external.com …`** — present before → **STRIPPED** (absent) after.
 - **`Reply-To: Reply Sender <replyto-sender@external.com>`** — present before → original
   **STRIPPED**, then **REPLACED** with
-  `"Reply Sender - replyto-sender at external.com" <replyto-sender_at_external_com_kvusdmq@sl.local>`
+  `"Reply Sender - replyto-sender at external.com" <replyto-sender_at_external_com_bopmfldug@sl.local>`
   (a reverse‑alias, a *different* value).
 - (Related) **`From`** rewritten from `External Sender <sender@external.com>` to
-  `"External Sender - sender at external.com" <sender_at_external_com_iugclqyea@sl.local>`.
+  `"External Sender - sender at external.com" <sender_at_external_com_mbciholwr@sl.local>`.
 - Headers that **survived** (on the allow‑list): `Subject`, `Date`, `Message-ID`,
   `Content-Type`, `Content-Transfer-Encoding`, `MIME-Version`, `To`. SimpleLogin then adds its
   own `X-SimpleLogin-*` and `DKIM-Signature` headers.
@@ -605,69 +684,140 @@ runs bracket the boundary consistently: last valid at `t=600.001s`, first expire
 `t=601.001s`/`t=601.002s`.
 
 **(b) Exact commands.** Sign a suffix with the **real** `app/alias_suffix.py` signer, then probe
-`check_suffix_signature` at increasing ages that cross the 600s boundary. Two runs launched in
-parallel for stability (Run A probes `0,300,590,598,599,600,601,602,605,610`s; Run B probes
-`0,595,599,601,603`s).
+`check_suffix_signature` at increasing ages that cross the 600s boundary. The complete
+self‑contained script `/tmp/q6_timing.py` (below) takes a run label and selects a probe schedule
+via `PROBE_SCHEDULES[run]` (Run A probes `0,300,590,598,599,600,601,602,605,610`s over ~610s of
+wall‑clock; Run B probes `0,595,599,601,603`s over ~603s). Two runs are launched detached, in
+parallel, so their overlapping schedules bracket the boundary for stability.
 
 ```python
-import time, sys
-from app import config
-from app.alias_suffix import signer, check_suffix_signature   # real module
+#!/usr/bin/env python3
+"""Q6 — empirical expiry-window probe for the alias-suffix signed token.
+
+Signs a suffix with the REAL app/alias_suffix.py signer, then calls the REAL
+check_suffix_signature() at a schedule of increasing ages that straddle the
+max_age=600 boundary (app/alias_suffix.py:40). Prints, for each probe, the
+monotonic elapsed time and whether the token is still VALID or has EXPIRED.
+
+Usage:  python /tmp/q6_timing.py <RUN_LABEL>
+        RUN_LABEL selects a probe schedule: "A" (dense, ~610s) or "B" (~603s).
+"""
+import sys
+import time
+
+from app import config                                   # canonical config
+from app.alias_suffix import signer, check_suffix_signature  # real module
+
+# Probe schedules (seconds since signing). Two independent schedules give an
+# overlapping, stability-confirming bracket around the 600s boundary.
+PROBE_SCHEDULES = {
+    "A": [0, 300, 590, 598, 599, 600, 601, 602, 605, 610],
+    "B": [0, 595, 599, 601, 603],
+}
+
+run = sys.argv[1] if len(sys.argv) > 1 else "A"
+probes = PROBE_SCHEDULES[run]
+tag = "[RUN %s]" % run
 
 suffix = ".investigation-q6@example.com"
-signed = signer.sign(suffix).decode()          # app/alias_suffix.py:114-style
+signed = signer.sign(suffix).decode()                    # app/alias_suffix.py:114-style
+
+print("%s CUSTOM_ALIAS_SECRET=%r (=FLASK_SECRET+\"custom_alias\", app/config.py:201)"
+      % (tag, config.CUSTOM_ALIAS_SECRET))
+print("%s signer=itsdangerous.TimestampSigner (app/alias_suffix.py:11); "
+      "check_suffix_signature max_age=600 (app/alias_suffix.py:40)" % tag)
+print("%s signed_suffix=%r" % (tag, signed))
+sys.stdout.flush()
+
 t0 = time.monotonic()
-for p in probes:                                # probe schedule per run
+for p in probes:
     now = time.monotonic() - t0
-    if p > now: time.sleep(p - now)
+    if p > now:
+        time.sleep(p - now)
     elapsed = time.monotonic() - t0
-    res = check_suffix_signature(signed)        # app/alias_suffix.py:37-42, max_age=600
-    print("t=%8.3fs -> %r" % (elapsed, res))
+    res = check_suffix_signature(signed)                 # app/alias_suffix.py:37-42, max_age=600
+    if res is None:
+        verdict = "EXPIRED (returns None)"
+        shown = "None"
+        print("%s t=%8.3fs  check_suffix_signature -> %-31s %s"
+              % (tag, elapsed, shown, verdict))
+    else:
+        verdict = "VALID (returns suffix)"
+        print("%s t=%8.3fs  check_suffix_signature -> %-31r %s"
+              % (tag, elapsed, res, verdict))
+    sys.stdout.flush()
+print("%s DONE" % tag)
+sys.stdout.flush()
 ```
+
+Launch (both detached, in parallel), then collect each complete log after they finish:
+
 ```bash
-# launched detached, in parallel:
-docker exec -d sl bash -c '… python /tmp/q6_timing.py A > /tmp/q6_runA.log 2>&1'
-docker exec -d sl bash -c '… python /tmp/q6_timing.py B > /tmp/q6_runB.log 2>&1'
+docker exec -d sl bash -c 'cd /app && . venv/bin/activate \
+  && eval "$(grep "^export " /build.sh)" \
+  && python /tmp/q6_timing.py A > /tmp/q6_runA.log 2>&1'
+docker exec -d sl bash -c 'cd /app && . venv/bin/activate \
+  && eval "$(grep "^export " /build.sh)" \
+  && python /tmp/q6_timing.py B > /tmp/q6_runB.log 2>&1'
+# after both finish (~610s / ~603s):
+docker exec sl cat /tmp/q6_runA.log
+docker exec sl cat /tmp/q6_runB.log
 ```
 
-**(c) Complete unedited output.**
+**(c) Complete unedited output.** The full, unfiltered logs of both runs (including the
+SimpleLogin import/init‑logging lines `>>> URL`, `Upload files to local dir`,
+`>>> init logging <<<`, and `load words file`) are reproduced below in their entirety.
+
+Run A — `docker exec sl cat /tmp/q6_runA.log`:
 
 ```
-=============== Q6 Run A ===============
+>>> URL: http://localhost
+Upload files to local dir
+>>> init logging <<<
+2026-07-08 05:09:05,208 - SL - DEBUG - 2539 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
 [RUN A] CUSTOM_ALIAS_SECRET='secretcustom_alias' (=FLASK_SECRET+"custom_alias", app/config.py:201)
 [RUN A] signer=itsdangerous.TimestampSigner (app/alias_suffix.py:11); check_suffix_signature max_age=600 (app/alias_suffix.py:40)
-[RUN A] signed_suffix='.investigation-q6@example.com.ak3QJw.BUNTTncx6DR896YZbgLNTXlaLx4'
-[RUN A] t=   0.000s  check_suffix_signature -> '.investigation-q6@example.com'   VALID (returns suffix)
-[RUN A] t= 300.099s  check_suffix_signature -> '.investigation-q6@example.com'   VALID (returns suffix)
-[RUN A] t= 590.100s  check_suffix_signature -> '.investigation-q6@example.com'   VALID (returns suffix)
-[RUN A] t= 598.008s  check_suffix_signature -> '.investigation-q6@example.com'   VALID (returns suffix)
-[RUN A] t= 599.001s  check_suffix_signature -> '.investigation-q6@example.com'   VALID (returns suffix)
-[RUN A] t= 600.001s  check_suffix_signature -> '.investigation-q6@example.com'   VALID (returns suffix)
-[RUN A] t= 601.001s  check_suffix_signature -> None                              EXPIRED (returns None)
-[RUN A] t= 602.000s  check_suffix_signature -> None                              EXPIRED (returns None)
-[RUN A] t= 605.003s  check_suffix_signature -> None                              EXPIRED (returns None)
-[RUN A] t= 610.004s  check_suffix_signature -> None                              EXPIRED (returns None)
+[RUN A] signed_suffix='.investigation-q6@example.com.ak3bcQ.fhOAjYecEx8GImx0RDpJ9Zt3pZM'
+[RUN A] t=   0.000s  check_suffix_signature -> '.investigation-q6@example.com' VALID (returns suffix)
+[RUN A] t= 300.079s  check_suffix_signature -> '.investigation-q6@example.com' VALID (returns suffix)
+[RUN A] t= 590.100s  check_suffix_signature -> '.investigation-q6@example.com' VALID (returns suffix)
+[RUN A] t= 598.004s  check_suffix_signature -> '.investigation-q6@example.com' VALID (returns suffix)
+[RUN A] t= 599.001s  check_suffix_signature -> '.investigation-q6@example.com' VALID (returns suffix)
+[RUN A] t= 600.001s  check_suffix_signature -> '.investigation-q6@example.com' VALID (returns suffix)
+[RUN A] t= 601.001s  check_suffix_signature -> None                            EXPIRED (returns None)
+[RUN A] t= 602.001s  check_suffix_signature -> None                            EXPIRED (returns None)
+[RUN A] t= 605.003s  check_suffix_signature -> None                            EXPIRED (returns None)
+[RUN A] t= 610.005s  check_suffix_signature -> None                            EXPIRED (returns None)
 [RUN A] DONE
+```
 
-=============== Q6 Run B ===============
+Run B — `docker exec sl cat /tmp/q6_runB.log`:
+
+```
+>>> URL: http://localhost
+Upload files to local dir
+>>> init logging <<<
+2026-07-08 05:09:05,316 - SL - DEBUG - 2547 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
 [RUN B] CUSTOM_ALIAS_SECRET='secretcustom_alias' (=FLASK_SECRET+"custom_alias", app/config.py:201)
 [RUN B] signer=itsdangerous.TimestampSigner (app/alias_suffix.py:11); check_suffix_signature max_age=600 (app/alias_suffix.py:40)
-[RUN B] signed_suffix='.investigation-q6@example.com.ak3QKA.ix1RpyIE_b-desyGbP9qZMZjlQg'
-[RUN B] t=   0.081s  check_suffix_signature -> '.investigation-q6@example.com'   VALID (returns suffix)
-[RUN B] t= 595.082s  check_suffix_signature -> '.investigation-q6@example.com'   VALID (returns suffix)
-[RUN B] t= 599.003s  check_suffix_signature -> '.investigation-q6@example.com'   VALID (returns suffix)
-[RUN B] t= 601.002s  check_suffix_signature -> None                              EXPIRED (returns None)
-[RUN B] t= 603.002s  check_suffix_signature -> None                              EXPIRED (returns None)
+[RUN B] signed_suffix='.investigation-q6@example.com.ak3bcQ.fhOAjYecEx8GImx0RDpJ9Zt3pZM'
+[RUN B] t=   0.000s  check_suffix_signature -> '.investigation-q6@example.com' VALID (returns suffix)
+[RUN B] t= 595.100s  check_suffix_signature -> '.investigation-q6@example.com' VALID (returns suffix)
+[RUN B] t= 599.004s  check_suffix_signature -> '.investigation-q6@example.com' VALID (returns suffix)
+[RUN B] t= 601.002s  check_suffix_signature -> None                            EXPIRED (returns None)
+[RUN B] t= 603.002s  check_suffix_signature -> None                            EXPIRED (returns None)
 [RUN B] DONE
 ```
 
 **(d) Concrete observed values.**
-- **Immediate:** valid (`Run A` `t=0.000s`, `Run B` `t=0.081s` → returns the suffix).
+- **Immediate:** valid (`Run A` `t=0.000s`, `Run B` `t=0.000s` → returns the suffix).
 - **Post‑expiry:** `None` (`Run A` `t=601.001s`+, `Run B` `t=601.002s`+).
-- **Boundary (run scale/duration):** each run spanned ~610s of real wall‑clock. **Last VALID at
-  `t=600.001s` (Run A); first EXPIRED at `t=601.001s` (Run A) and `t=601.002s` (Run B).** The
-  window is therefore **≈600 seconds**.
-- **Stability (≥2 runs):** both runs agree — valid at ≤600s, expired at ≥601s.
+- **Boundary (run scale/duration):** the two runs used different wall‑clock spans that both cross
+  the 600s boundary — **Run A spanned ~610s** (last probe `t=610.005s`) and **Run B spanned ~603s**
+  (last probe `t=603.002s`). **Last VALID at `t=600.001s` (Run A); first EXPIRED at `t=601.001s`
+  (Run A) and `t=601.002s` (Run B).** The window is therefore **≈600 seconds**.
+- **Stability (≥2 runs):** both runs agree — valid at ≤600s (Run A confirms `t=600.001s` still
+  valid), expired at ≥601s.
 
 **(e) `file:line` grounding.** `signer = itsdangerous.TimestampSigner(config.CUSTOM_ALIAS_SECRET)`
 (`app/alias_suffix.py:11`); `CUSTOM_ALIAS_SECRET = FLASK_SECRET + "custom_alias"`
@@ -796,51 +946,89 @@ limit off). Part 2 (429 edge) on a second gunicorn (`:7778`) started with `DISAB
 **unset** so rate limiting is **on**.
 
 ```bash
-# PART 1 — canonical gunicorn :7777
+# PART 1 — canonical gunicorn :7777 (rate limit OFF)
 BASE=http://localhost:7777 ; JAR=/tmp/q8_cookies.txt ; rm -f "$JAR"
+mark=$(wc -l < /tmp/gunicorn_7777.log)   # record log length BEFORE the login-page GET + failed POST
 CSRF=$(curl -s -c "$JAR" "$BASE/auth/login" | grep -oP 'name="csrf_token"[^>]*value="\K[^"]+' | head -1)
-curl -s -i -b "$JAR" -c "$JAR" \
+curl -s -b "$JAR" -c "$JAR" \
   --data-urlencode "email=john@wick.com" --data-urlencode "password=wrongpassword" \
   --data-urlencode "csrf_token=$CSRF" "$BASE/auth/login" -o /tmp/q8_response.html -D /tmp/q8_response_headers.txt
-cat /tmp/q8_response_headers.txt
+cat /tmp/q8_response_headers.txt                  # status line + response headers
 grep -n "Email or password incorrect" /tmp/q8_response.html
-# emitted server logs during the failed login:
-tail -n +<mark> /tmp/gunicorn_7777.log
+tail -n +$((mark+1)) /tmp/gunicorn_7777.log      # the emitted server logs during the failed login
 
-# PART 2 — 429 edge: second gunicorn with rate limiting ON
+# PART 2 — 429 edge: second gunicorn with rate limiting ON, then run the repeated-login loop
 docker exec -d sl bash -c 'cd /app && . venv/bin/activate && eval "$(grep "^export " /build.sh)" \
    && unset DISABLE_RATE_LIMIT && exec gunicorn wsgi:app -b 0.0.0.0:7778 -w 2 --timeout 15 > /tmp/gunicorn_7778.log 2>&1'
-# then POST wrong creds repeatedly against :7778 and record status per attempt
+bash /tmp/q8_429_loop.sh                          # the exact loop is shown in full below
+```
+
+The complete Part-2 loop script (`/tmp/q8_429_loop.sh`), run verbatim above:
+
+```bash
+#!/usr/bin/env bash
+# Q8 429 edge: drive repeated FAILED logins (wrong password) against the
+# rate-limited gunicorn on :7778 (started with DISABLE_RATE_LIMIT unset), record
+# the HTTP status per attempt, and capture the FIRST 429 response IN FULL
+# (status line + headers + body head). The failed-login branch sets g.deduct_limit,
+# so each failure deducts from the "10/minute" bucket (app/auth/views/login.py:22-24).
+set -u
+BASE=http://localhost:7778
+JAR=/tmp/q8_429_jar.txt ; rm -f "$JAR"
+RESP_DIR=/tmp/q8_429_resp ; rm -rf "$RESP_DIR" ; mkdir -p "$RESP_DIR"
+
+CSRF=$(curl -s -c "$JAR" "$BASE/auth/login" \
+        | grep -oP 'name="csrf_token"[^>]*value="\K[^"]+' | head -1)
+echo "csrf_token: $CSRF"
+echo 'Rate limit rule: @limiter.limit("10/minute", deduct_when=...g.deduct_limit) [app/auth/views/login.py:22-24]'
+echo ""
+echo "===== Repeated failed logins (wrong password) — observe status per attempt ====="
+first429=""
+for i in $(seq 1 15); do
+  curl -s -i -b "$JAR" -c "$JAR" \
+    --data-urlencode "email=john@wick.com" \
+    --data-urlencode "password=wrongpassword" \
+    --data-urlencode "csrf_token=$CSRF" \
+    "$BASE/auth/login" > "$RESP_DIR/resp_$i.txt"
+  code=$(awk 'NR==1{print $2}' "$RESP_DIR/resp_$i.txt")
+  printf "  attempt #%s -> HTTP %s\n" "$i" "$code"
+  if [ "$code" = "429" ] && [ -z "$first429" ]; then first429="$i"; fi
+done
+echo ""
+echo "===== Full response of the FIRST 429 (status line + headers + body head) ====="
+FILE="$RESP_DIR/resp_$first429.txt"
+# 1) status line + headers (everything up to and including the blank CRLF line)
+sed -n '1,/^\r\{0,1\}$/p' "$FILE"
+# 2) body head (first 20 lines after the header/body separator)
+echo "---- body head (first 20 lines of the 429 HTML) ----"
+awk 'b{print} /^\r?$/{b=1}' "$FILE" | head -20
 ```
 
 **(c) Complete unedited output.**
 
 ```
 === Q8 PART 1: failed login (wrong creds) on canonical gunicorn :7777 (rate limit OFF) ===
---- response status line + headers ---
+$ mark=$(wc -l < /tmp/gunicorn_7777.log)   # record log length BEFORE the login-page GET + failed POST
+mark=58
+--- response status line + headers (failed POST) ---
 HTTP/1.1 200 OK
 Server: gunicorn/20.0.4
-Date: Wed, 08 Jul 2026 04:25:11 GMT
+Date: Wed, 08 Jul 2026 05:24:12 GMT
 Connection: close
 Content-Type: text/html; charset=utf-8
 Content-Length: 7275
-Set-Cookie: slapp=c56ff1f8-b150-4e15-b0c4-f4fc38d2e45c.F4Y7BaCcioOVSo6E_yV0GuPxCvs; Expires=Wed, 15-Jul-2026 04:25:11 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=98a16904-c9d3-4de7-823d-1728f407995a.wIkEU24moEXpUQTCzDlKuJzqM4A; Expires=Wed, 15-Jul-2026 05:24:12 GMT; HttpOnly; Path=/; SameSite=Lax
 
---- grep the flash message in the rendered HTML body ---
-Email or password incorrect
---- surrounding HTML context of the flash ---
-100-
-101:            <script>toastr.error("Email or password incorrect");</script>
-102-
+--- flash message location in the rendered HTML (grep -n) ---
+93:            <script>toastr.error("Email or password incorrect");</script>
 
-=== gunicorn :7777 NEW log lines during the failed login (the emitted log output) ===
-2026-07-08 04:25:11,077 - SL - DEBUG - 1698 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET /auth/login ImmutableMultiDict([]) 200, takes 0.0012645721435546875
-2026-07-08 04:25:11,328 - SL - DEBUG - 1698 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /auth/login ImmutableMultiDict([]) 200, takes 0.24069523811340332
+=== gunicorn :7777 NEW log lines during the failed login (tail -n +$((mark+1))) ===
+2026-07-08 05:24:12,398 - SL - DEBUG - 2595 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET /auth/login ImmutableMultiDict([]) 200, takes 0.0012831687927246094
+2026-07-08 05:24:12,651 - SL - DEBUG - 2595 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /auth/login ImmutableMultiDict([]) 200, takes 0.24167585372924805
 ```
 
 ```
-=================== RUNNING Q8 429 edge ===================
-csrf_token: IjY1YmFlYmZjMzBlNzAzNjU4NTYyYmQ5Nzk1MzAwYWVhZjFlYTZjNDEi.ak3RVA.PVcrLBRhevP_CiYO7EQaxXW25Mk
+csrf_token: IjZiMWU3ZTZjY2QxYmZhZjVmODcyZTkxMmI4Yjg5ZTJlMzdmY2Y4ZjQi.ak3eMA.UZng9Jolyc_PTv3VMTIvIUrt0nM
 Rate limit rule: @limiter.limit("10/minute", deduct_when=...g.deduct_limit) [app/auth/views/login.py:22-24]
 
 ===== Repeated failed logins (wrong password) — observe status per attempt =====
@@ -860,21 +1048,43 @@ Rate limit rule: @limiter.limit("10/minute", deduct_when=...g.deduct_limit) [app
   attempt #14 -> HTTP 429
   attempt #15 -> HTTP 429
 
-===== Full response of the FIRST 429 (status line + body head) =====
+===== Full response of the FIRST 429 (status line + headers + body head) =====
 HTTP/1.1 429 TOO MANY REQUESTS
 Server: gunicorn/20.0.4
-Date: Wed, 08 Jul 2026 04:25:59 GMT
+Date: Wed, 08 Jul 2026 05:20:51 GMT
 Connection: close
 Content-Type: text/html; charset=utf-8
 Content-Length: 5617
-Set-Cookie: slapp=c4740114-5322-480d-9b37-4a74729a52a6.W7TRGGKxOVPGm4ntUpET10kxu4I; Expires=Wed, 15-Jul-2026 04:25:59 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=86cbcabb-fcca-403e-b573-47c0859a33f0.LJ5Gok-68iiaS2tOy0TqYWPetPM; Expires=Wed, 15-Jul-2026 05:20:51 GMT; HttpOnly; Path=/; SameSite=Lax
+
+---- body head (first 20 lines of the 429 HTML) ----
+
+<!DOCTYPE html>
+<html lang="en"
+      dir="ltr"
+      data-theme="">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport"
+          content="width=device-width, user-scalable=no, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0" />
+    <meta http-equiv="X-UA-Compatible" content="ie=edge" />
+    <meta http-equiv="Content-Language" content="en" />
+    <meta name="msapplication-TileColor" content="#2d89ef" />
+    <meta name="theme-color" content="#4188c9" />
+    <meta name="apple-mobile-web-app-status-bar-style"
+          content="black-translucent" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="HandheldFriendly" content="True" />
+    <meta name="MobileOptimized" content="320" />
+    <meta name="referrer" content="no-referrer" />
 ```
 
 **(d) Concrete observed values.**
 - **HTTP response:** `HTTP/1.1 200 OK` (not 401); body length 7275; flash rendered as
-  `<script>toastr.error("Email or password incorrect");</script>` (line 101 of the HTML).
+  `<script>toastr.error("Email or password incorrect");</script>` (line 93 of the HTML).
 - **Emitted log output:** only the `server.py:284` access lines
-  (`… GET /auth/login … 200 …` and `… POST /auth/login ImmutableMultiDict([]) 200, takes 0.240…`).
+  (`… GET /auth/login … 200 …` and `… POST /auth/login ImmutableMultiDict([]) 200, takes 0.241…`).
   **No dedicated application log line** exists for the failed‑credential branch.
 - **429 edge:** attempts `#1–#10` → `HTTP 200`; attempt `#11` onward → `HTTP 429 TOO MANY REQUESTS`.
 
@@ -944,19 +1154,20 @@ Re‑reading each question and confirming every named sub‑item is answered wit
 This was a read‑only investigation. No existing SimpleLogin source file was modified; all
 temporary observation scripts and crafted `.eml` fixtures were created inside the container's
 `/tmp` (outside any tracked tree) and removed afterward. The only committed artifact is this
-document. Verified on the host repository (`git status --porcelain` collapses the wholly‑new
-`blitzy/` directory to a single entry; `-uall` expands it to the individual file):
+document. Verified on the host repository **after committing**: the working tree is clean
+(`git status --porcelain` prints nothing), and diffing against the pre‑investigation baseline
+commit `2cd6ee777f8c2d3531559588bcfb18627ffb5d2c` shows exactly one added file and no source
+changes:
 
 ```
 $ git status --porcelain
-?? blitzy/
 
-$ git status --porcelain -uall
-?? blitzy/documentation/app_2cd6ee777f8c.md
+$ git diff 2cd6ee777f8c2d3531559588bcfb18627ffb5d2c --name-status
+A	blitzy/documentation/app_2cd6ee777f8c.md
 ```
 
-No tracked source file appears as modified or deleted — the only untracked content is this new
-document (its containing `blitzy/` and `blitzy/documentation/` directories are new only insofar
-as they hold this file). After staging, the entry becomes
-`A  blitzy/documentation/app_2cd6ee777f8c.md`, confirming exactly one committed artifact.
+The empty `git status --porcelain` confirms every change is committed with nothing left
+untracked or modified, and the baseline `--name-status` diff confirms the sole change
+introduced across the entire investigation is this one new document (`A` = added) — no tracked
+source file appears as added, modified, or deleted.
 
