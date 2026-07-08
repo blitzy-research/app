@@ -113,6 +113,40 @@ Dev-server kernel socket (loopback bind):
 local=127.0.0.1:7777 state=LISTEN
 ```
 
+Dev-server full stdout (one representative capture; because `debug=True` enables the
+Werkzeug reloader, the import runs twice, so the SL bootstrap block appears **twice** —
+once in the reloader parent and once in the reloaded child; the `/tmp/...` GNUPGHOME paths
+and the timestamps are volatile between runs):
+
+```
+load config file /app/tests/test.env
+>>> URL: http://localhost
+WARNING: Use a temp directory for GNUPGHOME /tmp/wnrfjqwdeakzftyohyfr
+Upload files to local dir
+>>> init logging <<<
+2026-07-08 08:28:15,012 - SL - DEBUG - 188 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+ * Serving Flask app "server" (lazy loading)
+ * Environment: production
+   WARNING: This is a development server. Do not use it in a production deployment.
+   Use a production WSGI server instead.
+ * Debug mode: on
+load config file /app/tests/test.env
+>>> URL: http://localhost
+WARNING: Use a temp directory for GNUPGHOME /tmp/djftrotxxfkwhplxqils
+Upload files to local dir
+>>> init logging <<<
+2026-07-08 08:28:16,889 - SL - DEBUG - 201 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+```
+
+Two observed facts in this capture matter for the answer: (1) the Flask CLI preamble lines
+(`* Serving Flask app "server" (lazy loading)`, `* Environment: production`, the two
+development-server `WARNING:` lines, and `* Debug mode: on`) **are** printed — they are
+emitted via `click`/`print`, not through the `werkzeug` logger; but (2) the Werkzeug
+`* Running on http://127.0.0.1:7777/` banner is **absent** (see **Why** below). That
+contrast — preamble present, banner and access logs absent — is itself the evidence that
+only the `werkzeug`-logger-emitted output is suppressed, while the bind and the plain
+`print`/`click` output are unaffected.
+
 Production (gunicorn) kernel socket:
 
 ```
@@ -164,7 +198,6 @@ Reproduced exactly (comment and both statements, no elision):
 
 ```
 # Disable flask logs such as 127.0.0.1 - - [15/Feb/2013 10:52:22] "GET /index.html HTTP/1.1" 200
-
 log = logging.getLogger("werkzeug")
 log.disabled = True
 ```
@@ -375,7 +408,7 @@ new row (`id=2`):
 ```
 id=2  email='rebels_cosies753@sl.local'  user_id=1  mailbox_id=1
 enabled=True  note='onboarding test alias'  name=None
-created_at=<Arrow 2026-07-07T22:19:53.776515+00:00>  updated_at=None
+created_at=<Arrow [2026-07-07T22:19:53.776515+00:00]>  updated_at=None
 automatic_creation=False  pinned=False  disable_pgp=False
 ```
 
@@ -384,7 +417,7 @@ How the persisted columns map to the JSON response fields:
 - `email` ↔ JSON `email` **and** the top-level `alias` (both are `alias.email`).
 - `note` ↔ JSON `note` (`onboarding test alias`).
 - `created_at` ↔ JSON `creation_date` (string form) **and** `creation_timestamp`
-  (Unix seconds); e.g. `created_at=<Arrow 2026-07-07T22:19:53.776515+00:00>` corresponds
+  (Unix seconds); e.g. `created_at=<Arrow [2026-07-07T22:19:53.776515+00:00]>` corresponds
   to `creation_date="2026-07-07 22:19:53+00:00"` and `creation_timestamp=1783462793`.
 - `mailbox_id=1` ↔ JSON `mailbox.id` (and the single entry in `mailboxes`), whose `email`
   is the seeded default mailbox `probe_orv0pbfx@example.com`.
@@ -534,11 +567,15 @@ connection to server at "localhost" (127.0.0.1), port 15432 failed: Connection r
 ### Why (cause → effect)
 
 The low-level driver error is `psycopg2.OperationalError`: the connect is attempted
-against `localhost`, which resolves to **both** IPv6 `::1` and IPv4 `127.0.0.1` — in that
-order, because `/etc/hosts` lists `::1 localhost` and the resolver returns the IPv6 entry
-first. In the canonical environment **both** address attempts fail with **Connection
-refused**: there is no listener on port `15432`, and because `::1` is assigned to the
-loopback interface (`/proc/net/if_inet6` shows `::1` on `lo`), `connect(::1:15432)` returns
+against `localhost`, which resolves to **both** IPv6 `::1` and IPv4 `127.0.0.1`. In this
+environment `/etc/hosts` lists **both** entries (`127.0.0.1 localhost` on the first line and
+`::1 localhost` on the second), and the C-library resolver (`getaddrinfo`) returns the
+**IPv6 address first** under its default RFC 3484 address-precedence rules — which is why
+`::1` is attempted (and reported) before `127.0.0.1`, even though `127.0.0.1` is the first
+line in `/etc/hosts`. In the canonical environment **both** address attempts fail with
+**Connection refused**: there is no listener on port `15432`, and because `::1` is assigned
+to the loopback interface (`/proc/net/if_inet6` shows `::1` on `lo`), `connect(::1:15432)`
+returns
 `ECONNREFUSED` ("Connection refused") rather than `EADDRNOTAVAIL`. SQLAlchemy then wraps
 that driver exception into `sqlalchemy.exc.OperationalError` (note the
 `(psycopg2.OperationalError)` prefix and the `http://sqlalche.me/e/13/e3q8` background
@@ -593,7 +630,7 @@ evidence, sibling variant, and causal reason:
 - [x] **Health status + Content-Type.** `200` with `Content-Type: text/html; charset=utf-8` — observed `status=200 content_type='text/html; charset=utf-8'`. `/health` excluded from `after_request` timing at `server.py:L281` (timing `LOG.d` at `server.py:L284`), verified by contrast with `/live`.
 - [x] **Alias JSON — both endpoints.** `201` JSON (verbatim 17-key body) from `POST /api/alias/random/new` (`app/api/views/new_random_alias.py:L21`, return tuple `L114-L117`, shape from `serialize_alias_info_v2` `app/api/serializer.py:L55-L93`). Sibling `POST /api/v3/alias/custom/new` (`app/api/views/new_custom_alias.py:L115`, handler `L119`) returns the identical shape; observed `email='my-custom-prefix.b7n3s9wh@sl.local'`.
 - [x] **Table name.** `alias` — `Alias.__tablename__ = "alias"` at `app/models.py:L1470`; historical `gen_email` → `alias` rename observed in the live PostgreSQL catalog (sequence `gen_email_id_seq`, constraint `gen_email_pkey` — these auto-generated names are **not** in `app/models.py`; table created as `gen_email` at `migrations/versions/5e549314e1e2_.py:L92-L101`, renamed at `migrations/versions/2020_031711_e9395fe234a4_.py:L20-L21`).
-- [x] **Persisted values.** The `id=2` row columns (`email`, `user_id=1`, `mailbox_id=1`, `enabled=True`, `note`, `name=None`, `created_at=<Arrow 2026-07-07T22:19:53.776515+00:00>`, `updated_at=None`, `automatic_creation=False`, `pinned=False`, `disable_pgp=False`), mapped to the JSON fields. `mailbox_id=1` resolved from `user.default_mailbox_id` (`app/models.py:L1753`), created by `User.create` (`app/models.py:L611-L613`).
+- [x] **Persisted values.** The `id=2` row columns (`email`, `user_id=1`, `mailbox_id=1`, `enabled=True`, `note`, `name=None`, `created_at=<Arrow [2026-07-07T22:19:53.776515+00:00]>`, `updated_at=None`, `automatic_creation=False`, `pinned=False`, `disable_pgp=False`), mapped to the JSON fields. `mailbox_id=1` resolved from `user.default_mailbox_id` (`app/models.py:L1753`), created by `User.create` (`app/models.py:L611-L613`).
 - [x] **PostgreSQL-down error.** Two-layer verbatim error: `psycopg2.OperationalError` (in the canonical environment **both** IPv6 `::1` and IPv4 `127.0.0.1` → Connection refused, `::1` listed first; port `15432`) wrapped by `sqlalchemy.exc.OperationalError` (`http://sqlalche.me/e/13/e3q8`). The per-address errno/ordering is environment-dependent (`::1` → `Cannot assign requested address` on a host where `::1` is not bound to loopback); the two-layer wrapping and the eager break at `app/db.py:L12` at import time are invariant.
 - [x] **Break location.** `app/db.py:L12` `connection = engine.connect()` (eager, import-time), reached via `server.py:L31` → `app/admin_model.py:L11` → `app/models.py:L32` → `app/db.py:L12`.
 - [x] **Both alias endpoints, both server entry points, happy + error paths.** Random + custom alias endpoints; dev + gunicorn entry points; health/alias happy paths + PostgreSQL-down error path — all exercised.
