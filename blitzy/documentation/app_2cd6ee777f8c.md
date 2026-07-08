@@ -137,7 +137,7 @@ psql "$DB" -c "SELECT table_name FROM information_schema.tables WHERE table_sche
 
 The **complete unedited output** of this exact sequence, for **both** runs, is in **Appendix A**
 (Run 1 = fresh/empty start; Run 2 = reset of the now-populated DB, whose `drop schema … cascade`
-NOTICE enumerates all 81 dropped objects). The `alembic upgrade head` step emits the full **255**
+NOTICE enumerates all 82 other objects — 77 tables + 4 enum types + 1 `pg_trgm` extension). The `alembic upgrade head` step emits the full **255**
 `Running upgrade` lines in each run — none are elided. The tail of Run 1 (the last two migration
 steps, `alembic current`, and both `information_schema` queries) is:
 
@@ -184,7 +184,7 @@ echo "drop schema public cascade; create schema public;" | psql "$DB"
 alembic -c /root/alembic_echo.ini upgrade head      # sqlalchemy.engine=INFO -> echoes every SQL statement
 ```
 
-That echo run emitted **2935** log lines and exactly **81** `CREATE TABLE` statements. The
+That echo run emitted exactly **81** `CREATE TABLE` statements (the total captured log-line volume is environment-dependent — it varies by config preamble and capture method — and is not itself a Q1 answer value). The
 **complete ordered list** of every `CREATE TABLE` emitted (execution order, via
 `grep -oE 'CREATE TABLE [a-z_]+'` over the echo log) is:
 
@@ -324,7 +324,7 @@ steps (`alias_audit_log` then `user_audit_log`):
 
 ```
 run1 (empty start):     count=77   head=32f25cbf12f6 (head)   upgrade_steps=255
-run2 (populated reset): count=77   head=32f25cbf12f6 (head)   upgrade_steps=255   (drop-cascade: 81 objects)
+run2 (populated reset): count=77   head=32f25cbf12f6 (head)   upgrade_steps=255   (drop-cascade: 82 objects)
 ```
 
 The count is observed via `information_schema`, not inferred. Complete logs: **Appendix A**.
@@ -1335,7 +1335,7 @@ INFO  [alembic.runtime.migration] Will assume transactional DDL.
 (3 rows)
 ```
 
-### Appendix A.2 — Run 2 (reset of the now-populated database; `drop schema … cascade` enumerates all 81 dropped objects)
+### Appendix A.2 — Run 2 (reset of the now-populated database; `drop schema … cascade` enumerates all 82 other objects)
 
 ```
 ===== run2: reset -> alembic upgrade head -> information_schema (canonical PG13) =====
