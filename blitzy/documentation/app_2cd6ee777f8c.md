@@ -74,7 +74,7 @@ readiness confirmation is `GET /health` → `HTTP/1.1 200 OK` body `success`
 
 **Q2 (walkthrough).** `POST /auth/register` creates the user (`create user …`
 [`app/auth/views/register.py:L85`]) and renders the `register_waiting_activation.html`
-"check your inbox" page. **Default-config note (see §4.2):** under `NOT_SEND_EMAIL=true`
+"check your inbox" page. **Default-config note (see §2.2):** under `NOT_SEND_EMAIL=true`
 [`example.env:L19`] the activation **link is NOT printed to the log** — only the email
 subject/from/to is [`app/mail_sender.py:L130-L137`]; the AAP's expectation of a printed activation
 link is **not reproduced**. `GET /auth/activate?code=<code>` flips `users.activated` from `f`→`t`,
@@ -83,7 +83,7 @@ deletes the code, flashes **"Your account has been activated"** and **302-redire
 `log user <User …> in` and redirects to `/dashboard/`
 [`app/auth/views/login_utils.py:L35,L44`]. All edge/error paths were also exercised (invalid code →
 400, expired code → 400, wrong password → 200, not-activated login → 200, resend, disabled account,
-scheduled-deletion, and `DISABLE_REGISTRATION` → 302) — see §4.3.
+scheduled-deletion, and `DISABLE_REGISTRATION` → 302) — see §2.6.
 
 **Q3 (behind the scenes).** Yes — the flow is backed by internal services that are observably active
 and communicating. On registration, `User.create` provisions a **verified default mailbox** and a
@@ -92,7 +92,7 @@ and communicating. On registration, `User.create` provisions a **verified defaul
 Real product paths (registration and dashboard alias creation) reach the **event dispatcher**, which
 under the default config (no `EVENT_WEBHOOK`) short-circuits at
 `Not sending events because webhook is not configured…` [`app/events/event_dispatcher.py:L62`]; the
-full persist→`NOTIFY`→consume mechanism is demonstrated via a clearly-labeled diagnostic (§5.3). The
+full persist→`NOTIFY`→consume mechanism is demonstrated via a clearly-labeled diagnostic (§3.3). The
 **email handler** on `:20381` forwards a real test message external-sender → alias → owning mailbox,
 finishing `Finish mail_from … '250 Message accepted for delivery'`
 [`email_handler.py:L2367`]. The **job runner** drains work on a **~10.02s** poll
@@ -204,7 +204,7 @@ it would print `Using DeadLetterEventSource` and with `--dry-run` it would use `
 [`event_listener.py:L30,L33,L40`] `(inferred — those modes were not launched; the running instance
 is LISTENER + HttpEventSink as shown)`. The two trailing lines are the listener consuming a Postgres
 `NOTIFY` on channel `simplelogin_sync_events` and skipping delivery because no webhook is configured
-(default) — the same channel exercised in §5.3.
+(default) — the same channel exercised in §3.3.
 
 ### Q1.4 Job runner — init banner, then a silent idle poll
 
@@ -223,7 +223,7 @@ Upload files to local dir
 Readiness marker: the `>>> init logging <<<` banner (PID 594). The runner then enters its poll loop
 and is **silent while idle** — it only logs when it takes a job (`Take job …` [`job_runner.py:L334`]).
 Under `DISABLE_ONBOARDING=true` registration enqueues nothing, so at rest the log shows only the
-banner. The live "it's polling" proof is in §5.5 (measured ~10.02s cadence).
+banner. The live "it's polling" proof is in §3.5 (measured ~10.02s cadence).
 
 ### Q1.5 Cron (`yacron`) — scheduled-job spawn lines
 
@@ -241,7 +241,7 @@ MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value
 
 Readiness marker: `yacron` logs `Starting job … / Job … spawned` for each scheduled command; the
 subprocesses print the SL banner. The full 15-job schedule and the measured 5-minute cadence are in
-§5.6.
+§3.7.
 
 ### Q1.6 Live readiness probe — `GET /health` → `200 success`
 
@@ -776,7 +776,7 @@ behavior under the default config (`EVENT_WEBHOOK` unset [`app/config.py:L612`])
 appears in the Q2.1 registration delta — i.e. the very first alias created during registration hits
 the same real path.
 
-### Q3.3 Event pipeline — MECHANISM (NON-CANONICAL DIAGNOSTIC, per rule R5)
+### Q3.3 Event pipeline — MECHANISM (NON-CANONICAL DIAGNOSTIC — labeled non-canonical per AAP §0.7 real-entry-point rule)
 
 Because the canonical path short-circuits before persisting when `EVENT_WEBHOOK` is unset, the full
 persist→`NOTIFY`→consume mechanism cannot be reached through a product entry point under the default
@@ -1192,7 +1192,7 @@ And a targeted check that **no** `blitzy-temp` reference survives anywhere
 The database is back to the seed baseline: only the two seed users (`john@wick.com`,
 `winston@continental.com`), 11 seed aliases, 4 seed mailboxes, and the single seed contact/email_log
 (user 1) and seed audit rows remain; `job`, `sync_event`, `activation_code`, and `deleted_alias` are
-all empty. **Temp password/activation-code values shown in §4 belong to these now-deleted users and
+all empty. **Temp password/activation-code values shown in §2 belong to these now-deleted users and
 are inert.**
 
 ---
@@ -1207,8 +1207,8 @@ Every named item in Q1/Q2/Q3, with where it is evidenced and whether it was **Ob
 - [x] `>>> init logging <<<` banner (all 5 processes) — Observed §1.1–1.5 [`app/log.py:L67`], SL logger [`app/log.py:L79`]
 - [x] Email handler `Listen for port 20381` / `Start mail controller` — Observed §1.2 [`email_handler.py:L2403,L2386`]
 - [x] Event listener source/sink + `Starting to listen to events` — Observed §1.3 [`event_listener.py:L34,L43`; `events/event_source.py:L49`]; DEAD_LETTER/ConsoleEventSink modes — (inferred) §1.3
-- [x] Job runner init banner + silent idle — Observed §1.4 (live poll in §5)
-- [x] `yacron` scheduled-spawn lines — Observed §1.5 (full schedule §5.7)
+- [x] Job runner init banner + silent idle — Observed §1.4 (live poll in §3.5)
+- [x] `yacron` scheduled-spawn lines — Observed §1.5 (full schedule §3.7)
 - [x] `GET /health` → `200 success` — Observed §1.6 [`server.py:L213-L215`]
 - [x] Login UI renders (`Welcome back!` + form) — Observed §1.7
 - [x] Per-request access log + `/health` exclusion — Observed §1.8 [`server.py:L284,L281`]
