@@ -16,7 +16,7 @@ This document answers three question groups about the SimpleLogin back-end by **
 
 ## Environment Identity (the exact code and runtime under test)
 
-- **Runtime image (mandated by setup instructions):** alias `andrewparkscaleai/coding-agent:simple-login__app__2cd6ee772d3531559588bcfb18627ffb5d2c`.
+- **Runtime image (mandated by setup instructions):** alias `andrewparkscaleai/coding-agent:simple-login__app__2cd6ee777f8c2d3531559588bcfb18627ffb5d2c`.
 - **OBSERVED image RepoTag actually running** (`docker inspect`): `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_simple-login_app_1.0`.
 - **OBSERVED source commit under test:** the image's `/app` git `HEAD` is `2cd6ee777f8c2d3531559588bcfb18627ffb5d2c` — the immutable source-parent commit of this branch (the exact code being documented). Every commit this branch adds sits on top of `2cd6ee777f8c...` and changes only this documentation file: `git diff --name-only 2cd6ee777f8c2d3531559588bcfb18627ffb5d2c HEAD` lists exactly `blitzy/documentation/app_2cd6ee777f8c.md` and nothing else (absolute-hash references are used deliberately so this identity claim stays correct regardless of how many documentation commits are later stacked on the branch). The image therefore ships the exact code being documented.
 - **Runtime:** Python 3.10.18 in the image's virtualenv at `/app/venv`. Key pins (from `poetry.lock`): Flask 1.1.2, Flask-Login 0.5.0, gunicorn 20.0.4, SQLAlchemy 1.3.24, aiosmtpd 1.4.2, redis 4.6.0, yacron 0.11.2.
