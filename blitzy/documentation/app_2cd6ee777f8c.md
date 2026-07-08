@@ -18,7 +18,7 @@ This document answers three question groups about the SimpleLogin back-end by **
 
 - **Runtime image (mandated by setup instructions):** alias `andrewparkscaleai/coding-agent:simple-login__app__2cd6ee772d3531559588bcfb18627ffb5d2c`.
 - **OBSERVED image RepoTag actually running** (`docker inspect`): `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_simple-login_app_1.0`.
-- **OBSERVED source commit under test:** the image's `/app` git `HEAD` is `2cd6ee777f8c2d3531559588bcfb18627ffb5d2c`, which equals this branch's source parent (`git rev-parse HEAD^`). The single commit added on this branch (`HEAD = 31ab7a39037d2d689882aa503d5cb5a03f2568dd`) is this documentation file only. The image therefore ships the exact code being documented.
+- **OBSERVED source commit under test:** the image's `/app` git `HEAD` is `2cd6ee777f8c2d3531559588bcfb18627ffb5d2c` — the immutable source-parent commit of this branch (the exact code being documented). Every commit this branch adds sits on top of `2cd6ee777f8c...` and changes only this documentation file: `git diff --name-only 2cd6ee777f8c2d3531559588bcfb18627ffb5d2c HEAD` lists exactly `blitzy/documentation/app_2cd6ee777f8c.md` and nothing else (absolute-hash references are used deliberately so this identity claim stays correct regardless of how many documentation commits are later stacked on the branch). The image therefore ships the exact code being documented.
 - **Runtime:** Python 3.10.18 in the image's virtualenv at `/app/venv`. Key pins (from `poetry.lock`): Flask 1.1.2, Flask-Login 0.5.0, gunicorn 20.0.4, SQLAlchemy 1.3.24, aiosmtpd 1.4.2, redis 4.6.0, yacron 0.11.2.
 - **Backing services:** PostgreSQL 13 (`sl-db`) and Redis 7 (`sl-redis`) on a shared Docker network; the app container is `sl-app`.
 
@@ -123,7 +123,7 @@ Upload files to local dir
 
 **Up-signals in this output** (OBSERVED): `Starting gunicorn 20.0.4`, `Listening at: http://0.0.0.0:7777 (1679)`, and two workers booted (`pid: 1680`, `pid: 1681`). The master PID is **1679**; workers are **1680** and **1681**. The `>>> init logging <<<` banner is emitted by `app/log.py:L67`; `MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value` reflects the free-plan alias limit default of 5 (`app/config.py:L124`), which §3.6 exercises.
 
-**Health endpoint** (OBSERVED). The health route is `@app.route("/health")` returning `"success", 200` (`server.py:L213-L215`):
+**Health endpoint** (OBSERVED). The health route `@app.route("/health")` (`server.py:L213`) is served by the `healthcheck()` view function (`server.py:L214`), whose body is `return "success", 200` (`server.py:L215`):
 
 ```
 $ curl -i http://localhost:7777/health
@@ -662,7 +662,25 @@ EXPOSE 7777
 CMD ["gunicorn","wsgi:app","-b","0.0.0.0:7777","-w","2","--timeout","15"]
 ```
 
-`Dockerfile:L44` exposes only 7777 (the web port); `Dockerfile:L47` runs only gunicorn. The email handler (port 20381) and job runner are started with their own commands (§1). (INFERRED, from setup notes: the email handler is launched from `/app` rather than `/code` to sidestep a dependency/runtime `re2` incompatibility in this image; this affects only the working directory, not behavior. All handler evidence above shows it functioning normally.)
+`Dockerfile:L44` exposes only 7777 (the web port); `Dockerfile:L47` runs only gunicorn. The email handler (port 20381) and job runner are started with their own commands (§1). (From setup notes, the email handler is launched from `/app` rather than `/code` to sidestep a dependency/runtime `re2` incompatibility in this image — INFERRED as the operator's rationale for the working-directory choice. To be precise, that working-directory change also changes *which* `app/spamassassin_utils.py` is imported: the two copies differ only at line 8 — `/code` has `import re2 as re` while the image's `/app` copy is pre-patched to `import re` (`app/spamassassin_utils.py:L8`, OBSERVED below). The branch's `re2` shim (google-re2) lacks `DOTALL` whereas the standard-library `re` provides it, so `re.compile(..., re.DOTALL)` (`app/spamassassin_utils.py:L13`) raises `AttributeError` when imported from `/code` but succeeds from `/app`. So the cwd choice is not purely cosmetic — it selects a different, `re`-compatible `spamassassin_utils.py` — but every other handler behavior shown above is unaffected, and `email_handler.py` itself is byte-identical between `/code` and `/app`.)
+
+**Evidence for the `/app` vs `/code` distinction** (OBSERVED). The two `spamassassin_utils.py` copies differ only at their import line; the `re2` shim lacks `DOTALL` while stdlib `re` provides it; and `email_handler.py` is identical in both trees:
+
+```
+$ diff /code/app/spamassassin_utils.py /app/app/spamassassin_utils.py
+8c8
+< import re2 as re
+---
+> import re
+
+$ /app/venv/bin/python -c 'import re2, re; print("re2 DOTALL:", hasattr(re2,"DOTALL"), "| stdlib re DOTALL:", hasattr(re,"DOTALL"))'
+re2 DOTALL: False | stdlib re DOTALL: True
+
+$ diff -q /code/email_handler.py /app/email_handler.py && echo IDENTICAL
+IDENTICAL
+```
+
+This confirms the working-directory choice selects a different (`re`-compatible) `spamassassin_utils.py` — the reason the import succeeds from `/app` — while leaving the handler's own code unchanged.
 
 ## 4.2 Process trees — before vs. after starting the daemons
 
@@ -705,7 +723,9 @@ $ grep -nE "email_handler|job_runner|subprocess|os\.system|Popen" server.py wsgi
 
 **Reasoning:** the job runner's `__main__` is an infinite loop (`job_runner.py:L330`) that, inside a fresh app context (`:L332`), fetches due jobs (`get_jobs_to_run`, `:L307`), logs `Take job %s` (`:L334`), marks each `taken` and increments attempts (`:L337-L341`), runs `process_job` (`:L342`), marks it `done` (`:L344-L345`), and then sleeps 10 seconds (`:L347`). `JobState` values are `ready=0, taken=1, done=2, error=3` (`app/models.py:L253`).
 
-**Cadence — three no-op jobs inserted, timed pickups over two poll cycles** (OBSERVED):
+**Methodology** (OBSERVED): to drive the loop, temporary no-op `Job` rows were enqueued through the **real model path** `Job.create(name=<temp-name>, commit=True)` (`app/models.py:L116`) and every pickup was read back from the job runner's own log line `Take job %s` (`job_runner.py:L334`). Per the magnitude/timing rule, the cadence was measured across **two separate `python job_runner.py` lifecycles**: **Run 1** — the original investigation session (job ids 25–27, name `blitzy-qa-noop`, helper `/tmp/jobcadence.py`) — and **Run 2**, an independent confirmation lifecycle started later in a fresh process (job ids 48–51, name `blitzy-qa-cp1fix-noop`, helper `/tmp/qa_cadence.py`, job-runner PID 4401). Both runs' raw pickup timestamps and each run's total span/duration are reported so the ~10s interval can be confirmed **stable across the two runs**.
+
+**Run 1 (original session) — enqueue/pickup timing** (OBSERVED). Three no-op jobs, timed pickups over two poll cycles:
 
 ```
 $ /app/venv/bin/python /tmp/jobcadence.py
@@ -723,7 +743,7 @@ gap pickup2->pickup3: 10.03s
 inserted job ids: [25, 26, 27]
 ```
 
-**Raw job-runner log for those pickups** (OBSERVED). Each `Take job` is exactly ~10s after the previous, and each unrecognized name is reported by `process_job` (`job_runner.py:L304`):
+**Run 1 — raw job-runner log for those pickups** (OBSERVED). Each `Take job` is ~10s after the previous, and each unrecognized name is reported by `process_job` (`job_runner.py:L304`):
 
 ```
 2026-07-08 05:30:03,072 - SL - DEBUG - 1806 - "/code/job_runner.py:334" - <module>() -  - Take job <Job 25 blitzy-qa-noop None>
@@ -734,7 +754,7 @@ inserted job ids: [25, 26, 27]
 2026-07-08 05:30:23,111 - SL - ERROR - 1806 - "/code/job_runner.py:304" - process_job() -  - Unknown job name blitzy-qa-noop
 ```
 
-**Persisted state transitions** (OBSERVED):
+**Run 1 — persisted state transitions** (OBSERVED):
 
 ```
 $ psql -h sl-db -U myuser -d simplelogin -c \
@@ -746,44 +766,76 @@ $ psql -h sl-db -U myuser -d simplelogin -c \
  27 | blitzy-qa-noop |     2 | t     |        1 | 05:30:13 | 05:30:23
 ```
 
-**Behavior confirmation** (OBSERVED): consecutive pickups are **9.86s** and **10.03s** apart (matching the `time.sleep(10)` cadence, `job_runner.py:L347`); the `Take job` timestamps (`05:30:03/13/23`) are exactly 10s apart across two full poll cycles. Each job progressed `ready(0) → taken(1) → done(2)` with `taken=t` and `attempts=1` — the transient `taken` state is written at `:L337-L341` and the terminal `done` at `:L344-L345`. The runner picks up work continuously without external prompting; that steady ~10s pickup is the "functioning as intended" signal. (`blitzy-qa-noop` is an intentionally unregistered name, so `process_job` logs `Unknown job name` at `:L304` — it still demonstrates the full pickup/commit lifecycle. These temp jobs were deleted in §6.)
+Run 1 spanned ~27s end to end (first insert `05:29:56` → last pickup `05:30:23`); its first pickup was a partial **6.66s** because that job was enqueued mid-poll-cycle, after which the steady-state gaps settled to ~10s (`9.86s`, `10.03s`).
+
+**Run 2 — raw job-runner log** (OBSERVED), a **separate** `python job_runner.py > /tmp/qa_jr_run2.log 2>&1 &` lifecycle started after Run 1 was stopped:
+
+```
+$ grep -E 'Take job|Unknown job name' /tmp/qa_jr_run2.log
+2026-07-08 07:18:32,585 - SL - DEBUG - 4401 - "/code/job_runner.py:334" - <module>() -  - Take job <Job 48 blitzy-qa-cp1fix-noop None>
+2026-07-08 07:18:32,589 - SL - ERROR - 4401 - "/code/job_runner.py:304" - process_job() -  - Unknown job name blitzy-qa-cp1fix-noop
+2026-07-08 07:18:42,603 - SL - DEBUG - 4401 - "/code/job_runner.py:334" - <module>() -  - Take job <Job 49 blitzy-qa-cp1fix-noop None>
+2026-07-08 07:18:42,606 - SL - ERROR - 4401 - "/code/job_runner.py:304" - process_job() -  - Unknown job name blitzy-qa-cp1fix-noop
+2026-07-08 07:18:52,621 - SL - DEBUG - 4401 - "/code/job_runner.py:334" - <module>() -  - Take job <Job 50 blitzy-qa-cp1fix-noop None>
+2026-07-08 07:18:52,624 - SL - ERROR - 4401 - "/code/job_runner.py:304" - process_job() -  - Unknown job name blitzy-qa-cp1fix-noop
+2026-07-08 07:19:02,638 - SL - DEBUG - 4401 - "/code/job_runner.py:334" - <module>() -  - Take job <Job 51 blitzy-qa-cp1fix-noop None>
+2026-07-08 07:19:02,641 - SL - ERROR - 4401 - "/code/job_runner.py:304" - process_job() -  - Unknown job name blitzy-qa-cp1fix-noop
+```
+
+**Run 2 — enqueue/pickup helper (DB-observed gaps + total duration)** (OBSERVED):
+
+```
+$ /app/venv/bin/python /tmp/qa_cadence.py 2>&1 | sed -n '/\[insert 1\]/,$p'
+[insert 1] job id=48 state=ready(0) at t=07:18:25.536
+[pickup 1] job id=48 picked up at t=07:18:32.611 -> state now 2 (2=done)
+[insert 2] job id=49 state=ready(0) at t=07:18:32.614
+[pickup 2] job id=49 picked up at t=07:18:42.618 -> state now 2 (2=done)
+[insert 3] job id=50 state=ready(0) at t=07:18:42.629
+[pickup 3] job id=50 picked up at t=07:18:52.633 -> state now 2 (2=done)
+[insert 4] job id=51 state=ready(0) at t=07:18:52.636
+[pickup 4] job id=51 picked up at t=07:19:02.671 -> state now 2 (2=done)
+
+=== poll-interval gaps between consecutive pickups (DB-observed) ===
+gap pickup1->pickup2: 10.01s
+gap pickup2->pickup3: 10.02s
+gap pickup3->pickup4: 10.04s
+
+inserted job ids: [48, 49, 50, 51]
+total run duration (first insert -> last pickup): 37.13s
+```
+
+**Behavior confirmation across two runs** (OBSERVED): the ~10s cadence is **stable across both independent `job_runner.py` lifecycles**, run in separate sessions with different job-runner PIDs (Run 1 PID 1806, Run 2 PID 4401). Run 1's steady-state gaps were **9.86s and 10.03s** (run span ~27s; its first pickup was a partial 6.66s because that job was enqueued mid-cycle); Run 2's three gaps were **10.01s, 10.02s, 10.04s** (total run duration **37.13s**). Every steady-state gap matches the `time.sleep(10)` cadence (`job_runner.py:L347`), and each run's `Take job` timestamps (Run 1 `05:30:03/13/23`; Run 2 `07:18:32/42/52` then `07:19:02`) are exactly 10s apart. Each job progressed `ready(0) → taken(1) → done(2)` with `taken=t` and `attempts=1` — the transient `taken` state is written at `:L337-L341` and the terminal `done` at `:L344-L345`. The runner picks up work continuously without external prompting; that steady ~10s pickup, reproduced in two separate runs, is the "functioning as intended" signal. (Both runs used intentionally unregistered job names — `blitzy-qa-noop` (Run 1) and `blitzy-qa-cp1fix-noop` (Run 2) — so `process_job` logs `Unknown job name` at `:L304` while still exercising the full pickup/commit lifecycle. Run 1's temp jobs 25–27 are removed in §6; Run 2's temp jobs 48–51 were deleted immediately after measurement, both leaving the `job` table at its baseline of only the pre-existing id=1 `blitzy-smoke-noop`.)
 
 ## 4.4 The cron scheduler is a distinct mechanism from the job runner
 
 **Reasoning:** the job runner (§4.3) polls the `Job` table every 10 seconds for on-demand work. Scheduled/periodic tasks are a **separate** subsystem: `cron.py` is invoked on cron schedules by **yacron** (0.11.2) per `crontab.yml`. They are different files, different triggers, and different cadences.
 
 ```
-$ sed -n '1,5p;8,11p;14,15p;20,23p;27,30p;34,37p;40,43p' crontab.yml
-jobs:
-  - name: SimpleLogin growth stats
-    command: python /code/cron.py -j stats
-    shell: /bin/bash
-    schedule: "0 0 * * *"
-  - name: SimpleLogin Delete Old Monitoring records
-    command: python /code/cron.py -j delete_old_monitoring
-    shell: /bin/bash
-    schedule: "15 1 * * *"
-  - name: SimpleLogin Custom Domain check
-    command: python /code/cron.py -j check_custom_domain
-  - name: SimpleLogin HIBP check
-    command: python /code/cron.py -j check_hibp
-    shell: /bin/bash
-    schedule: "15 3 * * *"
-  - name: SimpleLogin Notify HIBP breaches
-    command: python /code/cron.py -j notify_hibp
-    shell: /bin/bash
-    schedule: "15 4 * * *"
-  - name: SimpleLogin Delete Logs
-    command: python /code/cron.py -j delete_logs
-    shell: /bin/bash
-    schedule: "15 5 * * *"
-  - name: SimpleLogin Delete Old data
-    command: python /code/cron.py -j delete_old_data
-    shell: /bin/bash
-    schedule: "30 5 * * *"
+$ grep -cE 'cron\.py -j' crontab.yml            # total scheduled cron jobs
+15
+
+$ awk '/-j /{split($0,a," -j "); name=a[2]} /schedule:/{s=$0; sub(/^[[:space:]]*schedule:[[:space:]]*"/,"",s); sub(/".*/,"",s); printf "%-32s %s\n", name, s}' crontab.yml
+stats                            0 0 * * *
+delete_old_monitoring            15 1 * * *
+check_custom_domain              15 2 * * *
+check_hibp                       15 3 * * *
+notify_hibp                      15 4 * * *
+delete_logs                      15 5 * * *
+delete_old_data                  30 5 * * *
+poll_apple_subscription          15 6 * * *
+notify_trial_end                 15 8 * * *
+notify_manual_subscription_end   15 9 * * *
+notify_premium_end               15 10 * * *
+delete_scheduled_users           15 11 * * *
+send_undelivered_mails           */5 * * * *
+clear_alias_audit_log            0 * * * *
+clear_user_audit_log             0 * * * *
+
+$ grep -E 'schedule:' crontab.yml | grep -vcE '"[0-9]+ [0-9]+ \* \* \*"'   # schedules that are NOT fixed-daily
+3
 ```
 
-**Distinction** (OBSERVED from `crontab.yml`): the yacron schedule defines seven daily jobs, each running `python /code/cron.py -j <job>` at fixed daily times — `stats` (`crontab.yml:L3`, `0 0 * * *`), `delete_old_monitoring` (`:L9`, `15 1 * * *`), `check_custom_domain` (`:L15`, `15 2 * * *`), `check_hibp` (`:L21`, `15 3 * * *`), `notify_hibp` (`:L28`, `15 4 * * *`), `delete_logs` (`:L35`, `15 5 * * *`), and `delete_old_data` (`:L41`, `30 5 * * *`). This is the scheduled-maintenance mechanism (`cron.py` + yacron), separate from the `Job`-table-polling `job_runner.py`.
+**Distinction** (OBSERVED from `crontab.yml`): the yacron schedule defines **fifteen** scheduled jobs (the count command above returns `15`), each running `python /code/cron.py -j <job>`. **Twelve run at fixed daily times** — `stats` (`crontab.yml:L3`, `0 0 * * *`), `delete_old_monitoring` (`:L9`, `15 1 * * *`), `check_custom_domain` (`:L15`, `15 2 * * *`), `check_hibp` (`:L21`, `15 3 * * *`), `notify_hibp` (`:L28`, `15 4 * * *`), `delete_logs` (`:L35`, `15 5 * * *`), `delete_old_data` (`:L41`, `30 5 * * *`), `poll_apple_subscription` (`:L47`, `15 6 * * *`), `notify_trial_end` (`:L53`, `15 8 * * *`), `notify_manual_subscription_end` (`:L59`, `15 9 * * *`), `notify_premium_end` (`:L65`, `15 10 * * *`), and `delete_scheduled_users` (`:L71`, `15 11 * * *`) — and the remaining **three are not daily**: `send_undelivered_mails` runs every 5 minutes (`:L78`, `*/5 * * * *`), while `clear_alias_audit_log` (`:L85`, `0 * * * *`) and `clear_user_audit_log` (`:L92`, `0 * * * *`) run hourly. Regardless of the exact count, the point stands: this is the scheduled-maintenance mechanism (`cron.py` + yacron), separate from the `Job`-table-polling `job_runner.py`.
 
 ---
 
@@ -796,7 +848,7 @@ Every named item across Q1–Q3, with the evidence location and label.
 | Item | Signal / Evidence | Where | Label |
 |---|---|---|---|
 | Web server up | gunicorn banner, `Listening at: http://0.0.0.0:7777`, workers 1680/1681 | §2.1 | OBSERVED |
-| Web `/health` | `HTTP/1.1 200 OK`, body `success` (`server.py:L213-L215`) | §2.1 | OBSERVED |
+| Web `/health` | `HTTP/1.1 200 OK`, body `success` via `healthcheck()` (`server.py:L214`) | §2.1 | OBSERVED |
 | Web index redirect | `302 → /auth/login` (`server.py:L250-L251`) | §2.1 | OBSERVED |
 | Web dev mode | Werkzeug `HTTP/1.0`, `Server: Werkzeug/1.0.1` (`server.py:L588`) | §2.2 | OBSERVED |
 | Email handler up | `Listen for port 20381` (`:L2403`), `Start mail controller 0.0.0.0 20381` (`:L2386`) | §2.3 | OBSERVED |
@@ -825,10 +877,10 @@ Every named item across Q1–Q3, with the evidence location and label.
 | Do NOT auto-start | web-only process tree; no daemon match | §4.2 | OBSERVED |
 | Independent daemons | email handler 1805 & job runner 1806 as PPID-1 processes | §4.2 | OBSERVED |
 | No spawn mechanism | grep of `server.py`/`wsgi.py` → no matches | §4.2 | OBSERVED |
-| Job runner cadence | pickups 9.86s & 10.03s; `Take job` 10s apart (`:L334`, `:L347`) | §4.3 | OBSERVED |
+| Job runner cadence | ~10s poll stable across **2 runs** (Run 1 gaps 9.86/10.03s, span ~27s; Run 2 gaps 10.01/10.02/10.04s, dur 37.13s); `Take job` 10s apart (`:L334`, `:L347`) | §4.3 | OBSERVED |
 | Job state machine | ready(0)→taken(1)→done(2) persisted (`app/models.py:L253`) | §4.3 | OBSERVED |
-| Cron ≠ job runner | 7 yacron jobs run `cron.py` on daily schedules | §4.4 | OBSERVED |
-| Email-handler `/app` cwd rationale | re2 workaround (working dir only, not behavior) | §4.1 | INFERRED |
+| Cron ≠ job runner | 15 yacron `cron.py -j` jobs (12 daily; 3 non-daily: `send_undelivered_mails` every 5 min, `clear_alias_audit_log`/`clear_user_audit_log` hourly) | §4.4 | OBSERVED |
+| Email-handler `/app` cwd rationale | `/app` loads pre-patched `spamassassin_utils.py` (`import re` vs `/code` `import re2 as re`, `:L8`); `re2` lacks `DOTALL` → import succeeds from `/app`; `email_handler.py` identical | §4.1 | OBSERVED (diff) + INFERRED (operator rationale) |
 
 ---
 
@@ -893,9 +945,9 @@ remaining *.py in /tmp: 0
 $ git status --porcelain
                        # (empty output — working tree is clean)
 
-$ git diff --stat HEAD^ HEAD
- blitzy/documentation/app_2cd6ee777f8c.md | 501 +++++++++++++++++++++++++++++++
- 1 file changed, 501 insertions(+)
+$ git diff --stat 2cd6ee777f8c2d3531559588bcfb18627ffb5d2c HEAD
+ blitzy/documentation/app_2cd6ee777f8c.md | 961 +++++++++++++++++++++++++++++++
+ 1 file changed, 961 insertions(+)
 ```
 
 All observation scripts were removed (0 remaining). `git status --porcelain` produces **no output** (clean tree): the runtime investigation touched **zero** repository files — temp data lived only in the throwaway Postgres database and temp scripts only under `/tmp`, both outside the repo. The single change introduced on this branch versus the source parent is this documentation file.
