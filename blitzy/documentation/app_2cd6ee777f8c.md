@@ -651,7 +651,7 @@ Auth context is carried by **the signed `slapp` session cookie plus the two per-
 2. On each subsequent request, `before_request` (`server.py:L257-L270`) seeds `g.start_time`; then
    Flask-Login reads the cookie and calls `load_user(alternative_id)` (`server.py:L220-L222`), which
    resolves `current_user` from `User.get_by(alternative_id=...)`.
-3. The view executes with `current_user` populated; `after_request` (`server.py:L272-L299`) then logs
+3. The view executes with `current_user` populated; `after_request` (`server.py:L272-L296`) then logs
    the request via `LOG.d(...)` at `server.py:L284`.
 
 If no valid `slapp` cookie is present, `load_user` is not able to resolve a user and `current_user`
