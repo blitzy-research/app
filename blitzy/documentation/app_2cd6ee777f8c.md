@@ -547,7 +547,7 @@ $ docker exec -w /app sl-app bash -c \
 
 These two lines correspond to `LOG.i("Listen for port %s", args.port)` at `email_handler.py:2403` and `LOG.d("Start mail controller %s %s", controller.hostname, controller.port)` at `email_handler.py:2386`. Wiring: `def main(port)` at `email_handler.py:2381`; `controller = Controller(MailHandler(), hostname="0.0.0.0", port=port)` at `email_handler.py:2383`; argparse `default=20381` at `email_handler.py:2399`; `main(port=args.port)` at `email_handler.py:2404`.
 
-Binding proof (root-less container; `ss -p` shows nothing without root, so a TCP connect is the reliable proof):
+Binding proof (`ss`/iproute2 is not installed in the container, so a TCP connect via `/dev/tcp` is the reliable proof):
 
 ```
 $ docker exec sl-app bash -c 'timeout 3 bash -c "echo > /dev/tcp/127.0.0.1/20381" && echo "PORT 20381 ACCEPTS CONNECTIONS"'
