@@ -200,10 +200,13 @@ import (`app/config.py:602`) — it tests **key presence**, not value. The image
   `app.test_client().post("/api/v2|v3/alias/custom/new", …)` against `server.create_app()` with a real API
   key — never from calling `check_suffix_signature()` directly. The only non-canonical, library-level
   reproduction is the itsdangerous exception-hierarchy stand-in in §5, which is labelled as such.
-- **Zero-residue.** The whole run executes inside a single `connection.begin()` … `transaction.rollback()`
-  envelope, exactly like `tests/conftest.py`'s `flask_client` fixture (`:59-77`), so it leaves **zero net
-  PostgreSQL state** (§2.8). Redis is not transactional, so the harness additionally snapshots the full Redis
-  key set before the run and deletes exactly the keys it created (§2.8).
+- **Runtime state cleanup.** Read-only compliance rests on the **source repository** being byte-for-byte
+  unchanged (§2.8, `git status --porcelain` empty). The run executes inside a `connection.begin()` …
+  `transaction.rollback()` envelope like `tests/conftest.py`'s `flask_client` fixture (`:59-77`), but that
+  envelope is **not** a reliable cleanup for the *first* in-process envelope (the SQLAlchemy caveat detailed
+  in §2.8), so the harness additionally deletes exactly the PostgreSQL rows it created via an external
+  autocommit connection, restoring the pre-run counts. Redis is not transactional, so the harness likewise
+  snapshots the full Redis key set before the run and deletes exactly the keys it created (§2.8).
 - **Byte-identical console capture.** SL log lines are captured with a `logging.Handler` attached to the
   `"SL"` logger using the **exact** production format string and `time.gmtime` converter from
   `app/log.py:12-15`:
@@ -228,13 +231,45 @@ $ git status --porcelain
 (empty — no source/test/config file modified during the investigation)
 ```
 
-**PostgreSQL — zero net residue** (external autocommit connection, independent of the harness transaction):
+**PostgreSQL — read-only at the source level; runtime residue is reliably cleaned *explicitly* (the envelope
+rollback alone is not sufficient).** The binding read-only guarantee is the byte-for-byte-unchanged source
+repository shown above. For the *runtime* database, the harness wraps each run in a `connection.begin()` …
+`transaction.rollback()` envelope (mirroring `tests/conftest.py`'s `flask_client`, `:59-77`), but this
+envelope is **not** a reliable cleanup: `app/db.py:9-14` binds the ORM session with
+`Session = scoped_session(sessionmaker(bind=connection))` on a single module-level `connection` — the
+"join an external transaction" pattern **without** the `begin_nested()` + `after_transaction_end`
+savepoint-restart listener that pattern requires. Because `init_app.add_sl_domains()` / `add_proton_partner()`
+issue bare `Session.commit()`s at import and each request teardown calls `Session.remove()`
+(`server.py:132-134, 209-211`), the **first** `connection.begin()` envelope in a process has its
+`Session.commit()` propagate through to the database, so that envelope's `transaction.rollback()` is a
+**no-op**; a **later** envelope in the same process rolls back cleanly. The residue is therefore
+**state/order-dependent**, not a categorical zero — observed on the canonical stack, identical across two runs
+(external autocommit connection for the snapshots, independent of the harness transaction):
 
 ```text
-[F14] DB counts BEFORE (external autocommit conn): {'users': 447, 'alias': 655, 'api_key': 26, 'custom_domain': 139}
-[F14] DB counts AFTER rollback+close:              {'users': 447, 'alias': 655, 'api_key': 26, 'custom_domain': 139}
-[F14] DB net residue (AFTER - BEFORE): {'users': 0, 'alias': 0, 'api_key': 0, 'custom_domain': 0}
+$ docker exec sl_setup bash -lc 'cd /app && PYTHONPATH=/app CONFIG=tests/test.env DB_URI=postgresql://test:test@localhost:5432/test /app/venv/bin/python /tmp/qa_dbresidue.py 2>/dev/null | grep -E "^(BEFORE|AFTER ENVELOPE|ENVELOPE-|FINAL)"'
+BEFORE (external autocommit):                {'users': 599, 'alias': 871, 'api_key': 29, 'custom_domain': 186}
+AFTER ENVELOPE-1 (first) rollback:           {'users': 600, 'alias': 872, 'api_key': 30, 'custom_domain': 186}
+ENVELOPE-1 net residue (AFTER1 - BEFORE):    {'users': 1, 'alias': 1, 'api_key': 1, 'custom_domain': 0}
+AFTER ENVELOPE-2 (later) rollback:           {'users': 600, 'alias': 872, 'api_key': 30, 'custom_domain': 186}
+ENVELOPE-2 net residue (AFTER2 - AFTER1):    {'users': 0, 'alias': 0, 'api_key': 0, 'custom_domain': 0}
+FINAL after explicit external-conn cleanup:  {'users': 599, 'alias': 871, 'api_key': 29, 'custom_domain': 186}
+FINAL net residue vs BEFORE:                 {'users': 0, 'alias': 0, 'api_key': 0, 'custom_domain': 0}
 ```
+
+Reading the block: the **first** envelope leaks (`ENVELOPE-1 net residue` = one user / one auto-newsletter
+alias / one api-key — the rollback was a no-op), the **later** envelope contains (`ENVELOPE-2 net residue`
+all-zero), and the probe's explicit external-connection deletion of exactly the rows it created returns the
+counts to the pre-run values (`FINAL net residue` all-zero).
+
+The harness therefore does **not** rely on the envelope rollback for correctness: it additionally deletes
+exactly the rows it created through the external autocommit connection, restoring the pre-run counts (the
+`FINAL` line). Absolute counts differ from run to run because the shared container database accumulates rows
+from other activity; what is invariant — and what read-only compliance actually rests on — is (a) the
+byte-for-byte-unchanged **source repository** (`git status` above) and (b) the explicit restoration of the
+pre-run DB counts. (An earlier capture of a single *containing* envelope showed `BEFORE == AFTER` and was
+mis-generalized as a categorical "zero net residue"; the order-dependence above is the accurate finding, and
+the DB counts vary with the shared container's state rather than being a fixed invariant.)
 
 **Redis — zero net residue** via before/after key-set delta. The run creates only TTL-bounded keys —
 `session:*` (Flask server-side sessions, TTL ≈ 300 s for the non-authenticated API sessions, `app/session.py:95-96`),
@@ -1366,8 +1401,10 @@ are harness instrumentation (not production log output) and are labeled as such 
 ### 8.3 Repository state
 
 Per §2.8, the source repository was left byte-for-byte unchanged (`git status --porcelain` reports only this
-document), the DB net residue is zero (transaction rollback), the Redis net residue is zero (before/after key
-delta cleanup, `dbsize 468 → 468`), and all temporary observation scripts and transcripts created on the
+document) — the binding read-only guarantee. The runtime PostgreSQL residue is zero **after explicit
+external-connection cleanup** (the envelope rollback alone is not a reliable cleanup for the first in-process
+envelope — see the state/order-dependence documented in §2.8), the Redis net residue is zero (before/after
+key delta cleanup, `dbsize 468 → 468`), and all temporary observation scripts and transcripts created on the
 capture host were removed after their output was captured.
 
 --- 
