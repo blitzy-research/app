@@ -1,714 +1,1354 @@
-# SimpleLogin custom-alias creation: signed-suffix validation & alias-creation-limit — runtime investigation
+# SimpleLogin custom-alias creation — signed-suffix validation & alias-creation-limit: a runtime investigation
 
-**Scope of the question.** This report answers, from *observed runtime behavior*, exactly how SimpleLogin's
-custom-alias-creation endpoints behave when a **signed suffix is validated** and when the **alias-creation
-limit is enforced**, in response to the report of *"intermittent validation failures that don't match the
-expected behavior and appear related to how signed suffixes are verified."* It answers six sub-questions
-(Q1–Q6) with the actual HTTP status, JSON body, response headers, and server console (`SL`) log lines, each
-grounded in a `file:line` reference and the specific function/method that performs the work.
+This report answers, **from observed runtime behavior**, exactly how SimpleLogin's custom-alias-creation
+endpoints behave when a **signed suffix is validated** and when the **alias-creation limit is enforced**, in
+response to a report of *"intermittent validation failures that don't match the expected behavior and appear
+related to how signed suffixes are verified."* Every behavioral claim below is paired with the actual,
+unedited program output that produced it and a `file:line` reference to the code that emits it. Statements
+that are **inferred** from code rather than observed, or that come from a **non-canonical** stand-in rather
+than the real HTTP path, are explicitly labelled as such.
+
+## 0. Investigation identifiers
+
+These four identifiers are **distinct** and are kept separate throughout (they are easy to conflate because
+the source-branch name is derived from the first twelve hex characters of the source commit):
+
+| Identifier | Value | Meaning |
+|---|---|---|
+| Destination (working) branch | `blitzy-9b4ce125-7165-4a3a-b9c5-9be93b399ff9` | The branch this answer document is committed to. |
+| This document's commit | (this commit) — supersedes prior `37da2a08` | The commit that adds/updates this report. |
+| Canonical **source commit** under investigation | `2cd6ee777f8c2d3531559588bcfb18627ffb5d2c` (short `2cd6ee77`) | The SimpleLogin application code all `file:line` citations refer to. |
+| **Source-branch name** (deliverable naming convention) | `app_2cd6ee777f8c` | The mandated deliverable file base name `blitzy/documentation/app_2cd6ee777f8c.md`; its hex portion equals the **12-character prefix** of the source commit above — it is a naming convention, **not** itself a commit id. |
+
+`git rev-parse` outputs that establish the above (destination checkout):
+
+```text
+$ git rev-parse --abbrev-ref HEAD
+blitzy-9b4ce125-7165-4a3a-b9c5-9be93b399ff9
+$ git log --oneline -2
+37da2a08 docs: add runtime investigation of custom-alias signed-suffix validation & creation-limit (app_2cd6ee777f8c)
+2cd6ee77 chore: emit some missing contact audit logs (#2269)
+$ git rev-parse 2cd6ee77
+2cd6ee777f8c2d3531559588bcfb18627ffb5d2c
+```
+
+The source commit `2cd6ee77` is the parent of this documentation commit and is the exact application revision
+baked into the runtime container (§2).
+
+## 1. Executive summary
+
+The six sub-questions and their observed answers:
+
+| # | Sub-question | Observed answer (canonical HTTP path) |
+|---|---|---|
+| **Q1** | Status + body for an **invalid** (tampered/malformed) signed suffix | **HTTP 412** `{"error":"Alias creation time is expired, please retry"}` — the *same* response as an expired suffix. The intended **HTTP 400 `Tampered suffix`** branch is **dead code for signature errors** (§3.1, §5). |
+| **Q2** | Status + body for an **expired** signed suffix | **HTTP 412** `{"error":"Alias creation time is expired, please retry"}` (§3.2). Deterministic across repeated and multi-process runs (§6). |
+| **Q3** | Validation log entries printed on rejection | `LOG.w("Alias creation time expired for %s", user)` at `app/api/views/new_custom_alias.py:72` (v2) / `:187` (v3); the tamper log `LOG.w("Alias suffix is tampered, ...")` is **never** emitted for signature errors (observed count = 0) (§3.3). |
+| **Q4** | Rate-limiting headers on responses | **None.** No `X-RateLimit-Limit/Remaining/Reset` or `Retry-After` header appears on any status (201/400/401/409/412/429). On breach the API returns `{"error":"Rate limit exceeded"}` with HTTP 429 and **still** no rate-limit headers (§3.4). |
+| **Q5** | Quota checks + logged values on a successful attempt | `User.can_create_new_alias()` (`app/models.py:867-884`) calls `User.max_alias_for_free_account()` (`:858-865`); on **success nothing is logged** by the quota path; only on **rejection** does it log `LOG.d(... "cannot create any custom alias")` (`new_custom_alias.py:49`/`:138`). Observed with `MAX_NB_EMAIL_FREE_PLAN=3` (§3.5). |
+| **Q6** | Which component validates suffixes, which enforces the limit, what triggers rejection | Validator = `app/alias_suffix.py::check_suffix_signature` (`:37-42`); limit enforcer = `app/models.py::can_create_new_alias` (`:867-884`); a **third** rate control, the per-user token bucket `app/rate_limiter.py::check_bucket_limit` (`:19-42`), is invoked **inside** `Alias.create` (`app/models.py:1641`). Full branch table + trace in §3.6/§4. |
+
+**Central finding (root cause of the reported "intermittent" behavior).** `check_suffix_signature`
+(`app/alias_suffix.py:37-42`) calls `signer.unsign(signed_suffix, max_age=600)` inside
+`except itsdangerous.BadSignature: return None` (catch at `:41`). Under **itsdangerous 1.1.0**, both
+`SignatureExpired` and `BadTimeSignature` subclass `BadSignature`, so **expired, tampered, malformed, and
+empty** suffixes all collapse to a `None` return and are routed to the single **HTTP 412** branch
+(`if not alias_suffix:`). The **HTTP 400 `Tampered suffix`** branch (`except Exception:` at `:74-76` v2 /
+`:189-191` v3) fires only on a *non-*`BadSignature` exception and is therefore effectively **dead for
+signature problems**. A caller who expects `400 Tampered suffix` for a corrupted token instead always sees
+`412 …is expired…`; this mismatch is the most plausible explanation for the reported symptom. Per the task
+scope this defect is **documented, not fixed**.
+
+Given the same unchanged input, the endpoint is **deterministic** (§6): the apparent "sometimes it
+validates, sometimes it doesn't" is explained by the 412-collapse above (and, for ad-hoc "tamper by mutating
+one character" tests, by a base64 trailing-bit aliasing artifact described in §6), not by run-to-run
+nondeterminism in the server.
+
+## 2. Environment & methodology
+
+### 2.1 Canonical runtime (user-mandated Docker container)
+
+The investigation ran inside the user-mandated container image, which bakes the source revision `2cd6ee77`
+and provisions Python 3.10, PostgreSQL (with `pg_trgm`), and Redis.
+
+```text
+# container image and how the long-lived container was created
+$ docker inspect sl_setup --format 'Image={{.Config.Image}}\nCmd={{.Config.Cmd}}\nCreated={{.Created}}'
+Image=ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_simple-login_app_1.0
+Cmd=[infinity]
+Created=2026-07-10T07:01:37.758409924Z
+
+# creation command (long-lived container kept alive for repeated observation):
+$ docker run -d --name sl_setup ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_simple-login_app_1.0 sleep infinity
+```
+
+The image references the container tag mandated by the task setup
+(`andrewparkscaleai/coding-agent:simple-login__app__2cd6ee777f8c…` published at the `ghcr.io/scaleapi/swe-atlas`
+coordinate shown above).
+
+### 2.2 Build and service readiness (real output)
+
+The canonical build is the image's `/build.sh` (it creates the venv, runs `poetry install --no-root`, starts
+PostgreSQL + Redis, generates keys, drops+recreates the schema, and runs `alembic upgrade head`). Live
+readiness checks captured at investigation time:
+
+```text
+$ /app/venv/bin/python --version
+Python 3.10.18
+
+$ PGPASSWORD=test psql -h localhost -U test -d test -tAc "select version();"
+PostgreSQL 15.13 (Debian 15.13-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit
+
+$ PGPASSWORD=test psql -h localhost -U test -d test -tAc "select extname||' '||extversion from pg_extension where extname='pg_trgm';"
+pg_trgm 1.6
+
+$ PGPASSWORD=test psql -h localhost -U test -d test -tAc "select version_num from alembic_version;"
+32f25cbf12f6
+
+$ redis-cli ping
+PONG
+$ redis-cli dbsize
+(integer) 468
+```
+
+### 2.3 Dependency versions (pinned; investigation-relevant)
+
+```text
+$ /app/venv/bin/pip freeze | grep -iE '^(Flask|Flask-Limiter|limits|itsdangerous|SQLAlchemy|psycopg2|redis|gunicorn|arrow)=='
+arrow==0.16.0
+Flask==1.1.2
+Flask-Limiter==1.4
+itsdangerous==1.1.0
+limits==1.5.1
+psycopg2-binary==2.9.3
+redis==4.6.0
+SQLAlchemy==1.3.24
+gunicorn==20.0.4
+```
+
+`itsdangerous==1.1.0` is the exact version that produces the exception hierarchy at the heart of the central
+finding (§5); `Flask-Limiter==1.4` / `limits==1.5.1` govern the rate-limit-header behavior of Q4 (§3.4).
+
+### 2.4 Application boot (canonical entry point)
+
+The application object is built with `server.create_app()` — the same factory used by `tests/conftest.py` and
+by the production `gunicorn wsgi:app` command. The harness boots it under `CONFIG=/app/tests/test.env` with
+`DB_URI` pointed at the container Postgres, exactly as the in-process test client does. The boot banner and the
+resolved configuration printed by the harness:
+
+```text
+##############################################################################
+ENVIRONMENT: itsdangerous 1.1.0 | flask 1.1.2 | EMAIL_DOMAIN=sl.local | MAX_NB_EMAIL_FREE_PLAN=3 | MAX_NB_EMAIL_OLD_FREE_PLAN=15 | pid=9912
+ALIAS_LIMIT(decorator)='100/day;50/hour;5/minute' | ALIAS_CREATE_RATE_LIMIT_FREE(bucket)=[(10, 900), (50, 3600)]
+##############################################################################
+```
+
+Both target endpoints are exercised through the real routing + decorator stack:
+
+```text
+@api_bp.route("/v2/alias/custom/new", methods=["POST"])   # app/api/views/new_custom_alias.py:28
+@limiter.limit(ALIAS_LIMIT)                               # :29  (flask-limiter decorator)
+@require_api_auth                                         # :30  (app/api/base.py)
+@parallel_limiter.lock(name="alias_creation")            # :31  (app/parallel_limiter.py)
+def new_custom_alias_v2():                                # :32
+# v3 is identical: route :115, decorators :116-118, def :119
+```
+
+At request time the wrappers run outermost-first: `@limiter.limit` → `@require_api_auth` →
+`@parallel_limiter.lock` → the view body.
+
+### 2.5 Authentication path (canonical)
+
+The API key is presented in the **`Authentication`** header (not `Authorization`); `require_api_auth`
+(`app/api/base.py:52-60`) resolves it via `authorize_request` (`:16`), which looks up `ApiKey.get_by(...)`
+and, on failure, aborts with **HTTP 401** `{"error":"Wrong api key"}` (`:27`). Crucially, `require_api_auth`
+sets **`g.user`** only — it never calls `login_user()` — so under API-key auth `current_user` remains the
+anonymous user. This fact determines the parallel-lock key (§3.4). All positive observations below carry a
+real API key (redacted); the negative observation (§3.3) omits the header and receives 401.
+
+### 2.6 Configuration in effect (disclosure) and the scope of `DISABLE_RATE_LIMIT`
+
+| Config key | Value in effect | Source |
+|---|---|---|
+| `EMAIL_DOMAIN` | `sl.local` | `tests/test.env:8` |
+| `MAX_NB_EMAIL_FREE_PLAN` | **3** | `tests/test.env:13` (default is `5` in `example.env`; `app/config.py:121-124`) |
+| `MAX_NB_EMAIL_OLD_FREE_PLAN` | **15** | `app/config.py` default (branch of §3.5) |
+| `ALIAS_LIMIT` (decorator) | `100/day;50/hour;5/minute` | `app/config.py:448` |
+| `ALIAS_CREATE_RATE_LIMIT_FREE` (bucket) | `[(10, 900), (50, 3600)]` | `app/config.py:554-555` |
+| `MEM_STORE_URI` | `redis://localhost` | `tests/test.env` |
+
+All Q5 quota numbers below are therefore against `MAX_NB_EMAIL_FREE_PLAN = 3`.
+
+**`DISABLE_RATE_LIMIT` gates only the flask-limiter decorator.** It is read at request time by
+`@limiter.request_filter def disable_rate_limit(): return config.DISABLE_RATE_LIMIT`
+(`app/extensions.py:26-28`); `config.DISABLE_RATE_LIMIT` is `("DISABLE_RATE_LIMIT" in os.environ)` evaluated at
+import (`app/config.py:602`) — it tests **key presence**, not value. The image's app-run environment exports
+`DISABLE_RATE_LIMIT=1`; `tests/conftest.py:65` likewise sets it. Consequently:
+
+- For the functional conditions (§3.1–§3.3, §3.5, duplicate, ownership) the harness sets
+  `config.DISABLE_RATE_LIMIT = True`, mirroring the conftest test client — the decorator is disabled.
+- For the decorator rate-limit demonstration (§3.4) the harness sets `config.DISABLE_RATE_LIMIT = False`.
+- The **parallel-lock** (`cl:*`) and the **token-bucket** (`bl:*`, `app/rate_limiter.py`) are **not** gated by
+  this flag and run in every case (§3.4, §3.6).
+
+### 2.7 Observation methodology
+
+- **Canonical path.** Every status/body/header claim (Q1–Q4) comes from an actual
+  `app.test_client().post("/api/v2|v3/alias/custom/new", …)` against `server.create_app()` with a real API
+  key — never from calling `check_suffix_signature()` directly. The only non-canonical, library-level
+  reproduction is the itsdangerous exception-hierarchy stand-in in §5, which is labelled as such.
+- **Zero-residue.** The whole run executes inside a single `connection.begin()` … `transaction.rollback()`
+  envelope, exactly like `tests/conftest.py`'s `flask_client` fixture (`:59-77`), so it leaves **zero net
+  PostgreSQL state** (§2.8). Redis is not transactional, so the harness additionally snapshots the full Redis
+  key set before the run and deletes exactly the keys it created (§2.8).
+- **Byte-identical console capture.** SL log lines are captured with a `logging.Handler` attached to the
+  `"SL"` logger using the **exact** production format string and `time.gmtime` converter from
+  `app/log.py:12-15`:
+  `'%(asctime)s - %(name)s - %(levelname)s - %(process)d - "%(pathname)s:%(lineno)d" - %(funcName)s() - %(message_id)s - %(message)s'`.
+  Lines are reproduced verbatim; per-condition bounded counts (e.g. number of `Alias creation time expired`
+  vs `Alias suffix is tampered` warnings) prove both positive and negative log claims.
+- **Redaction policy.** Only credentials are redacted, with explicit markers: API keys →
+  `<API_KEY_REDACTED (len 60)>`; the session cookie value → `slapp=<SESSION_COOKIE_REDACTED>` (its
+  `Domain/Expires/HttpOnly/Path/SameSite` attributes are kept). **No** other field, header, or log line is
+  truncated; there are no ellipses in any evidence block.
+- **Instrumentation labels.** Lines prefixed `[INSTRUMENT]` are thin wrappers that print internal values
+  (e.g. the parallel-lock name, or `can_create_new_alias` sub-values) and then **call the real method** — they
+  observe, they do not replace, production behavior.
+
+### 2.8 Read-only guarantee and stateful cleanup (F14 evidence)
+
+The source repository is left **byte-for-byte unchanged**; the only file written is this report. All harness
+scripts live outside the checkout (container `/tmp/…`) and are removed after capture. Verified:
+
+```text
+$ git status --porcelain
+(empty — no source/test/config file modified during the investigation)
+```
+
+**PostgreSQL — zero net residue** (external autocommit connection, independent of the harness transaction):
+
+```text
+[F14] DB counts BEFORE (external autocommit conn): {'users': 447, 'alias': 655, 'api_key': 26, 'custom_domain': 139}
+[F14] DB counts AFTER rollback+close:              {'users': 447, 'alias': 655, 'api_key': 26, 'custom_domain': 139}
+[F14] DB net residue (AFTER - BEFORE): {'users': 0, 'alias': 0, 'api_key': 0, 'custom_domain': 0}
+```
+
+**Redis — zero net residue** via before/after key-set delta. The run creates only TTL-bounded keys —
+`session:*` (Flask server-side sessions, TTL ≈ 300 s for the non-authenticated API sessions, `app/session.py:95-96`),
+`bl:*` (token-bucket counters, TTL 900 s / 3600 s, `app/rate_limiter.py:31`), and, in §3.4, `LIMITER*`
+(decorator counters). The harness deletes exactly the keys it added:
+
+```text
+[F14] Redis dbsize BEFORE: 468 | category counts: {'session:': 448, 'bl:': 20, 'cl:': 0, 'LIMITER': 0, 'other': 0}
+[F14] Redis dbsize AFTER run (before cleanup): 564
+[F14] Redis keys CREATED by this run (after_set - before_set): count=96 | categories={'session:': 51, 'bl:': 42, 'cl:': 0, 'LIMITER': 3, 'other': 0}
+[F14] TTL sample of created keys (key, ttl_seconds): {'session:': ('session:01ca8cb9-173c-4347-98c1-cd90b1f06a2b', 296), 'bl:': ('bl:alias_create_3600d:1400:1783674000', 3593), 'LIMITER': ('LIMITER/ip:127.0.0.1/api.new_custom_alias_v3/100/1/day', 86400)}
+[F14] Deleted 96 keys created by this run.
+[F14] Pre-existing keys that expired via TTL during the run (not created by us): 0
+[F14] Redis dbsize FINAL (after deleting our keys): 468 | BEFORE was: 468
+[F14] Net Redis residue attributable to this run: 0 (must be 0)
+```
+
+The parallel-lock keys (`cl:*`) are acquired and released within each request and leave no residue (created
+count = 0). The two auxiliary probes (§5, §6) apply the same before/after delta cleanup; Redis `dbsize`
+returns to `468` after each.
 
 ---
 
-## 1. Title & Summary (executive answer)
+## 3. Direct Answers to the Investigation Questions
 
-Driving the **real** endpoints `POST /api/v2/alias/custom/new` and `POST /api/v3/alias/custom/new` through
-API-key authentication inside the canonical Docker container, the observed behavior is:
+This section answers Q1–Q6. Every behavioural claim is paired with the **complete, unedited** captured
+output for the condition it describes and with the `file:line` of the code that emits the value. The only
+substitutions in any quoted block are the two credentials redacted per the policy disclosed in §2.7 — the
+API key (`<API_KEY_REDACTED (len 60)>`) and the session-cookie value (`<SESSION_COOKIE_REDACTED>`); no
+other bytes were altered, shortened, or elided. The harness builds each request body **once** and passes
+the same object to both the POST and the printout, so the `signed_suffix` shown in every `COMMAND:` line is
+byte-for-byte the value that was actually transmitted.
 
-- **Every "bad" signed suffix — expired, tampered, malformed, *and* empty — returns the identical
-  `HTTP 412` with body `{"error":"Alias creation time is expired, please retry"}`.** The status is
-  **deterministic** (10/10 identical repeated POSTs → 412; see §6). There is **no run-to-run randomness**.
-- **The central finding (root cause):** the validator `check_suffix_signature()`
-  (`app/alias_suffix.py:37-42`) wraps `signer.unsign(signed_suffix, max_age=600)` in a
-  `try/except itsdangerous.BadSignature` (catch at `app/alias_suffix.py:41`). In **itsdangerous 1.1.0**
-  (runtime-confirmed), **both `SignatureExpired` and `BadTimeSignature` subclass `BadSignature`**, so a
-  tampered/malformed/empty suffix raises a `BadSignature` subclass that is *swallowed* exactly like a genuine
-  expiry — the function returns `None`, and the endpoint takes the `if not alias_suffix:` → **412** branch
-  (`app/api/views/new_custom_alias.py:71-73` v2 / `:186-188` v3). Consequently the intended
-  **`HTTP 400 {"error":"Tampered suffix"}`** branch (`:74-76` v2 / `:189-191` v3) is **dead code for
-  signature errors** — it can only fire on a *non-*`BadSignature` exception, which signature problems never
-  raise. This single-response-covers-four-distinct-causes behavior is the most likely explanation for the
-  user's "validation failures that don't match expected behavior": a caller expecting a `400 "Tampered
-  suffix"` for a tampered/invalid suffix instead *always* receives `412 "…expired…"`.
-- **Rate-limit headers (Q4): a clear NEGATIVE finding.** No `X-RateLimit-Limit`/`X-RateLimit-Remaining`/
-  `X-RateLimit-Reset`/`Retry-After` header is emitted on **any** response — normal (201/412/400) or the
-  rate-limit `429`. The limiter is built as `Limiter(key_func=__key_func)` with **no** `headers_enabled`
-  argument (`app/extensions.py:23`) and there is no `RATELIMIT_HEADERS_ENABLED` config anywhere. On breach
-  the app returns `{"error":"Rate limit exceeded"}, 429` from the 429 handler in the **root** `server.py:362-372`.
-- **Quota checks on success (Q5):** the enforcer is `User.can_create_new_alias()` (`app/models.py:867-884`),
-  which after `is_active()`/`disabled`/`lifetime_or_active_subscription()` short-circuits evaluates
-  `Alias.filter_by(user_id=self.id).count() < self.max_alias_for_free_account()` (`app/models.py:881-884`);
-  `max_alias_for_free_account()` (`app/models.py:858-865`) returns `config.MAX_NB_EMAIL_FREE_PLAN`
-  (**3** under `tests/test.env`). **`can_create_new_alias()` logs nothing on success**; the only related log
-  is the *failure*-path `LOG.d("user %s cannot create any custom alias", user)` (`:49` v2 / `:138` v3).
+### 3.1 Q1 — Invalid (tampered / malformed) signed suffix: HTTP status code and error body
 
-The remainder of this document provides the exact commands, unedited outputs, `file:line` references, and the
-execution-path trace behind each of these answers.
+**Answer (observed, canonical HTTP path).** Every *invalid* signed suffix — whether the signature is
+**tampered**, **malformed** (contains no separator), or **empty** — is rejected with **HTTP `412`** and the
+JSON body **`{"error":"Alias creation time is expired, please retry"}`** (Content-Length `57`), on **both**
+`POST /api/v2/alias/custom/new` and `POST /api/v3/alias/custom/new`.
 
----
+**Why this is the observed answer — and why it is *not* the intuitively-expected `400 "Tampered suffix"`.**
+The endpoints validate the suffix inside a `try/except`:
 
-## 2. Environment & Methodology
-
-### 2.1 Canonical runtime (exactly as used)
-
-All behavioral observations were produced **inside the user-supplied canonical Docker container** (a running
-container named `sl_setup`), never in the planning/authoring shell (which lacks PostgreSQL, Redis, and even
-`itsdangerous`).
-
-| Item | Value (observed) |
-|------|------------------|
-| Container image | `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_simple-login_app_1.0` |
-| Python | `3.10.18` (`Dockerfile:8` → `FROM python:3.10`; `pyproject.toml:61` → `python = "^3.10"`; CI `.github/workflows/main.yml:17` → `python-version: '3.10'`) |
-| itsdangerous | `1.1.0` (`poetry.lock:1617-1618`) |
-| flask | `1.1.2` (`poetry.lock:910-911`) |
-| flask-limiter | `1.4` (`poetry.lock:1013-1014`) |
-| limits | `1.5.1` (`poetry.lock:1759-1760`) |
-| PostgreSQL | `15.13` on `localhost:5432` (user/pw/db = `test`/`test`/`test`), `pg_trgm` extension enabled |
-| Redis | reachable on `localhost:6379` (`PONG`) |
-
-Version confirmation command and output:
-
-```
-$ docker exec sl_setup /app/venv/bin/python -c "import itsdangerous, flask, importlib.metadata as m, sys; \
-print('itsdangerous', itsdangerous.__version__); print('flask', flask.__version__); \
-print('flask-limiter', m.version('flask-limiter')); print('limits', m.version('limits')); \
-print('python', sys.version.split()[0])"
-itsdangerous 1.1.0
-flask 1.1.2
-flask-limiter 1.4
-limits 1.5.1
-python 3.10.18
+```text
+# app/api/views/new_custom_alias.py — v2 L69-76 (v3 L183-191 is identical)
+try:
+    alias_suffix = check_suffix_signature(signed_suffix)
+    if not alias_suffix:
+        LOG.w("Alias creation time expired for %s", user)          # v2 L72 / v3 L187
+        return jsonify(error="Alias creation time is expired, please retry"), 412
+except Exception:
+    LOG.w("Alias suffix is tampered, user %s", user)               # v2 L75 / v3 L190
+    return jsonify(error="Tampered suffix"), 400
 ```
 
-### 2.2 Entry point and boot commands
+`check_suffix_signature()` (`app/alias_suffix.py:37-42`) wraps `signer.unsign(signed_suffix, max_age=600)`
+in `except itsdangerous.BadSignature: return None` at `app/alias_suffix.py:41`. Under the pinned
+**itsdangerous 1.1.0** (§2.3), the exceptions raised for a tampered signature (`BadTimeSignature`), an
+expired signature (`SignatureExpired`), and a malformed/empty value (`BadSignature`) are **all subclasses of
+`BadSignature`** (proven directly in §5). They are therefore all caught at `alias_suffix.py:41`, collapse to
+a `None` return, and route into the `if not alias_suffix:` branch → **`412`**. The `except Exception:` arm
+that would emit `400 "Tampered suffix"` fires only for a *non-*`BadSignature` exception and is thus
+**dead code for every signature problem** (analysed in full in §5). This is the single most likely source of
+the user's "validation failures that don't match the expected behaviour": a tampered suffix returns the
+*expiry* message and status, not a tamper-specific `400`.
 
-The **canonical in-process entry point** was used: a Flask test client built from `server.create_app()`
-exactly as `tests/conftest.py` does (`from server import create_app` at `tests/conftest.py:20`;
-`app = create_app()` at `:23`; `add_sl_domains()` at `:38`; `add_proton_partner()` at `:39`; `pg_trgm` setup
-at `:28-36`). This exercises the full decorator stack, authentication, and HTTP response machinery.
-(The production out-of-process entry point is `gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15`,
-`Dockerfile:47`, `EXPOSE 7777` at `Dockerfile:44`; it was not required because the in-process test client
-drives the identical WSGI application.)
+Note that the `400 "Tampered suffix"` branch never fired in any run: the bounded per-request counter
+`'Alias suffix is tampered' WARN=0` on every one of the six invalid conditions below (F5 bounded-count
+evidence; see §3.3).
 
-Temporary observation scripts were written **outside** the repository checkout, under the container's
-`/tmp/blitzy_obs/`, and were run with:
+#### 3.1.1 Tampered suffix (last character flipped) — v2 then v3
 
+```text
+==============================================================================
+CONDITION: (c) TAMPERED suffix (flip last char) -> v2 (expect 412, NOT 400)
+COMMAND: POST /api/v2/alias/custom/new
+  json = {"alias_prefix": "tampv2", "signed_suffix": ".list@sl.local.alDCFA.3iK0tU6MFR19kcjvJh3cjYcHhUA"}
+  headers = {'Authentication': '<API_KEY_REDACTED (len 60)>'}
+STATUS: 412
+BODY: {"error":"Alias creation time is expired, please retry"}
+
+RESPONSE HEADERS:
+  Content-Type: application/json
+  Content-Length: 57
+  Access-Control-Allow-Origin: *
+  Set-Cookie: slapp=<SESSION_COOKIE_REDACTED>; Domain=.sl.test; Expires=Fri, 17-Jul-2026 09:57:40 GMT; HttpOnly; Path=/; SameSite=Lax
+RATE-LIMIT HEADERS PRESENT: NONE
+SL LOG LINES EMITTED DURING REQUEST (2 total; 'Alias creation time expired' WARN=1; 'Alias suffix is tampered' WARN=0):
+  2026-07-10 09:57:40,634 - SL - WARNING - 10042 - "/app/app/api/views/new_custom_alias.py:72" - new_custom_alias_v2() -  - Alias creation time expired for <User 1404 Obs obs_tam_v2_gntfecmc@mailbox.test>
+  2026-07-10 09:57:40,635 - SL - DEBUG - 10042 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 412, takes 0.0175018310546875
 ```
-$ docker exec sl_setup bash -lc 'cd /app && /app/venv/bin/python /tmp/blitzy_obs/<script>.py'
+
+```text
+==============================================================================
+CONDITION: (c) TAMPERED suffix (flip last char) -> v3 (expect 412, NOT 400)
+COMMAND: POST /api/v3/alias/custom/new
+  json = {"alias_prefix": "tampv3", "signed_suffix": ".list@sl.local.alDCFA.3iK0tU6MFR19kcjvJh3cjYcHhUA", "mailbox_ids": [1659]}
+  headers = {'Authentication': '<API_KEY_REDACTED (len 60)>'}
+STATUS: 412
+BODY: {"error":"Alias creation time is expired, please retry"}
+
+RESPONSE HEADERS:
+  Content-Type: application/json
+  Content-Length: 57
+  Access-Control-Allow-Origin: *
+  Set-Cookie: slapp=<SESSION_COOKIE_REDACTED>; Domain=.sl.test; Expires=Fri, 17-Jul-2026 09:57:40 GMT; HttpOnly; Path=/; SameSite=Lax
+RATE-LIMIT HEADERS PRESENT: NONE
+SL LOG LINES EMITTED DURING REQUEST (2 total; 'Alias creation time expired' WARN=1; 'Alias suffix is tampered' WARN=0):
+  2026-07-10 09:57:40,911 - SL - WARNING - 10042 - "/app/app/api/views/new_custom_alias.py:187" - new_custom_alias_v3() -  - Alias creation time expired for <User 1405 Obs obs_tam_v3_ynwmtuin@mailbox.test>
+  2026-07-10 09:57:40,911 - SL - DEBUG - 10042 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 412, takes 0.01650834083557129
 ```
 
-Each script sets, **before importing the app**, the canonical test configuration:
+#### 3.1.2 Malformed suffix (`'notasignature'`, no `.` separator) — v2 then v3 (F3: v3 covered)
 
-```python
-os.environ["CONFIG"]  = "/app/tests/test.env"                       # tests/conftest.py:8-10
-os.environ["DB_URI"]  = "postgresql://test:test@localhost:5432/test"  # override; see note below
-sys.path.insert(0, "/app"); os.chdir("/app")
-from server import create_app
-app = create_app(); app.config["TESTING"] = True
-app.config["WTF_CSRF_ENABLED"] = False; app.config["SERVER_NAME"] = "sl.test"
-# pg_trgm setup + add_sl_domains() + add_proton_partner()  (mirrors tests/conftest.py)
+```text
+==============================================================================
+CONDITION: (d) MALFORMED suffix 'notasignature' (no '.') -> v2 (expect 412)
+COMMAND: POST /api/v2/alias/custom/new
+  json = {"alias_prefix": "malfv2", "signed_suffix": "notasignature"}
+  headers = {'Authentication': '<API_KEY_REDACTED (len 60)>'}
+STATUS: 412
+BODY: {"error":"Alias creation time is expired, please retry"}
+
+RESPONSE HEADERS:
+  Content-Type: application/json
+  Content-Length: 57
+  Access-Control-Allow-Origin: *
+  Set-Cookie: slapp=<SESSION_COOKIE_REDACTED>; Domain=.sl.test; Expires=Fri, 17-Jul-2026 09:57:41 GMT; HttpOnly; Path=/; SameSite=Lax
+RATE-LIMIT HEADERS PRESENT: NONE
+SL LOG LINES EMITTED DURING REQUEST (2 total; 'Alias creation time expired' WARN=1; 'Alias suffix is tampered' WARN=0):
+  2026-07-10 09:57:41,185 - SL - WARNING - 10042 - "/app/app/api/views/new_custom_alias.py:72" - new_custom_alias_v2() -  - Alias creation time expired for <User 1406 Obs obs_malf_v2_rkruewix@mailbox.test>
+  2026-07-10 09:57:41,186 - SL - DEBUG - 10042 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 412, takes 0.015711069107055664
 ```
 
-> **DB_URI note (disclosed):** `tests/test.env:17` declares `DB_URI=postgresql://test:test@localhost:15432/test`,
-> but the container's PostgreSQL listens on `5432`. Because `app/config.py:69` calls `load_dotenv(...)` with the
-> default `override=False`, pre-setting `os.environ["DB_URI"]` to port `5432` takes precedence over the `.env`
-> value (`DB_URI = os.environ["DB_URI"]` at `app/config.py:192`). `MEM_STORE_URI=redis://localhost`
-> (`tests/test.env:78`) is used as-is.
+```text
+==============================================================================
+CONDITION: (d) MALFORMED suffix 'notasignature' (no '.') -> v3 (expect 412)  [F3]
+COMMAND: POST /api/v3/alias/custom/new
+  json = {"alias_prefix": "malfv3", "signed_suffix": "notasignature", "mailbox_ids": [1661]}
+  headers = {'Authentication': '<API_KEY_REDACTED (len 60)>'}
+STATUS: 412
+BODY: {"error":"Alias creation time is expired, please retry"}
 
-### 2.3 How a valid API token was obtained (the real, canonical auth path)
-
-Requests are authenticated through the real `require_api_auth` decorator (`app/api/base.py:52-60`), whose
-`authorize_request()` (`app/api/base.py:16`) reads `api_code = request.headers.get("Authentication")`
-(`:17`) and looks it up via `ApiKey.get_by(code=api_code)` (`:18`). Each observation script creates a fresh
-`User` and a real `ApiKey` (`ApiKey.create(user_id=..., name=...)`, `app/models.py:2364-2370`, which generates
-a 60-character `code`) and sends the header `Authentication: <api_key.code>` on every request. This was
-verified to be the enforced path: **omitting the header yields `HTTP 401 {"error":"Wrong api key"}`**
-(`app/api/base.py:27`). API-key values are redacted in this report as `<API_KEY_REDACTED (60 chars)>`.
-
-### 2.4 Configuration in effect (disclosed per observation)
-
-| Config key | Value | Where set | Applies to |
-|------------|-------|-----------|------------|
-| `EMAIL_DOMAIN` | `sl.local` | `tests/test.env:8` | valid-suffix construction |
-| `MAX_NB_EMAIL_FREE_PLAN` | `3` | `tests/test.env:13` (default would be `5` via `app/config.py:124` if unset) | Q5 quota numbers |
-| `DISABLE_RATE_LIMIT` | `False` by default | not set in `tests/test.env` → `app/config.py:602` = `False` | see below |
-| `ALIAS_LIMIT` | `"100/day;50/hour;5/minute"` | `app/config.py:448` | Q4/Q6 rate-limit bucket |
-
-> **Rate-limit isolation nuance (disclosed):** conditions (a)–(e) and the intermittency runs were executed
-> with `config.DISABLE_RATE_LIMIT = True` — the exact behavior of the canonical `flask_client` fixture, which
-> sets it at `tests/conftest.py:65` and again in its `finally` at `:73`. This isolates the suffix/quota logic
-> from the limiter. It is required because, under API-key auth (no session cookie), `current_user` is anonymous
-> at `@limiter.limit` time, so the limiter key is `ip:127.0.0.1` (`app/extensions.py:14-19`) and is *shared*
-> across all API requests; leaving the limiter active would spuriously `429` after a few requests. Condition
-> (f) — the rate-limit observation for Q4 — instead sets `config.DISABLE_RATE_LIMIT = False` and loops the POST
-> (resetting `g._rate_limiting_complete = False` each iteration), exactly as `test_too_many_requests`
-> (`tests/api/test_new_custom_alias.py:255-283`) does. Each observation below states the value in effect.
-
-### 2.5 Server-log capture
-
-The `SL` logger writes to **stdout** (`app/log.py:41`, `logging.StreamHandler(sys.stdout)`) using the format
-string at `app/log.py:12-15`:
-
+RESPONSE HEADERS:
+  Content-Type: application/json
+  Content-Length: 57
+  Access-Control-Allow-Origin: *
+  Set-Cookie: slapp=<SESSION_COOKIE_REDACTED>; Domain=.sl.test; Expires=Fri, 17-Jul-2026 09:57:41 GMT; HttpOnly; Path=/; SameSite=Lax
+RATE-LIMIT HEADERS PRESENT: NONE
+SL LOG LINES EMITTED DURING REQUEST (2 total; 'Alias creation time expired' WARN=1; 'Alias suffix is tampered' WARN=0):
+  2026-07-10 09:57:41,466 - SL - WARNING - 10042 - "/app/app/api/views/new_custom_alias.py:187" - new_custom_alias_v3() -  - Alias creation time expired for <User 1407 Obs obs_malf_v3_yoxjivdj@mailbox.test>
+  2026-07-10 09:57:41,467 - SL - DEBUG - 10042 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 412, takes 0.01630687713623047
 ```
+
+#### 3.1.3 Empty suffix (`''`) — v2 then v3 (F3: v3 covered)
+
+```text
+==============================================================================
+CONDITION: (e) EMPTY suffix '' -> v2 (expect 412)
+COMMAND: POST /api/v2/alias/custom/new
+  json = {"alias_prefix": "emptyv2", "signed_suffix": ""}
+  headers = {'Authentication': '<API_KEY_REDACTED (len 60)>'}
+STATUS: 412
+BODY: {"error":"Alias creation time is expired, please retry"}
+
+RESPONSE HEADERS:
+  Content-Type: application/json
+  Content-Length: 57
+  Access-Control-Allow-Origin: *
+  Set-Cookie: slapp=<SESSION_COOKIE_REDACTED>; Domain=.sl.test; Expires=Fri, 17-Jul-2026 09:57:41 GMT; HttpOnly; Path=/; SameSite=Lax
+RATE-LIMIT HEADERS PRESENT: NONE
+SL LOG LINES EMITTED DURING REQUEST (2 total; 'Alias creation time expired' WARN=1; 'Alias suffix is tampered' WARN=0):
+  2026-07-10 09:57:41,749 - SL - WARNING - 10042 - "/app/app/api/views/new_custom_alias.py:72" - new_custom_alias_v2() -  - Alias creation time expired for <User 1408 Obs obs_empty_v2_crcqegjt@mailbox.test>
+  2026-07-10 09:57:41,750 - SL - DEBUG - 10042 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 412, takes 0.017600297927856445
+```
+
+```text
+==============================================================================
+CONDITION: (e) EMPTY suffix '' -> v3 (expect 412)  [F3]
+COMMAND: POST /api/v3/alias/custom/new
+  json = {"alias_prefix": "emptyv3", "signed_suffix": "", "mailbox_ids": [1663]}
+  headers = {'Authentication': '<API_KEY_REDACTED (len 60)>'}
+STATUS: 412
+BODY: {"error":"Alias creation time is expired, please retry"}
+
+RESPONSE HEADERS:
+  Content-Type: application/json
+  Content-Length: 57
+  Access-Control-Allow-Origin: *
+  Set-Cookie: slapp=<SESSION_COOKIE_REDACTED>; Domain=.sl.test; Expires=Fri, 17-Jul-2026 09:57:42 GMT; HttpOnly; Path=/; SameSite=Lax
+RATE-LIMIT HEADERS PRESENT: NONE
+SL LOG LINES EMITTED DURING REQUEST (2 total; 'Alias creation time expired' WARN=1; 'Alias suffix is tampered' WARN=0):
+  2026-07-10 09:57:42,032 - SL - WARNING - 10042 - "/app/app/api/views/new_custom_alias.py:187" - new_custom_alias_v3() -  - Alias creation time expired for <User 1409 Obs obs_empty_v3_jfhzxwmh@mailbox.test>
+  2026-07-10 09:57:42,033 - SL - DEBUG - 10042 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 412, takes 0.02232503890991211
+```
+
+**Q1 summary.** Invalid suffix → `HTTP 412`, body `{"error":"Alias creation time is expired, please retry"}`,
+identical on v2 and v3, for all three invalid kinds (tampered / malformed / empty). Emitted at
+`app/api/views/new_custom_alias.py:73` (v2) / `:188` (v3) after the `if not alias_suffix:` guard, because
+`check_suffix_signature()` (`app/alias_suffix.py:41`) swallows every `BadSignature` subclass. The
+tamper-specific `400 "Tampered suffix"` is unreachable for signature errors.
+
+### 3.2 Q2 — Expired signed suffix: HTTP status code and error body
+
+**Answer (observed, canonical HTTP path).** An *expired* signed suffix (signing age greater than the
+`max_age=600` window enforced by `TimestampSigner` at `app/alias_suffix.py:11,39`) is rejected with
+**HTTP `412`** and the JSON body **`{"error":"Alias creation time is expired, please retry"}`**
+(Content-Length `57`), on **both** v2 and v3.
+
+**Relationship to Q1 (the crux).** Expiry is a *distinct underlying condition* from the tampered/malformed
+cases of Q1 — it is raised as `itsdangerous.SignatureExpired` ("Signature age 1000 > 600 seconds", proven in
+§5) rather than `BadTimeSignature`/`BadSignature` — **yet it produces the identical `412` status and identical
+body**. Expiry is in fact the *one* condition for which the `412 "…time is expired…"` message is
+semantically accurate; the finding of this investigation is that Q1's invalid-suffix cases are funnelled into
+this very same expiry response because `SignatureExpired` and `BadTimeSignature` share the `BadSignature`
+base class caught at `app/alias_suffix.py:41`. From the client's perspective the two questions have one
+answer, which is precisely why tamper vs. expiry cannot be distinguished from the HTTP response.
+
+The expired suffix was produced by signing with a back-dated timestamp so that
+`signer.unsign(signed_suffix, max_age=600)` observes an age of ≈1000 s. Complete captured output, v2 then v3:
+
+```text
+==============================================================================
+CONDITION: (b) EXPIRED suffix age~1000s -> v2 (expect 412)
+COMMAND: POST /api/v2/alias/custom/new
+  json = {"alias_prefix": "expv2", "signed_suffix": ".word@sl.local.alC-LA.3-B0zIHlkaV5aX0zBgxG5NBITlA"}
+  headers = {'Authentication': '<API_KEY_REDACTED (len 60)>'}
+STATUS: 412
+BODY: {"error":"Alias creation time is expired, please retry"}
+
+RESPONSE HEADERS:
+  Content-Type: application/json
+  Content-Length: 57
+  Access-Control-Allow-Origin: *
+  Set-Cookie: slapp=<SESSION_COOKIE_REDACTED>; Domain=.sl.test; Expires=Fri, 17-Jul-2026 09:57:40 GMT; HttpOnly; Path=/; SameSite=Lax
+RATE-LIMIT HEADERS PRESENT: NONE
+SL LOG LINES EMITTED DURING REQUEST (2 total; 'Alias creation time expired' WARN=1; 'Alias suffix is tampered' WARN=0):
+  2026-07-10 09:57:40,080 - SL - WARNING - 10042 - "/app/app/api/views/new_custom_alias.py:72" - new_custom_alias_v2() -  - Alias creation time expired for <User 1402 Obs obs_exp_v2_mzvcqool@mailbox.test>
+  2026-07-10 09:57:40,081 - SL - DEBUG - 10042 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 412, takes 0.016010522842407227
+```
+
+```text
+==============================================================================
+CONDITION: (b) EXPIRED suffix age~1000s -> v3 (expect 412)
+COMMAND: POST /api/v3/alias/custom/new
+  json = {"alias_prefix": "expv3", "signed_suffix": ".word@sl.local.alC-LA.3-B0zIHlkaV5aX0zBgxG5NBITlA", "mailbox_ids": [1657]}
+  headers = {'Authentication': '<API_KEY_REDACTED (len 60)>'}
+STATUS: 412
+BODY: {"error":"Alias creation time is expired, please retry"}
+
+RESPONSE HEADERS:
+  Content-Type: application/json
+  Content-Length: 57
+  Access-Control-Allow-Origin: *
+  Set-Cookie: slapp=<SESSION_COOKIE_REDACTED>; Domain=.sl.test; Expires=Fri, 17-Jul-2026 09:57:40 GMT; HttpOnly; Path=/; SameSite=Lax
+RATE-LIMIT HEADERS PRESENT: NONE
+SL LOG LINES EMITTED DURING REQUEST (2 total; 'Alias creation time expired' WARN=1; 'Alias suffix is tampered' WARN=0):
+  2026-07-10 09:57:40,357 - SL - WARNING - 10042 - "/app/app/api/views/new_custom_alias.py:187" - new_custom_alias_v3() -  - Alias creation time expired for <User 1403 Obs obs_exp_v3_ihljqqjh@mailbox.test>
+  2026-07-10 09:57:40,357 - SL - DEBUG - 10042 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 412, takes 0.016537189483642578
+```
+
+#### 3.2.1 Frequency / stability: same unchanged expired input POSTed repeatedly (F6)
+
+To characterise the reported "intermittent" behaviour with a *fixed* input, one single expired
+`signed_suffix` string was POSTed **5 times on v2 and 5 times on v3** without modification. The observed
+status distribution is **`{412: 5}` on v2 and `{412: 5}` on v3** — i.e. fully **deterministic**: the same
+unchanged expired input always yields `412`. (Run-to-run behaviour across *freshly generated* signatures,
+including a genuine base64 nuance, is examined separately in §6.) Run 1 is shown fully instrumented; runs
+2–5 emit the byte-identical `[INSTRUMENT]` + `WARNING` + `after_request` triplet (complete transcript in §8):
+
+```text
+FIXED expired signed_suffix = '.word@sl.local.alC-Lg.zR2dRnowV3GBBunIQQnrJgCXYNE'
+
+--- v2, request 1/5 (fully instrumented) ---
+  [INSTRUMENT] parallel_limiter._InnerLock.acquire_lock lock_name='cl:127.0.0.1:alias_creation'
+  [INSTRUMENT] can_create_new_alias(user_id=1410): is_active=True disabled=False lifetime_or_active_subscription=False Alias.filter_by(user_id).count()=1 max_alias_for_free_account()=3 -> returns True
+2026-07-10 09:57:42,577 - SL - WARNING - 10042 - "/app/app/api/views/new_custom_alias.py:72" - new_custom_alias_v2() -  - Alias creation time expired for <User 1410 Obs obs_exprep_v2_jddypltd@mailbox.test>
+2026-07-10 09:57:42,578 - SL - DEBUG - 10042 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 412, takes 0.015529870986938477
+  v2 run 1/5: HTTP 412 | {"error":"Alias creation time is expired, please retry"}
+  v2 run 2/5: HTTP 412 | {"error":"Alias creation time is expired, please retry"}
+  v2 run 3/5: HTTP 412 | {"error":"Alias creation time is expired, please retry"}
+  v2 run 4/5: HTTP 412 | {"error":"Alias creation time is expired, please retry"}
+  v2 run 5/5: HTTP 412 | {"error":"Alias creation time is expired, please retry"}
+  v2 DISTRIBUTION over 5 identical expired POSTs: {412: 5}
+
+--- v3, request 1/5 (fully instrumented) ---
+  [INSTRUMENT] parallel_limiter._InnerLock.acquire_lock lock_name='cl:127.0.0.1:alias_creation'
+  [INSTRUMENT] can_create_new_alias(user_id=1411): is_active=True disabled=False lifetime_or_active_subscription=False Alias.filter_by(user_id).count()=1 max_alias_for_free_account()=3 -> returns True
+2026-07-10 09:57:42,662 - SL - WARNING - 10042 - "/app/app/api/views/new_custom_alias.py:187" - new_custom_alias_v3() -  - Alias creation time expired for <User 1411 Obs obs_exprep_v3_wrmnlatn@mailbox.test>
+2026-07-10 09:57:42,663 - SL - DEBUG - 10042 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 412, takes 0.015637636184692383
+  v3 run 1/5: HTTP 412 | {"error":"Alias creation time is expired, please retry"}
+  v3 run 2/5: HTTP 412 | {"error":"Alias creation time is expired, please retry"}
+  v3 run 3/5: HTTP 412 | {"error":"Alias creation time is expired, please retry"}
+  v3 run 4/5: HTTP 412 | {"error":"Alias creation time is expired, please retry"}
+  v3 run 5/5: HTTP 412 | {"error":"Alias creation time is expired, please retry"}
+  v3 DISTRIBUTION over 5 identical expired POSTs: {412: 5}
+```
+
+**Q2 summary.** Expired suffix → `HTTP 412`, body `{"error":"Alias creation time is expired, please retry"}`,
+identical on v2 and v3 and deterministic across repeated identical POSTs (`{412: 5}` per version). Emitted at
+`app/api/views/new_custom_alias.py:73` (v2) / `:188` (v3).
+
+### 3.3 Q3 — Validation log entries printed to the server console
+
+**Answer (observed).** For *every* signed-suffix rejection (expired, tampered, malformed, empty), exactly one
+validation warning is printed to stdout by the `SL` logger. The real, complete lines captured on the expired
+condition (identical in shape for tampered / malformed / empty — see the per-request blocks in §3.1–§3.2)
+are, for v2 and v3 respectively:
+
+```text
+2026-07-10 09:57:40,080 - SL - WARNING - 10042 - "/app/app/api/views/new_custom_alias.py:72" - new_custom_alias_v2() -  - Alias creation time expired for <User 1402 Obs obs_exp_v2_mzvcqool@mailbox.test>
+2026-07-10 09:57:40,357 - SL - WARNING - 10042 - "/app/app/api/views/new_custom_alias.py:187" - new_custom_alias_v3() -  - Alias creation time expired for <User 1403 Obs obs_exp_v3_ihljqqjh@mailbox.test>
+```
+
+The tamper-specific warning
+`LOG.w("Alias suffix is tampered, user %s", user)` (`app/api/views/new_custom_alias.py:75` v2 / `:190` v3)
+was **never printed** — its bounded count is `0` on every request — confirming at the log level that the
+`400 "Tampered suffix"` branch is dead for signature errors.
+
+**Log format.** The `SL` logger's stdout handler uses the format defined at `app/log.py:12-15`:
+
+```text
 %(asctime)s - %(name)s - %(levelname)s - %(process)d - "%(pathname)s:%(lineno)d" - %(funcName)s() - %(message_id)s - %(message)s
 ```
 
-`LOG = _get_logger("SL")` (`app/log.py:79`); the shortcuts `LOG.d/i/w/e` map to `debug/info/warning/exception`
-(`app/log.py:74-77`); werkzeug's own access log is muted (`app/log.py:70-71`). Each script attaches an
-in-memory `logging.Handler` to the `"SL"` logger using this **same** format string (with `time.gmtime`
-converter, matching `app/log.py:43`), so the lines reproduced below are byte-identical to what appears on the
-server console; the request-terminating line at `server.py:284` (`after_request()`) corroborates each final
-status.
+Each observed warning above matches this format field-for-field: timestamp, logger name `SL`, level
+`WARNING`, PID (`10042` in this run), quoted `pathname:lineno`, `funcName()`, an empty `message_id`, then the
+message. The warning shortcut `LOG.w` is defined at `app/log.py:74-77`. The trailing
+`… - SL - DEBUG - … "/app/server.py:284" - after_request() - … <status>, takes <seconds>` line on every
+request is SimpleLogin's own request-completion log (`server.py:284`), not a validation log; werkzeug's
+access log is muted (`app/log.py:70-71`), so it does not appear.
 
----
+**Per-condition log mapping (observed).**
 
-## 3. Answers to Q1–Q6
+| Condition | Validation log line emitted | Emitting `file:line` | `'…time expired'` count | `'…is tampered'` count |
+|-----------|-----------------------------|----------------------|:-----------------------:|:----------------------:|
+| Expired (v2) | `WARNING … Alias creation time expired for <User …>` | `app/api/views/new_custom_alias.py:72` | 1 | 0 |
+| Expired (v3) | `WARNING … Alias creation time expired for <User …>` | `app/api/views/new_custom_alias.py:187` | 1 | 0 |
+| Tampered (v2 / v3) | `WARNING … Alias creation time expired for <User …>` | `:72` / `:187` | 1 | 0 |
+| Malformed (v2 / v3) | `WARNING … Alias creation time expired for <User …>` | `:72` / `:187` | 1 | 0 |
+| Empty (v2 / v3) | `WARNING … Alias creation time expired for <User …>` | `:72` / `:187` | 1 | 0 |
+| Valid (201) | *(no validation warning)* | — | 0 | 0 |
+| Auth-negative (401) | *(no validation warning; rejected before the suffix block)* | — | 0 | 0 |
 
-Both endpoints share the identical suffix-validation block; each answer below shows the observed result for
-**both** `v2` and `v3` where relevant.
+**Bounded-count methodology (F5).** The complete stdout of each request was captured in-process by a
+`logging.Handler` attached to the `SL` logger (implementation disclosed in §2.7), and after each request the
+harness counted occurrences of the two exact warning substrings and printed them on the
+`SL LOG LINES EMITTED DURING REQUEST (N total; 'Alias creation time expired' WARN=x; 'Alias suffix is
+tampered' WARN=y)` header seen in every block of §3.1–§3.2. These bounded counts are the direct evidence for
+the claim above: the positive warning fires exactly once per rejection (`WARN=1`) and the tamper warning
+never fires (`WARN=0`). On the valid path the `N total` header reads `WARN=0`/`WARN=0` (see the 201 block in
+§3.5).
 
-### Q1 — Invalid (tampered / malformed) signed suffix: status code + error body
+**Negative / observability case — missing API key → `401` before any suffix validation (F5).** When the
+`Authentication` header is absent, `require_api_auth` (`app/api/base.py`) rejects the request *before* the
+suffix-validation block runs, so **no** suffix warning is logged — only the `server.py:284` completion line
+with status `401`. Body `{"error":"Wrong api key"}` (Content-Length `26`). Complete captured output, v2 then
+v3:
 
-**Answer:** `HTTP 412` with body **`{"error":"Alias creation time is expired, please retry"}`** — for a
-tampered signature, a malformed (no-`.`) string, *and* an empty string. The intended `HTTP 400
-{"error":"Tampered suffix"}` is **never** returned for signature problems (it is dead code — see §5).
-
-- **Validator:** `check_suffix_signature()` (`app/alias_suffix.py:37-42`); the `except itsdangerous.BadSignature:`
-  at `app/alias_suffix.py:41` returns `None`.
-- **Status mapping (v2):** `new_custom_alias_v2()` — `if not alias_suffix:` at `app/api/views/new_custom_alias.py:71`
-  → `return jsonify(error="Alias creation time is expired, please retry"), 412` at `:73`.
-- **Status mapping (v3):** `new_custom_alias_v3()` — `:186` → `:188`.
-- **Dead intended branch:** `except Exception:` → `return jsonify(error="Tampered suffix"), 400`
-  at `:74-76` (v2) / `:189-191` (v3).
-
-Command (condition c, tampered — a valid signature with its last byte flipped) and unedited output:
-
-```
-$ docker exec sl_setup bash -lc 'cd /app && /app/venv/bin/python /tmp/blitzy_obs/observe_B.py'   # DISABLE_RATE_LIMIT=True
-...
-CONDITION: (c) TAMPERED suffix (flip last byte) -> v2 (expect 412, NOT 400)
+```text
+==============================================================================
+CONDITION: AUTH-NEGATIVE: no Authentication header -> v2 (expect 401)
 COMMAND: POST /api/v2/alias/custom/new
-  json = {'alias_prefix': 'tampv2', 'signed_suffix': '.list@sl.local.alCs5w.eL5N0YZ2fj0-sA1PWHH-meFfaqA'}
-  headers = {'Authentication': '<API_KEY_REDACTED (60 chars)>'}
-STATUS: 412
-BODY: {"error":"Alias creation time is expired, please retry"}
+  json = {"alias_prefix": "noauthv2", "signed_suffix": ".test@sl.local.alDCFg.VGpwlFbVyk-eF1LiIegyzA4hEgc"}
+  headers = {}   (NO Authentication header)
+STATUS: 401
+BODY: {"error":"Wrong api key"}
+
 RESPONSE HEADERS:
   Content-Type: application/json
-  Content-Length: 57
+  Content-Length: 26
   Access-Control-Allow-Origin: *
-  Set-Cookie: slapp=ae1af48d-...; Domain=.sl.test; ...; HttpOnly; Path=/; SameSite=Lax
-SL LOG LINES EMITTED DURING REQUEST:
-  2026-07-10 08:27:19,019 - SL - WARNING - 8348 - "/app/app/api/views/new_custom_alias.py:72" - new_custom_alias_v2() -  - Alias creation time expired for <User 1318 Obs tamper_xdmdwabb@mailbox.test>
-  2026-07-10 08:27:19,020 - SL - DEBUG - 8348 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 412, takes 0.010789632797241211
+  Set-Cookie: slapp=<SESSION_COOKIE_REDACTED>; Domain=.sl.test; Expires=Fri, 17-Jul-2026 09:57:42 GMT; HttpOnly; Path=/; SameSite=Lax
+RATE-LIMIT HEADERS PRESENT: NONE
+SL LOG LINES EMITTED DURING REQUEST (1 total; 'Alias creation time expired' WARN=0; 'Alias suffix is tampered' WARN=0):
+  2026-07-10 09:57:42,036 - SL - DEBUG - 10042 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 401, takes 0.0012133121490478516
 ```
 
-The `v3` tampered request, the **malformed** (`"notasignature"`) request, and the **empty** (`""`) request
-all produced the same `412` body (full blocks in the Appendix, §8). The `v3` warning line is emitted at
-`new_custom_alias.py:187` inside `new_custom_alias_v3()`. In none of these was the string `Tampered suffix`
-ever returned, and the log line `Alias suffix is tampered` (`:75`/`:190`) was **never** emitted.
-
-### Q2 — Expired signed suffix (age > 600 s): status code + error body
-
-**Answer:** `HTTP 412` with body **`{"error":"Alias creation time is expired, please retry"}`** — the *same*
-branch as Q1. The expiry threshold is `max_age=600` seconds at `app/alias_suffix.py:40`
-(`signer.unsign(signed_suffix, max_age=600)`).
-
-Command (condition b — a suffix signed with a timestamp backdated ~1000 s, i.e. age > 600) and unedited output:
-
-```
-$ docker exec sl_setup bash -lc 'cd /app && /app/venv/bin/python /tmp/blitzy_obs/observe_B.py'   # DISABLE_RATE_LIMIT=True
-...
-CONDITION: (b) EXPIRED suffix (age~1000s) -> v2 (expect 412)
-COMMAND: POST /api/v2/alias/custom/new
-  json = {'alias_prefix': 'expv2', 'signed_suffix': '.word@sl.local.alCo_g.iIVZL4dY4dHodbqlG1NDDIDhlZo'}
-  headers = {'Authentication': '<API_KEY_REDACTED (60 chars)>'}
-STATUS: 412
-BODY: {"error":"Alias creation time is expired, please retry"}
-RESPONSE HEADERS:
-  Content-Type: application/json
-  Content-Length: 57
-  Access-Control-Allow-Origin: *
-  Set-Cookie: slapp=ae1af48d-...; Domain=.sl.test; ...; HttpOnly; Path=/; SameSite=Lax
-SL LOG LINES EMITTED DURING REQUEST:
-  2026-07-10 08:27:18,464 - SL - WARNING - 8348 - "/app/app/api/views/new_custom_alias.py:72" - new_custom_alias_v2() -  - Alias creation time expired for <User 1316 Obs expired_gkcdzwiq@mailbox.test>
-  2026-07-10 08:27:18,465 - SL - DEBUG - 8348 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 412, takes 0.010904550552368164
-```
-
-The `v3` expired request produced the same `412` body, with the warning at `new_custom_alias.py:187`
-(`new_custom_alias_v3()`). At the library level (§5), the expired case is the *only* one whose underlying
-exception is genuinely an expiry: `itsdangerous.exc.SignatureExpired: Signature age 1000 > 600 seconds`.
-
-### Q3 — Validation log entries printed to the server console
-
-**Answer:** On every signature rejection (Q1 and Q2), the server console prints exactly **one** validation
-warning via `LOG.w("Alias creation time expired for %s", user)`:
-
-- v2: `app/api/views/new_custom_alias.py:72` (function `new_custom_alias_v2`)
-- v3: `app/api/views/new_custom_alias.py:187` (function `new_custom_alias_v3`)
-
-Verbatim captured stdout lines (already shown per condition above), e.g. for a tampered v2 request:
-
-```
-2026-07-10 08:27:19,019 - SL - WARNING - 8348 - "/app/app/api/views/new_custom_alias.py:72" - new_custom_alias_v2() -  - Alias creation time expired for <User 1318 Obs tamper_xdmdwabb@mailbox.test>
-```
-
-and for the `v3` path:
-
-```
-2026-07-10 08:27:18,743 - SL - WARNING - 8348 - "/app/app/api/views/new_custom_alias.py:187" - new_custom_alias_v3() -  - Alias creation time expired for <User 1317 Obs expired_zajmgvfb@mailbox.test>
-```
-
-These match the `SL` format `app/log.py:12-15` (asctime, logger name `SL`, level `WARNING`, pid `8348`,
-`"pathname:lineno"`, `funcName()`, empty `message_id`, message). `LOG.w` = `logging.Logger.warning`
-(`app/log.py:76`); `LOG = _get_logger("SL")` (`app/log.py:79`); output goes to stdout (`app/log.py:41`).
-
-**Important (grounded, observed):** the *other* warning in the endpoint,
-`LOG.w("Alias suffix is tampered, user %s", user)` (`:75` v2 / `:190` v3), was **not observed for any
-signature error** — it belongs to the unreachable `except Exception:` branch (§5). The success path (Q5) emits
-**no** validation warning at all; only the request-terminating `after_request()` debug line
-(`server.py:284`, e.g. `... 201, takes ...`) and an unrelated `event_dispatcher` info line appear.
-
-### Q4 — Rate-limiting headers on responses (NEGATIVE finding)
-
-**Answer:** **No rate-limit headers are present on any response.** Neither a normal response (201/412/400) nor
-the rate-limit `429` carries `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`, or
-`Retry-After`. On breach, the app returns **`{"error":"Rate limit exceeded"}` with `HTTP 429`**.
-
-- **Why (grounded):** the limiter is constructed as `limiter = Limiter(key_func=__key_func)` **without** a
-  `headers_enabled` argument (`app/extensions.py:23`); flask-limiter 1.4's `RATELIMIT_HEADERS_ENABLED` defaults
-  to `False`, and **no** `RATELIMIT_HEADERS_ENABLED` config key exists anywhere in `server.py` (root) or
-  `app/config.py`. The key resolver `__key_func` (`app/extensions.py:14-19`) returns `userid:{id}` or
-  `ip:{addr}`.
-- **The 429 body/handler:** `@app.errorhandler(429)` → `rate_limited(e)` in the **root** `server.py:362-372`;
-  `if request.path.startswith("/api/"): return jsonify(error="Rate limit exceeded"), 429` (`server.py:370`);
-  the web branch renders `error/429.html` (`server.py:372`). (Note: **`app/server.py` does not exist** — the
-  limiter wiring `limiter.init_app(app)` at `server.py:167` and the handler live in the root `server.py`;
-  `create_app` is at `server.py:139`.)
-
-Command (condition f — `DISABLE_RATE_LIMIT=False`; loop `POST /api/v3` > 5×/min, resetting
-`g._rate_limiting_complete=False` each iteration) and unedited output:
-
-```
-$ docker exec sl_setup bash -lc 'cd /app && /app/venv/bin/python /tmp/blitzy_obs/observe_B2.py'
-...
-  per-request statuses: [400, 400, 400, 400, 400, 400, 429]
-
-CONDITION: (f) RATE-LIMIT breach: final (7th) response (Q4)
+```text
+==============================================================================
+CONDITION: AUTH-NEGATIVE: no Authentication header -> v3 (expect 401)
 COMMAND: POST /api/v3/alias/custom/new
-  json = {'alias_prefix': 'rl6', 'signed_suffix': '<@domain signed>', 'mailbox_ids': [1577]}
-  headers = {'Authentication': '<API_KEY_REDACTED (60 chars)>'}
+  json = {"alias_prefix": "noauthv3", "signed_suffix": ".word@sl.local.alDCFg.AQ96w1H5fQrSARC6yVEm94xJ3do", "mailbox_ids": [1]}
+  headers = {}   (NO Authentication header)
+STATUS: 401
+BODY: {"error":"Wrong api key"}
+
+RESPONSE HEADERS:
+  Content-Type: application/json
+  Content-Length: 26
+  Access-Control-Allow-Origin: *
+  Set-Cookie: slapp=<SESSION_COOKIE_REDACTED>; Domain=.sl.test; Expires=Fri, 17-Jul-2026 09:57:42 GMT; HttpOnly; Path=/; SameSite=Lax
+RATE-LIMIT HEADERS PRESENT: NONE
+SL LOG LINES EMITTED DURING REQUEST (1 total; 'Alias creation time expired' WARN=0; 'Alias suffix is tampered' WARN=0):
+  2026-07-10 09:57:42,038 - SL - DEBUG - 10042 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 401, takes 0.0011305809020996094
+```
+
+**Q3 summary.** Each suffix rejection prints exactly one `SL` WARNING —
+`Alias creation time expired for <User …>` at `app/api/views/new_custom_alias.py:72` (v2) / `:187` (v3),
+formatted per `app/log.py:12-15`. The tamper warning (`:75` / `:190`) never prints (`WARN=0`), and a missing
+API key yields `401 {"error":"Wrong api key"}` with no validation log at all.
+
+### 3.4 Q4 — Rate-limiting headers on the responses
+
+**Answer (observed, negative finding).** **No** rate-limiting headers appear on *any* response, for *any*
+status. Across every status exercised — `201`, `412`, `400`, `401`, `409`, and **both** `429`
+variants — every response carried exactly four headers and **zero** `X-RateLimit-*` / `Retry-After`
+headers. The exact captured line on every single response is `RATE-LIMIT HEADERS PRESENT: NONE`.
+
+#### 3.4.1 Full header inventory across every observed status
+
+Every response, regardless of status, carried this exact header set (values vary only in `Content-Length`
+per body and in the cookie `Expires` timestamp):
+
+```text
+Content-Type: application/json
+Content-Length: <bytes>
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=<SESSION_COOKIE_REDACTED>; Domain=.sl.test; Expires=<ts> GMT; HttpOnly; Path=/; SameSite=Lax
+RATE-LIMIT HEADERS PRESENT: NONE
+```
+
+| Status | Where its complete block appears | `Content-Length` | `X-RateLimit-*` / `Retry-After` |
+|:------:|----------------------------------|:----------------:|:-------------------------------:|
+| `201` (valid create) | §3.5 (Q5 success block) | `464` | NONE |
+| `412` (suffix rejected) | §3.1, §3.2 | `57` | NONE |
+| `400` (wrong prefix/suffix — unverified domain) | §3.4.5 below | `41` | NONE |
+| `400` (quota exceeded) | §3.5 (Q5) | (see §3.5) | NONE |
+| `401` (missing API key) | §3.3 | `26` | NONE |
+| `409` (duplicate alias) | §3.4.5 below | `59` | NONE |
+| `429` (decorator breach) | §3.4.3 below | `32` | NONE |
+| `429` (bucket-limiter breach) | §3.4.3 below | `32` | NONE |
+
+The harness detected rate-limit headers by scanning each response's header keys for the case-insensitive
+prefixes `x-ratelimit` and `retry-after`; the `RATE-LIMIT HEADERS PRESENT: NONE` line printed in every block
+throughout §3 is the result of that scan.
+
+#### 3.4.2 Why there are none (source grounding)
+
+The Flask-Limiter instance is constructed as `limiter = Limiter(key_func=__key_func)` at
+`app/extensions.py:23` — with **no** `headers_enabled` argument — and there is **no** `RATELIMIT_HEADERS_ENABLED`
+key anywhere in `app/config.py` or `server.py`. Under the pinned **Flask-Limiter 1.4** (§2.3), the
+`X-RateLimit-Limit` / `X-RateLimit-Remaining` / `X-RateLimit-Reset` / `Retry-After` headers are written only
+when the limiter's `_headers_enabled` flag is true (gate at `flask_limiter/extension.py:388-389`), which in
+1.4 defaults to `False` unless `headers_enabled=True` (or the `RATELIMIT_HEADERS_ENABLED` config) is supplied.
+Neither is present, so the headers are never emitted — matching the observation exactly. This is an
+*inferred-then-confirmed* chain: the source construction predicts "no headers", and the runtime scan
+confirms `NONE` on all eight status conditions.
+
+#### 3.4.3 The `429` responses and the shared error handler (two independent mechanisms)
+
+`429` can arise from two distinct mechanisms on this endpoint, and **both were observed**. Both are rendered
+by the same Flask error handler `rate_limited` registered at `server.py:362-372` (which logs
+`Client hit rate limit on path …` at `server.py:364` and returns `jsonify(error="Rate limit exceeded"), 429`),
+so both produce the **identical** body `{"error":"Rate limit exceeded"}` (Content-Length `32`) and the
+identical header set with **no** rate-limit headers.
+
+Note on `DISABLE_RATE_LIMIT` (disclosed in §2.6): this flag gates **only** the `@limiter.limit` decorator
+(request-filter `disable_rate_limit` at `app/extensions.py:26-28`; key-presence semantics at
+`app/config.py:602`). It does **not** gate the parallel lock or the `Alias.create` bucket limiter. Conditions
+(a)–(e), the distributions, Q5, ownership, and duplicate were run with `DISABLE_RATE_LIMIT=True` (decorator
+off, mirroring `tests/conftest.py:65`); to observe the decorator `429` the harness explicitly set
+`DISABLE_RATE_LIMIT=False`.
+
+**(1) Decorator breach** — `@limiter.limit(ALIAS_LIMIT)` where `ALIAS_LIMIT="100/day;50/hour;5/minute"`
+(`app/config.py:448`). Looping the v3 endpoint with a single unchanged expired suffix (each pre-breach request
+deterministically `412`, so `Alias.create` is never reached) trips the `5/minute` limit on the 6th request.
+The per-IP counter keys and the per-request status vector were captured verbatim:
+
+```text
+  per-request statuses: [412, 412, 412, 412, 412, 429]
+  decorator LIMITER* keys after breach (confirms per-IP key): ['LIMITER/ip:127.0.0.1/api.new_custom_alias_v3/100/1/day', 'LIMITER/ip:127.0.0.1/api.new_custom_alias_v3/5/1/minute', 'LIMITER/ip:127.0.0.1/api.new_custom_alias_v3/50/1/hour']
+```
+
+```text
+==============================================================================
+CONDITION: Q4 DECORATOR rate-limit breach: 429 response
+COMMAND: POST /api/v3/alias/custom/new
+  json = {"alias_prefix": "rl5", "signed_suffix": "<FIXED expired suffix>", "mailbox_ids": [1674]}
+  headers = {'Authentication': '<API_KEY_REDACTED (len 60)>'}
 STATUS: 429
 BODY: {"error":"Rate limit exceeded"}
+
 RESPONSE HEADERS:
   Content-Type: application/json
   Content-Length: 32
   Access-Control-Allow-Origin: *
-  Set-Cookie: slapp=150a01ad-...; Domain=.sl.test; ...; HttpOnly; Path=/; SameSite=Lax
-SL LOG LINES EMITTED DURING REQUEST:
-  2026-07-10 08:28:36,634 - SL - WARNING - 8391 - "/app/server.py:364" - rate_limited() -  - Client hit rate limit on path /api/v3/alias/custom/new, user:<User 1324 Obs rl_tieowxye@mailbox.test>
-  2026-07-10 08:28:36,634 - SL - DEBUG - 8391 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 429, takes 0.0007886886596679688
-
-[Q4] Rate-limit-specific headers present on 429 response: NONE
-[Q4] Full 429 header names: ['Content-Type', 'Content-Length', 'Access-Control-Allow-Origin', 'Set-Cookie']
+  Set-Cookie: slapp=<SESSION_COOKIE_REDACTED>; Domain=.sl.test; Expires=Fri, 17-Jul-2026 09:57:46 GMT; HttpOnly; Path=/; SameSite=Lax
+RATE-LIMIT HEADERS PRESENT: NONE
+SL LOG LINES EMITTED DURING REQUEST (2 total; 'Alias creation time expired' WARN=0; 'Alias suffix is tampered' WARN=0):
+  2026-07-10 09:57:46,183 - SL - WARNING - 10042 - "/app/server.py:364" - rate_limited() -  - Client hit rate limit on path /api/v3/alias/custom/new, user:<User 1420 Obs obs_rl_wizhjcje@mailbox.test>
+  2026-07-10 09:57:46,184 - SL - DEBUG - 10042 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 429, takes 0.0007371902465820312
 ```
 
-The full header set on the `429` is exactly `Content-Type`, `Content-Length`, `Access-Control-Allow-Origin`,
-`Set-Cookie` — no rate-limit headers. The normal responses in Q1/Q2/Q5 show the same header set (plus a longer
-`Content-Length`), likewise with no rate-limit headers. The `429` is logged by the handler at `server.py:364`
-(`rate_limited()`: `LOG.w("Client hit rate limit on path %s, user:%s", ...)`).
+*(`<FIXED expired suffix>` is the harness's own label for the single unchanged, valid-but-expired signature
+reused on all six loop iterations — it is not an elision of captured output; the concrete form of such an
+expired suffix is shown verbatim in §3.2.1. Because all looped requests share one app context in the test
+client, the harness resets the per-request sentinel `g._rate_limiting_complete` before each iteration to
+emulate one request-context per request as under production gunicorn; the Redis-backed counter is unaffected —
+`flask_limiter/extension.py:511,701`. This instrumentation is disclosed per §2.7.)*
 
-> **Observed nuance (disclosed):** the first six loop requests returned `400` "wrong alias prefix or suffix"
-> (`app/alias_suffix.py:61`, `verify_prefix_suffix()`), because the freshly-created custom domain used to build
-> `@domain` suffixes is not in the user's `available_alias_domains()`. This does **not** affect the finding:
-> `@limiter.limit(ALIAS_LIMIT)` is the *outermost* decorator, so every request counts against the
-> `ip:127.0.0.1` "5/minute" bucket regardless of the body-level outcome; once the bucket is exceeded the 7th
-> request is short-circuited to `429` before the endpoint body runs. This mirrors `test_too_many_requests`
-> (`tests/api/test_new_custom_alias.py:255-283`), which also loops `signer.sign("@"+domain)` and asserts the
-> final response is `429 {"error":"Rate limit exceeded"}`.
+**(2) Bucket-limiter breach** — `Alias.create()` (`app/models.py:1628`) calls
+`rate_limiter.check_bucket_limit(...)` at `app/models.py:1641` for each limit in
+`ALIAS_CREATE_RATE_LIMIT_FREE=[(10, 900), (50, 3600)]` (`app/config.py:554-558`). A **non-premium** user whose
+free quota was raised to 15 (so the alias quota does not reject first) creates aliases until the `10/900s`
+bucket is exceeded; the 10th create returns `429`. The bucket key value ramp `2 → 11` and the per-create
+status vector were captured; the breach emits `LOG.i` at `app/rate_limiter.py:33`:
 
-### Q5 — Quota checks on a successful creation, and what gets logged
-
-**Answer.** On the creation path the enforcer `User.can_create_new_alias()` (`app/models.py:867-884`) runs
-**first** in the endpoint (`new_custom_alias.py:48` v2 / `:137` v3). It evaluates, in order:
-`is_active()` (`app/models.py:872-873`), `disabled` (`:875-876`), `lifetime_or_active_subscription()`
-(`:878-879`), and — for a free account — the decisive comparison
-`Alias.filter_by(user_id=self.id).count() < self.max_alias_for_free_account()` (`app/models.py:881-884`).
-`max_alias_for_free_account()` (`app/models.py:858-865`) returns `config.MAX_NB_EMAIL_FREE_PLAN` (`:865`),
-which is **3** under `tests/test.env:13` (the built-in default is **5**, `app/config.py:124`).
-
-**`can_create_new_alias()` logs nothing on the success path.** To *observe* the actual `count()` and
-`max_alias_for_free_account()` values, the observation script temporarily **wrapped** the two real methods
-(monkeypatch in the `/tmp` script — the underlying methods still execute; `app/models.py` was **not** edited).
-Values labeled `[INSTRUMENT]` below come from that wrapper; everything else is the app's own output.
-
-> **Baseline (observed):** a newly-created user already owns **1** alias — the auto-created
-> `simplelogin-newsletter.<word>@sl.local` — so a "fresh" user's `count()` starts at `1`.
-
-Command (condition e1 — success, `DISABLE_RATE_LIMIT=True`, `MAX_NB_EMAIL_FREE_PLAN=3`) and output:
-
-```
-$ docker exec sl_setup bash -lc 'cd /app && /app/venv/bin/python /tmp/blitzy_obs/observe_B2.py'
-...
->>> (e1) SUCCESS quota check (fresh user, trial_end=None, 0 aliases) — instrumentation follows:
-  [INSTRUMENT] can_create_new_alias(): is_active=True disabled=False lifetime_or_active_subscription=False Alias.count(user_id=1322)=1
-  [INSTRUMENT] User.max_alias_for_free_account() -> 3
-  [INSTRUMENT] can_create_new_alias() -> True
-CONDITION: (e1) SUCCESS: count<max -> 201 (Q5 success path)
-STATUS: 201
-BODY: {"alias":"quotaok.list@sl.local", ... "id":2193, ...}
-SL LOG LINES EMITTED DURING REQUEST:
-  2026-07-10 08:28:35,851 - SL - INFO - 8391 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
-  2026-07-10 08:28:35,860 - SL - DEBUG - 8391 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.05593538284301758
+```text
+     user trial_end=None is_premium()=False flags=5 -> FREE bucket limits=[(10, 900), (50, 3600)] ; quota(max_alias_for_free_account)=15
+       create #1 -> HTTP 201 ; bl:alias_create_900d value=['2']
+       create #9 -> HTTP 201 ; bl:alias_create_900d value=['10']
+2026-07-10 09:57:45,835 - SL - INFO - 10042 - "/app/app/rate_limiter.py:33" - check_bucket_limit() -  - Rate limit hit for alias_create_900d:1419 (bucket id 1783676700) -> 11/10
+2026-07-10 09:57:45,835 - SL - WARNING - 10042 - "/app/server.py:364" - rate_limited() -  - Client hit rate limit on path /api/v3/alias/custom/new, user:<User 1419 Obs obs_bkt2_yprfgjau@mailbox.test>
+       create #10 -> HTTP 429 ; bl:alias_create_900d value=['11']  LOG.i:  - Rate limit hit for alias_create_900d:1419 (bucket id 1783676700) -> 11/10
+     per-create statuses: [201, 201, 201, 201, 201, 201, 201, 201, 201, 429]
 ```
 
-So on success the quota check evaluates `count (1) < max (3)` → `True`, and **the only `SL` lines are the
-unrelated `event_dispatcher` info line and the `after_request` `201` line — no quota log**.
+```text
+==============================================================================
+CONDITION: BUCKET-LIMITER 429 (canonical, via Alias.create->check_bucket_limit models.py:1641)
+NOTE: This 429 originates INSIDE Alias.create (bucket limiter), NOT the @limiter decorator; body/headers identical via errorhandler(429).
+COMMAND: POST /api/v3/alias/custom/new
+  json = {"alias_prefix": "blk9_hhlk", "signed_suffix": ".crcdh@sl.local.alDCGQ.ei0uqERtth8hMGvvytnbEMM6kxU", "mailbox_ids": [1673]}
+  headers = {'Authentication': '<API_KEY_REDACTED (len 60)>'}
+STATUS: 429
+BODY: {"error":"Rate limit exceeded"}
 
-The complementary **quota-exceeded** case (condition e2) — after creating `MAX_NB_EMAIL_FREE_PLAN` more aliases
-via `Alias.create_new(user, prefix="test")` with `user.trial_end = None` (mirroring `test_out_of_quota`,
-`tests/api/test_new_custom_alias.py:184-210`) — makes `count (4) == …` exceed `max (3)`:
-
+RESPONSE HEADERS:
+  Content-Type: application/json
+  Content-Length: 32
+  Access-Control-Allow-Origin: *
+  Set-Cookie: slapp=<SESSION_COOKIE_REDACTED>; Domain=.sl.test; Expires=Fri, 17-Jul-2026 09:57:45 GMT; HttpOnly; Path=/; SameSite=Lax
+RATE-LIMIT HEADERS PRESENT: NONE
+SL LOG LINES EMITTED DURING REQUEST (3 total; 'Alias creation time expired' WARN=0; 'Alias suffix is tampered' WARN=0):
+  2026-07-10 09:57:45,835 - SL - INFO - 10042 - "/app/app/rate_limiter.py:33" - check_bucket_limit() -  - Rate limit hit for alias_create_900d:1419 (bucket id 1783676700) -> 11/10
+  2026-07-10 09:57:45,835 - SL - WARNING - 10042 - "/app/server.py:364" - rate_limited() -  - Client hit rate limit on path /api/v3/alias/custom/new, user:<User 1419 Obs obs_bkt2_yprfgjau@mailbox.test>
+  2026-07-10 09:57:45,835 - SL - DEBUG - 10042 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 429, takes 0.0368649959564209
 ```
->>> (e2) QUOTA-EXCEEDED (created 3 aliases, trial_end=None) — instrumentation follows:
-  [INSTRUMENT] can_create_new_alias(): is_active=True disabled=False lifetime_or_active_subscription=False Alias.count(user_id=1323)=4
-  [INSTRUMENT] User.max_alias_for_free_account() -> 3
-  [INSTRUMENT] can_create_new_alias() -> False
-CONDITION: (e2) QUOTA-EXCEEDED: count==max -> 400 (Q5)
+
+The full 9×`201` create ramp for the bucket case and the full 6-request decorator loop are reproduced in the
+appendix (§8). The complete wiring of the bucket limiter — which **corrects a false "not wired" statement in
+the prior draft** — is analysed in §4 and §5.
+
+#### 3.4.4 Parallel-lock key (F13)
+
+Before the quota check, each request acquires a concurrency lock via
+`parallel_limiter._InnerLock.acquire_lock` (`app/parallel_limiter.py:30-34`). The lock name is
+`cl:{key}:{lock_suffix}` where `lock_suffix="alias_creation"` (the decorator argument
+`@parallel_limiter.lock(name="alias_creation")`) and `{key}` is the current user id when authenticated or the
+client remote address otherwise. In the test client the Flask-Login `current_user` is anonymous during the
+locked section, so the key resolves to the **remote-address** branch. The exact observed lock name on **every**
+request throughout the run was:
+
+```text
+  [INSTRUMENT] parallel_limiter._InnerLock.acquire_lock lock_name='cl:127.0.0.1:alias_creation'
+```
+
+i.e. `cl:{remote_addr}:alias_creation` = `cl:127.0.0.1:alias_creation`. This lock is acquired and released
+**within** each request; it leaves **no** residual `cl:*` keys in Redis (created-count `0` in the F14 cleanup
+evidence of §2.8), which is why it never appears among the persisted keys.
+
+#### 3.4.5 Availability precision — `ownership_verified`, not merely `verified` (F9)
+
+The set of domains a user may build a custom alias on is produced by `User.verified_custom_domains()`
+(`app/models.py:954-958`), whose filter requires **`ownership_verified == True`** — a stricter condition than
+the domain's `verified` flag. This was exercised directly: a `CustomDomain` with `verified=True` but
+`ownership_verified=False` is **excluded** from `verified_custom_domains()` and therefore from
+`available_alias_domains()`, so a POST bearing a *valid* signature over that domain's suffix is rejected at
+`verify_prefix_suffix()` (`app/alias_suffix.py:45-91`, error log at `:61`) with `400`
+`{"error":"wrong alias prefix or suffix"}` (Content-Length `41`) — **not** at the signer. Flipping
+`ownership_verified=True` then makes the domain appear in both sets. Captured before/after and the `400`:
+
+```text
+OWNERSHIP_VERIFIED precision [F9]: verified_custom_domains() filters ownership_verified=True (models.py:954-958)
+  created CustomDomain domain=obsdom-pqpmjp.test verified=True ownership_verified=False
+  user.verified_custom_domains() domains: []
+  dom in user.available_alias_domains(): False
+2026-07-10 09:57:43,742 - SL - ERROR - 10042 - "/app/app/alias_suffix.py:61" - verify_prefix_suffix() -  - wrong alias suffix @obsdom-pqpmjp.test, user <User 1414 Obs obs_odom_nlnzcbis@mailbox.test>
+  after setting ownership_verified=True -> user.verified_custom_domains() domains: ['obsdom-pqpmjp.test']
+  after setting ownership_verified=True -> dom in user.available_alias_domains(): True
+```
+
+```text
+==============================================================================
+CONDITION: OWNERSHIP: POST @unverified-domain suffix -> v3 (expect 400 wrong prefix/suffix)
+NOTE: signed_suffix is a VALID signature over '@obsdom-pqpmjp.test'; rejection is at verify_prefix_suffix, not the signer
+COMMAND: POST /api/v3/alias/custom/new
+  json = {"alias_prefix": "odom", "signed_suffix": "@obsdom-pqpmjp.test.alDCFw.Hn4MuNzlBLBrNISR-z159Tb97Q8", "mailbox_ids": [1668]}
+  headers = {'Authentication': '<API_KEY_REDACTED (len 60)>'}
 STATUS: 400
-BODY: {"error":"You have reached the limitation of a free account with the maximum of 3 aliases, please upgrade your plan to create more aliases"}
-SL LOG LINES EMITTED DURING REQUEST:
-  2026-07-10 08:28:36,193 - SL - DEBUG - 8391 - "/app/app/api/views/new_custom_alias.py:138" - new_custom_alias_v3() -  - user <User 1323 Obs quota_full_wbzhssde@mailbox.test> cannot create any custom alias
-  2026-07-10 08:28:36,194 - SL - DEBUG - 8391 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 400, takes 0.015954971313476562
+BODY: {"error":"wrong alias prefix or suffix"}
+
+RESPONSE HEADERS:
+  Content-Type: application/json
+  Content-Length: 41
+  Access-Control-Allow-Origin: *
+  Set-Cookie: slapp=<SESSION_COOKIE_REDACTED>; Domain=.sl.test; Expires=Fri, 17-Jul-2026 09:57:43 GMT; HttpOnly; Path=/; SameSite=Lax
+RATE-LIMIT HEADERS PRESENT: NONE
+SL LOG LINES EMITTED DURING REQUEST (2 total; 'Alias creation time expired' WARN=0; 'Alias suffix is tampered' WARN=0):
+  2026-07-10 09:57:43,742 - SL - ERROR - 10042 - "/app/app/alias_suffix.py:61" - verify_prefix_suffix() -  - wrong alias suffix @obsdom-pqpmjp.test, user <User 1414 Obs obs_odom_nlnzcbis@mailbox.test>
+  2026-07-10 09:57:43,742 - SL - DEBUG - 10042 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 400, takes 0.02458810806274414
 ```
 
-Thus the **only** quota-related log is the *failure*-path `LOG.d("user %s cannot create any custom alias", user)`
-at `new_custom_alias.py:138` (v3) / `:49` (v2), producing the `400` body quoted verbatim above (note the literal
-`maximum of 3 aliases` — the `3` is `MAX_NB_EMAIL_FREE_PLAN` interpolated at `:53`/`:142`). **Config disclosure:**
-both quota numbers above were produced with `MAX_NB_EMAIL_FREE_PLAN = 3` (`tests/test.env:13`); with the
-built-in default (`5`, `app/config.py:124`) the message would read `maximum of 5 aliases` and the threshold
-comparison would use `5`.
+For completeness of the header inventory, the duplicate-alias `409` (which also carries **no** rate-limit
+headers) was captured as follows:
 
-### Q6 — Execution-path trace (validator, enforcer, and rejection conditions)
+```text
+CONDITION: DUPLICATE: create same alias twice -> v2 second attempt (expect 409)
+NOTE: SAME body dict POSTed twice; first attempt returned HTTP 201 (created); second attempt below
+COMMAND: POST /api/v2/alias/custom/new
+  json = {"alias_prefix": "dup_agthvl", "signed_suffix": ".dfyha@sl.local.alDCFg.wR836NfeZzN0dVzyXQ6xdUM-QxY"}
+  headers = {'Authentication': '<API_KEY_REDACTED (len 60)>'}
+STATUS: 409
+BODY: {"error":"alias dup_agthvl.dfyha@sl.local already exists"}
 
-**Answer.** The **signed-suffix validator** is `app/alias_suffix.py::check_suffix_signature`
-(`app/alias_suffix.py:37-42`); the **creation-limit enforcer** is `app/models.py::can_create_new_alias`
-(`app/models.py:867-884`). A request to `POST /api/vN/alias/custom/new` passes through a three-decorator stack
-and then a fixed validation sequence; the diagram and prose in §4 give the complete trace with the status code
-for each rejection condition.
+RESPONSE HEADERS:
+  Content-Type: application/json
+  Content-Length: 59
+  Access-Control-Allow-Origin: *
+  Set-Cookie: slapp=<SESSION_COOKIE_REDACTED>; Domain=.sl.test; Expires=Fri, 17-Jul-2026 09:57:43 GMT; HttpOnly; Path=/; SameSite=Lax
+RATE-LIMIT HEADERS PRESENT: NONE
+SL LOG LINES EMITTED DURING REQUEST (2 total; 'Alias creation time expired' WARN=0; 'Alias suffix is tampered' WARN=0):
+  2026-07-10 09:57:43,070 - SL - DEBUG - 10042 - "/app/app/api/views/new_custom_alias.py:87" - new_custom_alias_v2() -  - full alias already used dup_agthvl.dfyha@sl.local
+  2026-07-10 09:57:43,070 - SL - DEBUG - 10042 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 409, takes 0.03244972229003906
+```
 
----
+**Q4 summary.** No `X-RateLimit-*` / `Retry-After` headers on any response (`201/412/400/401/409/429×2`),
+because the limiter is built without `headers_enabled` (`app/extensions.py:23`; gate at
+`flask_limiter/extension.py:388-389`) and no `RATELIMIT_HEADERS_ENABLED` config exists. On breach the app
+returns `{"error":"Rate limit exceeded"}` `429` via `rate_limited` (`server.py:362-372`) from *two* possible
+sources — the decorator (`app/config.py:448`) and the `Alias.create` bucket limiter
+(`app/models.py:1641`, `app/config.py:554-558`) — neither adding rate-limit headers. The concurrency lock key
+is `cl:127.0.0.1:alias_creation` (`app/parallel_limiter.py:30-34`), and domain availability is gated by
+`ownership_verified` (`app/models.py:954-958`).
 
+### 3.5 Q5 — Quota checks on a successful creation, and what gets logged
 
-## 4. Execution-path trace (Q6)
+**Answer (observed).** Before the suffix is even parsed, the endpoint runs the alias-creation quota gate
+`user.can_create_new_alias()` (`app/models.py:867-884`). That method delegates the ceiling to
+`user.max_alias_for_free_account()` (`app/models.py:858-865`) and returns `True` iff
+`Alias.filter_by(user_id=user.id).count() < max_alias_for_free_account()` (after short-circuiting on
+`is_active` / `disabled` and on lifetime-or-active-subscription). The **specific values evaluated** on each
+call — the branch booleans, the live alias `count()`, the computed `max`, and the returned decision — were
+captured on every request via harness instrumentation wrapping `can_create_new_alias`, e.g.:
 
-### 4.1 Decorator stack (both endpoints)
+```text
+  [INSTRUMENT] can_create_new_alias(user_id=1415): is_active=True disabled=False lifetime_or_active_subscription=False Alias.filter_by(user_id).count()=2 max_alias_for_free_account()=3 -> returns True
+```
 
-Both endpoints declare the identical decorator stack (v2 `app/api/views/new_custom_alias.py:28-31`,
-v3 `:115-118`), which at request time executes **outermost-first**:
+**What the production code actually logs here (important nuance).** On a **passing** quota check the
+production code logs **nothing** — `can_create_new_alias()` has no log statement on the success branch, and
+the observed success requests emit only the unrelated event-dispatcher `INFO` line and the `server.py:284`
+completion `DEBUG` line (`quota-failure-log lines on this success = 0`, shown below). A quota-related log line
+is emitted **only on rejection**: `LOG.d("user %s cannot create any custom alias", user)` at
+`app/api/views/new_custom_alias.py:49` (v2) / `:138` (v3). So the honest answer to "what specific values get
+logged when the system verifies whether the user may create more aliases" is: **the production success path
+logs no quota values**; the actual comparison values (`count` vs `max`) are what the code evaluates, and they
+are surfaced here by instrumentation and confirmed against the resulting HTTP status. The `[INSTRUMENT]` lines
+are harness instrumentation, not production log output (labeled per §2.7).
 
-1. `@limiter.limit(ALIAS_LIMIT)` — `app/api/views/new_custom_alias.py:29` / `:116`; the flask-limiter instance
-   from `app/extensions.py:23`; `ALIAS_LIMIT = "100/day;50/hour;5/minute"` (`app/config.py:448`). On breach →
-   `HTTP 429 {"error":"Rate limit exceeded"}` via the root-`server.py:362-372` handler.
-2. `@require_api_auth` — `:30` / `:117`; `app/api/base.py:52-60` → `authorize_request()` (`:16`); missing/invalid
-   `Authentication` header → `HTTP 401 {"error":"Wrong api key"}` (`app/api/base.py:27`).
-3. `@parallel_limiter.lock(name="alias_creation")` — `:31` / `:118`; `app/parallel_limiter.py`; `acquire_lock()`
-   (`:30-34`) raises `werkzeug.exceptions.TooManyRequests()` (`:34`) → `HTTP 429` if the per-user/IP Redis lock
-   cannot be acquired within `max_wait_secs`.
+#### 3.5.1 The two quota components (source)
 
-### 4.2 In-body validation sequence
+- `User.can_create_new_alias()` — `app/models.py:867-884`: returns `False` when inactive/disabled; `True`
+  for lifetime or active-subscription users; otherwise
+  `return nb_alias < self.max_alias_for_free_account()` where `nb_alias` is the user's live alias count.
+- `User.max_alias_for_free_account()` — `app/models.py:858-865`: **two branches** —
+  if the `FLAG_FREE_OLD_ALIAS_LIMIT` bit (`1 << 2`, `app/models.py:341`) is set in `user.flags`, it returns
+  `MAX_NB_EMAIL_OLD_FREE_PLAN` (**15**); otherwise it returns `MAX_NB_EMAIL_FREE_PLAN`
+  (`app/config.py:121-124`, **3** under `tests/test.env`; note this key is `5` in `example.env` — the
+  configuration disclosure required for reproducibility).
 
-After the decorators, `new_custom_alias_v2/v3` runs these checks in order (status code in brackets):
+#### 3.5.2 Representative successful-creation response (`201`, header inventory)
 
-- **Quota** — `if not user.can_create_new_alias():` (`:48`/`:137`) → **[400]** `You have reached the limitation
-  of a free account with the maximum of N aliases…`, log `LOG.d("user %s cannot create any custom alias", user)`
-  (`:49`/`:138`).
-- **Empty body** — `if not data:` (`:61`/`:150`) → **[400]** `request body cannot be empty`. (v3 additionally:
-  non-dict body → **[400]** `:153-154`; `check_alias_prefix()` → **[400]** `alias prefix invalid format or too
-  long` `:167-168`, `app/alias_utils.py:418-425`; mailbox checks → **[400]** `:171-181`.)
-- **Signed-suffix signature** — `alias_suffix = check_suffix_signature(signed_suffix)` (`:70`/`:185`,
-  `app/alias_suffix.py:37-42`); `if not alias_suffix:` → **[412]** `Alias creation time is expired, please retry`,
-  log `LOG.w("Alias creation time expired for %s", user)` (`:72-73`/`:187-188`). The `except Exception:` →
-  **[400]** `Tampered suffix` (`:74-76`/`:189-191`) is **unreachable for signature errors** (§5).
-- **Prefix/suffix pairing** — `if not verify_prefix_suffix(...)` (`:78`/`:193`, `app/alias_suffix.py:45-91`) →
-  **[400]** `wrong alias prefix or suffix` (`:79`/`:194`).
-- **Duplicate** — existing alias/deleted alias → **[409]** `alias {full_alias} already exists`, log
-  `LOG.d("full alias already used %s", full_alias)` (`:87-88`/`:202-203`).
-- **Success** — `Alias.create(...)` → **[201]** with the serialized alias JSON (`:109-112`/`:232-235`).
+The canonical fresh-valid creation returns `201` with the full alias JSON and the standard four-header set
+(Content-Length `464`, no rate-limit headers). This is the `201` row referenced by the §3.4.1 inventory:
 
-A standalone bucket limiter also exists — `app/rate_limiter.py::check_bucket_limit` (`:19-42`; log
-`"Rate limit hit for {lock_name} (bucket id {bucket_id}) -> {value}/{max_hits}"` at `:33-35`;
-`raise werkzeug.exceptions.TooManyRequests()` at `:40`) — but it is **not** wired onto these two endpoints
-(their only rate control is the `@limiter.limit(ALIAS_LIMIT)` decorator); it is documented here for completeness.
+```text
+==============================================================================
+CONDITION: (a) FRESH VALID suffix -> v2 (expect 201)
+NOTE: body built ONCE and passed to both POST and display (signed_suffix shown is byte-identical to the one POSTed)
+COMMAND: POST /api/v2/alias/custom/new
+  json = {"alias_prefix": "v2valid_vdxbnr", "signed_suffix": ".gokqo@sl.local.alDCEw.wcQhMNubjim4YFmE0jY-E3Si5RI"}
+  headers = {'Authentication': '<API_KEY_REDACTED (len 60)>'}
+STATUS: 201
+BODY: {"alias":"v2valid_vdxbnr.gokqo@sl.local","creation_date":"2026-07-10 09:57:39+00:00","creation_timestamp":1783677459,"disable_pgp":false,"email":"v2valid_vdxbnr.gokqo@sl.local","enabled":true,"id":2331,"latest_activity":null,"mailbox":{"email":"obs_valid_v2_esmhiaid@mailbox.test","id":1654},"mailboxes":[{"email":"obs_valid_v2_esmhiaid@mailbox.test","id":1654}],"name":null,"nb_block":0,"nb_forward":0,"nb_reply":0,"note":null,"pinned":false,"support_pgp":false}
 
-### 4.3 Diagram
+RESPONSE HEADERS:
+  Content-Type: application/json
+  Content-Length: 464
+  Access-Control-Allow-Origin: *
+  Set-Cookie: slapp=<SESSION_COOKIE_REDACTED>; Domain=.sl.test; Expires=Fri, 17-Jul-2026 09:57:39 GMT; HttpOnly; Path=/; SameSite=Lax
+RATE-LIMIT HEADERS PRESENT: NONE
+SL LOG LINES EMITTED DURING REQUEST (2 total; 'Alias creation time expired' WARN=0; 'Alias suffix is tampered' WARN=0):
+  2026-07-10 09:57:39,486 - SL - INFO - 10042 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+  2026-07-10 09:57:39,495 - SL - DEBUG - 10042 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.05318164825439453
+```
+
+(The v3 fresh-valid create is analogous — `id=2333`, Content-Length `464`, same header set and
+`RATE-LIMIT HEADERS PRESENT: NONE`.)
+
+#### 3.5.3 Quota boundary via v2 — before / during / after, with the exact boundary (F4, F7)
+
+A fresh free user starts with **`count = 1`** — not `0` — because signup auto-creates a
+`simplelogin-newsletter.*@sl.local` alias. The harness seeds one more (→ `2`), succeeds at the boundary
+`count = 2 < max = 3` (→ `3`), and is rejected at **exactly** `count == max == 3` because `can_create_new_alias`
+evaluates `3 < 3 → False`. Complete captured block:
+
+```text
+Q5 QUOTA boundary via v2 [F4,F7]  (MAX_NB_EMAIL_FREE_PLAN=3)
+  user flags=1 (FLAG_FREE_OLD_ALIAS_LIMIT bit set=False) trial_end=2026-07-17T10:57:43.989187+00:00 lifetime=False
+  INITIAL Alias rows for user: ['simplelogin-newsletter.word427@sl.local']
+  INITIAL count = 1 (a fresh user owns the auto-created simplelogin-newsletter alias -> count starts at 1, not 0)
+  [INSTRUMENT] can_create_new_alias(user_id=1415): is_active=True disabled=False lifetime_or_active_subscription=False Alias.filter_by(user_id).count()=1 max_alias_for_free_account()=3 -> returns True
+  SEED POST -> HTTP 201 ; count now = 2
+  --- SUCCESS boundary: count=2 < max=3 -> expect 201 (count 2 -> 3) ---
+  [INSTRUMENT] can_create_new_alias(user_id=1415): is_active=True disabled=False lifetime_or_active_subscription=False Alias.filter_by(user_id).count()=2 max_alias_for_free_account()=3 -> returns True
+  RESULT HTTP 201 ; count now = 3 ; quota-failure-log lines on this success = 0
+  FULL SUCCESS BODY: {"alias":"q5ok_oezqx.bwrch@sl.local","creation_date":"2026-07-10 09:57:44+00:00","creation_timestamp":1783677464,"disable_pgp":false,"email":"q5ok_oezqx.bwrch@sl.local","enabled":true,"id":2350,"latest_activity":null,"mailbox":{"email":"obs_q5_v2_zdivrivv@mailbox.test","id":1669},"mailboxes":[{"email":"obs_q5_v2_zdivrivv@mailbox.test","id":1669}],"name":null,"nb_block":0,"nb_forward":0,"nb_reply":0,"note":null,"pinned":false,"support_pgp":false}
+  SL logs on success (2):
+    2026-07-10 09:57:44,108 - SL - INFO - 10042 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+    2026-07-10 09:57:44,113 - SL - DEBUG - 10042 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04447817802429199
+  --- REJECTION boundary: count=3, (3 < 3) is False -> expect 400 at EXACTLY count==max==3 ---
+  [INSTRUMENT] can_create_new_alias(user_id=1415): is_active=True disabled=False lifetime_or_active_subscription=False Alias.filter_by(user_id).count()=3 max_alias_for_free_account()=3 -> returns False
+  RESULT HTTP 400 ; count = 3 ; quota-failure-log lines = 1
+  FULL REJECTION BODY: {"error":"You have reached the limitation of a free account with the maximum of 3 aliases, please upgrade your plan to create more aliases"}
+  SL logs on rejection (2):
+    2026-07-10 09:57:44,133 - SL - DEBUG - 10042 - "/app/app/api/views/new_custom_alias.py:49" - new_custom_alias_v2() -  - user <User 1415 Obs obs_q5_v2_zdivrivv@mailbox.test> cannot create any custom alias
+    2026-07-10 09:57:44,134 - SL - DEBUG - 10042 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 400, takes 0.01477956771850586
+```
+
+#### 3.5.4 Quota boundary via v3 — version coverage (F7)
+
+The v3 endpoint behaves identically; the only difference is the rejection log line origin
+(`app/api/views/new_custom_alias.py:138`). Complete captured block:
+
+```text
+Q5 QUOTA boundary via v3 [F4,F7]  (MAX_NB_EMAIL_FREE_PLAN=3)
+  user flags=1 (FLAG_FREE_OLD_ALIAS_LIMIT bit set=False) trial_end=2026-07-17T10:57:44.374426+00:00 lifetime=False
+  INITIAL Alias rows for user: ['simplelogin-newsletter.list899@sl.local']
+  INITIAL count = 1 (a fresh user owns the auto-created simplelogin-newsletter alias -> count starts at 1, not 0)
+  [INSTRUMENT] can_create_new_alias(user_id=1416): is_active=True disabled=False lifetime_or_active_subscription=False Alias.filter_by(user_id).count()=1 max_alias_for_free_account()=3 -> returns True
+  SEED POST -> HTTP 201 ; count now = 2
+  --- SUCCESS boundary: count=2 < max=3 -> expect 201 (count 2 -> 3) ---
+  [INSTRUMENT] can_create_new_alias(user_id=1416): is_active=True disabled=False lifetime_or_active_subscription=False Alias.filter_by(user_id).count()=2 max_alias_for_free_account()=3 -> returns True
+  RESULT HTTP 201 ; count now = 3 ; quota-failure-log lines on this success = 0
+  FULL SUCCESS BODY: {"alias":"q5ok_wsafi.zuacm@sl.local","creation_date":"2026-07-10 09:57:44+00:00","creation_timestamp":1783677464,"disable_pgp":false,"email":"q5ok_wsafi.zuacm@sl.local","enabled":true,"id":2353,"latest_activity":null,"mailbox":{"email":"obs_q5_v3_swzavkzt@mailbox.test","id":1670},"mailboxes":[{"email":"obs_q5_v3_swzavkzt@mailbox.test","id":1670}],"name":null,"nb_block":0,"nb_forward":0,"nb_reply":0,"note":null,"pinned":false,"support_pgp":false}
+  SL logs on success (2):
+    2026-07-10 09:57:44,498 - SL - INFO - 10042 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+    2026-07-10 09:57:44,504 - SL - DEBUG - 10042 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 201, takes 0.045046329498291016
+  --- REJECTION boundary: count=3, (3 < 3) is False -> expect 400 at EXACTLY count==max==3 ---
+  [INSTRUMENT] can_create_new_alias(user_id=1416): is_active=True disabled=False lifetime_or_active_subscription=False Alias.filter_by(user_id).count()=3 max_alias_for_free_account()=3 -> returns False
+  RESULT HTTP 400 ; count = 3 ; quota-failure-log lines = 1
+  FULL REJECTION BODY: {"error":"You have reached the limitation of a free account with the maximum of 3 aliases, please upgrade your plan to create more aliases"}
+  SL logs on rejection (2):
+    2026-07-10 09:57:44,525 - SL - DEBUG - 10042 - "/app/app/api/views/new_custom_alias.py:138" - new_custom_alias_v3() -  - user <User 1416 Obs obs_q5_v3_swzavkzt@mailbox.test> cannot create any custom alias
+    2026-07-10 09:57:44,525 - SL - DEBUG - 10042 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 400, takes 0.014863729476928711
+```
+
+#### 3.5.5 Both branches of `max_alias_for_free_account()` (F10)
+
+The ceiling itself was exercised on both branches by toggling the `FLAG_FREE_OLD_ALIAS_LIMIT` bit:
+
+```text
+OLD-FREE-PLAN branch [F10]: max_alias_for_free_account() has TWO branches (models.py:858-865)
+  default flags=1 -> FLAG_FREE_OLD_ALIAS_LIMIT set=False -> max_alias_for_free_account()=3 (uses MAX_NB_EMAIL_FREE_PLAN=3)
+  after flags |= FLAG_FREE_OLD_ALIAS_LIMIT (=5): FLAG set=True -> max_alias_for_free_account()=15 (uses MAX_NB_EMAIL_OLD_FREE_PLAN=15)
+```
+
+(Setting the bit changes `flags` from `1` to `5` = `1 | (1 << 2)`; the ceiling then switches from `3` to `15`.
+This same raised-quota state was reused in §3.4.3(2) so the bucket limiter — not the alias quota — would be
+the rejecting mechanism.)
+
+**Q5 summary.** On success the quota gate `can_create_new_alias()` (`app/models.py:867-884`) evaluates
+`count < max_alias_for_free_account()` (`app/models.py:858-865`; `3` free / `15` old-free) and **logs no
+quota values** (`quota-failure-log = 0`); only on rejection does it log
+`user … cannot create any custom alias` at `app/api/views/new_custom_alias.py:49` (v2) / `:138` (v3) and
+return `400 {"error":"You have reached the limitation of a free account with the maximum of 3 aliases, please
+upgrade your plan to create more aliases"}`. A fresh free user starts at `count = 1` (auto-created newsletter
+alias), and rejection occurs at exactly `count == max == 3` on both v2 and v3.
+
+### 3.6 Q6 — Execution-path trace: validator, limit enforcer, rejection conditions
+
+**Answer (observed + source-grounded).**
+
+- The **signed-suffix validator** is `app/alias_suffix.py::check_suffix_signature` (`:37-42`), which calls
+  `signer.unsign(signed_suffix, max_age=600)` and returns `None` on any `itsdangerous.BadSignature` (catch at
+  `:41`).
+- The **alias-creation-limit enforcer** is `app/models.py::User.can_create_new_alias` (`:867-884`), backed by
+  `max_alias_for_free_account()` (`:858-865`). In addition, **two** rate controls sit on the same path: the
+  Flask-Limiter **decorator** `@limiter.limit(ALIAS_LIMIT)` (`app/extensions.py:23`, `app/config.py:448`) and
+  the per-user **token bucket** `app/rate_limiter.py::check_bucket_limit` (`:19-42`) which is invoked **inside**
+  `Alias.create` at `app/models.py:1641`. A concurrency **lock** (`app/parallel_limiter.py:30-34`) guards the
+  critical section.
+- **Rejection is triggered** (in source order) when: the decorator limit is breached (`429`); auth fails
+  (`401`); the concurrency lock cannot be acquired (`429`); the quota is exhausted (`400`); the body is empty
+  (`400`); the suffix fails signature verification (`412`, or the unreachable `400 "Tampered suffix"`); the
+  prefix/suffix pairing is invalid (`400`); the alias already exists (`409`); the token bucket is exceeded
+  inside `Alias.create` (`429`); or the resulting address is syntactically invalid (`400` for `..`, or `500`
+  for a construction that reaches `email_validator` with a leading-dot local part). Otherwise the alias is
+  created (`201`).
+
+## 4. Execution-path trace (decorator stack + validation sequence)
+
+The decorator stack on **both** endpoints is, top to bottom (confirmed by direct read):
+`@api_bp.route(...)` → `@limiter.limit(ALIAS_LIMIT)` → `@require_api_auth` →
+`@parallel_limiter.lock(name="alias_creation")` → the view body. The following flowchart traces a
+`POST /api/vN/alias/custom/new` request through that stack and the view's validation sequence, annotating each
+rejection branch with its status and `file:line`:
 
 ```mermaid
 flowchart TD
-    A["POST /api/vN/alias/custom/new"] --> B["@limiter.limit(ALIAS_LIMIT)\napp/extensions.py:23 · new_custom_alias.py:29/116"]
-    B -->|"bucket exceeded (5/min)"| B1["HTTP 429 {'error':'Rate limit exceeded'}\nserver.py:362-372 (root)"]
-    B --> C["@require_api_auth\napp/api/base.py:52-60"]
-    C -->|"no/invalid Authentication header"| C1["HTTP 401 {'error':'Wrong api key'}\napp/api/base.py:27"]
-    C --> D["@parallel_limiter.lock(name='alias_creation')\napp/parallel_limiter.py:30-34"]
-    D -->|"lock not acquired"| D1["HTTP 429 (TooManyRequests)\napp/parallel_limiter.py:34"]
-    D --> E{"user.can_create_new_alias()?\napp/models.py:867-884"}
-    E -->|"False (count >= max)"| E1["HTTP 400 'reached free-account limit'\nLOG.d cannot create — :49/:138"]
+    A["POST /api/vN/alias/custom/new"] --> B["@limiter.limit(ALIAS_LIMIT)<br/>app/extensions.py:23 · app/config.py:448"]
+    B -->|"limit breached"| B1["429 Rate limit exceeded<br/>server.py:362-372 (LOG.w :364)"]
+    B --> C["@require_api_auth<br/>app/api/base.py"]
+    C -->|"missing/invalid key"| C1["401 Wrong api key"]
+    C --> D["@parallel_limiter.lock(name=alias_creation)<br/>app/parallel_limiter.py:30-34"]
+    D -->|"lock not acquired"| D1["429 TooManyRequests"]
+    D --> E{"user.can_create_new_alias()?<br/>app/models.py:867-884"}
+    E -->|"False (count ≥ max)"| E1["400 reached free-account limit<br/>LOG.d :49 (v2) / :138 (v3)"]
     E -->|"True"| F{"request body present?"}
-    F -->|"empty"| F1["HTTP 400 'request body cannot be empty'\n:61-62 / :150-151"]
-    F --> G["check_suffix_signature(signed_suffix)\napp/alias_suffix.py:37-42 (catch BadSignature :41)"]
-    G -->|"returns None: expired/tampered/malformed/empty"| G1["HTTP 412 'Alias creation time is expired, please retry'\nLOG.w :72-73 / :187-188"]
-    G -->|"non-BadSignature exception (UNREACHABLE for sig errors)"| G2["HTTP 400 'Tampered suffix' — DEAD CODE\n:74-76 / :189-191"]
-    G -->|"valid suffix"| H{"verify_prefix_suffix()?\napp/alias_suffix.py:45-91"}
-    H -->|"False"| H1["HTTP 400 'wrong alias prefix or suffix'\n:79 / :194"]
+    F -->|"empty"| F1["400 request body cannot be empty"]
+    F --> G["check_suffix_signature(signed_suffix)<br/>app/alias_suffix.py:37-42"]
+    G -->|"None: expired / tampered / malformed / empty<br/>(BadSignature caught at :41)"| G1["412 Alias creation time is expired<br/>LOG.w :72 (v2) / :187 (v3)"]
+    G -->|"non-BadSignature exception (UNREACHABLE for signature errors)"| G2["400 Tampered suffix<br/>LOG.w :75 / :190 — DEAD branch"]
+    G -->|"valid suffix"| H{"verify_prefix_suffix()?<br/>app/alias_suffix.py:45-91"}
+    H -->|"False (e.g. unverified/foreign domain)"| H1["400 wrong alias prefix or suffix<br/>LOG ERROR alias_suffix.py:61"]
     H --> I{"alias already exists?"}
-    I -->|"yes"| I1["HTTP 409 'alias ... already exists'\nLOG.d :87-88 / :202-203"]
-    I --> J["Alias.create -> HTTP 201\n:109-112 / :232-235"]
+    I -->|"yes"| I1["409 alias already exists<br/>LOG.d new_custom_alias.py:87"]
+    I --> J["Alias.create()<br/>app/models.py:1628"]
+    J --> K{"check_bucket_limit()?<br/>app/models.py:1641 · app/rate_limiter.py:19-42"}
+    K -->|"bucket exceeded"| K1["429 Rate limit exceeded<br/>LOG.i rate_limiter.py:33"]
+    K -->|"within bucket"| L{"resulting address syntactically valid?<br/>get_custom_domain → validate_email"}
+    L -->|"'..' consecutive dots"| L1["400 2 consecutive dot signs aren't allowed"]
+    L -->|"leading-dot local part (e.g. '.dot')"| L2["500 Internal error<br/>server.py:390 error_handler"]
+    L -->|"valid"| M["201 alias JSON + bl:* bucket incremented"]
 ```
 
----
+### 4.1 Ordered branch table (observed)
 
-## 5. The central defect (documented, not fixed)
+| # | Condition | Guard (`file:line`) | Status | Body / effect | Log line |
+|---|-----------|---------------------|:------:|---------------|----------|
+| 1 | Decorator limit breached | `@limiter.limit` `app/extensions.py:23`; `ALIAS_LIMIT` `app/config.py:448` | `429` | `{"error":"Rate limit exceeded"}` | `LOG.w server.py:364` |
+| 2 | Missing/invalid API key | `require_api_auth` `app/api/base.py` | `401` | `{"error":"Wrong api key"}` | — |
+| 3 | Concurrency lock not acquired | `acquire_lock` `app/parallel_limiter.py:30-34` | `429` | `TooManyRequests` → same 429 handler | — |
+| 4 | Quota exhausted | `can_create_new_alias` `app/models.py:867-884` | `400` | free-account-limit message | `LOG.d :49` (v2) / `:138` (v3) |
+| 5 | Empty request body | `if not data` | `400` | `request body cannot be empty` | — |
+| 6 | Suffix expired/tampered/malformed/empty | `check_suffix_signature` `app/alias_suffix.py:37-42` (catch `:41`) | `412` | `{"error":"Alias creation time is expired, please retry"}` | `LOG.w :72` (v2) / `:187` (v3) |
+| 6′ | Suffix non-`BadSignature` exception | `except Exception` `:74-76` (v2) / `:189-191` (v3) | `400` | `{"error":"Tampered suffix"}` — **unreachable for signature errors** | `LOG.w :75` / `:190` (never fires) |
+| 7 | Wrong prefix/suffix (e.g. unverified domain) | `verify_prefix_suffix` `app/alias_suffix.py:45-91` | `400` | `{"error":"wrong alias prefix or suffix"}` | `LOG ERROR :61` |
+| 8 | Duplicate alias | alias-exists check | `409` | `{"error":"alias {full} already exists"}` | `LOG.d :87` |
+| 9 | Token bucket exceeded (inside `Alias.create`) | `check_bucket_limit` `app/models.py:1641`, `app/rate_limiter.py:19-42` | `429` | `{"error":"Rate limit exceeded"}` | `LOG.i rate_limiter.py:33` |
+| 10 | `..` in constructed address | `email_validator` via `get_custom_domain` | `400` | `2 consecutive dot signs aren't allowed in an email address` | — |
+| 11 | Leading-dot local part reaching validator | `validate_email` (`app/models.py:1617`) | `500` | `{"error":"Internal error"}` | `LOG ERROR server.py:390` + traceback |
+| 12 | All checks pass | — | `201` | alias JSON; `Alias.create` inserts row and increments `bl:*` bucket | — |
 
-**What the code does.** `check_suffix_signature()` (`app/alias_suffix.py:37-42`):
+### 4.2 Consecutive-dot / address-edge branches (observed, F11)
 
-```python
-def check_suffix_signature(signed_suffix: str) -> Optional[str]:
-    # hypothesis: user will click on the button in the 600 secs
-    try:
-        return signer.unsign(signed_suffix, max_age=600).decode()   # :40
-    except itsdangerous.BadSignature:                               # :41
-        return None                                                 # :42
+Three prefix shapes were POSTed to probe the address-construction edge. `dot.` and `a..b` both produce a `..`
+in the local part and are rejected cleanly with `400`; a leading-dot construction (`.dot`) reaches
+`email_validator` inside `Alias.create → get_custom_domain → validate_email` (`app/models.py:1656 → 1617`)
+and raises an unhandled `EmailSyntaxError`, surfaced by the generic error handler at `server.py:390` as
+`500 {"error":"Internal error"}`. Complete captured output (including the real traceback for the `500`):
+
+```text
+CONSECUTIVE-DOT / dot-edge attempt via API (prefix chosen to try to force '..' or leading/trailing dot in full_alias):
+  prefix='dot.' -> HTTP 400 | {"error":"2 consecutive dot signs aren't allowed in an email address"}
+2026-07-10 09:57:43,409 - SL - ERROR - 10042 - "/app/server.py:390" - error_handler() -  - The email address contains invalid characters before the @-sign: ..
+Traceback (most recent call last):
+  File "/app/venv/lib/python3.10/site-packages/flask/app.py", line 1950, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "/app/venv/lib/python3.10/site-packages/flask/app.py", line 1936, in dispatch_request
+    return self.view_functions[rule.endpoint](**req.view_args)
+  File "/app/venv/lib/python3.10/site-packages/flask_limiter/extension.py", line 702, in __inner
+    return obj(*a, **k)
+  File "/app/app/api/base.py", line 58, in decorated
+    return f(*args, **kwargs)
+  File "/app/app/parallel_limiter.py", line 61, in decorated
+    return f(*args, **kwargs)
+  File "/app/app/api/views/new_custom_alias.py", line 96, in new_custom_alias_v2
+    alias = Alias.create(
+  File "/app/app/models.py", line 1656, in create
+    custom_domain = Alias.get_custom_domain(email)
+  File "/app/app/models.py", line 1617, in get_custom_domain
+    alias_domain = validate_email(
+  File "/app/venv/lib/python3.10/site-packages/email_validator/__init__.py", line 223, in validate_email
+    local_part_info = validate_email_local_part(parts[0],
+  File "/app/venv/lib/python3.10/site-packages/email_validator/__init__.py", line 337, in validate_email_local_part
+    raise EmailSyntaxError("The email address contains invalid characters before the @-sign: %s." % bad_chars)
+email_validator.EmailSyntaxError: The email address contains invalid characters before the @-sign: ..
+  prefix='.dot' -> HTTP 500 | {"error":"Internal error"}
+  prefix='a..b' -> HTTP 400 | {"error":"2 consecutive dot signs aren't allowed in an email address"}
 ```
 
-**The exception hierarchy (runtime-confirmed).** In **itsdangerous 1.1.0**, `SignatureExpired` and
-`BadTimeSignature` are both subclasses of `BadSignature`. This was confirmed at runtime in the container with a
-**non-canonical** helper (a *direct* utility call — labeled non-canonical because it bypasses the HTTP path;
-the canonical evidence for behavior is the endpoint responses in §3):
+### 4.3 Correction: the token bucket **is** wired onto these endpoints
 
-```
-$ docker exec sl_setup bash -lc 'cd /app && /app/venv/bin/python /tmp/blitzy_obs/observe_D_hierarchy.py'
-itsdangerous.__version__ = 1.1.0
-issubclass(SignatureExpired,  BadSignature) = True
-issubclass(BadTimeSignature,  BadSignature) = True
-issubclass(BadSignature,      BadData)      = True
+An earlier draft of this report stated that the bucket limiter *"is not wired onto these two endpoints."*
+**That statement is incorrect and is corrected here.** `Alias.create()` (`app/models.py:1628`) calls
+`rate_limiter.check_bucket_limit(...)` at `app/models.py:1641` for each limit in
+`ALIAS_CREATE_RATE_LIMIT_FREE=[(10, 900), (50, 3600)]` (`app/config.py:554-558`) on the **success** path of
+custom-alias creation. It therefore runs on **every** successful create, increments Redis keys
+`bl:alias_create_900d:{uid}:{bucket}` / `bl:alias_create_3600d:{uid}:{bucket}`, and can itself return `429` —
+which was **observed** in §3.4.3(2) (create #10 → `429`, `LOG.i rate_limiter.py:33 … -> 11/10`). Unlike the
+decorator, `check_bucket_limit` is **not** gated by `DISABLE_RATE_LIMIT` (it only early-returns when no Redis
+store is configured), so it is active whenever `MEM_STORE_URI` is set — confirmed by the `bl:*` keys the
+successful creates produced (§2.8 F14 counts). This is the wiring correction required by the review.
+
+## 5. Central finding — why a *tampered* suffix returns the *expiry* response
+
+The behaviour that most plausibly matches the reported "validation failures that don't match the expected
+behaviour" is a **status/message collapse** in signed-suffix validation:
+
+- `check_suffix_signature()` (`app/alias_suffix.py:37-42`) wraps `signer.unsign(signed_suffix, max_age=600)`
+  in `except itsdangerous.BadSignature: return None` (`:41-42`).
+- Under **itsdangerous 1.1.0**, `SignatureExpired` **is** a subclass of `BadTimeSignature`, which **is** a
+  subclass of `BadSignature`, which is a subclass of `BadData`. A malformed/empty value raises `BadSignature`
+  directly. Consequently **every** signature problem — expired, tampered, malformed, empty — is caught at
+  `:41` and collapses to a `None` return.
+- The endpoint's `if not alias_suffix:` branch then returns **`412 "Alias creation time is expired, please
+  retry"`** for all of them (`app/api/views/new_custom_alias.py:71-73` v2 / `:185-188` v3). The sibling
+  `except Exception:` arm that would return **`400 "Tampered suffix"`** (`:74-76` v2 / `:189-191` v3) fires
+  only for a *non-*`BadSignature` exception, so it is **dead code for signature errors** — the tamper-specific
+  `400` cannot be produced by a bad signature.
+
+This is why a *tampered* suffix is indistinguishable, at the HTTP layer, from an *expired* one: both return
+`412` with the expiry message (§3.1, §3.2), and the `'Alias suffix is tampered'` warning never appears
+(`WARN=0` throughout §3.1–§3.3). Per §0.3 of the Agent Action Plan this condition is to be **documented, not
+fixed** — no source change is made.
+
+### 5.1 Non-canonical library stand-in confirming the exception hierarchy
+
+The following isolated reproduction exercises `itsdangerous` and `check_suffix_signature`'s exact `try/except`
+**directly**, *without* the HTTP stack. It is therefore **non-canonical** relative to the end-to-end endpoint
+observations in §3.1–§3.2 (which are the canonical evidence); it is included only to make the exception
+hierarchy explicit. Complete, unedited output of the stand-in script:
+
+```text
+itsdangerous version: 1.1.0
+SignatureExpired  subclass of BadSignature : True
+BadTimeSignature  subclass of BadSignature : True
+BadSignature      subclass of BadData      : True
 ----------------------------------------------------------------------
 CASE: FRESH valid
-  signer.unsign(max_age=600) -> returned '.word@sl.local' (no exception)
-  check_suffix_signature(...) -> '.word@sl.local'  => endpoint branch: verify_prefix_suffix (valid)
+  raw signer.unsign(...,max_age=600) -> OK (no exception)
+  check_suffix_signature(...) returns -> '.abc@sl.local'
+  endpoint branch -> continue -> 201 (alias_suffix='.abc@sl.local')
 
-CASE: EXPIRED (age~1000s)
-  signer.unsign(max_age=600) RAISED: itsdangerous.exc.SignatureExpired: Signature age 1000 > 600 seconds
-    isinstance(e, itsdangerous.BadSignature) = True
-  check_suffix_signature(...) -> None  => endpoint branch: if not alias_suffix -> HTTP 412
+CASE: EXPIRED (age~1000s>600)
+  raw signer.unsign(...,max_age=600) -> itsdangerous.exc.SignatureExpired: Signature age 1000 > 600 seconds
+  check_suffix_signature(...) returns -> None
+  endpoint branch -> HTTP 412 'Alias creation time is expired, please retry'  (LOG.w 'Alias creation time expired')
 
-CASE: TAMPERED sig
-  signer.unsign(max_age=600) RAISED: itsdangerous.exc.BadTimeSignature: Signature b'v-GSili5_PfujukKZfJoqfIkvTA' does not match
-    isinstance(e, itsdangerous.BadSignature) = True
-  check_suffix_signature(...) -> None  => endpoint branch: if not alias_suffix -> HTTP 412
+CASE: TAMPERED (last char flipped)
+  raw signer.unsign(...,max_age=600) -> itsdangerous.exc.BadTimeSignature: Signature b'LNRhhGaw-V1lK4eicjepRZLMN9A' does not match
+  check_suffix_signature(...) returns -> None
+  endpoint branch -> HTTP 412 'Alias creation time is expired, please retry'  (LOG.w 'Alias creation time expired')
 
-CASE: MALFORMED (no '.')
-  signer.unsign(max_age=600) RAISED: itsdangerous.exc.BadSignature: No b'.' found in value
-    isinstance(e, itsdangerous.BadSignature) = True
-  check_suffix_signature(...) -> None  => endpoint branch: if not alias_suffix -> HTTP 412
+CASE: MALFORMED ('notasignature')
+  raw signer.unsign(...,max_age=600) -> itsdangerous.exc.BadSignature: No b'.' found in value
+  check_suffix_signature(...) returns -> None
+  endpoint branch -> HTTP 412 'Alias creation time is expired, please retry'  (LOG.w 'Alias creation time expired')
 
-CASE: EMPTY ''
-  signer.unsign(max_age=600) RAISED: itsdangerous.exc.BadSignature: No b'.' found in value
-    isinstance(e, itsdangerous.BadSignature) = True
-  check_suffix_signature(...) -> None  => endpoint branch: if not alias_suffix -> HTTP 412
+CASE: EMPTY ('')
+  raw signer.unsign(...,max_age=600) -> itsdangerous.exc.BadSignature: No b'.' found in value
+  check_suffix_signature(...) returns -> None
+  endpoint branch -> HTTP 412 'Alias creation time is expired, please retry'  (LOG.w 'Alias creation time expired')
 ```
 
-**The consequence.** Because the single `except itsdangerous.BadSignature:` at `app/alias_suffix.py:41`
-catches the *whole* family, **expired, tampered, malformed, and empty** suffixes all collapse to a `None`
-return, and the endpoint always takes `if not alias_suffix:` → `HTTP 412 "Alias creation time is expired,
-please retry"` (`new_custom_alias.py:71-73` v2 / `:186-188` v3). The intended
-`except Exception:` → `LOG.w("Alias suffix is tampered, user %s", user)` + `return jsonify(error="Tampered
-suffix"), 400` (`:74-76` v2 / `:189-191` v3) can only run on a *non-*`BadSignature` exception, which a signed
-suffix never produces during verification — it is therefore **dead code for signature errors**. This is the
-most likely explanation for the reported "validation failures that don't match expected behavior": a tampered
-or malformed suffix is reported as *expired* (412), never as *tampered* (400).
+*(In the block above, `signer.unsign(...,max_age=600)` is the stand-in script's own literal label — the `...`
+is the script's shorthand for the long signed-token argument in its printout, reproduced here unedited. It is
+**not** an elision of results: every outcome after `->` (the exception type and message, the
+`check_suffix_signature` return, and the resulting endpoint branch) is shown in full.)*
 
-**Secondary (confirming) web path.** The dashboard route `custom_alias()`
-(`app/dashboard/views/custom_alias.py:30,34`) has the identical structure: `check_suffix_signature()` at `:90`;
-`if not suffix:` → `LOG.w("Alias creation time expired for %s", current_user)` (`:92`) +
-`flash("Alias creation time is expired, please retry", "warning")` (`:93`); and a matching dead
-`except Exception:` (`:95`) → `flash("Unknown error, refresh the page", "error")` (`:97`). The API path (§3) is
-the canonical evidence; the web path is confirming secondary evidence and was not exercised.
+### 5.2 The same collapse exists on the dashboard (web) path
 
-> **Remediation boundary:** per the task's read-only constraint, this defect is **documented, not fixed**. No
-> source file was modified.
+The finding is not confined to the API. The dashboard custom-alias view
+`app/dashboard/views/custom_alias.py` uses the identical helper and structure:
+`suffix = check_suffix_signature(signed_alias_suffix)` (`:90`); on a falsy result it logs
+`LOG.w("Alias creation time expired for %s", current_user)` (`:92`) and flashes
+`"Alias creation time is expired, please retry"` (`:93`); the sibling `except Exception:` (`:95`) is the only
+place a tamper-specific message could arise. Because `check_suffix_signature` collapses every `BadSignature`
+subclass to `None`, the dashboard likewise renders the *expiry* message for a *tampered* suffix, and its
+`except Exception:` arm is dead for signature errors — the same defect, one layer up. (Source-derived from
+`app/dashboard/views/custom_alias.py:90-95`; the canonical runtime evidence in §3 is captured on the API
+path, which is the entry point named in the investigation.)
 
----
+## 6. Reproducing the reported "intermittency"
 
-## 6. Intermittency characterization (repeated identical runs)
+The prompt frames the problem as *intermittent* validation failures. Per §0.8 of the Agent Action Plan, the
+same unchanged input must be run repeatedly and the distribution reported (rather than substituting a variant
+that looks stable). Two experiments were run.
 
-The reported "intermittent" symptom was probed by POSTing **one byte-for-byte identical** tampered payload
-repeatedly — 5 times within a process, and again in a **separate fresh process** — with the input held
-constant (`DISABLE_RATE_LIMIT=True` so the limiter cannot confound identical repeats). Command and unedited
-output:
+### 6.1 Canonical: same unchanged input, repeated across separate processes → deterministic
 
-```
-$ docker exec sl_setup bash -lc 'cd /app && /app/venv/bin/python /tmp/blitzy_obs/observe_C_intermittency.py 5 procA'
-[procA] pid=8466 DISABLE_RATE_LIMIT=True
-[procA] FIXED tampered signed_suffix = '.list@sl.local.alCs5w.eL5N0YZ2fj0-sA1PWHH-meFfaqB'
-[procA] run 1/5: HTTP 412 | body={"error":"Alias creation time is expired, please retry"}
-[procA] run 2/5: HTTP 412 | body={"error":"Alias creation time is expired, please retry"}
-[procA] run 3/5: HTTP 412 | body={"error":"Alias creation time is expired, please retry"}
-[procA] run 4/5: HTTP 412 | body={"error":"Alias creation time is expired, please retry"}
-[procA] run 5/5: HTTP 412 | body={"error":"Alias creation time is expired, please retry"}
-[procA] DISTRIBUTION over 5 identical POSTs: {412: 5}
+Three **separate OS processes** each POSTed the **same fixed tampered** suffix five times and the **same fixed
+expired** suffix five times. Every process, every time, returned `412` — the endpoint is **deterministic** for
+a fixed input. Complete summary output:
 
-$ docker exec sl_setup bash -lc 'cd /app && /app/venv/bin/python /tmp/blitzy_obs/observe_C_intermittency.py 5 procB'
-[procB] pid=8489 DISABLE_RATE_LIMIT=True
-[procB] FIXED tampered signed_suffix = '.list@sl.local.alCs5w.eL5N0YZ2fj0-sA1PWHH-meFfaqB'
-[procB] run 1/5: HTTP 412 | body={"error":"Alias creation time is expired, please retry"}
-[procB] run 2/5: HTTP 412 | body={"error":"Alias creation time is expired, please retry"}
-[procB] run 3/5: HTTP 412 | body={"error":"Alias creation time is expired, please retry"}
-[procB] run 4/5: HTTP 412 | body={"error":"Alias creation time is expired, please retry"}
-[procB] run 5/5: HTTP 412 | body={"error":"Alias creation time is expired, please retry"}
-[procB] DISTRIBUTION over 5 identical POSTs: {412: 5}
+```text
+PID 10225 | SAME FIXED tampered x5 -> {412: 5} | SAME FIXED expired x5 -> {412: 5}
+PID 10239 | SAME FIXED tampered x5 -> {412: 5} | SAME FIXED expired x5 -> {412: 5}
+PID 10252 | SAME FIXED tampered x5 -> {412: 5} | SAME FIXED expired x5 -> {412: 5}
 ```
 
-**Observed distribution: 10/10 → HTTP 412** (5/5 in process A pid 8466; 5/5 in fresh process B pid 8489).
-**The behavior is deterministic; there is no run-to-run randomness.** The user's perceived "intermittency"
-is therefore *not* nondeterminism — it is an **expectation mismatch**: four distinct causes (expired, tampered,
-malformed, empty) all yield the *same* `412 "Alias creation time is expired, please retry"`, so a suffix that
-is tampered/malformed appears to be reported as "expired," and the expected `400 "Tampered suffix"` is never
-seen (root cause in §5).
+Combined with the in-process repeat distributions of §3.2.1 (`{412: 5}` on both v2 and v3), this establishes
+that **the response to a given bad suffix does not vary run to run** — there is no endpoint nondeterminism.
 
----
+### 6.2 Honest nuance: a naïve tamper *generator* is nondeterministic across fresh signatures
+
+A second experiment used three processes that each generated their **own** signature and then tampered it by
+**flipping the last character**. Here the distribution is **not** always `{412: 5}`:
+
+```text
+PID 10146 | pid-unique | TAMPERED x5 distribution: {412: 5} | EXPIRED x5 distribution: {412: 5}
+PID 10160 | pid-unique | TAMPERED x5 distribution: {201: 1, 409: 4} | EXPIRED x5 distribution: {412: 5}
+PID 10173 | pid-unique | TAMPERED x5 distribution: {412: 5} | EXPIRED x5 distribution: {412: 5}
+```
+
+PID 10160's "tampered" suffix was, by chance, **still a valid signature**: flipping the final base64 character
+of an itsdangerous token can land on another character that decodes to the same trailing bits (base64
+trailing-bit aliasing), so `unsign` succeeded, the first POST created the alias (`201`), and the remaining four
+identical POSTs were duplicates (`409`). This is a property of the *test's tamper-generation*, **not** of the
+endpoint: a genuine mid-signature flip (used in §6.1 and §3.1) always yields `412`. This nuance is reported
+rather than hidden.
+
+### 6.3 Interpretation
+
+The user's "validation failures that don't match the expected behaviour" are best explained by the **status
+collapse of §5** — a tampered (or malformed, or empty) suffix returns the *expiry* `412` rather than a
+tamper-specific `400`, so the failure *mode* is surprising even though the endpoint is deterministic. If a
+client's tamper happens to alias to a valid signature (as in §6.2), the request can even *succeed*, which can
+further read as "sometimes it works, sometimes it doesn't" at the client — but that is a generator artefact,
+not endpoint randomness.
 
 ## 7. Coverage pass
 
-| Item / sub-question | Answered? | Observed status/value | `file:line` + function |
-|---------------------|-----------|-----------------------|------------------------|
-| **Q1** invalid (tampered) suffix | ✅ | `HTTP 412` `{"error":"Alias creation time is expired, please retry"}` | `check_suffix_signature` `app/alias_suffix.py:37-42` (catch `:41`) → `new_custom_alias.py:71-73`/`186-188` |
-| **Q1** invalid (malformed / empty) suffix | ✅ | `HTTP 412` (both) | same; `verify_prefix_suffix` not reached |
-| **Q2** expired suffix (age > 600 s) | ✅ | `HTTP 412` same body | `signer.unsign(..., max_age=600)` `app/alias_suffix.py:40` |
-| **Q3** validation log entries | ✅ | `SL - WARNING - … new_custom_alias.py:72 - Alias creation time expired for <User …>` (v3: `:187`) | `LOG.w` `new_custom_alias.py:72`/`187`; format `app/log.py:12-15`; `LOG` `app/log.py:79` |
-| **Q4** rate-limit headers | ✅ (NEGATIVE) | **none** present on 201/412/400 **or** 429; breach → `HTTP 429` `{"error":"Rate limit exceeded"}` | `Limiter(key_func=__key_func)` `app/extensions.py:23`; 429 handler `server.py:362-372` (root) |
-| **Q5** quota checks on success | ✅ | `is_active=True, disabled=False, lifetime_or_active_subscription=False, count=1 < max=3` → `201`; **no log on success**; failure → `400` + `LOG.d` | `can_create_new_alias` `app/models.py:867-884`; `max_alias_for_free_account` `:858-865`; `LOG.d` `new_custom_alias.py:49`/`138` |
-| **Q6** execution-path trace | ✅ | decorator stack + validation sequence (§4) | validator `app/alias_suffix.py:37-42`; enforcer `app/models.py:867-884` |
-| Named: **invalid suffix** | ✅ | 412 | §3 Q1 |
-| Named: **expired suffix** | ✅ | 412 | §3 Q2 |
-| Named: **validation logs** | ✅ | `LOG.w` "Alias creation time expired" | §3 Q3 |
-| Named: **rate-limit headers** | ✅ | none (negative) | §3 Q4 |
-| Named: **quota checks** | ✅ | `count < max` (1 < 3) | §3 Q5 |
-| Named: **execution path** | ✅ | full trace + diagram | §4 |
-| Central defect (412-vs-400 dead code) | ✅ (documented, not fixed) | tampered→412, `Tampered suffix` unreachable | §5; `app/alias_suffix.py:41` |
-| Intermittency | ✅ | 10/10 → 412 (deterministic) | §6 |
+### 7.1 Sub-question coverage (Q1–Q6)
 
-**Grounding / inference note.** Every behavioral statement above is backed by an unedited captured output block
-plus a `file:line` + function reference. The only value obtained via **temporary instrumentation** (rather than
-a native log) is the `[INSTRUMENT]`-labeled `count()`/`max_alias_for_free_account()` in Q5 — the underlying
-methods executed for real; the wrapper only printed their inputs/outputs and `app/models.py` was not modified.
-The itsdangerous subclass check in §5 is labeled **non-canonical** (a direct utility call); the canonical
-behavioral evidence is the HTTP responses in §3.
+| Q | Question | Observed answer | Evidence |
+|---|----------|-----------------|----------|
+| Q1 | Status + body for an **invalid** signed suffix | `412` `{"error":"Alias creation time is expired, please retry"}` (v2 + v3; tampered/malformed/empty) | §3.1 |
+| Q2 | Status + body for an **expired** signed suffix | `412` `{"error":"Alias creation time is expired, please retry"}` (v2 + v3; repeat `{412:5}`) | §3.2 |
+| Q3 | Validation **log** entries for these rejections | `WARNING … Alias creation time expired for <User …>` at `new_custom_alias.py:72`/`:187`; tamper warning never fires | §3.3 |
+| Q4 | **Rate-limit headers** present? | **None** on any status (`201/412/400/401/409/429×2`); `429` body `{"error":"Rate limit exceeded"}` | §3.4 |
+| Q5 | **Quota** checks on success + what is logged | `can_create_new_alias` → `max_alias_for_free_account` (`3`/`15`); success logs **no** quota values; rejection logs `LOG.d :49`/`:138` | §3.5 |
+| Q6 | **Execution path**: validator, enforcer, rejection conditions | Validator `check_suffix_signature`; enforcer `can_create_new_alias` (+ decorator + token bucket + lock); 12-branch table | §3.6, §4 |
 
----
+### 7.2 Named-element checklist (every element the questions imply)
 
-## 8. Appendix
+| Element | Addressed | Where |
+|---------|:---------:|-------|
+| Invalid suffix — tampered / malformed / empty, v2 **and** v3 | ✅ | §3.1 |
+| Expired suffix, v2 **and** v3, repeated-input distribution | ✅ | §3.2, §3.2.1 |
+| Validation logs, per-condition + bounded positive/negative counts | ✅ | §3.3 |
+| Auth-negative `401` (`Wrong api key`) | ✅ | §3.3 |
+| Rate-limit headers — negative finding across all 8 statuses | ✅ | §3.4.1 |
+| `429` — decorator breach (per-IP `LIMITER*` keys) | ✅ | §3.4.3(1) |
+| `429` — token-bucket breach (`rate_limiter.py:33`) | ✅ | §3.4.3(2) |
+| Parallel-lock key `cl:127.0.0.1:alias_creation` | ✅ | §3.4.4 |
+| `ownership_verified` availability precision + `400` | ✅ | §3.4.5 |
+| Duplicate alias `409` | ✅ | §3.4.5 |
+| Quota: `can_create_new_alias` values, before/during/after, exact boundary `count==max==3`, v2 **and** v3 | ✅ | §3.5.3–§3.5.4 |
+| `max_alias_for_free_account` **both** branches (`FLAG_FREE_OLD_ALIAS_LIMIT`, `MAX_NB_EMAIL_OLD_FREE_PLAN`) | ✅ | §3.5.1, §3.5.5 |
+| Success emits **no** quota log (bounded `= 0`) | ✅ | §3.5 |
+| Execution-path trace (decorator stack + branch table + flowchart) | ✅ | §4 |
+| Consecutive-dot / leading-dot address edges (`400`/`400`/`500`) | ✅ | §4.2 |
+| Token-bucket **wiring correction** (prior "not wired" claim) | ✅ | §4.3 |
+| Central defect — `BadSignature` collapse → `412`; dead `400` branch | ✅ | §5 |
+| Dashboard (web) path exhibits the same collapse | ✅ | §5.2 |
+| `itsdangerous` exception hierarchy (non-canonical stand-in) | ✅ | §5.1 |
+| Intermittency — deterministic for fixed input + generator nuance | ✅ | §6 |
+| Configuration disclosure (`MAX_NB_EMAIL_FREE_PLAN` = 3 test / 5 example) | ✅ | §2.6, §3.5.1 |
+| Read-only + DB/Redis net-zero cleanup | ✅ | §2.8 |
 
-### 8.1 Full unedited transcript — conditions (a)–(d) [`DISABLE_RATE_LIMIT=True`]
+Every sub-question and every named element is answered with directly observed output and a `file:line`
+reference; the single explicitly-labeled non-canonical item is the library stand-in of §5.1.
 
-Command: `docker exec sl_setup bash -lc 'cd /app && /app/venv/bin/python /tmp/blitzy_obs/observe_B.py'`
+## 8. Appendix — capture artifacts and sanitization statement
 
-```
-==================== ENVIRONMENT ====================
-itsdangerous 1.1.0 | flask 1.1.2
-EMAIL_DOMAIN = sl.local | MAX_NB_EMAIL_FREE_PLAN = 3
+### 8.1 Artifact inventory
 
-[CONFIG] config.DISABLE_RATE_LIMIT = True (conditions a-e; matches conftest flask_client L65)
+All runtime output was captured to transcript files on the capture host (outside the source repository, under
+`/tmp/blitzy_obs2/`, per the read-only constraint of §2.8). The relevant blocks are reproduced **inline** in
+§2–§6; the auxiliary transcripts are reproduced in full at §5.1 (itsdangerous stand-in) and §6.1–§6.2
+(intermittency).
 
-##############################################################################
-CONDITION: (a) FRESH VALID suffix -> v2 (expect 201)
-##############################################################################
-COMMAND: POST /api/v2/alias/custom/new
-  json = {'alias_prefix': 'validv2', 'signed_suffix': '.test@sl.local.alCs5Q.dU5u0azHAW2cMxpP2hPM2PtdFTo'}
-  headers = {'Authentication': '<API_KEY_REDACTED (60 chars)>'}
-STATUS: 201
-BODY: {"alias":"validv2.test@sl.local","creation_date":"2026-07-10 08:27:17+00:00","creation_timestamp":1783672037,"disable_pgp":false,"email":"validv2.test@sl.local","enabled":true,"id":2183,"latest_activity":null,"mailbox":{"email":"valid_gzlvqqja@mailbox.test","id":1567},"mailboxes":[{"email":"valid_gzlvqqja@mailbox.test","id":1567}],"name":null,"nb_block":0,"nb_forward":0,"nb_reply":0,"note":null,"pinned":false,"support_pgp":false}
-RESPONSE HEADERS:
-  Content-Type: application/json
-  Content-Length: 434
-  Access-Control-Allow-Origin: *
-  Set-Cookie: slapp=<SESSION_COOKIE_REDACTED>; Domain=.sl.test; Expires=Fri, 17-Jul-2026 08:27:17 GMT; HttpOnly; Path=/; SameSite=Lax
+| Artifact | Lines | Contents | Reproduced in |
+|----------|:-----:|----------|---------------|
+| `out_final.txt` | 700 | Main harness: conditions (a)–(e) v2+v3, auth-`401`, expired-repeat distributions, duplicate `409`, consecutive-dot, ownership, Q5 quota v2+v3, `FLAG_FREE_OLD_ALIAS_LIMIT` branches, token-bucket wiring + `429`, decorator `429`, DB/Redis before/after | §2.2, §2.8, §3.1–§3.5, §4.2, §4.3 |
+| `itsd_out.txt` | 30 | Non-canonical `itsdangerous` stand-in (exception hierarchy + per-case collapse) | §5.1 (in full) |
+| `intermit_fixed_summary.txt` | 3 | Canonical run-to-run: 3 processes, same fixed input → `{412:5}` | §6.1 (in full) |
+| `intermit_naive_flip.txt` | 3 | Nuance: per-process fresh-signature naïve flip (base64 aliasing) | §6.2 (in full) |
 
-##############################################################################
-CONDITION: (a) FRESH VALID suffix -> v3 (expect 201)   [STATUS: 201]
-##############################################################################
-BODY: {"alias":"validv3.word@sl.local", ... "id":2185, ...}
+### 8.2 Sanitization statement (what was and was not altered)
 
-##############################################################################
-CONDITION: (b) EXPIRED suffix (age~1000s) -> v2   [STATUS: 412]
-##############################################################################
-BODY: {"error":"Alias creation time is expired, please retry"}
-SL: 2026-07-10 08:27:18,464 - SL - WARNING - 8348 - "/app/app/api/views/new_custom_alias.py:72" - new_custom_alias_v2() -  - Alias creation time expired for <User 1316 Obs expired_gkcdzwiq@mailbox.test>
+The evidence blocks reproduced in this report are **verbatim** from the artifacts above, with exactly **two**
+credential substitutions and **no** other edits:
 
-##############################################################################
-CONDITION: (b) EXPIRED suffix (age~1000s) -> v3   [STATUS: 412]
-##############################################################################
-BODY: {"error":"Alias creation time is expired, please retry"}
-SL: 2026-07-10 08:27:18,743 - SL - WARNING - 8348 - "/app/app/api/views/new_custom_alias.py:187" - new_custom_alias_v3() -  - Alias creation time expired for <User 1317 Obs expired_zajmgvfb@mailbox.test>
+- The API key value in every `Authentication` header was replaced with `<API_KEY_REDACTED (len 60)>`
+  (the length is preserved for reference).
+- The `slapp` session-cookie value in every `Set-Cookie` header was replaced with `<SESSION_COOKIE_REDACTED>`
+  (the cookie **attributes** — `Domain`, `Expires`, `HttpOnly`, `Path`, `SameSite` — are shown unaltered).
 
-##############################################################################
-CONDITION: (c) TAMPERED suffix -> v2   [STATUS: 412, NOT 400]
-##############################################################################
-BODY: {"error":"Alias creation time is expired, please retry"}
-SL: 2026-07-10 08:27:19,019 - SL - WARNING - 8348 - "/app/app/api/views/new_custom_alias.py:72" - new_custom_alias_v2() -  - Alias creation time expired for <User 1318 Obs tamper_xdmdwabb@mailbox.test>
+No response bodies, status codes, headers, log lines, counts, or key names were truncated, paraphrased, or
+elided within any evidence block. Two clearly-labeled, non-elision placeholders appear and are called out at
+their site: the header-inventory **legend** in §3.4.1 (`<bytes>` / `<ts>`, explicitly a template, with every
+concrete value shown in the real blocks), and the harness's own label `<FIXED expired suffix>` in the
+decorator-loop block of §3.4.3 (footnoted, with the concrete form shown in §3.2.1). The `[INSTRUMENT]` lines
+are harness instrumentation (not production log output) and are labeled as such (§2.7).
 
-##############################################################################
-CONDITION: (c) TAMPERED suffix -> v3   [STATUS: 412]
-##############################################################################
-BODY: {"error":"Alias creation time is expired, please retry"}
-SL: 2026-07-10 08:27:19,299 - SL - WARNING - 8348 - "/app/app/api/views/new_custom_alias.py:187" - new_custom_alias_v3() -  - Alias creation time expired for <User 1319 Obs tamper_bnesmfcv@mailbox.test>
+### 8.3 Repository state
 
-##############################################################################
-CONDITION: (d) MALFORMED suffix 'notasignature' (no '.') -> v2   [STATUS: 412]
-##############################################################################
-BODY: {"error":"Alias creation time is expired, please retry"}
-SL: 2026-07-10 08:27:19,575 - SL - WARNING - 8348 - "/app/app/api/views/new_custom_alias.py:72" - new_custom_alias_v2() -  - Alias creation time expired for <User 1320 Obs malf_cyzqbrmo@mailbox.test>
+Per §2.8, the source repository was left byte-for-byte unchanged (`git status --porcelain` reports only this
+document), the DB net residue is zero (transaction rollback), the Redis net residue is zero (before/after key
+delta cleanup, `dbsize 468 → 468`), and all temporary observation scripts and transcripts created on the
+capture host were removed after their output was captured.
 
-##############################################################################
-CONDITION: (d) EMPTY suffix '' -> v2   [STATUS: 412]
-##############################################################################
-BODY: {"error":"Alias creation time is expired, please retry"}
-SL: 2026-07-10 08:27:19,852 - SL - WARNING - 8348 - "/app/app/api/views/new_custom_alias.py:72" - new_custom_alias_v2() -  - Alias creation time expired for <User 1321 Obs empty_scdlvujb@mailbox.test>
-```
+--- 
 
-(For (a) both v2 and v3 the response header set is exactly `Content-Type, Content-Length,
-Access-Control-Allow-Origin, Set-Cookie`; every 412 header set is identical except `Content-Length: 57`.)
-
-### 8.2 Full unedited transcript — conditions (e)–(f)
-
-Command: `docker exec sl_setup bash -lc 'cd /app && /app/venv/bin/python /tmp/blitzy_obs/observe_B2.py'`
-(see the verbatim `[INSTRUMENT]`, `STATUS`, `BODY`, `SL` and `[Q4]` lines embedded in §3 Q4 and Q5; the final
-`[Q4]` summary was `Rate-limit-specific headers present on 429 response: NONE` and
-`Full 429 header names: ['Content-Type', 'Content-Length', 'Access-Control-Allow-Origin', 'Set-Cookie']`.)
-
-### 8.3 Read-only proof — repository left unchanged
-
-The only artifact written to the repository is this document. The temporary observation scripts lived under the
-container's `/tmp/blitzy_obs/` (outside the repository checkout) and were deleted after capture. On the host
-checkout, `git status --porcelain` collapses the brand-new, fully-untracked `blitzy/` tree to a single entry;
-expanding untracked directories to individual files shows the one and only file written, and there are **no
-modified or deleted tracked files**:
-
-```
-$ git rev-parse --abbrev-ref HEAD
-blitzy-9b4ce125-7165-4a3a-b9c5-9be93b399ff9
-
-$ git status --porcelain
-?? blitzy/
-
-# blitzy/ has zero tracked files, so porcelain collapses it. Expanded to files it is exactly one file:
-$ git status --porcelain --untracked-files=all
-?? blitzy/documentation/app_2cd6ee777f8c.md
-
-# No tracked file was modified or deleted (empty output = read-only constraint satisfied):
-$ git status --porcelain --untracked-files=all | grep -E '^( M|MM|A |D | D|R |C )'
-(no output)
-```
-
-> Note: `blitzy/` also contains empty `screenshots/` and `screen_recordings/` scaffold directories; Git does not
-> track empty directories, so `--untracked-files=all` correctly lists only the report file.
-
-> The filename `app_2cd6ee777f8c.md` matches the investigation's source branch/commit
-> (`2cd6ee777f8c…`), per the task's mandated single-deliverable location `blitzy/documentation/`.
+*End of investigation report.*
