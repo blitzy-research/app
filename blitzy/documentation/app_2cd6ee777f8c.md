@@ -5,8 +5,11 @@ endpoints behave when a **signed suffix is validated** and when the **alias-crea
 response to a report of *"intermittent validation failures that don't match the expected behavior and appear
 related to how signed suffixes are verified."* Every behavioral claim below is paired with the actual,
 unedited program output that produced it and a `file:line` reference to the code that emits it. Statements
-that are **inferred** from code rather than observed, or that come from a **non-canonical** stand-in rather
-than the real HTTP path, are explicitly labelled as such.
+that are **inferred** from code rather than observed, that come from a **non-canonical** stand-in rather than
+the real HTTP path, that are **verified against public advisory databases** rather than an in-container scanner
+(the dependency advisories of §2.12), or that could **not be exercised to completion** in this environment
+(the external-service-bound test of §2.11(b)) are explicitly labelled as such at each point of use; where a
+claimed identifier could not be verified, it is **withheld rather than asserted**.
 
 ## 0. Investigation identifiers
 
@@ -291,6 +294,381 @@ The parallel-lock keys (`cl:*`) are acquired and released within each request an
 count = 0). The two auxiliary probes (§5, §6) apply the same before/after delta cleanup; Redis `dbsize`
 returns to `468` after each.
 
+### 2.9 Two entry points exercised — in-process route stack (primary) and the production `gunicorn wsgi:app` HTTP transport (confirmation)
+
+Two distinct real entry points were exercised, and this report is explicit about which produced which evidence:
+
+- **Primary capture path — in-process Werkzeug test client over `server.create_app()`.** Every
+  per-condition status/body/log block in §3 is captured with
+  `app.test_client().post("/api/v2|v3/alias/custom/new", …)` carrying a real API key. This drives the
+  **real routing + decorator stack** (`@limiter.limit` → `@require_api_auth` → `@parallel_limiter.lock` → view
+  body) and the real `require_api_auth` authentication — it is **not** a helper bypass. It is the same
+  `create_app()` object the production `gunicorn wsgi:app` command loads and the same client `tests/conftest.py`
+  uses, so it is the canonical *application* path. What it does **not** exercise is the WSGI **transport**
+  layer (the gunicorn worker + HTTP/1.1 socket), so a handful of transport-only response headers
+  (`Server`, `Date`, `Connection`) are added by gunicorn and are therefore **absent** from the in-process
+  captures. This distinction is made precise below and drives the two header inventories in §3.4.1.
+
+- **Production HTTP path — live `gunicorn wsgi:app` on port 7777.** To confirm the status/body answers and to
+  record the true wire-level header set, the same conditions were re-issued over the real gunicorn transport.
+  The exact canonical build/run commands used (sanitized; the API-key value is the disposable observation
+  user's key, redacted):
+
+```text
+# canonical dependency/service readiness (image's /build.sh provisions these; live re-checks):
+$ /app/venv/bin/python --version
+Python 3.10.18
+$ /app/venv/bin/gunicorn --version
+gunicorn (version 20.0.4)
+$ PGPASSWORD=test psql -h localhost -U test -d test -tAc "select version();"
+PostgreSQL 15.13 (Debian 15.13-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit
+$ redis-cli ping
+PONG
+
+# production entry point (the Dockerfile CMD form), backgrounded for observation:
+$ cd /app && CONFIG=tests/test.env DB_URI=postgresql://test:test@localhost:5432/test \
+      DISABLE_RATE_LIMIT=1 EVENT_WEBHOOK_DISABLE=1 PYTHONPATH=/app \
+      /app/venv/bin/gunicorn wsgi:app -b 127.0.0.1:7777 -w 2 --timeout 15
+
+# every condition below was issued with a runnable curl of this exact shape (redacted key):
+$ curl -s -D - -o /tmp/body -X POST http://127.0.0.1:7777/api/v2/alias/custom/new \
+      -H "Authentication: <API_KEY_REDACTED (len 60)>" -H "Content-Type: application/json" \
+      -d '{"alias_prefix":"livev2ok","signed_suffix":"<VALID_SIGNED_SUFFIX>"}'
+```
+
+`CONFIG=tests/test.env` is the canonical test configuration disclosed throughout this report
+(`MAX_NB_EMAIL_FREE_PLAN=3`, `EMAIL_DOMAIN=sl.local`, `FLASK_SECRET=secret`). Because
+`CUSTOM_ALIAS_SECRET = FLASK_SECRET + "custom_alias"` (`app/config.py:201`) and the image's app-run
+environment also exports `FLASK_SECRET=secret`, the signed suffixes generated for these requests validate
+identically under either environment — so this run genuinely exercises the production `gunicorn wsgi:app`
+transport, not a stand-in.
+
+**Status/body parity — every answer reproduced on the live transport.** Each status class was reproduced
+byte-for-byte over gunicorn (bodies identical to the in-process §3 captures):
+
+| Live status line (gunicorn) | Body | `Content-Length` | In-process §3 match |
+|---|---|:--:|:--:|
+| `HTTP/1.1 201 CREATED` | alias JSON | `445`/`447` | §3.5 (`201`) |
+| `HTTP/1.1 412 PRECONDITION FAILED` | `{"error":"Alias creation time is expired, please retry"}` | `57` | §3.1, §3.2 |
+| `HTTP/1.1 400 BAD REQUEST` | `{"error":"request body cannot be empty"}` | `41` | §3.4.1 |
+| `HTTP/1.1 400 BAD REQUEST` | free-account-limit message | `141` | §3.5 |
+| `HTTP/1.1 401 UNAUTHORIZED` | `{"error":"Wrong api key"}` | `26` | §3.3 |
+| `HTTP/1.1 409 CONFLICT` | `{"error":"alias <full> already exists"}` | `59` | §3.4.5 |
+| `HTTP/1.1 429 TOO MANY REQUESTS` | `{"error":"Rate limit exceeded"}` | `32` | §3.4.3 |
+
+Representative complete live blocks (session-cookie value redacted per §2.7; everything else verbatim from
+`curl -s -D -`):
+
+```text
+############## 201 VALID v2  (live gunicorn :7777)
+HTTP/1.1 201 CREATED
+Server: gunicorn/20.0.4
+Date: Fri, 10 Jul 2026 18:35:58 GMT
+Connection: close
+Content-Type: application/json
+Content-Length: 445
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=<SESSION_COOKIE_REDACTED>; Expires=Fri, 17-Jul-2026 18:35:58 GMT; HttpOnly; Path=/; SameSite=Lax
+----- BODY -----
+{"alias":"livev2ok.wda37bd@sl.local","creation_date":"2026-07-10 18:35:58+00:00","creation_timestamp":1783708558,"disable_pgp":false,"email":"livev2ok.wda37bd@sl.local","enabled":true,"id":411,"latest_activity":null,"mailbox":{"email":"qa2_live_8d6005b5@mailbox.test","id":199},"mailboxes":[{"email":"qa2_live_8d6005b5@mailbox.test","id":199}],"name":null,"nb_block":0,"nb_forward":0,"nb_reply":0,"note":null,"pinned":false,"support_pgp":false}
+
+############## 401 NOAUTH v2  (live gunicorn :7777)
+HTTP/1.1 401 UNAUTHORIZED
+Server: gunicorn/20.0.4
+Date: Fri, 10 Jul 2026 18:35:58 GMT
+Connection: close
+Content-Type: application/json
+Content-Length: 26
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=<SESSION_COOKIE_REDACTED>; Expires=Fri, 17-Jul-2026 18:35:58 GMT; HttpOnly; Path=/; SameSite=Lax
+----- BODY -----
+{"error":"Wrong api key"}
+
+############## 409 DUP-second v2  (live gunicorn :7777; fresh user, duplicate is the 2nd op so quota check passes first)
+HTTP/1.1 409 CONFLICT
+Server: gunicorn/20.0.4
+Date: Fri, 10 Jul 2026 18:36:58 GMT
+Connection: close
+Content-Type: application/json
+Content-Length: 59
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=<SESSION_COOKIE_REDACTED>; Expires=Fri, 17-Jul-2026 18:36:58 GMT; HttpOnly; Path=/; SameSite=Lax
+----- BODY -----
+{"error":"alias live3dup.w544641@sl.local already exists"}
+
+############## 429 LOCK-HELD v2  (live gunicorn :7777; Redis key cl:127.0.0.1:alias_creation pre-held — see §3.4.4)
+HTTP/1.1 429 TOO MANY REQUESTS
+Server: gunicorn/20.0.4
+Date: Fri, 10 Jul 2026 18:35:58 GMT
+Connection: close
+Content-Type: application/json
+Content-Length: 32
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=<SESSION_COOKIE_REDACTED>; Expires=Fri, 17-Jul-2026 18:35:58 GMT; HttpOnly; Path=/; SameSite=Lax
+----- BODY -----
+{"error":"Rate limit exceeded"}
+```
+
+(An observation-ordering note: a clean `409` requires the duplicate POST to be the user's **second** create,
+because the quota gate `can_create_new_alias()` runs *before* the duplicate check — a user already holding
+`count == max == 3` receives the quota `400` first, not the `409`. This ordering is exactly the §4.1 branch
+order and was observed both in-process and live.)
+
+The **complete live header inventory and its security/cache-header analysis** (which headers appear, which are
+absent, and the server-version disclosure) is in §3.4.1. All disposable live users were deleted afterward
+(FK-cascade) and the gunicorn process stopped; the host repository remained byte-for-byte unchanged (§2.8,
+§8.3).
+
+### 2.10 Server-restart lifecycle — clean stop/start and stable post-restart behavior (observed)
+
+To confirm that the observed behavior is a stable property of the application rather than an artifact of one
+long-lived process, the production `gunicorn wsgi:app` server (§2.9) was **stopped and restarted**, and two
+representative conditions were reproduced against the *fresh* worker processes. The canonical restart command
+is the Dockerfile CMD form, backgrounded for observation (note: environment assignments must **precede** the
+program under `nohup`, e.g. via `nohup env VAR=val … gunicorn …`):
+
+```text
+# stop:    kill the running `gunicorn wsgi:app` master (and its workers) in the container
+# restart: nohup env CONFIG=tests/test.env DB_URI=postgresql://test:test@localhost:5432/test \
+#            DISABLE_RATE_LIMIT=1 EVENT_WEBHOOK_DISABLE=1 PYTHONPATH=/app \
+#            /app/venv/bin/gunicorn wsgi:app -b 127.0.0.1:7777 -w 2 --timeout 15 > /tmp/qa2/gunicorn_restart.log 2>&1 &
+```
+
+The complete, unedited transcript (`/tmp/qa2/restart_out.txt`, one run; a second run produced the same
+sequence with different PIDs, confirming stability across ≥2 restarts):
+
+```text
+### 1) PREP disposable user + suffixes
+uid=222  db_before={'users': 49, 'alias': 128, 'api_key': 35}
+token_len=60  signed_ok_len=52  signed_exp_len=52
+
+### 2) PRE-RESTART pids
+26503 26501 00:23
+26507 26503 00:23
+26508 26503 00:23
+
+### 3) STOP (kill all gunicorn wsgi:app in this container)
+confirm down:
+  http=000 (000=refused)
+residual:
+  (empty above = none)
+
+### 4) RESTART
+  READY after 2s (unauth_POST=401)
+POST-RESTART pids (must differ from step 2):
+26592 26550 00:01
+26597 26592 00:01
+26598 26592 00:01
+
+### 5) REPRODUCE EXPIRED -> 412
+{"error":"Alias creation time is expired, please retry"}
+  [HTTP 412]
+### 6) REPRODUCE VALID -> 201
+{"alias":"restartok.wfc44b7@sl.local", … ,"id":472, … }
+  [HTTP 201]
+
+### 7) validation LOG.w line (expired) from fresh process log
+2026-07-10 19:14:18,116 - SL - WARNING - 26597 - "/app/app/api/views/new_custom_alias.py:72" - new_custom_alias_v2() -  - Alias creation time expired for <User 222 QA2 qa2_restart_8505b9b8@mailbox.test>
+
+### 8) CLEANUP disposable user
+  deleted uid 222 | db_after_cleanup {'users': 48, 'alias': 127, 'api_key': 34}
+```
+
+**What this shows (all observed).** (1) The stop is clean — the port stops accepting connections
+(`http=000`, connection refused) with **no residual** `gunicorn wsgi:app` process. (2) The restart yields a
+**new master and two new workers** (PIDs `26592`/`26597`/`26598`, all distinct from the pre-restart
+`26503`/`26507`/`26508`), ready within ~2 s (an unauthenticated `POST` correctly returns `401` once up).
+(3) Against the fresh workers the same two inputs reproduce **identically**: an expired suffix →
+**`HTTP 412`** `{"error":"Alias creation time is expired, please retry"}`, and a fresh valid suffix →
+**`HTTP 201`** with the created alias — and the expiry warning is emitted by the *new* worker `26597` at
+`app/api/views/new_custom_alias.py:72` (`new_custom_alias_v2()`), in the `app/log.py:12-15` format. (4) The
+disposable user was removed afterward, returning the row counts toward baseline; the source repository was
+untouched (§2.8, §8.3). The 412/201 outcomes are therefore process-independent and survive a full restart.
+
+### 2.11 Test-suite behavior and limitations (observed)
+
+Two behaviors of the project's own test harness were exercised because they bear on reproducibility. Both are
+**documentation observations under the read-only scope** — no test, fixture, or configuration file was
+modified; the only overrides used were process-local environment variables (never written to disk in the
+repository), and any variant word list lived under `/tmp` (outside the checkout).
+
+**(a) The focused alias tests are state-leaky / order-dependent against the reused canonical DB.** Running the
+alias test module under the canonical test environment (`CONFIG=tests/test.env`, `DB_URI` overridden to the
+container Postgres on `:5432`, workflow flags `--timeout=30 --timeout-method=signal`) yields **2 failures**
+where a create that should return `201` instead returns `409` (duplicate). The complete, unedited capture
+(`/tmp/qa2/t1_out.txt`):
+
+```text
+### CONFIG (canonical test env)
+MAX_NB_EMAIL_FREE_PLAN=3
+WORDS_FILE_PATH=local_data/test_words.txt
+canonical word pool size: 3 words -> test,word,list
+
+### PRE-EXISTING colliding rows in reused DB (email LIKE prefix.%@sl.local)
+ prefix.list@sl.local
+ prefix.phase7oneb@sl.local
+ prefix.phase7twoh@sl.local
+ prefix.qa2uniq0513@sl.local
+ prefix.test@sl.local
+ prefix.word@sl.local
+
+### RUN #1 canonical WORDS_FILE_PATH (=local_data/test_words.txt, 3 words) -> collisions
+# $ DB_URI=postgresql://test:test@localhost:5432/test /app/venv/bin/python -m pytest \
+#     tests/api/test_new_custom_alias.py --timeout=30 --timeout-method=signal -p no:randomly
+#   (CONFIG defaults to tests/test.env via tests/conftest.py; -p no:randomly fixes order; rerunfailures stays active)
+E   assert 409 == 201
+E   assert 409 == 201
+FAILED tests/api/test_new_custom_alias.py::test_v2 - assert 409 == 201
+FAILED tests/api/test_new_custom_alias.py::test_minimal_payload - assert 409 ...
+============== 2 failed, 8 passed, 18 warnings, 6 rerun in 9.99s ===============
+
+### RUN #2 isolated unique WORDS_FILE_PATH (/tmp, env-only, 2000 words) -> all pass
+# $ DB_URI=postgresql://test:test@localhost:5432/test WORDS_FILE_PATH=/tmp/qa2/unique_words.txt \
+#     /app/venv/bin/python -m pytest tests/api/test_new_custom_alias.py --timeout=30 --timeout-method=signal -p no:randomly
+======================= 10 passed, 18 warnings in 6.49s ========================
+```
+
+**Root cause (observed, not inferred).** The two failing tests — `test_v2` (`tests/api/test_new_custom_alias.py:13`,
+the v2 endpoint) and `test_minimal_payload` (`:45`, the v3 endpoint) — each build `alias_prefix="prefix"` plus a
+`random_word()` suffix. The word pool is `WORDS_FILE_PATH=local_data/test_words.txt`, which — in the **canonical
+user-mandated build** — contains **exactly three words** (`test`, `word`, `list`). This is not incidental: the
+container's `/build.sh` deliberately writes that three-word file and points the test env at it, so three words is
+the *canonical* test configuration, not a contamination:
+
+```text
+# /build.sh:67   export WORDS_FILE_PATH=local_data/test_words.txt
+# /build.sh:118  echo -e "test\nword\nlist" > local_data/test_words.txt
+# tests/test.env:38   WORDS_FILE_PATH=local_data/test_words.txt
+```
+
+Combined with the free-plan cap `MAX_NB_EMAIL_FREE_PLAN=3`, the reachable alias space for these tests is just the
+three names `prefix.test`, `prefix.word`, `prefix.list`. The reused canonical DB **already contains**
+`prefix.test@sl.local`, `prefix.word@sl.local`, and `prefix.list@sl.local` (shown above), so every combination the
+tests can generate already exists → the endpoint's duplicate guard returns `409` and the `assert … == 201` fails. Crucially, re-running does **not** recover (`6 rerun` under the pyproject
+`--reruns=3` addopts still fails), because the collisions are committed rows, not transient state. Re-running
+with an **isolated 2000-word pool** supplied purely via a process-local `WORDS_FILE_PATH=/tmp/qa2/unique_words.txt`
+(no repository change) makes all **10 pass**. The leak mechanism is directly observable: an alias created by a
+passing run (e.g. `prefix.qa2uniq0513@sl.local`, present in the pre-existing-rows list above) **persists in the
+DB past the test's transactional rollback**, because the endpoint performs `Alias.create(...)` and **commits**;
+successive runs therefore progressively exhaust the tiny word pool. This is a property of running against a
+**shared, already-populated** database, not a defect in the alias-creation code under investigation.
+
+**(b) The full 639-test suite cannot run to completion here — it blocks on an external Apple call.** The
+workflow-authoritative collection count and the blocker were both captured (`/tmp/qa2/t2_out.txt`):
+
+```text
+### full-suite collection (workflow-authoritative rootdir /app)
+# $ DB_URI=postgresql://test:test@localhost:5432/test /app/venv/bin/python -m pytest tests/ --collect-only -q
+========================= 639 tests collected in 1.20s =========================
+
+### external call site (no timeout arg) — app/api/views/apple.py
+# $ grep -nE '_SANDBOX_URL|_PROD_URL|requests\.post' app/api/views/apple.py
+29:_SANDBOX_URL = "https://sandbox.itunes.apple.com/verifyReceipt"
+30:_PROD_URL = "https://buy.itunes.apple.com/verifyReceipt"
+319:        r = requests.post(
+333:        r = requests.post(
+
+### single-test stall under workflow-authoritative flags (bounded 90s wall-clock)
+# $ DB_URI=postgresql://test:test@localhost:5432/test /app/venv/bin/python -m pytest \
+#     tests/api/test_apple.py::test_apple_process_payment --timeout=30 --timeout-method=signal
+plugins: xdist-3.8.0, cov-3.0.0, rerunfailures-15.1, timeout-2.4.0
+timeout: 30.0s
+timeout method: signal
+collecting ... collected 1 item
+tests/api/test_apple.py::test_apple_process_payment +++++++++++++++++++++++++++++++++++ Timeout ++++++++++++++++++++++++++++++++++++
+  File "/app/venv/lib/python3.10/site-packages/pytest_rerunfailures.py", line 438, in run_server
++++++++++++++++++++++++++++++++++++ Timeout ++++++++++++++++++++++++++++++++++++
+end=…  (outer bound=90s; earlier UNbounded-to-200s run was killed at 200s still not done)
+```
+
+**Interpretation (observed + grounded).** The suite collects exactly **639 tests**. Execution stalls at
+`tests/api/test_apple.py::test_apple_process_payment`, which drives `POST /apple/process_payment` and reaches
+`app/api/views/apple.py` where the receipt is verified via `requests.post(_PROD_URL, …)` at `apple.py:319`
+(with a sandbox fallback `requests.post(_SANDBOX_URL, …)` at `:333`) against Apple's live endpoints
+(`_PROD_URL`/`_SANDBOX_URL` at `apple.py:30`/`:29`) — **with no `timeout=` argument** on the `requests.post`
+calls. The per-test 30 s `pytest-timeout` fires, `pytest-rerunfailures` then reruns it (per the pyproject
+`--reruns=3` addopts), and even this **single** test exceeded a 200 s outer wall-clock in an unbounded attempt.
+This is an **environmental** limitation (a test that depends on an unreachable third-party service with no
+client-side timeout), not a fault in the alias-creation subsystem under investigation, and it does not affect
+any Q1–Q6 answer — all of which were obtained through the real endpoints as shown in §3.
+
+### 2.12 Known advisories for the pinned dependencies (supplementary security observation)
+
+The dependency versions the alias endpoints actually run on are pinned and old (§2.3). This subsection records
+the **known published advisories** that apply to those pinned versions, with each advisory's affected range,
+severity, fixed version, and — most importantly for this investigation — its **relevance to the
+custom-alias-creation request path**. This is a **documentation-only** observation under the read-only,
+no-remediation scope: **no dependency is added, updated, or removed**, and no code is changed.
+
+**Provenance of the data below (labeled explicitly).** The JavaScript findings are the **observed output** of
+an `npm audit` run in the container. The Python findings are **public GitHub Advisory Database / NVD entries**
+matched to the observed pinned versions; they are *not* the output of an in-container Python scanner, because
+neither `pip-audit` nor `safety` is installed and installing one would modify the environment (out of scope) —
+so those entries are labeled **advisory-database (verified), applied to observed versions**, distinct from the
+tool-observed `npm audit`.
+
+**Observed pinned versions and the observed `npm audit`** (`/tmp/qa2/a1_out.txt`; the pip list is the
+request-path-relevant subset of `/app/venv/bin/pip freeze`, the JS block is verbatim `npm audit
+--package-lock-only` run in `/app/static`):
+
+```text
+### OBSERVED pinned versions (/app/venv/bin/pip freeze), request-path-relevant subset
+# $ /app/venv/bin/pip freeze | grep -iE '^(gunicorn|cryptography|Flask|Flask-Limiter|limits|itsdangerous|Werkzeug|Jinja2|SQLAlchemy|requests|urllib3|redis|psycopg2)'
+Flask==1.1.2
+Flask-Limiter==1.4
+Jinja2==2.11.3
+SQLAlchemy==1.3.24
+Werkzeug==1.0.1
+cryptography==37.0.1
+gunicorn==20.0.4
+itsdangerous==1.1.0
+limits==1.5.1
+psycopg2-binary==2.9.3
+redis==4.6.0
+requests==2.31.0
+urllib3==1.26.20
+
+### OBSERVED npm audit --package-lock-only (static/) totals + findings
+# $ cd /app/static && npm audit --package-lock-only --json   # (parsed to totals + per-package findings)
+totals: {'low': 1, 'moderate': 2, 'high': 0, 'critical': 0, 'total': 3}
+  @sentry/browser: severity=moderate range=<7.119.1 ids=['GHSA-593m-55hh-j8gv'] fixed_in=10.65.0
+      title=Sentry SDK Prototype Pollution gadget in JavaScript SDKs
+  bootbox: severity=moderate range=<=6.0.0 ids=['GHSA-m4ch-4m5f-2gp6'] fixed_in=6.0.4
+      title=Bootbox.js Cross Site Scripting vulnerability
+  vue: severity=low range=2.0.0-alpha.1 - 2.7.16 ids=['GHSA-5j4c-8p2g-v4jx'] fixed_in=3.5.39
+      title=ReDoS vulnerability … inefficient regex evaluation in the parseHTML function
+```
+
+**(a) Python — server/runtime dependencies (advisory-database, verified; applied to observed versions).**
+
+| Package (pinned) | Advisory (GHSA / CVE) | Affected range | Severity | Fixed in | Relevance to the alias-creation path |
+|---|---|---|:--:|:--:|---|
+| `gunicorn==20.0.4` | GHSA-w3h3-4rj7-4ph4 / CVE-2024-1135 (HTTP request smuggling, CWE-444) | `< 22.0.0` | High | `22.0.0` | **Direct** — gunicorn is the production WSGI server for these endpoints (Dockerfile CMD `gunicorn wsgi:app`, §2.9). Smuggling is typically exploitable only when a fronting proxy and gunicorn disagree on `Transfer-Encoding`/`Content-Length`; this investigation drove gunicorn directly on `127.0.0.1` with no proxy. |
+| `gunicorn==20.0.4` | GHSA-hc5x-x2vx-497g / CVE-2024-6827 (TE.CL request/response smuggling, CWE-444) | `< 23.0.0` | High | `23.0.0` | **Direct** (same transport as above). Same proxy-dependent exploitability caveat. |
+| `cryptography==37.0.1` | GHSA-3ww4-gg4f-jr7f / CVE-2023-50782 (Bleichenbacher RSA decryption timing oracle) | `< 42.0.0` | High | `42.0.0` | **Indirect / not on this path** — concerns RSA decryption in TLS servers using RSA key exchange. The signed-suffix path uses `itsdangerous` HMAC (`TimestampSigner`, §3.1), not `cryptography` RSA; `cryptography` is used by other subsystems (PGP/JWT), not by suffix validation or the quota check. |
+| `Werkzeug==1.0.1` | CVE-2023-25577 (multipart form parser resource exhaustion / DoS) | `< 2.2.3` | High | `2.2.3` | **Reachable** — Werkzeug is the WSGI layer under Flask for these endpoints; its request-body parser is on the path. The alias endpoints consume JSON rather than `multipart/form-data`, so this specific parser branch is not exercised by the observed requests, but it is present in the same request-handling stack. |
+| `Werkzeug==1.0.1` | GHSA-2g68-c3qc-8985 / CVE-2024-34069 (interactive-debugger RCE) | `< 3.0.3` | High (CVSS 7.5) | `3.0.3` | **Not applicable to the observed production boot** — requires the Werkzeug interactive debugger (debug mode). The endpoints were exercised under production `gunicorn` with the debugger off, so this path is not reachable in the observed configuration. |
+| `Flask==1.1.2` | GHSA-m2qf-hxjv-5gpq / CVE-2023-30861 (permanent-session-cookie disclosure via missing `Vary: Cookie`, CWE-539) | `< 2.2.5` (also `2.3.0`–`2.3.1`) | High (CVSS 7.5) | `2.2.5` / `2.3.2` | **Conditional** — the alias responses do set `Set-Cookie: slapp=…` and do **not** set a `Cache-Control` header (observed, §3.4.1(b)), so one precondition holds; full exploitability additionally requires a shared caching proxy that caches `Set-Cookie`, `session.permanent = True`, and the session being untouched during the request — deployment-dependent conditions not established here. |
+
+*Note on a separately-cited Flask advisory.* Intake notes referenced a low-severity Flask advisory with a
+future-dated identifier that could **not** be independently verified against the advisory databases; it is
+therefore **not** asserted here. The verified advisory applicable to the pinned `Flask==1.1.2` is
+CVE-2023-30861 above. (This follows the "be exact and grounded / do not state unverified identifiers" rule.)
+
+**(b) JavaScript — front-end static assets (tool-observed via `npm audit`, verbatim above).** Three findings,
+none `high`/`critical`: `@sentry/browser` (`<7.119.1`, moderate, prototype-pollution gadget,
+GHSA-593m-55hh-j8gv), `bootbox` (`<=6.0.0`, moderate, XSS, GHSA-m4ch-4m5f-2gp6), and `vue`
+(`2.0.0-alpha.1`–`2.7.16`, low, ReDoS in `parseHTML`, GHSA-5j4c-8p2g-v4jx). **Relevance to the alias-creation
+path: none** — these are browser-side assets served under `static/` for the dashboard UI; they are not loaded,
+parsed, or executed by the JSON API endpoints `POST /api/v{2,3}/alias/custom/new` that this investigation
+exercises. They are recorded here only for completeness of the dependency-advisory coverage.
+
+**Bottom line (observed + grounded).** The most path-relevant advisories are the two `gunicorn` request-smuggling
+CVEs (the endpoints' actual transport) and, conditionally, the `Flask` session-cookie/`Vary: Cookie` advisory
+(which intersects the observed absence of `Cache-Control` in §3.4.1(b)). The `cryptography` RSA advisory and
+the front-end JS findings do **not** lie on the suffix-validation or quota-enforcement path. Consistent with
+the read-only, no-remediation scope, all of the above is **documented, not fixed**.
+
 ---
 
 ## 3. Direct Answers to the Investigation Questions
@@ -480,7 +858,54 @@ SL LOG LINES EMITTED DURING REQUEST (2 total; 'Alias creation time expired' WARN
 identical on v2 and v3, for all three invalid kinds (tampered / malformed / empty). Emitted at
 `app/api/views/new_custom_alias.py:73` (v2) / `:188` (v3) after the `if not alias_suffix:` guard, because
 `check_suffix_signature()` (`app/alias_suffix.py:41`) swallows every `BadSignature` subclass. The
-tamper-specific `400 "Tampered suffix"` is unreachable for signature errors.
+tamper-specific `400 "Tampered suffix"` is unreachable for signature errors. **This v2/v3 parity is specific
+to the *signed-suffix* rejection**; for other malformed inputs — a non-object JSON body, a JSON-`null`
+suffix, a non-array `mailbox_ids`, or an out-of-charset/overlong `alias_prefix` — v2 and v3 **diverge**,
+because v3 carries input guards that v2 lacks. That divergence is inventoried in §3.1.1.
+
+#### 3.1.1 v2 vs v3 input-handling divergence matrix (observed, live gunicorn)
+
+The two endpoints are **not** interchangeable for malformed input. `new_custom_alias_v3` adds four guards
+that `new_custom_alias_v2` does not have — `isinstance(data, dict)` (`app/api/views/new_custom_alias.py:153-154`),
+a null-coercing `signed_suffix = data.get("signed_suffix","") or ""` (`:157`), `check_alias_prefix(...)`
+(`:167-168`), and `isinstance(mailbox_ids, list)` (`:171-172`) — and it checks the prefix and mailboxes
+*before* the suffix, whereas v2 parses with bare `data.get(...).strip()` (`:64-65`), never reads
+`mailbox_ids` (it always uses `user.default_mailbox_id`, `:99`), and reaches the suffix check first. The
+effect, exercised end-to-end against live `gunicorn` (fresh disposable user per case; `alias Δ` is the
+observed alias-row change; every value is the real captured status/body):
+
+| # | Same input to both endpoints | v2 → status / body | v3 → status / body | Why they differ (file:line) |
+|:-:|------------------------------|--------------------|--------------------|-----------------------------|
+| 1 | scalar JSON body `5` | **500** `{"error":"Internal error"}` (Δ0) | **400** `request body does not follow the required format` (Δ0) | v3 `isinstance(data,dict)` (`:153-154`); v2 `data.get` on non-dict → `AttributeError` (`:64`) |
+| 2 | `signed_suffix: null` | **500** `{"error":"Internal error"}` (Δ0) | **412** `Alias creation time is expired, please retry` (Δ0) | v3 `… or ""` coerces `None`→`""` (`:157`); v2 `None.strip()` → `AttributeError` (`:65`) |
+| 3 | `mailbox_ids: 5` (scalar) | **201** created — `mailbox_ids` **ignored**, default mailbox used (Δ+1) | **400** `mailbox_ids must be an array of id` (Δ0) | v3 `isinstance(mailbox_ids,list)` (`:171-172`); v2 never reads it, uses `user.default_mailbox_id` (`:99`) |
+| 4 | `alias_prefix` omitted | **400** `wrong alias prefix or suffix` (Δ0) | **400** `alias prefix invalid format or too long` (Δ0) | same status, different guard: v2 `verify_prefix_suffix` (`:78`); v3 `check_alias_prefix("")` (`:167-168`) |
+| 5 | prefix `x' OR '1'='1` | **201** created `x'or'1'='1.…@sl.local` (Δ+1) | **400** `alias prefix invalid format or too long` (Δ0) | v2 has no charset check; `convert_to_id` keeps `'` (`app/utils.py:50`); v3 pattern `[0-9a-z-_.]{1,}` rejects (`alias_utils.py:415,422`) |
+| 6 | prefix `<script>alert(1)</script>` | **500** `{"error":"Internal error"}` (Δ0) | **400** `alias prefix invalid format or too long` (Δ0) | v2 carries `<>` downstream → exception → generic 500; v3 rejects at `check_alias_prefix` |
+| 7 | prefix `x;rm -rf /` | **500** `{"error":"Internal error"}` (Δ0) | **400** `alias prefix invalid format or too long` (Δ0) | as (6): v2 no charset check → downstream 500; v3 rejects |
+| 8 | prefix `café` (unicode) | **201** created `cafe.…` (Δ+1) | **201** created `cafe.…` (Δ+1) | **parity** — `convert_to_id` unidecodes `café`→`cafe`, which passes both |
+| 9 | prefix 41×`a` (overlong) | **201** created 41-char prefix (Δ+1) | **400** `alias prefix invalid format or too long` (Δ0) | v3 enforces `len>40` (`alias_utils.py:419-420`); v2 has no length check |
+| 10 | prefix 40×`a` (boundary) | **201** (Δ+1) | **201** (Δ+1) | **parity** — 40 is the inclusive limit; both accept |
+| 11 | prefix `.x` (leading dot) | **500** `{"error":"Internal error"}` (Δ0) | **500** `{"error":"Internal error"}` (Δ0) | **parity (both fail)** — `.` is in the pattern so v3's `check_alias_prefix` passes; the leading-dot local part fails downstream on both → generic 500 |
+| 12 | prefix `x.` (trailing dot) | **400** `2 consecutive dot signs aren't allowed in an email address` (Δ0) | **400** (same) (Δ0) | **parity** — `x.`+`.word@…` → `x..word` → `".." in full_alias` guard (`:90` v2 / `:205` v3) |
+| 13 | prefix `   ` (whitespace) | **400** `wrong alias prefix or suffix` (Δ0) | **400** `alias prefix invalid format or too long` (Δ0) | spaces stripped → empty prefix; same divergence as case 4 |
+| 14 | prefix `x..y` (consecutive dots) | **400** `2 consecutive dot signs aren't allowed in an email address` (Δ0) | **400** (same) (Δ0) | **parity** — `".." in full_alias` guard on both |
+
+Three cross-cutting observations:
+
+1. **Missing structural guards in v2 turn client input errors into server errors.** Cases 1, 2, 6, 7 return
+   a precise `400` on v3 but crash v2 to `500`, because v2 dereferences the request with bare `data.get(...)`
+   / `.strip()` and has no prefix charset check. This is a robustness gap in v2, not a v3 defect.
+2. **v2 accepts alias local-parts that v3 forbids.** Cases 3, 5, 9 create aliases on v2 that v3 rejects —
+   including a quote-bearing local part (`x'or'1'='1.…`) and a 41-character prefix. This is a *data-quality*
+   divergence, **not** a SQL-injection vector: the value is stored literally (the `201` body echoes it back
+   verbatim) because persistence goes through SQLAlchemy's parameterized `Alias.create`; no observation showed
+   query manipulation.
+3. **Every `500` is the generic, non-leaking body.** Across both endpoints, *all* `500`s returned exactly
+   `{"error":"Internal error"}` (Content-Length `26`) — no stack trace, no file path, no secret. This is the
+   generic API error handler at `server.py:388-394`, which logs the exception server-side (`LOG.e(e)`, `:390`)
+   and returns `jsonify(error="Internal error"), 500` (`:392`) for `/api/` paths. So the v2 crashes above do
+   not disclose internals to the client.
 
 ### 3.2 Q2 — Expired signed suffix: HTTP status code and error body
 
@@ -543,12 +968,18 @@ SL LOG LINES EMITTED DURING REQUEST (2 total; 'Alias creation time expired' WARN
 
 #### 3.2.1 Frequency / stability: same unchanged expired input POSTed repeatedly (F6)
 
-To characterise the reported "intermittent" behaviour with a *fixed* input, one single expired
-`signed_suffix` string was POSTed **5 times on v2 and 5 times on v3** without modification. The observed
-status distribution is **`{412: 5}` on v2 and `{412: 5}` on v3** — i.e. fully **deterministic**: the same
-unchanged expired input always yields `412`. (Run-to-run behaviour across *freshly generated* signatures,
-including a genuine base64 nuance, is examined separately in §6.) Run 1 is shown fully instrumented; runs
-2–5 emit the byte-identical `[INSTRUMENT]` + `WARNING` + `after_request` triplet (complete transcript in §8):
+To characterise the reported "intermittent" behaviour with a *fixed* input, two complementary captures are
+reported: an **in-process test-client** series (immediately below) and a **live `gunicorn` transport**
+byte/timing/process proof (§3.2.1(F6-live), which supplies the request-body digests, cadence, duration,
+sample size, and cross-process breakdown the in-process series omits).
+
+**(a) In-process test client.** One single expired `signed_suffix` string was POSTed **5 times on v2 and 5
+times on v3** without modification. The observed status distribution is **`{412: 5}` on v2 and `{412: 5}` on
+v3** — i.e. fully **deterministic**: the same unchanged expired input always yields `412`. (Run-to-run
+behaviour across *freshly generated* signatures, including a genuine base64 nuance, is examined separately in
+§6.) Run 1 is shown fully instrumented; runs 2–5 emitted the byte-identical `[INSTRUMENT]` + `WARNING` +
+`after_request` triplet and are represented here by their per-run status lines (the `{412: 5}` line is the
+harness's own end-of-loop tally; the removed raw capture files are inventoried in §8.1):
 
 ```text
 FIXED expired signed_suffix = '.word@sl.local.alC-Lg.zR2dRnowV3GBBunIQQnrJgCXYNE'
@@ -578,9 +1009,52 @@ FIXED expired signed_suffix = '.word@sl.local.alC-Lg.zR2dRnowV3GBBunIQQnrJgCXYNE
   v3 DISTRIBUTION over 5 identical expired POSTs: {412: 5}
 ```
 
+**(F6-live) Byte / timing / process proof over the production `gunicorn` transport.** The fixed-input
+characterisation was repeated end-to-end over HTTP against the live `gunicorn wsgi:app` server (§2.9). For
+each of four series *(v2, v3) × (expired, tampered)* a single request body was serialised to bytes **once**,
+its SHA-256 recorded, and those **byte-identical** bytes POSTed **N = 6** times at a fixed **0.25 s** cadence.
+The reusable signed material is elided — only the request-body digest is published:
+
+```text
+# $ CONFIG=/app/tests/test.env PYTHONPATH=/app python repro_d5.py     # -> http://127.0.0.1:7777
+# body per series serialised ONCE:
+#   raw = json.dumps({"alias_prefix": "d5_<ep>_<cond>", "signed_suffix": "<FIXED>", "mailbox_ids": [<mbx>]}).encode()
+# each series: 6 × requests.post(url, data=raw, headers={"Authentication": "<API_KEY_REDACTED>"}) ; sleep 0.25s
+```
+
+Observed (run 1). Every request-body digest is constant *within* its series (the bytes are serialised once and
+reused), and every sample returned `412`:
+
+| Series | Request-body SHA-256 | N | Cadence | Wall-clock | Status distribution | Worker-PID breakdown |
+|--------|----------------------|:-:|:-------:|:----------:|:-------------------:|----------------------|
+| v2 expired  | `21c6abbe…5ddbf8` | 6 | 0.25 s | 1.606 s | `{412: 6}` | pid 25077 ×4, pid 25076 ×2 |
+| v2 tampered | `3bcab27f…a688d9` | 6 | 0.25 s | 1.598 s | `{412: 6}` | pid 25077 ×6 |
+| v3 expired  | `1b97df13…f722df` | 6 | 0.25 s | 1.601 s | `{412: 6}` | pid 25077 ×5, pid 25076 ×1 |
+| v3 tampered | `4d0de0af…f2c558` | 6 | 0.25 s | 1.600 s | `{412: 6}` | pid 25077 ×4, pid 25076 ×2 |
+
+All **24** samples returned `412`. Requests were distributed across **both** gunicorn workers (PIDs `25076`
+and `25077`), so the determinism is not a single-process artefact. The user/alias/api_key counts captured
+before and after the 24 rejections were **`users 49 / alias 128 / api_key 35` → unchanged**, proving the
+rejections created **zero** rows.
+
+**Stability across runs (≥2).** The whole four-series harness was executed **twice**. The second run minted
+*fresh* suffixes — so its per-series digests differ (e.g. `81e1ea37…6ed10` for v2-expired, because the signed
+material is regenerated) — yet every series again returned `{412: 6}` (overall `{412: 24}`), again across both
+workers, again with `alias` unchanged. Across the two runs, **48 / 48** fixed-input samples were `412`; the
+fixed-input behaviour is **deterministic**, not intermittent.
+
+The cross-process determinism is visible directly in the live `SL` log (format per `app/log.py:12-15`; the
+`%(process)d` field is the worker PID; user redacted), e.g.:
+
+```text
+2026-07-10 18:46:27,111 - SL - WARNING - 25077 - "/app/app/api/views/new_custom_alias.py:187" - new_custom_alias_v3() -  - Alias creation time expired for <User REDACTED>
+2026-07-10 18:46:27,380 - SL - WARNING - 25076 - "/app/app/api/views/new_custom_alias.py:187" - new_custom_alias_v3() -  - Alias creation time expired for <User REDACTED>
+```
+
 **Q2 summary.** Expired suffix → `HTTP 412`, body `{"error":"Alias creation time is expired, please retry"}`,
-identical on v2 and v3 and deterministic across repeated identical POSTs (`{412: 5}` per version). Emitted at
-`app/api/views/new_custom_alias.py:73` (v2) / `:188` (v3).
+identical on v2 and v3 and deterministic across repeated identical POSTs — in-process `{412: 5}` per version,
+and live `{412: 6}` per series across **both** gunicorn workers over two runs (`{412: 24}` each run, 48/48
+overall). Emitted at `app/api/views/new_custom_alias.py:73` (v2) / `:188` (v3).
 
 ### 3.3 Q3 — Validation log entries printed to the server console
 
@@ -685,14 +1159,25 @@ API key yields `401 {"error":"Wrong api key"}` with no validation log at all.
 ### 3.4 Q4 — Rate-limiting headers on the responses
 
 **Answer (observed, negative finding).** **No** rate-limiting headers appear on *any* response, for *any*
-status. Across every status exercised — `201`, `412`, `400`, `401`, `409`, and **both** `429`
-variants — every response carried exactly four headers and **zero** `X-RateLimit-*` / `Retry-After`
-headers. The exact captured line on every single response is `RATE-LIMIT HEADERS PRESENT: NONE`.
+status, on **either** entry point (§2.9). Across every status exercised — `201`, `412`, `400`, `401`, `409`,
+and **both** `429` variants — the response carried **zero** `X-RateLimit-*` / `Retry-After` headers. In the
+in-process capture the exact printed line on every response is `RATE-LIMIT HEADERS PRESENT: NONE`; on the live
+`gunicorn` transport a `grep -icE 'x-ratelimit|retry-after'` over all captures returns `0` (§3.4.1(b)). The
+two entry points differ only in transport-layer headers — the in-process response carries a four-application-header
+set while the live response carries those four plus gunicorn's `Server`/`Date`/`Connection` (seven total) —
+and the negative rate-limit finding holds identically on both, as inventoried in §3.4.1.
 
 #### 3.4.1 Full header inventory across every observed status
 
-Every response, regardless of status, carried this exact header set (values vary only in `Content-Length`
-per body and in the cookie `Expires` timestamp):
+**Two inventories are reported because there are two entry points (§2.9), and they differ only in
+transport-layer headers.** The negative Q4 finding — *no rate-limit headers* — holds identically on both.
+
+**(a) In-process Werkzeug test-client capture (the §3 per-condition blocks).** Every in-process response,
+regardless of status, carried this exact **four-application-header** set (values vary only in `Content-Length`
+per body and in the cookie `Expires` timestamp). This is a *test-client* capture: the Werkzeug test client
+does **not** run the gunicorn worker/socket, so the WSGI transport headers `Server`/`Date`/`Connection` are
+**not** present here, and the cookie carries `Domain=.sl.test` because the in-process app sets
+`SERVER_NAME=sl.test` (`tests/conftest.py:26`):
 
 ```text
 Content-Type: application/json
@@ -716,6 +1201,72 @@ RATE-LIMIT HEADERS PRESENT: NONE
 The harness detected rate-limit headers by scanning each response's header keys for the case-insensitive
 prefixes `x-ratelimit` and `retry-after`; the `RATE-LIMIT HEADERS PRESENT: NONE` line printed in every block
 throughout §3 is the result of that scan.
+
+**(b) Live `gunicorn wsgi:app` transport capture (`curl -s -D -` on :7777, §2.9).** Over the real HTTP
+transport, every response — on **all six** observed statuses `201`/`400`/`401`/`409`/`412`/`429` — carried
+**exactly seven** header names and no others. The case-insensitive union of header names across every live
+response was computed directly:
+
+```text
+# $ cat live_out*.txt | grep -iE '^[A-Za-z-]+: ' | sed -E 's/:.*$//' | tr 'A-Z' 'a-z' | sort -u
+access-control-allow-origin
+connection
+content-length
+content-type
+date
+server
+set-cookie
+```
+
+Concretely (representative `412`, verbatim except the redacted cookie value):
+
+```text
+HTTP/1.1 412 PRECONDITION FAILED
+Server: gunicorn/20.0.4
+Date: Fri, 10 Jul 2026 18:35:58 GMT
+Connection: close
+Content-Type: application/json
+Content-Length: 57
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=<SESSION_COOKIE_REDACTED>; Expires=Fri, 17-Jul-2026 18:35:58 GMT; HttpOnly; Path=/; SameSite=Lax
+```
+
+The three headers that appear live but **not** in the in-process capture are the WSGI transport headers added
+by gunicorn/Werkzeug: `Server: gunicorn/20.0.4`, `Date: <RFC-1123 GMT>`, and `Connection: close`. Conversely,
+the live cookie omits the `Domain=.sl.test` attribute present in-process (no `SERVER_NAME` override under
+gunicorn). No other header differs.
+
+**Rate-limit headers — negative finding confirmed on the live transport.** A case-insensitive scan of every
+live response for `x-ratelimit*` / `retry-after` returned **zero** matches (including on both `429` blocks):
+
+```text
+# $ cat live_out*.txt | grep -icE 'x-ratelimit|retry-after'
+0
+```
+
+**Security / cache headers — absent (documentation-only observation; no runtime change is made).** The same
+live responses were scanned for the common browser-security and cache-control headers; **none are emitted** on
+any status (occurrence counts are exact, from `grep -icE '^<Header>'` over all live captures):
+
+| Security/cache header | Live occurrences | Present? |
+|---|:--:|:--:|
+| `X-Frame-Options` | 0 | No |
+| `Strict-Transport-Security` (HSTS) | 0 | No |
+| `Content-Security-Policy` | 0 | No |
+| `X-Content-Type-Options` | 0 | No |
+| `X-XSS-Protection` | 0 | No |
+| `Referrer-Policy` | 0 | No |
+| `Permissions-Policy` | 0 | No |
+| `Cross-Origin-Opener-Policy` | 0 | No |
+| `Cache-Control` / `Pragma` | 0 | No |
+
+**Server-version disclosure.** The live transport discloses the server software and version via
+`Server: gunicorn/20.0.4` on every response — an information-disclosure surface that is present at the
+transport layer only (it does not appear in the in-process captures because the test client does not run
+gunicorn). This is a **documentation observation**: per the investigation's read-only, no-remediation scope,
+no header is added, removed, or reconfigured; the finding is recorded, not fixed. The security-header
+*absence* above is likewise a factual observation about the default response surface, not a defect this task
+remediates.
 
 #### 3.4.2 Why there are none (source grounding)
 
@@ -842,6 +1393,58 @@ i.e. `cl:{remote_addr}:alias_creation` = `cl:127.0.0.1:alias_creation`. This loc
 **within** each request; it leaves **no** residual `cl:*` keys in Redis (created-count `0` in the F14 cleanup
 evidence of §2.8), which is why it never appears among the persisted keys.
 
+**(F13-live) Observed lock contention (`429`) and recovery (`201`) over the production transport.** The key's
+*effect* — not merely its name — was exercised end-to-end against live `gunicorn` (§2.9): the Redis key was
+**pre-held** externally, an authenticated create was issued (observed `429`, no alias row), the key was then
+deleted, and the identical create was retried (observed `201`):
+
+```text
+# $ CONFIG=/app/tests/test.env PYTHONPATH=/app python repro_d3.py        # -> http://127.0.0.1:7777
+#   redis.set("cl:127.0.0.1:alias_creation", "held-by-d3-test", ex=30, nx=True)   # prehold
+#   POST /api/{v2,v3}/alias/custom/new  (Authentication: <API_KEY_REDACTED>, fresh valid suffix)  # contended
+#   redis.delete("cl:127.0.0.1:alias_creation") ; POST the same body               # recovery
+```
+
+Observed on **both** endpoints (alias counts are the live run's own before/during/after triple):
+
+| Endpoint | Phase | Redis `cl:*` present | HTTP | Body | Alias count |
+|----------|-------|----------------------|:----:|------|:-----------:|
+| v2 | before | (none) | — | — | 128 |
+| v2 | contended (key pre-held) | `cl:127.0.0.1:alias_creation` | **429** | `{"error":"Rate limit exceeded"}` | 128 (unchanged) |
+| v2 | recovery (key deleted) | (none) | **201** | `{"alias":"d3_v2_lock.…@sl.local",…}` | 129 (+1) |
+| v3 | before | (none) | — | — | 129 |
+| v3 | contended (key pre-held) | `cl:127.0.0.1:alias_creation` | **429** | `{"error":"Rate limit exceeded"}` | 129 (unchanged) |
+| v3 | recovery (key deleted) | (none) | **201** | `{"alias":"d3_v3_lock.…@sl.local",…}` | 130 (+1) |
+
+Two facts are confirmed **empirically** here (not merely inferred from the test client):
+
+1. **The effective key is the remote-address branch even for an API-key-authenticated request.** During
+   contention the *only* `cl:*` key present was `cl:127.0.0.1:alias_creation`; no `cl:190:alias_creation` (the
+   user-id branch) ever appeared. This is because `require_api_auth` sets `g.user` but does **not**
+   `login_user()` the API caller (`app/api/base.py:34`, `:52-60`), so Flask-Login's `current_user` is still
+   **anonymous** when `parallel_limiter` evaluates `"id" in dir(current_user)` (`app/parallel_limiter.py:55-58`)
+   — routing to `cl:{request.remote_addr}:alias_creation`.
+
+2. **A failed acquisition creates no row.** The alias count was unchanged across each `429` (`128 → 128`,
+   `129 → 129`), because `acquire_lock` raises `werkzeug.exceptions.TooManyRequests` at
+   `app/parallel_limiter.py:34` **before** the view body runs; the `429` error handler at `server.py:362-372`
+   then logs and returns `{"error":"Rate limit exceeded"}` (`server.py:370`).
+
+The corresponding server log (verbatim, worker PID retained, user redacted) shows the handler firing at
+`server.py:364`, the `after_request` line recording the `429`, and the immediate recovery `201`:
+
+```text
+2026-07-10 18:54:31,850 - SL - WARNING - 25077 - "/app/server.py:364" - rate_limited() -  - Client hit rate limit on path /api/v2/alias/custom/new, user:<User REDACTED>
+2026-07-10 18:54:31,851 - SL - DEBUG - 25077 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 429, takes 0.006737470626831055
+2026-07-10 18:54:31,911 - SL - DEBUG - 25077 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.04676389694213867
+```
+
+A subtlety worth stating precisely: the `429` handler logs `user:<the API-key user>` because
+`require_api_auth` populates `g.user` (read by `get_current_user()` at `server.py:367`) *before* the inner
+lock decorator raises — whereas the lock *key* derivation reads Flask-Login `current_user` (anonymous). The
+two mechanisms consult **different** notions of "user", which is why the log can name a user that the lock key
+(remote-address-based) does not.
+
 #### 3.4.5 Availability precision — `ownership_verified`, not merely `verified` (F9)
 
 The set of domains a user may build a custom alias on is produced by `User.verified_custom_domains()`
@@ -955,8 +1558,11 @@ are harness instrumentation, not production log output (labeled per §2.7).
 
 #### 3.5.2 Representative successful-creation response (`201`, header inventory)
 
-The canonical fresh-valid creation returns `201` with the full alias JSON and the standard four-header set
-(Content-Length `464`, no rate-limit headers). This is the `201` row referenced by the §3.4.1 inventory:
+The canonical fresh-valid creation returns `201` with the full alias JSON. In the **in-process** capture below
+it carries the four-application-header set (Content-Length `464`, no rate-limit headers); over the live
+`gunicorn` transport the same `201` additionally carries `Server`/`Date`/`Connection` (seven total) with a
+body-dependent `Content-Length` of `443`–`447` (§2.9, §3.4.1(b)). This is the `201` row referenced by the
+§3.4.1 inventory:
 
 ```text
 ==============================================================================
@@ -1121,6 +1727,13 @@ flowchart TD
 ```
 
 ### 4.1 Ordered branch table (observed)
+
+This table lists the guards in the order encountered on the typical path. **It reflects the guards common to
+both endpoints; v2 and v3 differ in guard *set and order* for malformed input** (fully inventoried in
+§3.1.1): v3 inserts `isinstance(data, dict)` (`:153-154`), null-coercion of `signed_suffix` (`:157`),
+`check_alias_prefix` (`:167-168`), and `isinstance(mailbox_ids, list)` (`:171-172`), and evaluates the prefix
+and mailboxes **before** the suffix — whereas v2 omits all four and reaches the suffix check first, so several
+malformed inputs that v3 answers with a precise `400` instead crash v2 to the generic `500` of row 11.
 
 | # | Condition | Guard (`file:line`) | Status | Body / effect | Log line |
 |---|-----------|---------------------|:------:|---------------|----------|
@@ -1288,8 +1901,12 @@ PID 10239 | SAME FIXED tampered x5 -> {412: 5} | SAME FIXED expired x5 -> {412: 
 PID 10252 | SAME FIXED tampered x5 -> {412: 5} | SAME FIXED expired x5 -> {412: 5}
 ```
 
-Combined with the in-process repeat distributions of §3.2.1 (`{412: 5}` on both v2 and v3), this establishes
-that **the response to a given bad suffix does not vary run to run** — there is no endpoint nondeterminism.
+Combined with the in-process repeat distributions of §3.2.1(a) (`{412: 5}` on both v2 and v3) and the
+live-transport byte/timing/process proof of §3.2.1(F6-live) — where the *same byte-identical* expired and
+tampered bodies (per-series SHA-256 recorded) each returned `{412: 6}` across **both** gunicorn worker
+processes (PIDs `25076` / `25077`) over two independent runs, **48/48** samples `412` — this establishes that
+**the response to a given bad suffix does not vary run to run or worker to worker**: there is no endpoint
+nondeterminism.
 
 ### 6.2 Honest nuance: a naïve tamper *generator* is nondeterministic across fresh signatures
 
@@ -1361,25 +1978,56 @@ not endpoint randomness.
 | Intermittency — deterministic for fixed input + generator nuance | ✅ | §6 |
 | Configuration disclosure (`MAX_NB_EMAIL_FREE_PLAN` = 3 test / 5 example) | ✅ | §2.6, §3.5.1 |
 | Read-only + DB/Redis net-zero cleanup | ✅ | §2.8 |
+| Security / cache headers absent + `Server: gunicorn/20.0.4` version disclosure | ✅ | §3.4.1(b) |
+| Server-restart lifecycle — clean stop/start, fresh PIDs, stable `412`/`201` post-restart | ✅ | §2.10 |
+| Test-suite behavior — focused-alias state-leak/order-dependence (`409` collisions) | ✅ | §2.11(a) |
+| Test-suite behavior — full 639-test suite blocker (`test_apple_process_payment`, no-timeout external call) | ✅ | §2.11(b) |
+| Pinned-dependency advisories — range/severity/fixed-version/path-relevance (pip + `npm audit`) | ✅ | §2.12 |
 
-Every sub-question and every named element is answered with directly observed output and a `file:line`
-reference; the single explicitly-labeled non-canonical item is the library stand-in of §5.1.
+Every sub-question and every named element is answered with directly observed, unedited output and a
+`file:line` reference, **except** for the following explicitly-labeled classes, each flagged at its point of
+use: (1) the **non-canonical** `itsdangerous` library stand-in (§5.1) — a helper that confirms the exception
+hierarchy, not the HTTP path; (2) the **inferred-then-confirmed** source-level header-emission reasoning
+(§3.4.2), whose prediction is validated by the runtime header scan; (3) the pinned-dependency advisories
+(§2.12(a)), which are **advisory-database-verified** rather than produced by an in-container scanner (the
+`npm audit` findings of §2.12(b) are, by contrast, tool-observed); and (4) the one **environmentally-limited**
+item that could not be run to completion — the external-service-bound `test_apple_process_payment` (§2.11(b)).
+Every other claim — all Q1–Q6 endpoint behaviors, the live header inventory (§3.4.1(b)), the parallel-lock
+`429`/recovery (§3.4.4), the v2/v3 divergences (§3.1.1), the fixed-input timing/hash proof (§3.2.1), the
+focused-test state-leak (§2.11(a)), and the server-restart lifecycle (§2.10) — is backed by directly observed,
+unedited output; and where a claimed identifier could not be verified, it is **withheld rather than asserted**.
 
 ## 8. Appendix — capture artifacts and sanitization statement
 
 ### 8.1 Artifact inventory
 
-All runtime output was captured to transcript files on the capture host (outside the source repository, under
-`/tmp/blitzy_obs2/`, per the read-only constraint of §2.8). The relevant blocks are reproduced **inline** in
-§2–§6; the auxiliary transcripts are reproduced in full at §5.1 (itsdangerous stand-in) and §6.1–§6.2
-(intermittency).
+Runtime output was captured in **two** capture sets, each outside the source repository and removed after its
+output was transcribed here (per the read-only constraint of §2.8):
 
-| Artifact | Lines | Contents | Reproduced in |
-|----------|:-----:|----------|---------------|
-| `out_final.txt` | 700 | Main harness: conditions (a)–(e) v2+v3, auth-`401`, expired-repeat distributions, duplicate `409`, consecutive-dot, ownership, Q5 quota v2+v3, `FLAG_FREE_OLD_ALIAS_LIMIT` branches, token-bucket wiring + `429`, decorator `429`, DB/Redis before/after | §2.2, §2.8, §3.1–§3.5, §4.2, §4.3 |
-| `itsd_out.txt` | 30 | Non-canonical `itsdangerous` stand-in (exception hierarchy + per-case collapse) | §5.1 (in full) |
-| `intermit_fixed_summary.txt` | 3 | Canonical run-to-run: 3 processes, same fixed input → `{412:5}` | §6.1 (in full) |
-| `intermit_naive_flip.txt` | 3 | Nuance: per-process fresh-signature naïve flip (base64 aliasing) | §6.2 (in full) |
+- **Set 1 — in-process test client** (built from `server.create_app()`), originally captured under
+  `/tmp/blitzy_obs2/` on the capture host. Supplies the per-condition route-stack blocks.
+- **Set 2 — live `gunicorn wsgi:app` HTTP transport** on `127.0.0.1:7777` (§2.9), captured under `/tmp/qa2/`
+  in the canonical container. Supplies the live header inventory (§3.4.1(b)), the fixed-input
+  byte/timing/process proof (§3.2.1(F6-live)), and the supplementary robustness captures of §2.10–§2.12
+  (server-restart lifecycle, test-suite behavior, and pinned-dependency advisories).
+
+The relevant blocks are reproduced **inline** in §2–§6; the auxiliary transcripts are reproduced in full at
+§5.1 (itsdangerous stand-in) and §6.1–§6.2 (intermittency).
+
+| Artifact | Set | Contents | Reproduced in |
+|----------|:---:|----------|---------------|
+| `out_final.txt` | 1 | Main in-process harness: conditions (a)–(e) v2+v3, auth-`401`, expired-repeat distributions, duplicate `409`, consecutive-dot, ownership, Q5 quota v2+v3, `FLAG_FREE_OLD_ALIAS_LIMIT` branches, token-bucket wiring + `429`, decorator `429`, DB/Redis before/after | §2.2, §2.8, §3.1–§3.5, §4.2, §4.3 |
+| `itsd_out.txt` | 1 | Non-canonical `itsdangerous` stand-in (exception hierarchy + per-case collapse) | §5.1 (in full) |
+| `intermit_fixed_summary.txt` | 1 | In-process run-to-run: 3 processes, same fixed input → `{412:5}` | §6.1 (in full) |
+| `intermit_naive_flip.txt` | 1 | Nuance: per-process fresh-signature naïve flip (base64 aliasing) | §6.2 (in full) |
+| `live_out*.txt` | 2 | Live `curl -s -D -` header + body captures for `201/400/401/409/412/429` over gunicorn | §2.9, §3.4.1(b) |
+| `repro_d5_out.txt` | 2 | Live fixed-input proof: 4 series × N=6 at 0.25 s, per-series SHA-256, duration, distribution, worker-PID breakdown, DB before/after (two runs) | §3.2.1(F6-live) |
+| `repro_d3_out.txt` | 2 | Live parallel-lock proof: prehold `cl:127.0.0.1:alias_creation` → `429` (alias unchanged) → delete → `201` recovery, on v2 + v3, with `cl:*` snapshot during contention | §3.4.4(F13-live) |
+| `repro_d4_out.txt` | 2 | Live v2/v3 divergence matrix: 14 structural + adversarial inputs on both endpoints, exact status/body/alias-Δ; all `500`s are the generic `{"error":"Internal error"}` | §3.1.1 |
+| `restart_out.txt` | 2 | Server-restart lifecycle: pre/post-restart PIDs (distinct), clean `http=000` stop, `412` (expired) + `201` (valid) reproduced against fresh workers, expiry `LOG.w` from new worker, disposable-user cleanup (≥2 runs) | §2.10 (in full) |
+| `t1_out.txt` | 2 | Focused-alias test leak: canonical 3-word pool → `2 failed, 8 passed` (`409` collisions on pre-existing `prefix.{test,word,list}` rows); isolated 2000-word pool → `10 passed` | §2.11(a) (in full) |
+| `t2_out.txt` | 2 | Full-suite blocker: `639 tests collected`; `apple.py` external call sites (`:29/:30/:319/:333`, no `timeout=`); `test_apple_process_payment` Timeout+RERUN exceeding the outer wall-clock | §2.11(b) (in full) |
+| `a1_out.txt` | 2 | Dependency advisories: request-path-relevant `pip freeze` subset + verbatim `npm audit --package-lock-only` (3 findings: 1 low, 2 moderate) | §2.12 (in full) |
 
 ### 8.2 Sanitization statement (what was and was not altered)
 
@@ -1403,10 +2051,12 @@ are harness instrumentation (not production log output) and are labeled as such 
 Per §2.8, the source repository was left byte-for-byte unchanged (`git status --porcelain` reports only this
 document) — the binding read-only guarantee. The runtime PostgreSQL residue is zero **after explicit
 external-connection cleanup** (the envelope rollback alone is not a reliable cleanup for the first in-process
-envelope — see the state/order-dependence documented in §2.8), the Redis net residue is zero (before/after
-key delta cleanup, `dbsize 468 → 468`), and all temporary observation scripts and transcripts created on the
-capture host were removed after their output was captured.
+envelope — see the state/order-dependence documented in §2.8): every disposable user created by either capture
+set was deleted (FK-cascade), and the live fixed-input proof confirmed `alias` unchanged (`128 → 128`) across
+its 24 rejections (§3.2.1(F6-live)). The Redis net residue is zero (Set-1 before/after key delta cleanup,
+`dbsize 468 → 468`; Set-2 disposable `LIMITER`/`cl:` counters purged). All temporary observation scripts and
+transcripts from **both** capture sets (§8.1) were removed after their output was captured.
 
---- 
+---
 
 *End of investigation report.*
