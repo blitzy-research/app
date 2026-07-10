@@ -78,8 +78,11 @@ Image=ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_simple-login_app_1.0
 Cmd=[infinity]
 Created=2026-07-10T07:01:37.758409924Z
 
-# creation command (long-lived container kept alive for repeated observation):
-$ docker run -d --name sl_setup ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_simple-login_app_1.0 sleep infinity
+# creation command (long-lived container kept alive for repeated observation).
+# NOTE: the image's ENTRYPOINT is /bin/bash, so `--entrypoint sleep` is required to override it and run
+# `sleep infinity`; the single argument `infinity` then becomes the container Cmd — matching the
+# `Cmd=[infinity]` shown by the docker inspect above.
+$ docker run -d --name sl_setup --entrypoint sleep ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_simple-login_app_1.0 infinity
 ```
 
 The image references the container tag mandated by the task setup
@@ -114,16 +117,16 @@ $ redis-cli dbsize
 ### 2.3 Dependency versions (pinned; investigation-relevant)
 
 ```text
-$ /app/venv/bin/pip freeze | grep -iE '^(Flask|Flask-Limiter|limits|itsdangerous|SQLAlchemy|psycopg2|redis|gunicorn|arrow)=='
+$ /app/venv/bin/pip freeze | grep -iE '^(Flask|Flask-Limiter|limits|itsdangerous|SQLAlchemy|psycopg2-binary|redis|gunicorn|arrow)=='
 arrow==0.16.0
 Flask==1.1.2
 Flask-Limiter==1.4
+gunicorn==20.0.4
 itsdangerous==1.1.0
 limits==1.5.1
 psycopg2-binary==2.9.3
 redis==4.6.0
 SQLAlchemy==1.3.24
-gunicorn==20.0.4
 ```
 
 `itsdangerous==1.1.0` is the exact version that produces the exception hierarchy at the heart of the central
@@ -171,7 +174,7 @@ real API key (redacted); the negative observation (§3.3) omits the header and r
 | Config key | Value in effect | Source |
 |---|---|---|
 | `EMAIL_DOMAIN` | `sl.local` | `tests/test.env:8` |
-| `MAX_NB_EMAIL_FREE_PLAN` | **3** | `tests/test.env:13` (default is `5` in `example.env`; `app/config.py:121-124`) |
+| `MAX_NB_EMAIL_FREE_PLAN` | **3** | `tests/test.env:13` (default `5` — shown commented at `example.env:55`, hard-coded fallback at `app/config.py:124`) |
 | `MAX_NB_EMAIL_OLD_FREE_PLAN` | **15** | `app/config.py` default (branch of §3.5) |
 | `ALIAS_LIMIT` (decorator) | `100/day;50/hour;5/minute` | `app/config.py:448` |
 | `ALIAS_CREATE_RATE_LIMIT_FREE` (bucket) | `[(10, 900), (50, 3600)]` | `app/config.py:554-555` |
@@ -303,6 +306,16 @@ Note that the `400 "Tampered suffix"` branch never fired in any run: the bounded
 evidence; see §3.3).
 
 #### 3.1.1 Tampered suffix (last character flipped) — v2 then v3
+
+**Method note (reproducibility).** The fixed `signed_suffix` below is a genuine *last-character* flip of a
+valid token, chosen so that the flipped final character does **not** alias back to the correct signature — it
+is therefore truly invalid and deterministically returns `412` (`check_suffix_signature` → `None`). This
+qualification matters because flipping the *final* base64 character of an `itsdangerous` token occasionally
+lands on a *still-valid* signature (base64 trailing-bit aliasing: the last character of the 27-character
+HMAC-SHA1 signature carries only 4 significant bits, so 3 of the 63 possible substitutions alias to the same
+bits). The specific string used here is one of the majority that genuinely invalidate; re-running with a
+*freshly generated* signature and a naïve last-character flip can therefore occasionally yield `201`/`409`
+instead — the run-to-run nuance analysed in §6.2.
 
 ```text
 ==============================================================================
@@ -437,7 +450,7 @@ tamper-specific `400 "Tampered suffix"` is unreachable for signature errors.
 ### 3.2 Q2 — Expired signed suffix: HTTP status code and error body
 
 **Answer (observed, canonical HTTP path).** An *expired* signed suffix (signing age greater than the
-`max_age=600` window enforced by `TimestampSigner` at `app/alias_suffix.py:11,39`) is rejected with
+`max_age=600` window enforced by `TimestampSigner` at `app/alias_suffix.py:11,40`) is rejected with
 **HTTP `412`** and the JSON body **`{"error":"Alias creation time is expired, please retry"}`**
 (Content-Length `57`), on **both** v2 and v3.
 
@@ -901,8 +914,9 @@ are harness instrumentation, not production log output (labeled per §2.7).
 - `User.max_alias_for_free_account()` — `app/models.py:858-865`: **two branches** —
   if the `FLAG_FREE_OLD_ALIAS_LIMIT` bit (`1 << 2`, `app/models.py:341`) is set in `user.flags`, it returns
   `MAX_NB_EMAIL_OLD_FREE_PLAN` (**15**); otherwise it returns `MAX_NB_EMAIL_FREE_PLAN`
-  (`app/config.py:121-124`, **3** under `tests/test.env`; note this key is `5` in `example.env` — the
-  configuration disclosure required for reproducibility).
+  (`app/config.py:121-124`, **3** under `tests/test.env`; note the default is `5` — shown commented at
+  `example.env:55` and used as the hard-coded fallback at `app/config.py:124` — the configuration
+  disclosure required for reproducibility).
 
 #### 3.5.2 Representative successful-creation response (`201`, header inventory)
 
@@ -1061,11 +1075,12 @@ flowchart TD
     H -->|"False (e.g. unverified/foreign domain)"| H1["400 wrong alias prefix or suffix<br/>LOG ERROR alias_suffix.py:61"]
     H --> I{"alias already exists?"}
     I -->|"yes"| I1["409 alias already exists<br/>LOG.d new_custom_alias.py:87"]
-    I --> J["Alias.create()<br/>app/models.py:1628"]
+    I --> IA{"'..' in full_alias?<br/>app-level guard new_custom_alias.py:90 (v2) / :205 (v3)"}
+    IA -->|"yes — 2 consecutive dots"| IA1["400 2 consecutive dot signs aren't allowed<br/>new_custom_alias.py:92 (v2) / :207 (v3)"]
+    IA --> J["Alias.create()<br/>app/models.py:1628"]
     J --> K{"check_bucket_limit()?<br/>app/models.py:1641 · app/rate_limiter.py:19-42"}
     K -->|"bucket exceeded"| K1["429 Rate limit exceeded<br/>LOG.i rate_limiter.py:33"]
-    K -->|"within bucket"| L{"resulting address syntactically valid?<br/>get_custom_domain → validate_email"}
-    L -->|"'..' consecutive dots"| L1["400 2 consecutive dot signs aren't allowed"]
+    K -->|"within bucket"| L{"resulting address syntactically valid?<br/>get_custom_domain → validate_email<br/>app/models.py:1656 → 1617"}
     L -->|"leading-dot local part (e.g. '.dot')"| L2["500 Internal error<br/>server.py:390 error_handler"]
     L -->|"valid"| M["201 alias JSON + bl:* bucket incremented"]
 ```
@@ -1083,15 +1098,17 @@ flowchart TD
 | 6′ | Suffix non-`BadSignature` exception | `except Exception` `:74-76` (v2) / `:189-191` (v3) | `400` | `{"error":"Tampered suffix"}` — **unreachable for signature errors** | `LOG.w :75` / `:190` (never fires) |
 | 7 | Wrong prefix/suffix (e.g. unverified domain) | `verify_prefix_suffix` `app/alias_suffix.py:45-91` | `400` | `{"error":"wrong alias prefix or suffix"}` | `LOG ERROR :61` |
 | 8 | Duplicate alias | alias-exists check | `409` | `{"error":"alias {full} already exists"}` | `LOG.d :87` |
-| 9 | Token bucket exceeded (inside `Alias.create`) | `check_bucket_limit` `app/models.py:1641`, `app/rate_limiter.py:19-42` | `429` | `{"error":"Rate limit exceeded"}` | `LOG.i rate_limiter.py:33` |
-| 10 | `..` in constructed address | `email_validator` via `get_custom_domain` | `400` | `2 consecutive dot signs aren't allowed in an email address` | — |
-| 11 | Leading-dot local part reaching validator | `validate_email` (`app/models.py:1617`) | `500` | `{"error":"Internal error"}` | `LOG ERROR server.py:390` + traceback |
+| 9 | `..` in constructed address (app-level guard, **before** `Alias.create`) | `if ".." in full_alias` `app/api/views/new_custom_alias.py:90,92` (v2) / `:205,207` (v3) | `400` | `2 consecutive dot signs aren't allowed in an email address` | — |
+| 10 | Token bucket exceeded (inside `Alias.create`) | `check_bucket_limit` `app/models.py:1641`, `app/rate_limiter.py:19-42` | `429` | `{"error":"Rate limit exceeded"}` | `LOG.i rate_limiter.py:33` |
+| 11 | Leading-dot local part reaching validator (inside `Alias.create`) | `validate_email` (`app/models.py:1617`, via `get_custom_domain` `:1656`) | `500` | `{"error":"Internal error"}` | `LOG ERROR server.py:390` + traceback |
 | 12 | All checks pass | — | `201` | alias JSON; `Alias.create` inserts row and increments `bl:*` bucket | — |
 
 ### 4.2 Consecutive-dot / address-edge branches (observed, F11)
 
 Three prefix shapes were POSTed to probe the address-construction edge. `dot.` and `a..b` both produce a `..`
-in the local part and are rejected cleanly with `400`; a leading-dot construction (`.dot`) reaches
+in the local part and are rejected cleanly with `400` by the app-level guard `if ".." in full_alias`
+(`app/api/views/new_custom_alias.py:90,92` v2 / `:205,207` v3), **before** `Alias.create` runs; a leading-dot
+construction (`.dot`) — which contains no `..` and therefore passes that guard — instead reaches
 `email_validator` inside `Alias.create → get_custom_domain → validate_email` (`app/models.py:1656 → 1617`)
 and raises an unhandled `EmailSyntaxError`, surfaced by the generic error handler at `server.py:390` as
 `500 {"error":"Internal error"}`. Complete captured output (including the real traceback for the `500`):
@@ -1254,8 +1271,12 @@ PID 10160's "tampered" suffix was, by chance, **still a valid signature**: flipp
 of an itsdangerous token can land on another character that decodes to the same trailing bits (base64
 trailing-bit aliasing), so `unsign` succeeded, the first POST created the alias (`201`), and the remaining four
 identical POSTs were duplicates (`409`). This is a property of the *test's tamper-generation*, **not** of the
-endpoint: a genuine mid-signature flip (used in §6.1 and §3.1) always yields `412`. This nuance is reported
-rather than hidden.
+endpoint: the **fixed** tampered string reused in §6.1 and §3.1 is a last-character flip that lands on a
+**non-aliasing** character, so it is genuinely invalid and deterministically yields `412` (a mid-signature
+flip would likewise always invalidate). The nondeterminism seen here arises only from regenerating a *fresh*
+signature and re-flipping its last character each run — 3 of the 63 possible last-character substitutions
+alias to the same trailing bits — and never from endpoint randomness. This nuance is reported rather than
+hidden.
 
 ### 6.3 Interpretation
 
