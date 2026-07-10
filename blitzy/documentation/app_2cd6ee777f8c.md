@@ -23,7 +23,7 @@ the source-branch name is derived from the first twelve hex characters of the so
 | Canonical **source commit** under investigation | `2cd6ee777f8c2d3531559588bcfb18627ffb5d2c` (short `2cd6ee77`) | The SimpleLogin application code all `file:line` citations refer to. |
 | **Source-branch name** (deliverable naming convention) | `app_2cd6ee777f8c` | The mandated deliverable file base name `blitzy/documentation/app_2cd6ee777f8c.md`; its hex portion equals the **12-character prefix** of the source commit above — it is a naming convention, **not** itself a commit id. |
 
-`git rev-parse` outputs that establish the above (destination checkout):
+`git` identifiers captured **at original authoring time** — when this document was first committed as `37da2a08` (destination checkout). Because later QA-driven corrections to this same file are appended on top of that commit, a present-day `git log` will show a newer tip; the snapshot below is preserved as it was when authored, and the "This document's commit" row of the table above always denotes the current commit:
 
 ```text
 $ git rev-parse --abbrev-ref HEAD
@@ -35,8 +35,9 @@ $ git rev-parse 2cd6ee77
 2cd6ee777f8c2d3531559588bcfb18627ffb5d2c
 ```
 
-The source commit `2cd6ee77` is the parent of this documentation commit and is the exact application revision
-baked into the runtime container (§2).
+The source commit `2cd6ee77` was the **direct parent** of the original documentation commit `37da2a08` and
+remains an **ancestor** of every later (QA-corrected) revision of this document; it is the exact application
+revision under investigation, baked into the runtime container (§2).
 
 ## 1. Executive summary
 
@@ -861,9 +862,9 @@ identical on v2 and v3, for all three invalid kinds (tampered / malformed / empt
 tamper-specific `400 "Tampered suffix"` is unreachable for signature errors. **This v2/v3 parity is specific
 to the *signed-suffix* rejection**; for other malformed inputs — a non-object JSON body, a JSON-`null`
 suffix, a non-array `mailbox_ids`, or an out-of-charset/overlong `alias_prefix` — v2 and v3 **diverge**,
-because v3 carries input guards that v2 lacks. That divergence is inventoried in §3.1.1.
+because v3 carries input guards that v2 lacks. That divergence is inventoried in §3.1.4.
 
-#### 3.1.1 v2 vs v3 input-handling divergence matrix (observed, live gunicorn)
+#### 3.1.4 v2 vs v3 input-handling divergence matrix (observed, live gunicorn)
 
 The two endpoints are **not** interchangeable for malformed input. `new_custom_alias_v3` adds four guards
 that `new_custom_alias_v2` does not have — `isinstance(data, dict)` (`app/api/views/new_custom_alias.py:153-154`),
@@ -902,7 +903,7 @@ Three cross-cutting observations:
    verbatim) because persistence goes through SQLAlchemy's parameterized `Alias.create`; no observation showed
    query manipulation.
 3. **Every `500` is the generic, non-leaking body.** Across both endpoints, *all* `500`s returned exactly
-   `{"error":"Internal error"}` (Content-Length `26`) — no stack trace, no file path, no secret. This is the
+   `{"error":"Internal error"}` (Content-Length `27`) — no stack trace, no file path, no secret. This is the
    generic API error handler at `server.py:388-394`, which logs the exception server-side (`LOG.e(e)`, `:390`)
    and returns `jsonify(error="Internal error"), 500` (`:392`) for `/api/` paths. So the v2 crashes above do
    not disclose internals to the client.
@@ -1730,7 +1731,7 @@ flowchart TD
 
 This table lists the guards in the order encountered on the typical path. **It reflects the guards common to
 both endpoints; v2 and v3 differ in guard *set and order* for malformed input** (fully inventoried in
-§3.1.1): v3 inserts `isinstance(data, dict)` (`:153-154`), null-coercion of `signed_suffix` (`:157`),
+§3.1.4): v3 inserts `isinstance(data, dict)` (`:153-154`), null-coercion of `signed_suffix` (`:157`),
 `check_alias_prefix` (`:167-168`), and `isinstance(mailbox_ids, list)` (`:171-172`), and evaluates the prefix
 and mailboxes **before** the suffix — whereas v2 omits all four and reaches the suffix check first, so several
 malformed inputs that v3 answers with a precise `400` instead crash v2 to the generic `500` of row 11.
@@ -1993,7 +1994,7 @@ hierarchy, not the HTTP path; (2) the **inferred-then-confirmed** source-level h
 `npm audit` findings of §2.12(b) are, by contrast, tool-observed); and (4) the one **environmentally-limited**
 item that could not be run to completion — the external-service-bound `test_apple_process_payment` (§2.11(b)).
 Every other claim — all Q1–Q6 endpoint behaviors, the live header inventory (§3.4.1(b)), the parallel-lock
-`429`/recovery (§3.4.4), the v2/v3 divergences (§3.1.1), the fixed-input timing/hash proof (§3.2.1), the
+`429`/recovery (§3.4.4), the v2/v3 divergences (§3.1.4), the fixed-input timing/hash proof (§3.2.1), the
 focused-test state-leak (§2.11(a)), and the server-restart lifecycle (§2.10) — is backed by directly observed,
 unedited output; and where a claimed identifier could not be verified, it is **withheld rather than asserted**.
 
@@ -2023,7 +2024,7 @@ The relevant blocks are reproduced **inline** in §2–§6; the auxiliary transc
 | `live_out*.txt` | 2 | Live `curl -s -D -` header + body captures for `201/400/401/409/412/429` over gunicorn | §2.9, §3.4.1(b) |
 | `repro_d5_out.txt` | 2 | Live fixed-input proof: 4 series × N=6 at 0.25 s, per-series SHA-256, duration, distribution, worker-PID breakdown, DB before/after (two runs) | §3.2.1(F6-live) |
 | `repro_d3_out.txt` | 2 | Live parallel-lock proof: prehold `cl:127.0.0.1:alias_creation` → `429` (alias unchanged) → delete → `201` recovery, on v2 + v3, with `cl:*` snapshot during contention | §3.4.4(F13-live) |
-| `repro_d4_out.txt` | 2 | Live v2/v3 divergence matrix: 14 structural + adversarial inputs on both endpoints, exact status/body/alias-Δ; all `500`s are the generic `{"error":"Internal error"}` | §3.1.1 |
+| `repro_d4_out.txt` | 2 | Live v2/v3 divergence matrix: 14 structural + adversarial inputs on both endpoints, exact status/body/alias-Δ; all `500`s are the generic `{"error":"Internal error"}` | §3.1.4 |
 | `restart_out.txt` | 2 | Server-restart lifecycle: pre/post-restart PIDs (distinct), clean `http=000` stop, `412` (expired) + `201` (valid) reproduced against fresh workers, expiry `LOG.w` from new worker, disposable-user cleanup (≥2 runs) | §2.10 (in full) |
 | `t1_out.txt` | 2 | Focused-alias test leak: canonical 3-word pool → `2 failed, 8 passed` (`409` collisions on pre-existing `prefix.{test,word,list}` rows); isolated 2000-word pool → `10 passed` | §2.11(a) (in full) |
 | `t2_out.txt` | 2 | Full-suite blocker: `639 tests collected`; `apple.py` external call sites (`:29/:30/:319/:333`, no `timeout=`); `test_apple_process_payment` Timeout+RERUN exceeding the outer wall-clock | §2.11(b) (in full) |
