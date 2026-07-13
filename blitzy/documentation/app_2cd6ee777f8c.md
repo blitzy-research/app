@@ -1717,7 +1717,7 @@ base64-decoded payload (no secret key used => readable => signed, NOT encrypted)
   `User.get_by(alternative_id=alternative_id)` (`L222`); when a user is found (`if user:` `L223`) it
   **sets the Sentry user identity** `sentry_sdk.set_user({"email": user.email, "id": user.id})`
   (`L224`), then returns `None` if `user.disabled` (`L225-226`) or `not user.is_active()`
-  (`L227-228`); `is_active` at `app/models.py:L766` (`True` iff `delete_on is None` or in the future).
+  (`L227-228`); `is_active` at `app/models.py:L766` (`True` iff `delete_on is None` or in the past).
 - **API auth:** `app/api/base.py:L16` `def authorize_request()`; `L17`
   `api_code = request.headers.get("Authentication")`; `L18` `api_key = ApiKey.get_by(code=api_code)`;
   no-key branch `L20-27` (`if current_user.is_authenticated:` `L21` → `g.user = current_user` `L25`,
