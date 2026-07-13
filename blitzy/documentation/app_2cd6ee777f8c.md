@@ -1,67 +1,230 @@
 # SimpleLogin Backend — DEV-Mode Runtime Behavior (Observed)
 
-This document answers seven questions about how the **SimpleLogin** email-aliasing
-backend (a Python/Flask web application) behaves when run **locally in DEVELOPMENT
-mode**. Every answer is written from **observed runtime output** captured by actually
-building and running the code through its canonical entry point — not from reading the
-source alone. Each behavioral claim is paired with the exact command that produced it,
-the complete unedited output, a live-derived `file:line` grounding, and an
-**Observed** / **Inferred** label.
+This document answers seven questions about how the **SimpleLogin** email-aliasing backend
+(a Python/Flask email service) behaves when run **locally in DEVELOPMENT mode**. Every answer
+is written from **observed runtime output** captured by actually building and running the code
+through its canonical entry point (`python3 server.py`) — not from reading source alone. Each
+question is answered in the mandated five-stage order: **(1) direct answer → (2) command(s) run
+→ (3) complete, unedited output → (4) `file:line` grounding → (5) Observed / Inferred label.**
+
+> **Evidence discipline.** Every fenced output block below is the *verbatim* stdout/stderr of the
+> command shown immediately above it, copied byte-for-byte from a capture file. Nothing inside an
+> output block is truncated, re-ordered, or annotated; all interpretation lives *outside* the
+> blocks. The one normalization applied is line endings: `curl -i` HTTP responses are
+> **CRLF-terminated on the wire** (RFC 7230) and are shown here **LF-normalized** — the status line,
+> headers and body are otherwise verbatim. Where a value can vary run-to-run (PIDs, timestamps, the session id, the elapsed
+> `takes`, the Debugger PIN), the same unchanged path was exercised **at least twice** and the
+> distribution is reported honestly (stable vs variable). Runs are labelled with **Run IDs**
+> (RUN‑A, RUN‑B, RUN‑Q5‑REDIS, RUN‑Q5‑COOKIE‑1/2, RUN‑Q6, RUN‑Q7) so HTTP responses, Redis keys,
+> DB rows and logger lines can be correlated to the exact server process that produced them.
+
+> **Security scope (read this first).** Every credential, key and setting shown in this document
+> — the seed login `john@wick.com` / `password`, `FLASK_SECRET=secret`, the DB credentials
+> `test:test`, the seeded API keys `code` / `codeFF`, session cookies, `DISABLE_RATE_LIMIT=1`,
+> `debug=True`, and `OAUTHLIB_INSECURE_TRANSPORT=1` — is **disposable, DEVELOPMENT-only**, created
+> by `flask dummy-data` in a throwaway local container. **None of it is production guidance.** Each
+> sensitive value is re-flagged as DEV-only beside its use below.
 
 ## Investigation environment
 
-- **Application:** SimpleLogin webapp, whose app object is built by the application
-  factory `create_app()` in `server.py` and served in production via `wsgi.py`
-  (`from server import create_app` / `app = create_app()`, `wsgi.py:L1-3`).
-- **Branch / commit:** `app_2cd6ee777f8c` — the checkout is at detached `HEAD`
-  `2cd6ee777f8c2d3531559588bcfb18627ffb5d2c` (`chore: emit some missing contact audit
-  logs (#2269)`). The deliverable filename is locked to this branch name.
-- **Runtime:** the provisioned Docker container (`ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_simple-login_app_1.0`),
-  with PostgreSQL and Redis running locally. All capture was performed inside this
-  container; the interpreter is the project virtualenv at `/app/venv` (the system
-  `python3` has no Flask installed).
-- **Pinned stack** (observed exact versions; `pyproject.toml` anchors in parentheses):
+- **Application.** The SimpleLogin webapp object is built by the application factory
+  `create_app()` in `server.py` and served in production by `wsgi.py`
+  (`from server import create_app` / `app = create_app()`, `wsgi.py:L1,L3`). The dev entry point is
+  `local_main()` (`server.py:L572-595`), reached by `if __name__ == "__main__": local_main()`
+  (`server.py:L598-599`) when running `python3 server.py`.
+
+- **Branch / commit.** The active branch checkout is at detached `HEAD`
+  `2cd6ee777f8c2d3531559588bcfb18627ffb5d2c`; the deliverable filename `app_2cd6ee777f8c.md` is
+  locked to the branch name. Command and complete output:
 
   ```
-  $ /app/venv/bin/python -c "import flask, flask_login, sqlalchemy, redis, coloredlogs, werkzeug, sys; \
-      print('python     ', sys.version.split()[0]); print('flask      ', flask.__version__); \
-      print('werkzeug   ', werkzeug.__version__); print('flask_login', flask_login.__version__); \
-      print('sqlalchemy ', sqlalchemy.__version__); print('redis      ', redis.__version__); \
-      print('coloredlogs', coloredlogs.__version__)"
-  python      3.10.18
-  flask       1.1.2
-  werkzeug    1.0.1
-  flask_login 0.5.0
-  sqlalchemy  1.3.24
-  redis       4.6.0
-  coloredlogs 14.0
+  $ git rev-parse HEAD; git log -1 --oneline
+  ```
+  ```
+  git rev-parse HEAD:
+  2cd6ee777f8c2d3531559588bcfb18627ffb5d2c
+  git log -1 --oneline:
+  2cd6ee77 chore: emit some missing contact audit logs (#2269)
   ```
 
-  `pyproject.toml`: `python = "^3.10"` (L61), `flask = "^1.1.2"` (L62),
-  `SQLAlchemy = "1.3.24"` (L116), `python-dotenv = "^0.14.0"` (L68),
-  `gunicorn = "^20.0.4"` (L66), `flask-debugtoolbar = "^0.11.0"` (L84),
-  `coloredlogs = "^14.0"` (L89), `Flask-Limiter = "^1.4"` (L101),
-  `redis = "^4.5.3"` (L117). Werkzeug 1.0.1 is the transitive pin under Flask 1.1.2.
+- **Runtime.** All capture was performed inside the provisioned Docker container
+  (`ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_simple-login_app_1.0`). The interpreter is the
+  project virtualenv **`/app/venv`** — the *system* `python3` has no Flask, so every command uses
+  the venv interpreter/tools (`/app/venv/bin/python`, `/app/venv/bin/alembic`,
+  `/app/venv/bin/flask`). PostgreSQL and Redis run locally in the container. The webapp binds
+  loopback `127.0.0.1:7777` inside the container, so HTTP is exercised with
+  `docker exec ... curl http://localhost:7777/...`.
 
-- **Canonical bootstrap & run commands** (per `CONTRIBUTING.md:L106`):
+- **Datastore provenance** (complete output):
 
   ```
-  cp example.env .env          # local config (git-ignored)
-  alembic upgrade head         # apply migrations
-  flask dummy-data             # seed dev data (john@wick.com / password)
-  python3 server.py            # dev entry point -> local_main() -> app.run(debug=True, port=7777)
+  $ pg_isready
+  $ psql -h localhost -U test -d test -t -c "select version()"
+  ```
+  ```
+  $ pg_isready
+  /var/run/postgresql:5432 - accepting connections
+
+  $ psql -c "select version()"
+   PostgreSQL 15.13 (Debian 15.13-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit
+  ```
+  ```
+  $ redis-cli ping
+  $ redis-cli INFO server | grep redis_version
+  ```
+  ```
+  $ redis-cli ping
+  PONG
+  $ redis-cli INFO server | grep redis_version
+  redis_version:7.0.15
   ```
 
-  The local `.env` used for capture set `URL=http://localhost:7777`,
-  `DB_URI=postgresql://test:test@localhost:5432/test`, `MEM_STORE_URI=redis://localhost`
-  (to exercise the Redis session backend), `FLASK_SECRET=secret`, `EMAIL_DOMAIN=sl.local`,
-  `SUPPORT_EMAIL=support@sl.local`, `DISABLE_RATE_LIMIT=1`. `.env`/`config` are
-  git-ignored, so this does not alter tracked source; `flask dummy-data` mutates only the
-  local dev database.
+- **Pinned stack** (observed exact versions):
 
-- **Reproducibility discipline:** any value that could vary run-to-run (PIDs, the Werkzeug
-  Debugger PIN, the `takes` request timing, the session id, the user's `alternative_id`)
-  was exercised **at least twice** and is reported as *stable* or *variable* accordingly.
+  ```
+  $ /app/venv/bin/python -c "import flask, flask_login, sqlalchemy, redis, coloredlogs, werkzeug, dotenv, alembic, sys; \
+      print('python      ', sys.version.split()[0]); print('flask       ', flask.__version__); \
+      print('werkzeug    ', werkzeug.__version__); print('flask_login ', flask_login.__version__); \
+      print('sqlalchemy  ', sqlalchemy.__version__); print('redis       ', redis.__version__); \
+      print('coloredlogs ', coloredlogs.__version__); print('alembic     ', alembic.__version__)"
+  $ /app/venv/bin/pip show python-dotenv | grep -i '^Version'
+  ```
+  ```
+  python       3.10.18
+  flask        1.1.2
+  werkzeug     1.0.1
+  flask_login  0.5.0
+  sqlalchemy   1.3.24
+  redis        4.6.0
+  coloredlogs  14.0
+  alembic      1.4.3
+  python-dotenv Version: 0.14.0
+  ```
+
+  Werkzeug **1.0.1** is the transitive pin under Flask 1.1.2 (`pyproject.toml`: `flask = "^1.1.2"`
+  L62, `SQLAlchemy = "1.3.24"` L116, `python-dotenv = "^0.14.0"` L68, `coloredlogs = "^14.0"` L89,
+  `redis = "^4.5.3"` L117). The pinned Flask/Werkzeug pair is what makes the Q3 readiness question
+  version-sensitive.
+
+- **Canonical bootstrap** (per `CONTRIBUTING.md:L106`). Every command is prefixed with the
+  container's mandated env sourcing, which exports config into the process environment before the
+  app is imported:
+
+  ```
+  $ cd /app && set -a && . /tmp/sl_env.sh && set +a && unset EVENT_WEBHOOK_DISABLE && export GNUPGHOME=/tmp/sl_clean_gnupg
+  $ /app/venv/bin/alembic upgrade head      # apply migrations
+  $ /app/venv/bin/flask  dummy-data          # seed dev data (john@wick.com / password) — DEV-only
+  ```
+
+  Migrations were applied from an empty schema (261 lines of migration output — 255 `Running
+  upgrade …` steps — ending at revision `32f25cbf12f6`). The idempotent re-run and `alembic current` confirm the DB is at
+  head — complete output of the exact venv command:
+
+  ```
+  $ /app/venv/bin/alembic upgrade head
+  ```
+  ```
+  >>> URL: http://localhost
+  Upload files to local dir
+  >>> init logging <<<
+  2026-07-13 18:18:17,051 - SL - DEBUG - 4868 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+  INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+  INFO  [alembic.runtime.migration] Will assume transactional DDL.
+  ```
+  ```
+  $ /app/venv/bin/alembic current
+  ```
+  ```
+  >>> URL: http://localhost
+  Upload files to local dir
+  >>> init logging <<<
+  2026-07-13 18:17:35,396 - SL - DEBUG - 4848 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+  INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+  INFO  [alembic.runtime.migration] Will assume transactional DDL.
+  32f25cbf12f6 (head)
+  ```
+
+  The seed (`flask dummy-data` → `dummy_data()` `server.py:L491-497` → `fake_data()`) — complete
+  unedited output:
+
+  ```
+  $ /app/venv/bin/flask dummy-data
+  ```
+  ```
+  >>> URL: http://localhost
+  Upload files to local dir
+  >>> init logging <<<
+  2026-07-13 18:17:32,798 - SL - DEBUG - 4831 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+  2026-07-13 18:17:33,621 - SL - WARNING - 4831 - "/app/server.py:494" - dummy_data() -  - reset db, add fake data
+  2026-07-13 18:17:33,621 - SL - DEBUG - 4831 - "/app/app/fake_data.py:41" - fake_data() -  - create fake data
+  2026-07-13 18:17:33,906 - SL - INFO - 4831 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+  2026-07-13 18:17:33,931 - SL - DEBUG - 4831 - "/app/app/models.py:1459" - generate_random_alias_email() -  - generate email test_list620@sl.local
+  2026-07-13 18:17:33,942 - SL - INFO - 4831 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+  2026-07-13 18:17:33,992 - SL - INFO - 4831 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+  2026-07-13 18:17:34,002 - SL - INFO - 4831 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+  2026-07-13 18:17:34,023 - SL - INFO - 4831 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+  2026-07-13 18:17:34,035 - SL - INFO - 4831 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+  2026-07-13 18:17:34,050 - SL - INFO - 4831 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+  2026-07-13 18:17:34,058 - SL - INFO - 4831 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+  2026-07-13 18:17:34,069 - SL - DEBUG - 4831 - "/app/app/models.py:1255" - generate_oauth_client_id() -  - generate oauth_client_id demo-lxoqekszui
+  2026-07-13 18:17:34,075 - SL - DEBUG - 4831 - "/app/app/models.py:1255" - generate_oauth_client_id() -  - generate oauth_client_id demo2-lflynsksor
+  2026-07-13 18:17:34,349 - SL - INFO - 4831 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+  2026-07-13 18:17:34,375 - SL - INFO - 4831 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+  2026-07-13 18:17:34,388 - SL - INFO - 4831 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+  2026-07-13 18:17:34,397 - SL - INFO - 4831 - "/app/init_app.py:44" - add_sl_domains() -  - Add sl.local to SL domain
+  ```
+
+  Seed verification — the dev account and its API keys created by `fake_data()`
+  (`app/fake_data.py:L44-54`, `is_admin=True`; API keys `app/fake_data.py:L121-125`). **DEV-only
+  seed values:**
+
+  ```
+  $ psql -h localhost -U test -d test -x -c "select id,email,activated,disabled,is_admin,delete_on,enable_otp,alternative_id from users where email='john@wick.com'"
+  $ psql -h localhost -U test -d test    -c "select id,user_id,name,code from api_key where user_id=1 order by id"
+  ```
+  ```
+  -[ RECORD 1 ]--+-------------------------------------
+  id             | 1
+  email          | john@wick.com
+  activated      | t
+  disabled       | f
+  is_admin       | t
+  delete_on      | 
+  enable_otp     | f
+  alternative_id | bfb8024e-6c00-4c33-ac2c-e60bf3b7003d
+
+   id | user_id |  name   |  code  
+  ----+---------+---------+--------
+    1 |       1 | Chrome  | code
+    2 |       1 | Firefox | codeFF
+  (2 rows)
+  ```
+
+  The freshly seeded `alternative_id` is **`bfb8024e-6c00-4c33-ac2c-e60bf3b7003d`**; it is used to
+  verify web identity in Q5. (It is a fresh UUID4 per seed — `user.alternative_id = str(uuid.uuid4())`
+  `app/models.py:L617` — so it is *stable within a seed* but *regenerated by a re-seed*.)
+
+- **Effective, observed config** (canonical load with the env sourced). Note **`URL` resolves to
+  `http://localhost`, not `http://localhost:7777`** — this is a real read-vs-run result explained
+  in Q2 (the shell env var wins over `./.env` because `python-dotenv` uses `override=False`):
+
+  ```
+  $ /app/venv/bin/python -c "import app.config as c; print(repr(c.URL)); print(repr(c.SESSION_COOKIE_NAME)); print(repr(c.MEM_STORE_URI)); print(repr(c.DISABLE_RATE_LIMIT)); print(repr(c.DB_URI)); print(repr(c.DB_CONN_NAME))"
+  ```
+  ```
+  >>> URL: http://localhost
+  Upload files to local dir
+  'http://localhost'
+  'slapp'
+  'redis://localhost'
+  True
+  'postgresql://test:test@localhost:5432/test'
+  'webapp'
+  ```
+
+  `MEM_STORE_URI=redis://localhost` means the **server-side Redis session backend** is active for
+  the primary runs; a separate run with `MEM_STORE_URI=""` exercises the signed-cookie backend
+  (Q5). `.env`/`config` and the local dev DB are git-ignored, so none of this alters tracked source.
 
 ---
 
@@ -70,75 +233,129 @@ the complete unedited output, a live-derived `file:line` grounding, and an
 ### Direct answer (Observed)
 
 Running `python3 server.py` executes the `if __name__ == "__main__": local_main()` guard
-(`server.py:L598-599`). `local_main()` (`server.py:L572-595`) forces colored logging on
-(`config.COLOR_LOG = True`, L573), builds the app with the factory `create_app()` (L574),
-enables the Flask-Debug-Toolbar (L577/L582), sets `app.debug = True` (L581), and finally
-calls `app.run(debug=True, port=7777)` (L588). Because `debug=True` and `use_reloader` is
-not disabled, Werkzeug's **stat reloader** forks a child process, so the whole module —
-including its import-time `print` banners — is imported **twice** (parent + serving child).
-The server then binds **127.0.0.1:7777** and serves via Werkzeug's development WSGI server.
+(`server.py:L598-599`). `local_main()` (`server.py:L572-595`) does, in order: sets
+`config.COLOR_LOG = True` (L573) — which, as Q3 proves, has **no retroactive effect** on the
+already-built `SL` logger; builds the app with the factory `create_app()` (L574); enables the
+Flask-DebugToolbar (`from flask_debugtoolbar import DebugToolbarExtension` L577;
+`DebugToolbarExtension(app)` L582); sets `app.debug = True` (L581); and calls
+`app.run(debug=True, port=7777)` (L588). Because `debug=True` and `use_reloader` is not disabled,
+Werkzeug's **stat reloader** forks a serving child, so the whole module — including its import-time
+`print` banners — is imported **twice** (reloader parent, then serving child). The server then
+binds **`127.0.0.1:7777`** and serves via Werkzeug's development WSGI server. Flask labels the run
+`Environment: production` even with debug on (explained in the Observed section). Production is
+different: `wsgi.py` exposes `app = create_app()` served by gunicorn (`Dockerfile:L47`) — that path
+is **Inferred** (not run here).
 
 ### Command(s) run
 
 ```
-# from /app, with the local .env as the config source
-PYTHONPATH=/app /app/venv/bin/python server.py
+$ cd /app && set -a && . /tmp/sl_env.sh && set +a && unset EVENT_WEBHOOK_DISABLE && export GNUPGHOME=/tmp/sl_clean_gnupg
+# bounded lifecycle (one shell): launch, wait 5s for BOTH reloader imports (NO request yet),
+# snapshot the PURE startup stream, then probe /health, then terminate parent+child by PID.
+$ /app/venv/bin/python server.py >/tmp/q1.log 2>&1 &   PARENT=$!
+$ sleep 5 ; cp /tmp/q1.log q1_startup.log              # pure startup, before any HTTP
+$ ps -eo pid,ppid,args | grep "[s]erver.py"
+$ curl -s -i http://localhost:7777/health              # first HTTP request (readiness)
+$ kill -TERM $CHILD $PARENT ; kill -KILL $CHILD $PARENT
 ```
 
-### Complete, unedited output (startup stream)
+### Complete, unedited output (RUN‑A)
 
-The following is the complete stdout+stderr emitted at startup. It is **identical across
-Run 1 and Run 2** except for the process ids (Run 1 parent/child PIDs 3439/3459; Run 2
-3520/3540 — shown here). Note every banner block appears **twice** (reloader parent, then
-reloader-spawned serving child):
+**Pure startup stream** — the complete stdout+stderr captured **before any HTTP request was made**
+(so nothing here is request-triggered). Every banner block appears **twice** (reloader parent PID
+5058, then serving child PID 5070):
 
 ```
->>> URL: http://localhost:7777
+>>> URL: http://localhost
 Upload files to local dir
 >>> init logging <<<
-2026-07-13 17:13:43,463 - SL - DEBUG - 3520 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+2026-07-13 18:23:21,160 - SL - DEBUG - 5058 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
  * Serving Flask app "server" (lazy loading)
  * Environment: production
    WARNING: This is a development server. Do not use it in a production deployment.
    Use a production WSGI server instead.
  * Debug mode: on
->>> URL: http://localhost:7777
+>>> URL: http://localhost
 Upload files to local dir
 >>> init logging <<<
-2026-07-13 17:13:45,050 - SL - DEBUG - 3540 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+2026-07-13 18:23:22,753 - SL - DEBUG - 5070 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+```
+
+The reloader parent and its serving child, confirmed as two separate OS processes (child PPID =
+parent PID 5058):
+
+```
+   5058    5052 /app/venv/bin/python server.py
+   5070    5058 /app/venv/bin/python /app/server.py
+```
+
+**Request-triggered output (NOT part of startup).** The Flask-DebugToolbar
+`Could not insert debug toolbar. </body> tag not found` warning is emitted by the toolbar's
+`after_request` processing of a *response*, not at startup. It is **absent** from the pure startup
+stream above and appears **only after** the first HTTP response (`/health` returns the 7-byte body
+`success`, which has no `</body>`). These are the exact two extra lines that appear after the
+`/health` request:
+
+```
 /app/venv/lib/python3.10/site-packages/flask_debugtoolbar/__init__.py:213: UserWarning: Could not insert debug toolbar. </body> tag not found in response.
+  warnings.warn('Could not insert debug toolbar.'
 ```
 
-The reloader-spawned serving child was confirmed as a separate OS process (parent 3520):
+**Reproducibility (RUN‑A vs RUN‑B).** The pure startup stream is **identical across both runs
+except the PIDs and the timestamps**: RUN‑A parent/child PIDs `5058`/`5070` at `18:23:21`/`18:23:22`;
+RUN‑B parent/child PIDs `5101`/`5113` at `18:23:30`/`18:23:31`. Both are variable; the line content,
+ordering and the double-import are stable. Both runs bound and then released `127.0.0.1:7777`
+cleanly (no LISTEN socket after termination). The complete RUN‑B pure-startup transcript
+(`q1_runB_startup.log`, captured before any HTTP request) and its process tree follow — compare
+line-for-line with RUN‑A above; only the PID and timestamp fields change:
 
 ```
-$ ps -eo pid,ppid,args | grep "[s]erver.py"
-   3520    ....  /app/venv/bin/python server.py
-   3540    3520  /app/venv/bin/python /app/server.py
+>>> URL: http://localhost
+Upload files to local dir
+>>> init logging <<<
+2026-07-13 18:23:30,291 - SL - DEBUG - 5101 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+ * Serving Flask app "server" (lazy loading)
+ * Environment: production
+   WARNING: This is a development server. Do not use it in a production deployment.
+   Use a production WSGI server instead.
+ * Debug mode: on
+>>> URL: http://localhost
+Upload files to local dir
+>>> init logging <<<
+2026-07-13 18:23:31,837 - SL - DEBUG - 5113 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+```
+
+The two RUN‑B processes (child PPID = parent PID 5101):
+
+```
+   5101    5095 /app/venv/bin/python server.py
+   5113    5101 /app/venv/bin/python /app/server.py
 ```
 
 ### File:line grounding
 
-- Entry guard: `server.py:L598-599` — `if __name__ == "__main__":` / `local_main()`.
-- `local_main()` `server.py:L572-595`: `config.COLOR_LOG = True` (L573); `app = create_app()`
-  (L574); `from flask_debugtoolbar import DebugToolbarExtension` (L577); `app.debug = True`
-  (L581); `DebugToolbarExtension(app)` (L582); `app.run(debug=True, port=7777)` (L588).
-- Factory `create_app()` `server.py:L139`: `app = Flask(__name__)` (L128 is the *light* app;
-  the webapp app is created at L139), `app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_host=1)`
-  (L142), `app.url_map.strict_slashes = False` (L144), `app.secret_key = FLASK_SECRET` (L151),
-  `SESSION_COOKIE_NAME` (L159), `SESSION_COOKIE_SAMESITE = "Lax"` (L162), Redis wiring when
-  `MEM_STORE_URI` is set (L163-165), `register_blueprints(app)` (within L233-246), `/health`
-  (L213-215), and the app is returned at the end of the factory.
-- Production contrast: `wsgi.py:L1` `from server import create_app`; `wsgi.py:L3` `app = create_app()`;
-  `Dockerfile:L8` `FROM python:3.10`; `Dockerfile:L44` `EXPOSE 7777`; `Dockerfile:L47`
-  `CMD ["gunicorn", "wsgi:app", "-b", "0.0.0.0:7777", "-w", "2", "--timeout", "15"]`.
+- Entry guard: `if __name__ == "__main__":` (`server.py:L598`) → `local_main()` (`server.py:L599`).
+- `def local_main():` `server.py:L572`: `config.COLOR_LOG = True` (L573); `app = create_app()` (L574);
+  `from flask_debugtoolbar import DebugToolbarExtension` (L577); `app.config["DEBUG_TB_PROFILER_ENABLED"] = True`
+  (L579); `app.config["DEBUG_TB_INTERCEPT_REDIRECTS"] = False` (L580); `app.debug = True` (L581);
+  `DebugToolbarExtension(app)` (L582); `app.run(debug=True, port=7777)` (L588).
+- Factory `def create_app() -> Flask:` `server.py:L139`; the **webapp** `app = Flask(__name__)` is at
+  `server.py:L140` (the `create_light_app()` app at L128 is a different, request-less app);
+  `app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_host=1)` (L142); `app.url_map.strict_slashes = False`
+  (L144); `app.secret_key = FLASK_SECRET` (L151); `register_blueprints(app)` (L172); `/health` (L213-215).
+- Production contrast (**Inferred**, not run): `wsgi.py:L1` `from server import create_app`; `wsgi.py:L3`
+  `app = create_app()`; `Dockerfile:L8` `FROM python:3.10`; `Dockerfile:L44` `EXPOSE 7777`; `Dockerfile:L47`
+  `CMD ["gunicorn","wsgi:app","-b","0.0.0.0:7777","-w","2","--timeout","15"]`.
 
 ### Observed vs Inferred
 
-- **Observed:** the entire dev startup sequence above, the double import (reloader child as a
-  separate process), the bind on port 7777 (confirmed in Q3/Q4), and the DebugToolbar warning.
-- **Inferred:** the production `gunicorn wsgi:app` command binding `0.0.0.0:7777` — this is read
-  from the `Dockerfile` and was **not** run; the dev-vs-prod contrast is code-derived.
+- **Observed:** the full dev startup sequence and its ordering; the double import (reloader parent
+  PID 5058 + serving child PID 5070 as separate processes); the `Environment: production` /
+  `Debug mode: on` banner; that the DebugToolbar warning is *request-triggered* (absent from pure
+  startup, present only after `/health`); the port-7777 bind (confirmed in Q3/Q4); and the
+  PID/timestamp-only variance across two runs.
+- **Inferred:** the production `gunicorn wsgi:app` binding `0.0.0.0:7777` — read from the
+  `Dockerfile` and **not** run; the dev-vs-prod contrast is code-derived.
 
 ---
 
@@ -146,35 +363,97 @@ $ ps -eo pid,ppid,args | grep "[s]erver.py"
 
 ### Direct answer (Observed)
 
-Configuration is resolved **at import time** by `app/config.py` using `python-dotenv`. The
-module reads the `CONFIG` environment variable (`config_file = os.environ.get("CONFIG")`,
-`app/config.py:L65`). If `CONFIG` is set, it prints `load config file <path>`
-(`app/config.py:L68`) and loads that file (`load_dotenv(get_abs_path(config_file))`, L69);
-otherwise it silently loads `./.env` (`load_dotenv()`, L71). Several variables are then read
-with **subscript access** `os.environ["..."]`, so a missing one raises `KeyError` at import
-and the process dies before the app is built. The unconditional required variables are
-`URL` (L79), `EMAIL_DOMAIN` (L92), `SUPPORT_EMAIL` (L93), `DB_URI` (L192), and `FLASK_SECRET`
-(L196); an **empty** `FLASK_SECRET` additionally raises `RuntimeError` (L197-198).
+Configuration is resolved **entirely at import time** of `app/config.py` — the first SimpleLogin
+module `server.py` imports (`server.py:L30` `from app import config, constants`). The module uses
+**python-dotenv 0.14.0**. At `config.py:L65` it reads `config_file = os.environ.get("CONFIG")`; when
+`CONFIG` **is set** it prints `load config file <abs-path>` (L68) and calls
+`load_dotenv(get_abs_path(config_file))` (L69); when `CONFIG` **is not set** it silently calls
+`load_dotenv()` (L71), which loads `./.env`. `load_dotenv` runs with dotenv's default
+**`override=False`**, so any variable already present in the process environment **wins over** the
+file. That is exactly why the canonical dev run observes **`URL=http://localhost`** (the value
+exported by `/tmp/sl_env.sh`) even though `/app/.env:L53` sets `URL=http://localhost:7777` — the
+shell/process value takes precedence and the file value is ignored.
+
+Five variables are read with **bracket access** `os.environ["…"]` and therefore **hard-fail with
+`KeyError`** when absent, evaluated in this top-to-bottom order: `URL` (L79), `EMAIL_DOMAIN` (L92),
+`SUPPORT_EMAIL` (L93), `DB_URI` (L192), `FLASK_SECRET` (L196). A **present-but-empty** `FLASK_SECRET`
+instead raises **`RuntimeError("FLASK_SECRET is empty. Please define it.")`** (L197-198). A sixth
+value is also required but fails differently: `EMAIL_SERVERS_WITH_PRIORITY` (L172) is loaded via
+`sl_getenv("EMAIL_SERVERS_WITH_PRIORITY")` with **no `default_factory`**, so when it is absent
+`sl_getenv` calls `default_factory()` — i.e. `None()` — raising **`TypeError: 'NoneType' object is
+not callable`** at `config.py:L33`.
 
 ### Command(s) run
 
 ```
-# (A) CONFIG branch + a required variable (URL) removed -> KeyError at import
-env -u URL CONFIG=/tmp/blitzy_no_url.env PYTHONPATH=/app /app/venv/bin/python server.py ; echo EXIT=$?
+# ---- DEFAULT (else) branch + override=False precedence: canonical env, no CONFIG ----
+$ cd /app && set -a && . /tmp/sl_env.sh && set +a && unset EVENT_WEBHOOK_DISABLE && export GNUPGHOME=/tmp/sl_clean_gnupg
+$ unset CONFIG
+$ /app/venv/bin/python -c "import app.config"          # app.config is the exact module server.py imports at L30
 
-# (B) empty FLASK_SECRET -> RuntimeError at import
-FLASK_SECRET="" PYTHONPATH=/app /app/venv/bin/python server.py ; echo EXIT=$?
+# ---- CONFIG branch: a controlled file whose URL is a distinctive :9999 ----
+# full.env = a byte-copy of /app/.env with ONLY the URL line changed to http://localhost:9999
+$ env -i PATH=/usr/bin:/bin CONFIG=/tmp/blitzy_cap/q2/full.env \
+      /app/venv/bin/python -c "import app.config; print('[import ok] app.config.URL =', app.config.URL)"
 
-# (C) default ./.env branch (no CONFIG) -> silent load, resolved values printed
-PYTHONPATH=/app /app/venv/bin/python /tmp/blitzy_probe_config.py
+# ---- the two conflicting URL definitions (precedence proof) ----
+$ grep -nE '^URL='        /app/.env        # the .env FILE value (loses to process env)
+$ grep -nE '^export URL=' /tmp/sl_env.sh   # the shell/process-env value (wins)
+
+# ---- required-variable hard-fails through the REAL entry point: python3 server.py ----
+# each no_<VAR>.env is /app/.env with exactly ONE required line removed; run in a clean env
+# (env -i) so ONLY the CONFIG file supplies values and the removed var is genuinely absent.
+$ env -i PATH=/usr/bin:/bin CONFIG=/tmp/blitzy_cap/q2/no_url.env            /app/venv/bin/python server.py
+$ env -i PATH=/usr/bin:/bin CONFIG=/tmp/blitzy_cap/q2/no_email_domain.env   /app/venv/bin/python server.py
+$ env -i PATH=/usr/bin:/bin CONFIG=/tmp/blitzy_cap/q2/no_support_email.env  /app/venv/bin/python server.py
+$ env -i PATH=/usr/bin:/bin CONFIG=/tmp/blitzy_cap/q2/no_db_uri.env         /app/venv/bin/python server.py
+$ env -i PATH=/usr/bin:/bin CONFIG=/tmp/blitzy_cap/q2/no_flask_secret.env   /app/venv/bin/python server.py
+# present-but-empty FLASK_SECRET → RuntimeError (not KeyError):
+$ env -i PATH=/usr/bin:/bin CONFIG=/tmp/blitzy_cap/q2/empty_flask_secret.env /app/venv/bin/python server.py
+# sixth required value, loaded via sl_getenv() with no default_factory → TypeError:
+$ env -i PATH=/usr/bin:/bin CONFIG=/tmp/blitzy_cap/q2/no_email_servers.env  /app/venv/bin/python server.py
 ```
 
 ### Complete, unedited output
 
-**(A) `CONFIG` set (prints the load line) and `URL` missing → `KeyError: 'URL'`:**
+**(a) DEFAULT (`else`) branch + `override=False` precedence** — canonical env sourced, `CONFIG`
+unset. No `load config file` line is printed (the `else` branch at L71 is taken), and the observed
+URL is `http://localhost` — the process-env value, **not** the `/app/.env` value `:7777`:
 
 ```
-load config file /tmp/blitzy_no_url.env
+>>> URL: http://localhost
+Upload files to local dir
+```
+
+**(b) `CONFIG` branch** — a controlled file is loaded; the `load config file <abs-path>` banner
+(L68) fires and the file's distinctive `URL=http://localhost:9999` is what the module ends up with,
+proving the CONFIG file is the source:
+
+```
+load config file /tmp/blitzy_cap/q2/full.env
+>>> URL: http://localhost:9999
+Upload files to local dir
+[import ok] app.config.URL = http://localhost:9999
+```
+
+**(c) The two conflicting `URL` definitions** (precedence proof — the file loses, the process env
+wins):
+
+```
+--- /app/.env line 53 (the file value, LOSES) ---
+53:URL=http://localhost:7777
+--- /tmp/sl_env.sh line 4 (the shell/process-env value, WINS) ---
+4:export URL="http://localhost"
+```
+
+**(d) Required-variable hard-fails through `python3 server.py`.** Each aborts at the exact line that
+reads the missing variable; note the `>>> URL:` print (L80) appears for every case *after* the first
+(because `URL` is resolved first at L79):
+
+`no_url.env` → `KeyError: 'URL'` at `config.py:L79`:
+
+```
+load config file /tmp/blitzy_cap/q2/no_url.env
 Traceback (most recent call last):
   File "/app/server.py", line 30, in <module>
     from app import config, constants
@@ -183,57 +462,135 @@ Traceback (most recent call last):
   File "/usr/local/lib/python3.10/os.py", line 680, in __getitem__
     raise KeyError(key) from None
 KeyError: 'URL'
-EXIT=1
 ```
 
-**(B) empty `FLASK_SECRET` → `RuntimeError` (note `>>> URL:` prints first, then the crash):**
+`no_email_domain.env` → `KeyError: 'EMAIL_DOMAIN'` at `config.py:L92`:
 
 ```
->>> URL: http://localhost:7777
+load config file /tmp/blitzy_cap/q2/no_email_domain.env
+>>> URL: http://localhost:9999
+Traceback (most recent call last):
+  File "/app/server.py", line 30, in <module>
+    from app import config, constants
+  File "/app/app/config.py", line 92, in <module>
+    EMAIL_DOMAIN = os.environ["EMAIL_DOMAIN"].lower()
+  File "/usr/local/lib/python3.10/os.py", line 680, in __getitem__
+    raise KeyError(key) from None
+KeyError: 'EMAIL_DOMAIN'
+```
+
+`no_support_email.env` → `KeyError: 'SUPPORT_EMAIL'` at `config.py:L93`:
+
+```
+load config file /tmp/blitzy_cap/q2/no_support_email.env
+>>> URL: http://localhost:9999
+Traceback (most recent call last):
+  File "/app/server.py", line 30, in <module>
+    from app import config, constants
+  File "/app/app/config.py", line 93, in <module>
+    SUPPORT_EMAIL = os.environ["SUPPORT_EMAIL"]
+  File "/usr/local/lib/python3.10/os.py", line 680, in __getitem__
+    raise KeyError(key) from None
+KeyError: 'SUPPORT_EMAIL'
+```
+
+`no_db_uri.env` → `KeyError: 'DB_URI'` at `config.py:L192`:
+
+```
+load config file /tmp/blitzy_cap/q2/no_db_uri.env
+>>> URL: http://localhost:9999
+Traceback (most recent call last):
+  File "/app/server.py", line 30, in <module>
+    from app import config, constants
+  File "/app/app/config.py", line 192, in <module>
+    DB_URI = os.environ["DB_URI"]
+  File "/usr/local/lib/python3.10/os.py", line 680, in __getitem__
+    raise KeyError(key) from None
+KeyError: 'DB_URI'
+```
+
+`no_flask_secret.env` → `KeyError: 'FLASK_SECRET'` at `config.py:L196`:
+
+```
+load config file /tmp/blitzy_cap/q2/no_flask_secret.env
+>>> URL: http://localhost:9999
+Traceback (most recent call last):
+  File "/app/server.py", line 30, in <module>
+    from app import config, constants
+  File "/app/app/config.py", line 196, in <module>
+    FLASK_SECRET = os.environ["FLASK_SECRET"]
+  File "/usr/local/lib/python3.10/os.py", line 680, in __getitem__
+    raise KeyError(key) from None
+KeyError: 'FLASK_SECRET'
+```
+
+`empty_flask_secret.env` (`FLASK_SECRET=` present but blank) → `RuntimeError` at `config.py:L198`:
+
+```
+load config file /tmp/blitzy_cap/q2/empty_flask_secret.env
+>>> URL: http://localhost:9999
 Traceback (most recent call last):
   File "/app/server.py", line 30, in <module>
     from app import config, constants
   File "/app/app/config.py", line 198, in <module>
     raise RuntimeError("FLASK_SECRET is empty. Please define it.")
 RuntimeError: FLASK_SECRET is empty. Please define it.
-EXIT=1
 ```
 
-**(C) default `./.env` branch — no `load config file` line is printed, and the resolved
-values are read straight from the local `.env`:**
+**(e) Additional required value with a different failure mode** — `no_email_servers.env`
+(`EMAIL_SERVERS_WITH_PRIORITY` removed) → `TypeError` from `sl_getenv`'s `default_factory()` call at
+`config.py:L33`:
 
 ```
->>> URL: http://localhost:7777
-RESOLVED: URL='http://localhost:7777'
-RESOLVED: SESSION_COOKIE_NAME='slapp'
-RESOLVED: MEM_STORE_URI='redis://localhost'
-RESOLVED: DISABLE_RATE_LIMIT=True
-RESOLVED: DB_CONN_NAME='webapp'
+load config file /tmp/blitzy_cap/q2/no_email_servers.env
+>>> URL: http://localhost:9999
+Traceback (most recent call last):
+  File "/app/server.py", line 30, in <module>
+    from app import config, constants
+  File "/app/app/config.py", line 172, in <module>
+    EMAIL_SERVERS_WITH_PRIORITY = sl_getenv("EMAIL_SERVERS_WITH_PRIORITY")
+  File "/app/app/config.py", line 33, in sl_getenv
+    return default_factory()
+TypeError: 'NoneType' object is not callable
 ```
 
 ### File:line grounding
 
-- `config_file = os.environ.get("CONFIG")` `app/config.py:L65`.
-- `if config_file:` → `print("load config file", config_file)` (L68) + `load_dotenv(get_abs_path(config_file))` (L69);
-  `else:` → `load_dotenv()` (L71).
-- `COLOR_LOG = "COLOR_LOG" in os.environ` `app/config.py:L73`.
-- Hard-fail required vars: `URL = os.environ["URL"]` (L79) immediately followed by
-  `print(">>> URL:", URL)` (L80); `EMAIL_DOMAIN` (L92); `SUPPORT_EMAIL` (L93);
-  `DB_URI = os.environ["DB_URI"]` (L192); `DB_CONN_NAME = os.environ.get("DB_CONN_NAME", "webapp")`
-  (L193); `FLASK_SECRET = os.environ["FLASK_SECRET"]` (L196);
-  `if not FLASK_SECRET: raise RuntimeError("FLASK_SECRET is empty. Please define it.")` (L197-198);
-  `SESSION_COOKIE_NAME = "slapp"` (L199); `MEM_STORE_URI = os.environ.get("MEM_STORE_URI", None)` (L568);
-  `DISABLE_RATE_LIMIT = "DISABLE_RATE_LIMIT" in os.environ` (L602).
-- The crash surfaces during `from app import config, constants` at `server.py:L30`, confirming config
-  resolution happens **at import time**, before `local_main()`/`create_app()` runs.
+- `server.py:L30` `from app import config, constants` — the first SL import; triggers all of
+  `app/config.py` at module load.
+- `app/config.py:L65` `config_file = os.environ.get("CONFIG")`; `L66` `if config_file:`; `L68`
+  `print("load config file", config_file)`; `L69` `load_dotenv(get_abs_path(config_file))`; `L70-71`
+  `else:` / `load_dotenv()` (default `override=False`).
+- `app/config.py:L17-18` `get_abs_path` returns absolute paths unchanged (`if file_path.startswith("/"): return file_path`).
+- Required bracket variables: `L79` `URL = os.environ["URL"]`; `L80` `print(">>> URL:", URL)`; `L92`
+  `EMAIL_DOMAIN = os.environ["EMAIL_DOMAIN"].lower()`; `L93` `SUPPORT_EMAIL = os.environ["SUPPORT_EMAIL"]`;
+  `L192` `DB_URI = os.environ["DB_URI"]`; `L196` `FLASK_SECRET = os.environ["FLASK_SECRET"]`.
+- Empty-secret guard: `L197` `if not FLASK_SECRET:`; `L198` `raise RuntimeError("FLASK_SECRET is empty. Please define it.")`.
+- `sl_getenv` required value: `L23` `def sl_getenv(env_var: str, default_factory: Callable = None):`;
+  `L31-33` `value = os.getenv(env_var)` / `if value is None:` / `return default_factory()`; used at
+  `L172` `EMAIL_SERVERS_WITH_PRIORITY = sl_getenv("EMAIL_SERVERS_WITH_PRIORITY")`.
+- `app/config.py:L328` `print("Upload files to local dir")` — printed because `LOCAL_FILE_UPLOAD=1`
+  is set in both the canonical env and the copied `full.env`.
+- `app/config.py:L199` `SESSION_COOKIE_NAME = "slapp"` (the cookie name confirmed live in Q3/Q5).
 
 ### Observed vs Inferred
 
-- **Observed:** all three branches — the `CONFIG` path printing `load config file ...`, the
-  `KeyError: 'URL'` traceback, the empty-`FLASK_SECRET` `RuntimeError`, and the silent `./.env`
-  load with the resolved values. (`/tmp/blitzy_no_url.env` and `/tmp/blitzy_probe_config.py` were
-  temporary and have been deleted; no tracked file was edited.)
-- **Inferred:** none.
+- **Observed:** the `else`/`CONFIG` branch selection and their prints; the `override=False`
+  precedence (`URL=http://localhost` wins over the file's `:7777`); the CONFIG file being
+  authoritative (`URL=http://localhost:9999`); and every required-variable failure with its exact
+  exception type and `config.py` line (`KeyError` for the five bracket vars at L79/L92/L93/L192/L196,
+  `RuntimeError` for empty `FLASK_SECRET` at L198, `TypeError` for `EMAIL_SERVERS_WITH_PRIORITY` at
+  L33/L172).
+- **Canonical-entry-point notes:** the five `KeyError` cases, the empty-secret `RuntimeError`, and the
+  `TypeError` case were exercised through the **real** entry point `python3 server.py`. The default-branch
+  and `CONFIG`-branch success probes used `import app.config` — the **same module object** `server.py`
+  imports at `L30`; the identical `>>> URL: http://localhost` value is independently corroborated by
+  the canonical `python3 server.py` startup captured in Q1/Q3.
+- **Inferred:** nothing in this section is inferred — every branch and failure was run and its
+  complete output captured above.
+- **Security note (DEVELOPMENT only):** the values shown here (`FLASK_SECRET=secret`, local DB URI,
+  the seeded `.env`) are the container's throwaway development configuration. They are not production
+  secrets and must never be reused outside this local investigation environment.
 
 ---
 
@@ -241,1024 +598,1860 @@ RESOLVED: DB_CONN_NAME='webapp'
 
 ### Direct answer (Observed)
 
-**There is no explicit "server is ready / listening" log line in dev mode.** SimpleLogin
-disables the `werkzeug` logger at import (`log.disabled = True`, `app/log.py:L71`), which
-**suppresses Werkzeug's standard readiness banner** — the familiar
-`* Running on http://127.0.0.1:7777/` and `Press CTRL+C to quit` lines never appear, and
-neither do `* Restarting with stat`, `* Debugger is active!`, or `* Debugger PIN: NNN-NNN-NNN`,
-because all of those are emitted through the `werkzeug` logger. The only startup markers
-actually printed are SimpleLogin's own `print()` banners — `>>> URL: http://localhost:7777`
-(`app/config.py:L80`) and `>>> init logging <<<` (`app/log.py:L67`) — plus Flask's CLI banner
-(`* Serving Flask app ...`, `* Environment: production`, the production warning, `* Debug mode: on`),
-which Flask emits via `click.echo` (stdout), not through the `werkzeug` logger. Because the
-reloader double-imports the module, the last observable markers before the socket accepts are
-the **second** (serving-child) `>>> init logging <<<` / `>>> URL:` pair after `* Debug mode: on`;
-true readiness must be confirmed out-of-band (e.g. `GET /health` → `200`).
+**There is no explicit "server is ready / listening" log line in dev mode.** SimpleLogin disables
+the `werkzeug` logger at import (`log = logging.getLogger("werkzeug")` / `log.disabled = True`,
+`app/log.py:L70-71`), which **suppresses Werkzeug's entire standard startup banner** on this pinned
+stack (Werkzeug **1.0.1** / Flask **1.1.2**): the familiar `* Running on http://127.0.0.1:7777/`
+and `Press CTRL+C to quit`, and (because `debug=True` + reloader) `* Restarting with stat`,
+`* Debugger is active!`, and `* Debugger PIN: NNN-NNN-NNN` — **none of these appear** (verified by
+capturing the actual stream in Q1). The only startup markers actually printed are:
+
+1. SimpleLogin's own `print()` banners — `>>> URL: http://localhost` (`app/config.py:L80`) and
+   `>>> init logging <<<` (`app/log.py:L67`) — each printed **twice** (reloader parent + child); and
+2. Flask's CLI banner — `* Serving Flask app "server" (lazy loading)`, `* Environment: production`,
+   the two-line development-server `WARNING`, and `* Debug mode: on` — which Flask emits through
+   `click.echo` (its `show_server_banner`), **not** through the `werkzeug` logger, so it survives.
+
+Because there is no readiness line, practical readiness must be confirmed out-of-band; the
+`/health` endpoint returning **`HTTP/1.0 200 OK`** with body `success` is the reliable signal. The
+last observable startup marker before the socket accepts is the **second** (serving-child)
+`>>> init logging <<<` line. Separately, `local_main()` runs `config.COLOR_LOG = True` (`server.py:L573`)
+but this does **not** colorize the logs — see the COLOR_LOG sub-finding below.
 
 ### Command(s) run
 
 ```
-# confirm the Werkzeug version paired with Flask 1.1.2
-PYTHONPATH=/app /app/venv/bin/python -c "import werkzeug, flask; print('werkzeug', werkzeug.__version__, '| flask', flask.__version__)"
-
-# capture full startup stream (see Q1) then probe readiness out-of-band
-PYTHONPATH=/app /app/venv/bin/python server.py     # (full stream shown in Q1)
-curl -s -i http://localhost:7777/health            # out-of-band readiness confirmation
+$ /app/venv/bin/python -c "import werkzeug, flask; print('werkzeug', werkzeug.__version__, '| flask', flask.__version__)"
+# full startup stream captured as in Q1 (reproduced below), then out-of-band readiness probe:
+$ curl -s -i http://localhost:7777/health
+# COLOR_LOG behaviour probe (NON-CANONICAL: imports modules directly to mimic local_main L573):
+$ /app/venv/bin/python /tmp/blitzy_cap/colorlog_probe.py
 ```
 
 ### Complete, unedited output
 
-Version pairing:
+Werkzeug/Flask version pairing:
 
 ```
 werkzeug 1.0.1 | flask 1.1.2
 ```
 
-The full startup stream is reproduced verbatim in **Q1**. The lines that actually appear
-(mapped to emitter below) are the two `print` markers, the Flask CLI banner, and the
-DebugToolbar warning — and **nothing** from Werkzeug's `werkzeug`-logger banner. Out-of-band
-readiness confirmation while the server was up (Run 2):
+The complete **pure startup stream** (RUN‑A, before any request) — this is the evidence for which
+readiness lines appear. Note the **absence** of every Werkzeug-logger line and the presence of only
+the two SL `print` markers (×2) and the Flask CLI banner:
 
 ```
-$ curl -s -i http://localhost:7777/health
+>>> URL: http://localhost
+Upload files to local dir
+>>> init logging <<<
+2026-07-13 18:23:21,160 - SL - DEBUG - 5058 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+ * Serving Flask app "server" (lazy loading)
+ * Environment: production
+   WARNING: This is a development server. Do not use it in a production deployment.
+   Use a production WSGI server instead.
+ * Debug mode: on
+>>> URL: http://localhost
+Upload files to local dir
+>>> init logging <<<
+2026-07-13 18:23:22,753 - SL - DEBUG - 5070 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+```
+
+Out-of-band readiness confirmation while the server was up (RUN‑A):
+
+```
 HTTP/1.0 200 OK
 Content-Type: text/html; charset=utf-8
 Content-Length: 7
-Set-Cookie: slapp=8a88eeb0-16d5-4d9a-a3fd-103b1f7c0330.Z1IZeiULJ5f1iyV4VvziVCLfZcU; Expires=Mon, 20-Jul-2026 17:13:47 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=c44ff3a2-7a92-4b69-8a61-c1b58ab5332d.fMfM_lS9OERlPc0EletbOR-aA7E; Expires=Mon, 20-Jul-2026 18:23:25 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
-Date: Mon, 13 Jul 2026 17:13:47 GMT
+Date: Mon, 13 Jul 2026 18:23:25 GMT
 
 success
 ```
 
+**COLOR_LOG sub-finding (why `local_main()`'s `config.COLOR_LOG = True` does not colorize logs).**
+The `SL` logger is built at import time in `app/log.py`, which imports `COLOR_LOG` *by value*
+(`from app.config import (COLOR_LOG,)` L7-9) and only calls `coloredlogs.install(...)` inside
+`_get_logger()` when that import-time value is truthy (L61-62). `local_main()` sets
+`config.COLOR_LOG = True` **after** `app/log.py` has already been imported and `LOG` already built,
+so it neither changes `app.log.COLOR_LOG` nor re-installs coloredlogs. This probe demonstrates it
+(and matches the plain, un-colored SL lines in the startup stream above — a `cat -A` of the stream
+shows no ANSI escape codes):
+
+```
+>>> URL: http://localhost
+Upload files to local dir
+>>> init logging <<<
+import-time : config.COLOR_LOG=False  log.COLOR_LOG=False
+after set   : config.COLOR_LOG=True  log.COLOR_LOG=False
+SL handlers : ['logging.StreamHandler']
+SL formatter: 'logging.Formatter'
+```
+
 ### File:line grounding
 
-- `print(">>> init logging <<<")` `app/log.py:L67` (**appears**, twice).
-- `log = logging.getLogger("werkzeug")` `app/log.py:L70`; `log.disabled = True` `app/log.py:L71`
-  — this is why the Werkzeug banner is suppressed.
-- `print(">>> URL:", URL)` `app/config.py:L80` (**appears**, twice).
-- SL log format `_log_format` `app/log.py:L11-14`; UTC `converter = time.gmtime` (L43);
-  `logger.setLevel(logging.DEBUG)` (L51); `coloredlogs.install(...)` when `COLOR_LOG` (L61-62),
-  which `local_main()` forces on.
-- **Suppressed** (routed through the disabled `werkzeug` logger via `werkzeug._internal._log`):
-  `* Running on ...` and `Press CTRL+C to quit` (Werkzeug 1.0.1 `serving.py`),
-  `* Restarting with stat` (`_reloader.py`), `* Debugger is active!` / `* Debugger PIN:`
-  (`debug/__init__.py`). The `* Serving Flask app` / `* Environment` / `* Debug mode` lines
-  survive because Flask emits them via `click.echo` (`flask/cli.py` `show_server_banner`), not
-  the `werkzeug` logger.
-- `/health` handler returns `("success", 200)` `server.py:L213-215`.
+- **Appears:** `print(">>> init logging <<<")` `app/log.py:L67` (×2); `print(">>> URL:", URL)`
+  `app/config.py:L80` (×2). The Flask CLI banner lines are produced by Flask's `show_server_banner`
+  (via `click.echo`, `flask/cli.py`), independent of the `werkzeug` logger.
+- **Suppressor:** `log = logging.getLogger("werkzeug")` (`app/log.py:L70`); `log.disabled = True`
+  (`app/log.py:L71`) — this is why the entire Werkzeug banner is absent.
+- **SL logger construction (import time):** `from app.config import (COLOR_LOG,)` (`app/log.py:L7-9`);
+  `_log_format` (`app/log.py:L12-15`); console handler on `sys.stdout` with UTC `converter = time.gmtime`
+  (`app/log.py:L43`); `logger.setLevel(logging.DEBUG)` (`app/log.py:L51`); `if COLOR_LOG: coloredlogs.install(...)`
+  (`app/log.py:L61-62`); `LOG = _get_logger("SL")` (`app/log.py:L79`).
+- **Suppressed lines' emitters (code-grounded / Inferred, not run):** `* Running on ...` and
+  `Press CTRL+C to quit` are logged by Werkzeug 1.0.1 `serving.py` `run_simple` via the `werkzeug`
+  logger; `* Restarting with stat` by `werkzeug/_reloader.py`; `* Debugger is active!` / `* Debugger PIN:`
+  by `werkzeug/debug/__init__.py`. Their **absence** is Observed; that the `werkzeug` logger is their
+  channel is code-grounded.
+- `/health` handler returns `("success", 200)` `server.py:L214-215` (`healthcheck()` inside `create_app`).
 
 ### Observed vs Inferred
 
-- **Observed:** which lines actually appear (the two `print` markers ×2 and the Flask CLI banner)
-  and which are absent (the entire Werkzeug banner, including the Debugger PIN) on the pinned
-  Flask 1.1.2 / Werkzeug 1.0.1 stack; the `/health` 200 as the practical readiness signal;
-  `Server: Werkzeug/1.0.1 Python/3.10.18`. The Debugger PIN is a run-to-run-variable value in
-  the general case, but here its **absence** is the stable cross-run observation (it is never
-  emitted because the logger is disabled).
-- **Inferred:** none — the version-dependent banner question was settled by capturing the real
-  stream rather than assuming.
+- **Observed:** exactly which lines appear (the two `print` markers ×2 and the Flask CLI banner) and
+  which are absent (the entire Werkzeug banner including the Debugger PIN) on Werkzeug 1.0.1 /
+  Flask 1.1.2; the `/health` `200`/`success` as the practical readiness signal
+  (`Server: Werkzeug/1.0.1 Python/3.10.18`); and that `config.COLOR_LOG=True` leaves
+  `log.COLOR_LOG=False` with a plain `StreamHandler`/`Formatter` (no colorization). The Debugger PIN
+  is run-to-run-variable in general, but here its **absence** is the stable cross-run observation.
+- **Inferred / code-grounded (not run):** the specific Werkzeug source functions that would emit the
+  suppressed lines. The absence itself is Observed; the causal attribution to the disabled
+  `werkzeug` logger is grounded in `app/log.py:L70-71` and the Werkzeug source.
 
 ---
 
-## Q4 — What ports and endpoints are exposed?
+## Q4 — Which ports and endpoints does it expose?
 
 ### Direct answer (Observed)
 
-The dev server listens on a single TCP port, **7777**, bound to **127.0.0.1** (loopback)
-because `app.run(..., port=7777)` (`server.py:L588`) defaults the host to `127.0.0.1`
-(`Dockerfile:L44` also declares `EXPOSE 7777`). The live route table (`app.url_map`) holds
-**292 rules**. They come from ten blueprints registered in `register_blueprints()`
-(`server.py:L233-246`) — `auth_bp` `/auth`, `monitor_bp` **`/`** (root!), `dashboard_bp`
-`/dashboard`, `developer_bp` `/developer`, `phone_bp` `/phone`, `oauth_bp` registered **twice**
-at `/oauth` **and** `/oauth2`, `onboarding_bp` `/onboarding`, `discover_bp` `/discover`,
-`internal_bp` `/internal`, `api_bp` `/api` (`app/api/base.py:L11`) — plus the Flask-Admin mount
-at `/admin` (122 auto-generated CRUD rules) and several direct (non-blueprint) routes: `/`,
-`/health`, `/favicon.ico`, `/dnt`, `/.well-known/openid-configuration`, `/jwks`, `/coinbase`,
-`/paddle`, `/paddle_coupon`, `/static/<path:filename>`. **Read-vs-run finding:** `monitor_bp`
-is mounted at the **root** `/`, so its routes are `/git`, `/live`, `/exception` — **not**
-`/monitor/*` (an earlier tech-spec draft claimed `/monitor`; the live `url_map` is authoritative).
+In development the server listens on **one TCP port, `7777`, bound to the loopback interface
+`127.0.0.1`** — set by `app.run(debug=True, port=7777)` (`server.py:L588`) and confirmed live in
+`/proc/net/tcp` as `0100007F:1E61` (127.0.0.1:7777) in state `0A` (LISTEN). (`EXPOSE 7777` in
+`Dockerfile:L44` documents the same port for the production `gunicorn` bind `0.0.0.0:7777`, which is
+**Inferred** — not run here.) The app built by the canonical factory `create_app()` exposes a route
+map of **exactly 292 rules** (stable across two independent builds). Those 292 rules break down as:
+
+| Mount / prefix | Rules | Source |
+|----------------|------:|--------|
+| `/admin` (Flask-Admin UI) | 122 | `Admin(...)` mount in `create_app()` |
+| `/api` (`api_bp`) | 52 | `app/api/base.py:L11` `url_prefix="/api"` |
+| `/dashboard` (`dashboard_bp`) | 51 | `app/dashboard/base.py:L6` |
+| `/auth` (`auth_bp`) | 23 | `app/auth/base.py:L4` |
+| `/developer` (`developer_bp`) | 7 | `app/developer/base.py:L6` |
+| `/onboarding` (`onboarding_bp`) | 6 | `app/onboarding/base.py:L6` |
+| `/phone` (`phone_bp`) | 5 | `app/phone/base.py:L6` |
+| `/oauth` (`oauth_bp`) | 5 | `server.py:L240` `url_prefix="/oauth"` |
+| `/oauth2` (`oauth_bp` again) | 5 | `server.py:L241` `url_prefix="/oauth2"` |
+| `/internal` (`internal_bp`) | 2 | `app/internal/base.py:L6` |
+| `/static` | 1 | Flask default static route |
+| direct + `monitor_bp` routes | 13 | see below |
+
+`register_blueprints(app)` (`server.py:L233-246`) performs **11 registrations across 10 distinct
+blueprints** — `oauth_bp` is registered **twice** (at `/oauth` and `/oauth2`). The 13 remaining rules
+are direct (non-blueprint) app routes plus the `monitor_bp` routes: `/` (`index`),
+`/health` (`healthcheck`), `/jwks`, `/favicon.ico`, `/dnt` (`do_not_track`),
+`/.well-known/openid-configuration` (`openid_config`), `/paddle`, `/paddle_coupon`,
+`/coinbase` (`coinbase_webhook`), `/discover` (`discover.index`), and the three `monitor_bp` routes
+`/git` (`monitor.git_sha1`), `/live` (`monitor.live`), `/exception` (`monitor.test_exception`).
+
+**Discrepancy (Observed, code-authoritative):** `monitor_bp` is mounted at **`url_prefix="/"`**
+(`app/monitor/base.py:L3`), so its routes are `/git`, `/live`, `/exception` — **not** under a
+`/monitor` prefix as an earlier tech-spec draft (§5.2.1) suggested. The running route map is
+authoritative.
 
 ### Command(s) run
 
 ```
-# port bind (ss/netstat are non-functional in this container; use /proc/net/tcp)
-grep -i ':1E61 ' /proc/net/tcp          # 1E61 hex = 7777 dec
-curl -s -i http://localhost:7777/health
+$ cd /app && set -a && . /tmp/sl_env.sh && set +a && unset EVENT_WEBHOOK_DISABLE && export GNUPGHOME=/tmp/sl_clean_gnupg
 
-# enumerate the LIVE route table through the canonical factory
-cat > /tmp/blitzy_q4_dump.py <<'PY'
+# (1) enumerate the live route table from the SAME factory local_main() uses (create_app):
+$ cat dump_routes.py
 from server import create_app
 app = create_app()
-rules = sorted(app.url_map.iter_rules(), key=lambda r: str(r.rule))
+rules = list(app.url_map.iter_rules())
 print("TOTAL RULES:", len(rules))
-for r in rules:
-    methods = ",".join(sorted(m for m in r.methods if m not in ("HEAD", "OPTIONS")))
-    print("%-45s  [%s]  -> %s" % (str(r.rule), methods, r.endpoint))
-PY
-PYTHONPATH=/app /app/venv/bin/python /tmp/blitzy_q4_dump.py
+def methods_of(r):
+    return ",".join(sorted(m for m in r.methods if m not in ("HEAD","OPTIONS")))
+for r in sorted(rules, key=lambda r: (str(r), r.endpoint)):
+    print(f"{methods_of(r):22s} {str(r):55s} -> {r.endpoint}")
+$ /app/venv/bin/python dump_routes.py           # run twice; the route portion is identical
+
+# (2) confirm the listening socket while a real server is up, then probe readiness:
+$ /app/venv/bin/python server.py >/tmp/q4srv.log 2>&1 &   PARENT=$!
+$ sleep 5
+$ head -1 /proc/net/tcp ; grep -iE ':1E61 [0-9A-F:]+ 0A ' /proc/net/tcp   # :7777 LISTEN
+$ curl -s -i http://localhost:7777/health
+$ kill -TERM $CHILD $PARENT ; kill -KILL $CHILD $PARENT
+$ grep -iE ':1E61 [0-9A-F:]+ 0A ' /proc/net/tcp || echo PORT FREE   # after termination
 ```
 
 ### Complete, unedited output
 
-Port bind (`0100007F` = 127.0.0.1 little-endian, `1E61` = 7777, state `0A` = `TCP_LISTEN`):
+**Listening socket** (`/proc/net/tcp`, header + the single `:1E61`/state-`0A` line for this run;
+parent/child PIDs recorded):
 
 ```
-   2: 0100007F:1E61 00000000:0000 0A 00000000:00000000 ...
+### /proc/net/tcp header + the :7777 (hex 1E61) LISTEN (state 0A) line:
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode                                                     
+   2: 0100007F:1E61 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 879068313 1 0000000000000000 100 0 0 10 0                 
+
+### decode: local_address 0100007F:1E61 = 127.0.0.1:7777 ; st 0A = LISTEN
+### server PIDs: parent=5507 child=5520
 ```
 
-The complete live route table (all 292 rules, sorted by path; `create_app()` also prints its
-two import-time markers first):
+**Readiness probe** — `GET /health` returns `200`/`success` on the loopback bind:
 
 ```
->>> URL: http://localhost:7777
-Upload files to local dir
->>> init logging <<<
-2026-07-13 17:32:08,275 - SL - DEBUG - 4169 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+HTTP/1.0 200 OK
+Content-Type: text/html; charset=utf-8
+Content-Length: 7
+Set-Cookie: slapp=71782d44-deb0-4725-afa3-52c158f17fe7.PZ5Rfs8U77E0ygSYInhf00QOtQU; Expires=Mon, 20-Jul-2026 18:42:37 GMT; HttpOnly; Path=/; SameSite=Lax
+Server: Werkzeug/1.0.1 Python/3.10.18
+Date: Mon, 13 Jul 2026 18:42:37 GMT
+
+success
+```
+
+**Full live route map** — the complete, unedited enumeration of all 292 rules (methods with
+`HEAD`/`OPTIONS` elided for readability of the *methods column only*; the rule paths and endpoints are
+verbatim). Identical across both builds:
+
+```
 TOTAL RULES: 292
-================================================================================
-/                                              [GET,POST]  -> index
-/.well-known/openid-configuration              [GET]  -> openid_config
-/admin/                                        [GET]  -> admin.index
-/admin/adminauditlog/                          [GET]  -> adminauditlog.index_view
-/admin/adminauditlog/action/                   [POST]  -> adminauditlog.action_view
-/admin/adminauditlog/ajax/lookup/              [GET]  -> adminauditlog.ajax_lookup
-/admin/adminauditlog/ajax/update/              [POST]  -> adminauditlog.ajax_update
-/admin/adminauditlog/delete/                   [POST]  -> adminauditlog.delete_view
-/admin/adminauditlog/details/                  [GET]  -> adminauditlog.details_view
-/admin/adminauditlog/edit/                     [GET,POST]  -> adminauditlog.edit_view
-/admin/adminauditlog/export/<export_type>/     [GET]  -> adminauditlog.export
-/admin/adminauditlog/new/                      [GET,POST]  -> adminauditlog.create_view
-/admin/alias/                                  [GET]  -> alias.index_view
-/admin/alias/action/                           [POST]  -> alias.action_view
-/admin/alias/ajax/lookup/                      [GET]  -> alias.ajax_lookup
-/admin/alias/ajax/update/                      [POST]  -> alias.ajax_update
-/admin/alias/delete/                           [POST]  -> alias.delete_view
-/admin/alias/details/                          [GET]  -> alias.details_view
-/admin/alias/edit/                             [GET,POST]  -> alias.edit_view
-/admin/alias/export/<export_type>/             [GET]  -> alias.export
-/admin/alias/new/                              [GET,POST]  -> alias.create_view
-/admin/coupon/                                 [GET]  -> coupon.index_view
-/admin/coupon/action/                          [POST]  -> coupon.action_view
-/admin/coupon/ajax/lookup/                     [GET]  -> coupon.ajax_lookup
-/admin/coupon/ajax/update/                     [POST]  -> coupon.ajax_update
-/admin/coupon/delete/                          [POST]  -> coupon.delete_view
-/admin/coupon/details/                         [GET]  -> coupon.details_view
-/admin/coupon/edit/                            [GET,POST]  -> coupon.edit_view
-/admin/coupon/export/<export_type>/            [GET]  -> coupon.export
-/admin/coupon/new/                             [GET,POST]  -> coupon.create_view
-/admin/customdomain/                           [GET]  -> customdomain.index_view
-/admin/customdomain/action/                    [POST]  -> customdomain.action_view
-/admin/customdomain/ajax/lookup/               [GET]  -> customdomain.ajax_lookup
-/admin/customdomain/ajax/update/               [POST]  -> customdomain.ajax_update
-/admin/customdomain/delete/                    [POST]  -> customdomain.delete_view
-/admin/customdomain/details/                   [GET]  -> customdomain.details_view
-/admin/customdomain/edit/                      [GET,POST]  -> customdomain.edit_view
-/admin/customdomain/export/<export_type>/      [GET]  -> customdomain.export
-/admin/customdomain/new/                       [GET,POST]  -> customdomain.create_view
-/admin/dailymetric/                            [GET]  -> dailymetric.index_view
-/admin/dailymetric/action/                     [POST]  -> dailymetric.action_view
-/admin/dailymetric/ajax/lookup/                [GET]  -> dailymetric.ajax_lookup
-/admin/dailymetric/ajax/update/                [POST]  -> dailymetric.ajax_update
-/admin/dailymetric/delete/                     [POST]  -> dailymetric.delete_view
-/admin/dailymetric/details/                    [GET]  -> dailymetric.details_view
-/admin/dailymetric/edit/                       [GET,POST]  -> dailymetric.edit_view
-/admin/dailymetric/export/<export_type>/       [GET]  -> dailymetric.export
-/admin/dailymetric/new/                        [GET,POST]  -> dailymetric.create_view
-/admin/email_search/                           [GET,POST]  -> email_search.index
-/admin/invalidmailboxdomain/                   [GET]  -> invalidmailboxdomain.index_view
-/admin/invalidmailboxdomain/action/            [POST]  -> invalidmailboxdomain.action_view
-/admin/invalidmailboxdomain/ajax/lookup/       [GET]  -> invalidmailboxdomain.ajax_lookup
-/admin/invalidmailboxdomain/ajax/update/       [POST]  -> invalidmailboxdomain.ajax_update
-/admin/invalidmailboxdomain/delete/            [POST]  -> invalidmailboxdomain.delete_view
-/admin/invalidmailboxdomain/details/           [GET]  -> invalidmailboxdomain.details_view
-/admin/invalidmailboxdomain/edit/              [GET,POST]  -> invalidmailboxdomain.edit_view
-/admin/invalidmailboxdomain/export/<export_type>/  [GET]  -> invalidmailboxdomain.export
-/admin/invalidmailboxdomain/new/               [GET,POST]  -> invalidmailboxdomain.create_view
-/admin/mailbox/                                [GET]  -> mailbox.index_view
-/admin/mailbox/action/                         [POST]  -> mailbox.action_view
-/admin/mailbox/ajax/lookup/                    [GET]  -> mailbox.ajax_lookup
-/admin/mailbox/ajax/update/                    [POST]  -> mailbox.ajax_update
-/admin/mailbox/delete/                         [POST]  -> mailbox.delete_view
-/admin/mailbox/details/                        [GET]  -> mailbox.details_view
-/admin/mailbox/edit/                           [GET,POST]  -> mailbox.edit_view
-/admin/mailbox/export/<export_type>/           [GET]  -> mailbox.export
-/admin/mailbox/new/                            [GET,POST]  -> mailbox.create_view
-/admin/manualsubscription/                     [GET]  -> manualsubscription.index_view
-/admin/manualsubscription/action/              [POST]  -> manualsubscription.action_view
-/admin/manualsubscription/ajax/lookup/         [GET]  -> manualsubscription.ajax_lookup
-/admin/manualsubscription/ajax/update/         [POST]  -> manualsubscription.ajax_update
-/admin/manualsubscription/delete/              [POST]  -> manualsubscription.delete_view
-/admin/manualsubscription/details/             [GET]  -> manualsubscription.details_view
-/admin/manualsubscription/edit/                [GET,POST]  -> manualsubscription.edit_view
-/admin/manualsubscription/export/<export_type>/  [GET]  -> manualsubscription.export
-/admin/manualsubscription/new/                 [GET,POST]  -> manualsubscription.create_view
-/admin/metric2/                                [GET]  -> metric2.index_view
-/admin/metric2/action/                         [POST]  -> metric2.action_view
-/admin/metric2/ajax/lookup/                    [GET]  -> metric2.ajax_lookup
-/admin/metric2/ajax/update/                    [POST]  -> metric2.ajax_update
-/admin/metric2/delete/                         [POST]  -> metric2.delete_view
-/admin/metric2/details/                        [GET]  -> metric2.details_view
-/admin/metric2/edit/                           [GET,POST]  -> metric2.edit_view
-/admin/metric2/export/<export_type>/           [GET]  -> metric2.export
-/admin/metric2/new/                            [GET,POST]  -> metric2.create_view
-/admin/newsletter/                             [GET]  -> newsletter.index_view
-/admin/newsletter/action/                      [POST]  -> newsletter.action_view
-/admin/newsletter/ajax/lookup/                 [GET]  -> newsletter.ajax_lookup
-/admin/newsletter/ajax/update/                 [POST]  -> newsletter.ajax_update
-/admin/newsletter/delete/                      [POST]  -> newsletter.delete_view
-/admin/newsletter/details/                     [GET]  -> newsletter.details_view
-/admin/newsletter/edit/                        [GET,POST]  -> newsletter.edit_view
-/admin/newsletter/export/<export_type>/        [GET]  -> newsletter.export
-/admin/newsletter/new/                         [GET,POST]  -> newsletter.create_view
-/admin/newsletteruser/                         [GET]  -> newsletteruser.index_view
-/admin/newsletteruser/action/                  [POST]  -> newsletteruser.action_view
-/admin/newsletteruser/ajax/lookup/             [GET]  -> newsletteruser.ajax_lookup
-/admin/newsletteruser/ajax/update/             [POST]  -> newsletteruser.ajax_update
-/admin/newsletteruser/delete/                  [POST]  -> newsletteruser.delete_view
-/admin/newsletteruser/details/                 [GET]  -> newsletteruser.details_view
-/admin/newsletteruser/edit/                    [GET,POST]  -> newsletteruser.edit_view
-/admin/newsletteruser/export/<export_type>/    [GET]  -> newsletteruser.export
-/admin/newsletteruser/new/                     [GET,POST]  -> newsletteruser.create_view
-/admin/providercomplaint/                      [GET]  -> providercomplaint.index_view
-/admin/providercomplaint/action/               [POST]  -> providercomplaint.action_view
-/admin/providercomplaint/ajax/lookup/          [GET]  -> providercomplaint.ajax_lookup
-/admin/providercomplaint/ajax/update/          [POST]  -> providercomplaint.ajax_update
-/admin/providercomplaint/delete/               [POST]  -> providercomplaint.delete_view
-/admin/providercomplaint/details/              [GET]  -> providercomplaint.details_view
-/admin/providercomplaint/download_eml          [GET]  -> providercomplaint.download_eml
-/admin/providercomplaint/edit/                 [GET,POST]  -> providercomplaint.edit_view
-/admin/providercomplaint/export/<export_type>/  [GET]  -> providercomplaint.export
-/admin/providercomplaint/mark_ok               [GET]  -> providercomplaint.mark_ok
-/admin/providercomplaint/new/                  [GET,POST]  -> providercomplaint.create_view
-/admin/static/<path:filename>                  [GET]  -> admin.static
-/admin/user/                                   [GET]  -> user.index_view
-/admin/user/action/                            [POST]  -> user.action_view
-/admin/user/ajax/lookup/                       [GET]  -> user.ajax_lookup
-/admin/user/ajax/update/                       [POST]  -> user.ajax_update
-/admin/user/delete/                            [POST]  -> user.delete_view
-/admin/user/details/                           [GET]  -> user.details_view
-/admin/user/edit/                              [GET,POST]  -> user.edit_view
-/admin/user/export/<export_type>/              [GET]  -> user.export
-/admin/user/new/                               [GET,POST]  -> user.create_view
-/api/alias/random/new                          [POST]  -> api.new_random_alias
-/api/aliases                                   [GET,POST]  -> api.get_aliases
-/api/aliases/<int:alias_id>                    [DELETE]  -> api.delete_alias
-/api/aliases/<int:alias_id>                    [PATCH,PUT]  -> api.update_alias
-/api/aliases/<int:alias_id>                    [GET]  -> api.get_alias
-/api/aliases/<int:alias_id>/activities         [GET]  -> api.get_alias_activities
-/api/aliases/<int:alias_id>/contacts           [GET]  -> api.get_alias_contacts_route
-/api/aliases/<int:alias_id>/contacts           [POST]  -> api.create_contact_route
-/api/aliases/<int:alias_id>/toggle             [POST]  -> api.toggle_alias
-/api/api_key                                   [POST]  -> api.create_api_key
-/api/apple/process_payment                     [POST]  -> api.apple_process_payment
-/api/apple/update_notification                 [GET,POST]  -> api.apple_update_notification
-/api/auth/activate                             [POST]  -> api.auth_activate
-/api/auth/facebook                             [POST]  -> api.auth_facebook
-/api/auth/forgot_password                      [POST]  -> api.forgot_password
-/api/auth/google                               [POST]  -> api.auth_google
-/api/auth/login                                [POST]  -> api.auth_login
-/api/auth/mfa                                  [POST]  -> api.auth_mfa
-/api/auth/reactivate                           [POST]  -> api.auth_reactivate
-/api/auth/register                             [POST]  -> api.auth_register
-/api/contacts/<int:contact_id>                 [DELETE]  -> api.delete_contact
-/api/contacts/<int:contact_id>/toggle          [POST]  -> api.toggle_contact
-/api/custom_domains                            [GET]  -> api.get_custom_domains
-/api/custom_domains/<int:custom_domain_id>     [PATCH]  -> api.update_custom_domain
-/api/custom_domains/<int:custom_domain_id>/trash  [GET]  -> api.get_custom_domain_trash
-/api/export/aliases                            [GET]  -> api.export_aliases
-/api/export/data                               [GET]  -> api.export_data
-/api/logout                                    [GET]  -> api.logout
-/api/mailboxes                                 [POST]  -> api.create_mailbox
-/api/mailboxes                                 [GET]  -> api.get_mailboxes
-/api/mailboxes/<int:mailbox_id>                [DELETE]  -> api.delete_mailbox
-/api/mailboxes/<int:mailbox_id>                [PUT]  -> api.update_mailbox
-/api/notifications                             [GET]  -> api.get_notifications
-/api/notifications/<int:notification_id>/read  [POST]  -> api.mark_as_read
-/api/phone/reservations/<int:reservation_id>   [GET,POST]  -> api.phone_messages
-/api/setting                                   [GET]  -> api.get_setting
-/api/setting                                   [PATCH]  -> api.update_setting
-/api/setting/domains                           [GET]  -> api.get_available_domains_for_random_alias
-/api/setting/unlink_proton_account             [DELETE]  -> api.unlink_proton_account
-/api/stats                                     [GET]  -> api.user_stats
-/api/sudo                                      [PATCH]  -> api.enter_sudo
-/api/user                                      [DELETE]  -> api.delete_user
-/api/user/cookie_token                         [GET]  -> api.get_api_session_token
-/api/user_info                                 [GET]  -> api.user_info
-/api/user_info                                 [PATCH]  -> api.update_user_info
-/api/v2/alias/custom/new                       [POST]  -> api.new_custom_alias_v2
-/api/v2/aliases                                [GET,POST]  -> api.get_aliases_v2
-/api/v2/mailboxes                              [GET]  -> api.get_mailboxes_v2
-/api/v2/setting/domains                        [GET]  -> api.get_available_domains_for_random_alias_v2
-/api/v3/alias/custom/new                       [POST]  -> api.new_custom_alias_v3
-/api/v4/alias/options                          [GET]  -> api.options_v4
-/api/v5/alias/options                          [GET]  -> api.options_v5
-/auth/activate                                 [GET,POST]  -> auth.activate
-/auth/api_to_cookie                            [GET]  -> auth.api_to_cookie
-/auth/change_email                             [GET,POST]  -> auth.change_email
-/auth/facebook/callback                        [GET]  -> auth.facebook_callback
-/auth/facebook/login                           [GET]  -> auth.facebook_login
-/auth/fido                                     [GET,POST]  -> auth.fido
-/auth/forgot_password                          [GET,POST]  -> auth.forgot_password
-/auth/github/callback                          [GET]  -> auth.github_callback
-/auth/github/login                             [GET]  -> auth.github_login
-/auth/google/callback                          [GET]  -> auth.google_callback
-/auth/google/login                             [GET]  -> auth.google_login
-/auth/login                                    [GET,POST]  -> auth.login
-/auth/logout                                   [GET]  -> auth.logout
-/auth/mfa                                      [GET,POST]  -> auth.mfa
-/auth/oidc/callback                            [GET]  -> auth.oidc_callback
-/auth/oidc/login                               [GET]  -> auth.oidc_login
-/auth/proton/callback                          [GET]  -> auth.proton_callback
-/auth/proton/login                             [GET]  -> auth.proton_login
-/auth/recovery                                 [GET,POST]  -> auth.recovery_route
-/auth/register                                 [GET,POST]  -> auth.register
-/auth/resend_activation                        [GET,POST]  -> auth.resend_activation
-/auth/reset_password                           [GET,POST]  -> auth.reset_password
-/auth/social                                   [GET,POST]  -> auth.social
-/coinbase                                      [POST]  -> coinbase_webhook
-/dashboard/                                    [GET,POST]  -> dashboard.index
-/dashboard/account_setting                     [GET,POST]  -> dashboard.account_setting
-/dashboard/alias_contact_manager/<int:alias_id>/  [GET,POST]  -> dashboard.alias_contact_manager
-/dashboard/alias_export                        [GET]  -> dashboard.alias_export_route
-/dashboard/alias_log/<int:alias_id>            [GET]  -> dashboard.alias_log
-/dashboard/alias_log/<int:alias_id>/<int:page_id>  [GET]  -> dashboard.alias_log
-/dashboard/alias_transfer/receive              [GET,POST]  -> dashboard.alias_transfer_receive_route
-/dashboard/alias_transfer/send/<int:alias_id>/  [GET,POST]  -> dashboard.alias_transfer_send_route
-/dashboard/api_key                             [GET,POST]  -> dashboard.api_key
-/dashboard/app                                 [GET,POST]  -> dashboard.app_route
-/dashboard/batch_import                        [GET,POST]  -> dashboard.batch_import_route
-/dashboard/billing                             [GET,POST]  -> dashboard.billing
-/dashboard/block_contact/<int:contact_id>      [GET,POST]  -> dashboard.block_contact
-/dashboard/cancel_email_change                 [GET,POST]  -> dashboard.cancel_email_change
-/dashboard/coinbase_checkout                   [GET]  -> dashboard.coinbase_checkout_route
-/dashboard/contact/<int:contact_id>/           [GET,POST]  -> dashboard.contact_detail_route
-/dashboard/contacts/<int:contact_id>/toggle    [POST]  -> dashboard.toggle_contact
-/dashboard/coupon                              [GET,POST]  -> dashboard.coupon_route
-/dashboard/custom_alias                        [GET,POST]  -> dashboard.custom_alias
-/dashboard/custom_domain                       [GET,POST]  -> dashboard.custom_domain
-/dashboard/delete_account                      [GET,POST]  -> dashboard.delete_account
-/dashboard/directory                           [GET,POST]  -> dashboard.directory
-/dashboard/domains/<int:custom_domain_id>/auto-create  [GET,POST]  -> dashboard.domain_detail_auto_create
-/dashboard/domains/<int:custom_domain_id>/dns  [GET,POST]  -> dashboard.domain_detail_dns
-/dashboard/domains/<int:custom_domain_id>/info  [GET,POST]  -> dashboard.domain_detail
-/dashboard/domains/<int:custom_domain_id>/trash  [GET,POST]  -> dashboard.domain_detail_trash
-/dashboard/enter_sudo                          [GET,POST]  -> dashboard.enter_sudo
-/dashboard/fido_manage                         [GET,POST]  -> dashboard.fido_manage
-/dashboard/fido_setup                          [GET,POST]  -> dashboard.fido_setup
-/dashboard/lifetime_licence                    [GET,POST]  -> dashboard.lifetime_licence
-/dashboard/mailbox                             [GET,POST]  -> dashboard.mailbox_route
-/dashboard/mailbox/<int:mailbox_id>/           [GET,POST]  -> dashboard.mailbox_detail_route
-/dashboard/mailbox/<int:mailbox_id>/cancel_email_change  [GET,POST]  -> dashboard.cancel_mailbox_change_route
-/dashboard/mailbox/confirm_change              [GET]  -> dashboard.mailbox_confirm_change_route
-/dashboard/mailbox_verify                      [GET]  -> dashboard.mailbox_verify
-/dashboard/mfa_cancel                          [GET,POST]  -> dashboard.mfa_cancel
-/dashboard/mfa_setup                           [GET,POST]  -> dashboard.mfa_setup
-/dashboard/notification/<notification_id>      [GET,POST]  -> dashboard.notification_route
-/dashboard/notifications                       [GET,POST]  -> dashboard.notifications_route
-/dashboard/pricing                             [GET,POST]  -> dashboard.pricing
-/dashboard/referral                            [GET,POST]  -> dashboard.referral_route
-/dashboard/refused_email                       [GET,POST]  -> dashboard.refused_email_route
-/dashboard/resend_email_change                 [GET,POST]  -> dashboard.resend_email_change
-/dashboard/setting                             [GET,POST]  -> dashboard.setting
-/dashboard/setup_done                          [GET,POST]  -> dashboard.setup_done
-/dashboard/subdomain                           [GET,POST]  -> dashboard.subdomain_route
-/dashboard/subscription_success                [GET]  -> dashboard.subscription_success
-/dashboard/support                             [GET,POST]  -> dashboard.support_route
-/dashboard/unlink_proton_account               [POST]  -> dashboard.unlink_proton_account
-/dashboard/unsubscribe/<int:alias_id>          [GET,POST]  -> dashboard.unsubscribe
-/dashboard/unsubscribe/encoded/<encoded_request>  [GET]  -> dashboard.encoded_unsubscribe
-/developer/                                    [GET,POST]  -> developer.index
-/developer/clients/<client_id>                 [GET,POST]  -> developer.client_detail
-/developer/clients/<client_id>/advanced        [GET,POST]  -> developer.client_detail_advanced
-/developer/clients/<client_id>/oauth_endpoint  [GET,POST]  -> developer.client_detail_oauth_endpoint
-/developer/clients/<client_id>/oauth_setting   [GET,POST]  -> developer.client_detail_oauth_setting
-/developer/clients/<client_id>/referral        [GET,POST]  -> developer.client_detail_referral
-/developer/new_client                          [GET,POST]  -> developer.new_client
-/discover/                                     [GET,POST]  -> discover.index
-/dnt                                           [GET]  -> do_not_track
-/exception                                     [GET]  -> monitor.test_exception
-/favicon.ico                                   [GET]  -> favicon
-/git                                           [GET]  -> monitor.git_sha1
-/health                                        [GET]  -> healthcheck
-/internal/exit-sudo-mode                       [GET]  -> internal.exit_sudo_mode
-/internal/integrations/proton                  [GET]  -> internal.set_enable_proton_cookie
-/jwks                                          [GET]  -> jwks
-/live                                          [GET]  -> monitor.live
-/oauth/authorize                               [GET,POST]  -> oauth.authorize
-/oauth/me                                      [GET]  -> oauth.user_info
-/oauth/token                                   [GET,POST]  -> oauth.token
-/oauth/user_info                               [GET]  -> oauth.user_info
-/oauth/userinfo                                [GET]  -> oauth.user_info
-/oauth2/authorize                              [GET,POST]  -> oauth.authorize
-/oauth2/me                                     [GET]  -> oauth.user_info
-/oauth2/token                                  [GET,POST]  -> oauth.token
-/oauth2/user_info                              [GET]  -> oauth.user_info
-/oauth2/userinfo                               [GET]  -> oauth.user_info
-/onboarding/                                   [GET]  -> onboarding.index
-/onboarding/account_activated                  [GET]  -> onboarding.account_activated
-/onboarding/extension_redirect                 [GET]  -> onboarding.extension_redirect
-/onboarding/final                              [GET,POST]  -> onboarding.final
-/onboarding/setup                              [GET]  -> onboarding.setup
-/onboarding/setup_done                         [GET,POST]  -> onboarding.setup_done
-/paddle                                        [GET,POST]  -> paddle
-/paddle_coupon                                 [GET,POST]  -> paddle_coupon
-/phone/                                        [GET,POST]  -> phone.index
-/phone/provider1/sms                           [GET,POST]  -> phone.provider1_sms
-/phone/provider2/sms                           [GET,POST]  -> phone.provider2_sms
-/phone/reservation/<int:reservation_id>        [GET,POST]  -> phone.reservation_route
-/phone/twilio/sms                              [GET,POST]  -> phone.twilio_sms
-/static/<path:filename>                        [GET]  -> static
-```
-
-Rule counts by first path segment (derived from the dump above; totals to 292):
-`/admin` = 122, `/api` = 52, `/dashboard` = 51, `/auth` = 23, `/developer` = 7,
-`/onboarding` = 6, `/oauth` = 5, `/oauth2` = 5, `/phone` = 5, `/internal` = 2, and one each for
-`/`, `/.well-known`, `/coinbase`, `/discover`, `/dnt`, `/exception`, `/favicon.ico`, `/git`,
-`/health`, `/jwks`, `/live`, `/paddle`, `/paddle_coupon`, `/static`.
-
-Monitor-discrepancy proof (queried the live map for any `/monitor/*` rule):
-
-```
-Any /monitor/* rule?: []
-/git      -> monitor.git_sha1
-/live     -> monitor.live
-/exception-> monitor.test_exception
+GET,POST               /                                                       -> index
+GET                    /.well-known/openid-configuration                       -> openid_config
+GET                    /admin/                                                 -> admin.index
+GET                    /admin/adminauditlog/                                   -> adminauditlog.index_view
+POST                   /admin/adminauditlog/action/                            -> adminauditlog.action_view
+GET                    /admin/adminauditlog/ajax/lookup/                       -> adminauditlog.ajax_lookup
+POST                   /admin/adminauditlog/ajax/update/                       -> adminauditlog.ajax_update
+POST                   /admin/adminauditlog/delete/                            -> adminauditlog.delete_view
+GET                    /admin/adminauditlog/details/                           -> adminauditlog.details_view
+GET,POST               /admin/adminauditlog/edit/                              -> adminauditlog.edit_view
+GET                    /admin/adminauditlog/export/<export_type>/              -> adminauditlog.export
+GET,POST               /admin/adminauditlog/new/                               -> adminauditlog.create_view
+GET                    /admin/alias/                                           -> alias.index_view
+POST                   /admin/alias/action/                                    -> alias.action_view
+GET                    /admin/alias/ajax/lookup/                               -> alias.ajax_lookup
+POST                   /admin/alias/ajax/update/                               -> alias.ajax_update
+POST                   /admin/alias/delete/                                    -> alias.delete_view
+GET                    /admin/alias/details/                                   -> alias.details_view
+GET,POST               /admin/alias/edit/                                      -> alias.edit_view
+GET                    /admin/alias/export/<export_type>/                      -> alias.export
+GET,POST               /admin/alias/new/                                       -> alias.create_view
+GET                    /admin/coupon/                                          -> coupon.index_view
+POST                   /admin/coupon/action/                                   -> coupon.action_view
+GET                    /admin/coupon/ajax/lookup/                              -> coupon.ajax_lookup
+POST                   /admin/coupon/ajax/update/                              -> coupon.ajax_update
+POST                   /admin/coupon/delete/                                   -> coupon.delete_view
+GET                    /admin/coupon/details/                                  -> coupon.details_view
+GET,POST               /admin/coupon/edit/                                     -> coupon.edit_view
+GET                    /admin/coupon/export/<export_type>/                     -> coupon.export
+GET,POST               /admin/coupon/new/                                      -> coupon.create_view
+GET                    /admin/customdomain/                                    -> customdomain.index_view
+POST                   /admin/customdomain/action/                             -> customdomain.action_view
+GET                    /admin/customdomain/ajax/lookup/                        -> customdomain.ajax_lookup
+POST                   /admin/customdomain/ajax/update/                        -> customdomain.ajax_update
+POST                   /admin/customdomain/delete/                             -> customdomain.delete_view
+GET                    /admin/customdomain/details/                            -> customdomain.details_view
+GET,POST               /admin/customdomain/edit/                               -> customdomain.edit_view
+GET                    /admin/customdomain/export/<export_type>/               -> customdomain.export
+GET,POST               /admin/customdomain/new/                                -> customdomain.create_view
+GET                    /admin/dailymetric/                                     -> dailymetric.index_view
+POST                   /admin/dailymetric/action/                              -> dailymetric.action_view
+GET                    /admin/dailymetric/ajax/lookup/                         -> dailymetric.ajax_lookup
+POST                   /admin/dailymetric/ajax/update/                         -> dailymetric.ajax_update
+POST                   /admin/dailymetric/delete/                              -> dailymetric.delete_view
+GET                    /admin/dailymetric/details/                             -> dailymetric.details_view
+GET,POST               /admin/dailymetric/edit/                                -> dailymetric.edit_view
+GET                    /admin/dailymetric/export/<export_type>/                -> dailymetric.export
+GET,POST               /admin/dailymetric/new/                                 -> dailymetric.create_view
+GET,POST               /admin/email_search/                                    -> email_search.index
+GET                    /admin/invalidmailboxdomain/                            -> invalidmailboxdomain.index_view
+POST                   /admin/invalidmailboxdomain/action/                     -> invalidmailboxdomain.action_view
+GET                    /admin/invalidmailboxdomain/ajax/lookup/                -> invalidmailboxdomain.ajax_lookup
+POST                   /admin/invalidmailboxdomain/ajax/update/                -> invalidmailboxdomain.ajax_update
+POST                   /admin/invalidmailboxdomain/delete/                     -> invalidmailboxdomain.delete_view
+GET                    /admin/invalidmailboxdomain/details/                    -> invalidmailboxdomain.details_view
+GET,POST               /admin/invalidmailboxdomain/edit/                       -> invalidmailboxdomain.edit_view
+GET                    /admin/invalidmailboxdomain/export/<export_type>/       -> invalidmailboxdomain.export
+GET,POST               /admin/invalidmailboxdomain/new/                        -> invalidmailboxdomain.create_view
+GET                    /admin/mailbox/                                         -> mailbox.index_view
+POST                   /admin/mailbox/action/                                  -> mailbox.action_view
+GET                    /admin/mailbox/ajax/lookup/                             -> mailbox.ajax_lookup
+POST                   /admin/mailbox/ajax/update/                             -> mailbox.ajax_update
+POST                   /admin/mailbox/delete/                                  -> mailbox.delete_view
+GET                    /admin/mailbox/details/                                 -> mailbox.details_view
+GET,POST               /admin/mailbox/edit/                                    -> mailbox.edit_view
+GET                    /admin/mailbox/export/<export_type>/                    -> mailbox.export
+GET,POST               /admin/mailbox/new/                                     -> mailbox.create_view
+GET                    /admin/manualsubscription/                              -> manualsubscription.index_view
+POST                   /admin/manualsubscription/action/                       -> manualsubscription.action_view
+GET                    /admin/manualsubscription/ajax/lookup/                  -> manualsubscription.ajax_lookup
+POST                   /admin/manualsubscription/ajax/update/                  -> manualsubscription.ajax_update
+POST                   /admin/manualsubscription/delete/                       -> manualsubscription.delete_view
+GET                    /admin/manualsubscription/details/                      -> manualsubscription.details_view
+GET,POST               /admin/manualsubscription/edit/                         -> manualsubscription.edit_view
+GET                    /admin/manualsubscription/export/<export_type>/         -> manualsubscription.export
+GET,POST               /admin/manualsubscription/new/                          -> manualsubscription.create_view
+GET                    /admin/metric2/                                         -> metric2.index_view
+POST                   /admin/metric2/action/                                  -> metric2.action_view
+GET                    /admin/metric2/ajax/lookup/                             -> metric2.ajax_lookup
+POST                   /admin/metric2/ajax/update/                             -> metric2.ajax_update
+POST                   /admin/metric2/delete/                                  -> metric2.delete_view
+GET                    /admin/metric2/details/                                 -> metric2.details_view
+GET,POST               /admin/metric2/edit/                                    -> metric2.edit_view
+GET                    /admin/metric2/export/<export_type>/                    -> metric2.export
+GET,POST               /admin/metric2/new/                                     -> metric2.create_view
+GET                    /admin/newsletter/                                      -> newsletter.index_view
+POST                   /admin/newsletter/action/                               -> newsletter.action_view
+GET                    /admin/newsletter/ajax/lookup/                          -> newsletter.ajax_lookup
+POST                   /admin/newsletter/ajax/update/                          -> newsletter.ajax_update
+POST                   /admin/newsletter/delete/                               -> newsletter.delete_view
+GET                    /admin/newsletter/details/                              -> newsletter.details_view
+GET,POST               /admin/newsletter/edit/                                 -> newsletter.edit_view
+GET                    /admin/newsletter/export/<export_type>/                 -> newsletter.export
+GET,POST               /admin/newsletter/new/                                  -> newsletter.create_view
+GET                    /admin/newsletteruser/                                  -> newsletteruser.index_view
+POST                   /admin/newsletteruser/action/                           -> newsletteruser.action_view
+GET                    /admin/newsletteruser/ajax/lookup/                      -> newsletteruser.ajax_lookup
+POST                   /admin/newsletteruser/ajax/update/                      -> newsletteruser.ajax_update
+POST                   /admin/newsletteruser/delete/                           -> newsletteruser.delete_view
+GET                    /admin/newsletteruser/details/                          -> newsletteruser.details_view
+GET,POST               /admin/newsletteruser/edit/                             -> newsletteruser.edit_view
+GET                    /admin/newsletteruser/export/<export_type>/             -> newsletteruser.export
+GET,POST               /admin/newsletteruser/new/                              -> newsletteruser.create_view
+GET                    /admin/providercomplaint/                               -> providercomplaint.index_view
+POST                   /admin/providercomplaint/action/                        -> providercomplaint.action_view
+GET                    /admin/providercomplaint/ajax/lookup/                   -> providercomplaint.ajax_lookup
+POST                   /admin/providercomplaint/ajax/update/                   -> providercomplaint.ajax_update
+POST                   /admin/providercomplaint/delete/                        -> providercomplaint.delete_view
+GET                    /admin/providercomplaint/details/                       -> providercomplaint.details_view
+GET                    /admin/providercomplaint/download_eml                   -> providercomplaint.download_eml
+GET,POST               /admin/providercomplaint/edit/                          -> providercomplaint.edit_view
+GET                    /admin/providercomplaint/export/<export_type>/          -> providercomplaint.export
+GET                    /admin/providercomplaint/mark_ok                        -> providercomplaint.mark_ok
+GET,POST               /admin/providercomplaint/new/                           -> providercomplaint.create_view
+GET                    /admin/static/<path:filename>                           -> admin.static
+GET                    /admin/user/                                            -> user.index_view
+POST                   /admin/user/action/                                     -> user.action_view
+GET                    /admin/user/ajax/lookup/                                -> user.ajax_lookup
+POST                   /admin/user/ajax/update/                                -> user.ajax_update
+POST                   /admin/user/delete/                                     -> user.delete_view
+GET                    /admin/user/details/                                    -> user.details_view
+GET,POST               /admin/user/edit/                                       -> user.edit_view
+GET                    /admin/user/export/<export_type>/                       -> user.export
+GET,POST               /admin/user/new/                                        -> user.create_view
+POST                   /api/alias/random/new                                   -> api.new_random_alias
+GET,POST               /api/aliases                                            -> api.get_aliases
+DELETE                 /api/aliases/<int:alias_id>                             -> api.delete_alias
+GET                    /api/aliases/<int:alias_id>                             -> api.get_alias
+PATCH,PUT              /api/aliases/<int:alias_id>                             -> api.update_alias
+GET                    /api/aliases/<int:alias_id>/activities                  -> api.get_alias_activities
+POST                   /api/aliases/<int:alias_id>/contacts                    -> api.create_contact_route
+GET                    /api/aliases/<int:alias_id>/contacts                    -> api.get_alias_contacts_route
+POST                   /api/aliases/<int:alias_id>/toggle                      -> api.toggle_alias
+POST                   /api/api_key                                            -> api.create_api_key
+POST                   /api/apple/process_payment                              -> api.apple_process_payment
+GET,POST               /api/apple/update_notification                          -> api.apple_update_notification
+POST                   /api/auth/activate                                      -> api.auth_activate
+POST                   /api/auth/facebook                                      -> api.auth_facebook
+POST                   /api/auth/forgot_password                               -> api.forgot_password
+POST                   /api/auth/google                                        -> api.auth_google
+POST                   /api/auth/login                                         -> api.auth_login
+POST                   /api/auth/mfa                                           -> api.auth_mfa
+POST                   /api/auth/reactivate                                    -> api.auth_reactivate
+POST                   /api/auth/register                                      -> api.auth_register
+DELETE                 /api/contacts/<int:contact_id>                          -> api.delete_contact
+POST                   /api/contacts/<int:contact_id>/toggle                   -> api.toggle_contact
+GET                    /api/custom_domains                                     -> api.get_custom_domains
+PATCH                  /api/custom_domains/<int:custom_domain_id>              -> api.update_custom_domain
+GET                    /api/custom_domains/<int:custom_domain_id>/trash        -> api.get_custom_domain_trash
+GET                    /api/export/aliases                                     -> api.export_aliases
+GET                    /api/export/data                                        -> api.export_data
+GET                    /api/logout                                             -> api.logout
+POST                   /api/mailboxes                                          -> api.create_mailbox
+GET                    /api/mailboxes                                          -> api.get_mailboxes
+DELETE                 /api/mailboxes/<int:mailbox_id>                         -> api.delete_mailbox
+PUT                    /api/mailboxes/<int:mailbox_id>                         -> api.update_mailbox
+GET                    /api/notifications                                      -> api.get_notifications
+POST                   /api/notifications/<int:notification_id>/read           -> api.mark_as_read
+GET,POST               /api/phone/reservations/<int:reservation_id>            -> api.phone_messages
+GET                    /api/setting                                            -> api.get_setting
+PATCH                  /api/setting                                            -> api.update_setting
+GET                    /api/setting/domains                                    -> api.get_available_domains_for_random_alias
+DELETE                 /api/setting/unlink_proton_account                      -> api.unlink_proton_account
+GET                    /api/stats                                              -> api.user_stats
+PATCH                  /api/sudo                                               -> api.enter_sudo
+DELETE                 /api/user                                               -> api.delete_user
+GET                    /api/user/cookie_token                                  -> api.get_api_session_token
+PATCH                  /api/user_info                                          -> api.update_user_info
+GET                    /api/user_info                                          -> api.user_info
+POST                   /api/v2/alias/custom/new                                -> api.new_custom_alias_v2
+GET,POST               /api/v2/aliases                                         -> api.get_aliases_v2
+GET                    /api/v2/mailboxes                                       -> api.get_mailboxes_v2
+GET                    /api/v2/setting/domains                                 -> api.get_available_domains_for_random_alias_v2
+POST                   /api/v3/alias/custom/new                                -> api.new_custom_alias_v3
+GET                    /api/v4/alias/options                                   -> api.options_v4
+GET                    /api/v5/alias/options                                   -> api.options_v5
+GET,POST               /auth/activate                                          -> auth.activate
+GET                    /auth/api_to_cookie                                     -> auth.api_to_cookie
+GET,POST               /auth/change_email                                      -> auth.change_email
+GET                    /auth/facebook/callback                                 -> auth.facebook_callback
+GET                    /auth/facebook/login                                    -> auth.facebook_login
+GET,POST               /auth/fido                                              -> auth.fido
+GET,POST               /auth/forgot_password                                   -> auth.forgot_password
+GET                    /auth/github/callback                                   -> auth.github_callback
+GET                    /auth/github/login                                      -> auth.github_login
+GET                    /auth/google/callback                                   -> auth.google_callback
+GET                    /auth/google/login                                      -> auth.google_login
+GET,POST               /auth/login                                             -> auth.login
+GET                    /auth/logout                                            -> auth.logout
+GET,POST               /auth/mfa                                               -> auth.mfa
+GET                    /auth/oidc/callback                                     -> auth.oidc_callback
+GET                    /auth/oidc/login                                        -> auth.oidc_login
+GET                    /auth/proton/callback                                   -> auth.proton_callback
+GET                    /auth/proton/login                                      -> auth.proton_login
+GET,POST               /auth/recovery                                          -> auth.recovery_route
+GET,POST               /auth/register                                          -> auth.register
+GET,POST               /auth/resend_activation                                 -> auth.resend_activation
+GET,POST               /auth/reset_password                                    -> auth.reset_password
+GET,POST               /auth/social                                            -> auth.social
+POST                   /coinbase                                               -> coinbase_webhook
+GET,POST               /dashboard/                                             -> dashboard.index
+GET,POST               /dashboard/account_setting                              -> dashboard.account_setting
+GET,POST               /dashboard/alias_contact_manager/<int:alias_id>/        -> dashboard.alias_contact_manager
+GET                    /dashboard/alias_export                                 -> dashboard.alias_export_route
+GET                    /dashboard/alias_log/<int:alias_id>                     -> dashboard.alias_log
+GET                    /dashboard/alias_log/<int:alias_id>/<int:page_id>       -> dashboard.alias_log
+GET,POST               /dashboard/alias_transfer/receive                       -> dashboard.alias_transfer_receive_route
+GET,POST               /dashboard/alias_transfer/send/<int:alias_id>/          -> dashboard.alias_transfer_send_route
+GET,POST               /dashboard/api_key                                      -> dashboard.api_key
+GET,POST               /dashboard/app                                          -> dashboard.app_route
+GET,POST               /dashboard/batch_import                                 -> dashboard.batch_import_route
+GET,POST               /dashboard/billing                                      -> dashboard.billing
+GET,POST               /dashboard/block_contact/<int:contact_id>               -> dashboard.block_contact
+GET,POST               /dashboard/cancel_email_change                          -> dashboard.cancel_email_change
+GET                    /dashboard/coinbase_checkout                            -> dashboard.coinbase_checkout_route
+GET,POST               /dashboard/contact/<int:contact_id>/                    -> dashboard.contact_detail_route
+POST                   /dashboard/contacts/<int:contact_id>/toggle             -> dashboard.toggle_contact
+GET,POST               /dashboard/coupon                                       -> dashboard.coupon_route
+GET,POST               /dashboard/custom_alias                                 -> dashboard.custom_alias
+GET,POST               /dashboard/custom_domain                                -> dashboard.custom_domain
+GET,POST               /dashboard/delete_account                               -> dashboard.delete_account
+GET,POST               /dashboard/directory                                    -> dashboard.directory
+GET,POST               /dashboard/domains/<int:custom_domain_id>/auto-create   -> dashboard.domain_detail_auto_create
+GET,POST               /dashboard/domains/<int:custom_domain_id>/dns           -> dashboard.domain_detail_dns
+GET,POST               /dashboard/domains/<int:custom_domain_id>/info          -> dashboard.domain_detail
+GET,POST               /dashboard/domains/<int:custom_domain_id>/trash         -> dashboard.domain_detail_trash
+GET,POST               /dashboard/enter_sudo                                   -> dashboard.enter_sudo
+GET,POST               /dashboard/fido_manage                                  -> dashboard.fido_manage
+GET,POST               /dashboard/fido_setup                                   -> dashboard.fido_setup
+GET,POST               /dashboard/lifetime_licence                             -> dashboard.lifetime_licence
+GET,POST               /dashboard/mailbox                                      -> dashboard.mailbox_route
+GET,POST               /dashboard/mailbox/<int:mailbox_id>/                    -> dashboard.mailbox_detail_route
+GET,POST               /dashboard/mailbox/<int:mailbox_id>/cancel_email_change -> dashboard.cancel_mailbox_change_route
+GET                    /dashboard/mailbox/confirm_change                       -> dashboard.mailbox_confirm_change_route
+GET                    /dashboard/mailbox_verify                               -> dashboard.mailbox_verify
+GET,POST               /dashboard/mfa_cancel                                   -> dashboard.mfa_cancel
+GET,POST               /dashboard/mfa_setup                                    -> dashboard.mfa_setup
+GET,POST               /dashboard/notification/<notification_id>               -> dashboard.notification_route
+GET,POST               /dashboard/notifications                                -> dashboard.notifications_route
+GET,POST               /dashboard/pricing                                      -> dashboard.pricing
+GET,POST               /dashboard/referral                                     -> dashboard.referral_route
+GET,POST               /dashboard/refused_email                                -> dashboard.refused_email_route
+GET,POST               /dashboard/resend_email_change                          -> dashboard.resend_email_change
+GET,POST               /dashboard/setting                                      -> dashboard.setting
+GET,POST               /dashboard/setup_done                                   -> dashboard.setup_done
+GET,POST               /dashboard/subdomain                                    -> dashboard.subdomain_route
+GET                    /dashboard/subscription_success                         -> dashboard.subscription_success
+GET,POST               /dashboard/support                                      -> dashboard.support_route
+POST                   /dashboard/unlink_proton_account                        -> dashboard.unlink_proton_account
+GET,POST               /dashboard/unsubscribe/<int:alias_id>                   -> dashboard.unsubscribe
+GET                    /dashboard/unsubscribe/encoded/<encoded_request>        -> dashboard.encoded_unsubscribe
+GET,POST               /developer/                                             -> developer.index
+GET,POST               /developer/clients/<client_id>                          -> developer.client_detail
+GET,POST               /developer/clients/<client_id>/advanced                 -> developer.client_detail_advanced
+GET,POST               /developer/clients/<client_id>/oauth_endpoint           -> developer.client_detail_oauth_endpoint
+GET,POST               /developer/clients/<client_id>/oauth_setting            -> developer.client_detail_oauth_setting
+GET,POST               /developer/clients/<client_id>/referral                 -> developer.client_detail_referral
+GET,POST               /developer/new_client                                   -> developer.new_client
+GET,POST               /discover/                                              -> discover.index
+GET                    /dnt                                                    -> do_not_track
+GET                    /exception                                              -> monitor.test_exception
+GET                    /favicon.ico                                            -> favicon
+GET                    /git                                                    -> monitor.git_sha1
+GET                    /health                                                 -> healthcheck
+GET                    /internal/exit-sudo-mode                                -> internal.exit_sudo_mode
+GET                    /internal/integrations/proton                           -> internal.set_enable_proton_cookie
+GET                    /jwks                                                   -> jwks
+GET                    /live                                                   -> monitor.live
+GET,POST               /oauth/authorize                                        -> oauth.authorize
+GET                    /oauth/me                                               -> oauth.user_info
+GET,POST               /oauth/token                                            -> oauth.token
+GET                    /oauth/user_info                                        -> oauth.user_info
+GET                    /oauth/userinfo                                         -> oauth.user_info
+GET,POST               /oauth2/authorize                                       -> oauth.authorize
+GET                    /oauth2/me                                              -> oauth.user_info
+GET,POST               /oauth2/token                                           -> oauth.token
+GET                    /oauth2/user_info                                       -> oauth.user_info
+GET                    /oauth2/userinfo                                        -> oauth.user_info
+GET                    /onboarding/                                            -> onboarding.index
+GET                    /onboarding/account_activated                           -> onboarding.account_activated
+GET                    /onboarding/extension_redirect                          -> onboarding.extension_redirect
+GET,POST               /onboarding/final                                       -> onboarding.final
+GET                    /onboarding/setup                                       -> onboarding.setup
+GET,POST               /onboarding/setup_done                                  -> onboarding.setup_done
+GET,POST               /paddle                                                 -> paddle
+GET,POST               /paddle_coupon                                          -> paddle_coupon
+GET,POST               /phone/                                                 -> phone.index
+GET,POST               /phone/provider1/sms                                    -> phone.provider1_sms
+GET,POST               /phone/provider2/sms                                    -> phone.provider2_sms
+GET,POST               /phone/reservation/<int:reservation_id>                 -> phone.reservation_route
+GET,POST               /phone/twilio/sms                                       -> phone.twilio_sms
+GET                    /static/<path:filename>                                 -> static
 ```
 
 ### File:line grounding
 
-- Port: `app.run(debug=True, port=7777)` `server.py:L588`; `Dockerfile:L44` `EXPOSE 7777`.
-- Blueprint registration: `register_blueprints(app)` body `server.py:L233-246`. `oauth_bp` is
-  registered twice — once at `/oauth` and once at `/oauth2` (that is why `/oauth/authorize`
-  and `/oauth2/authorize` both map to `oauth.authorize`).
-- `api_bp = Blueprint(..., url_prefix="/api")` `app/api/base.py:L11`.
-- `monitor_bp = Blueprint(name="monitor", import_name=__name__, url_prefix="/")` `app/monitor/base.py:L3`;
-  routes `@monitor_bp.route("/git")` `app/monitor/views.py:L5-7`, `/live` (L10-12), `/exception` (L15-17).
-- Direct routes: `index` `server.py:L250-256`; `healthcheck` `server.py:L213-215`;
-  `favicon` `server.py:L398-400`; `openid_config` `server.py:L300`; `jwks` `server.py:L327`.
+- Port: `server.py:L588` `app.run(debug=True, port=7777)`; live `/proc/net/tcp` local address
+  `0100007F:1E61` = `127.0.0.1:7777`, state `0A` = LISTEN. `Dockerfile:L44` `EXPOSE 7777`;
+  `Dockerfile:L47` prod `CMD ["gunicorn","wsgi:app","-b","0.0.0.0:7777",...]` (**Inferred**, not run).
+- `/health`: `server.py:L213-215` `@app.route("/health")` / `def healthcheck():` / `return "success", 200`.
+- Blueprint registration: `server.py:L233-246` `register_blueprints(app)`:
+  `auth_bp` (L234), `monitor_bp` (L235), `dashboard_bp` (L236), `developer_bp` (L237),
+  `phone_bp` (L238), `oauth_bp` @ `/oauth` (L240), `oauth_bp` @ `/oauth2` (L241),
+  `onboarding_bp` (L242), `discover_bp` (L244), `internal_bp` (L245), `api_bp` (L246).
+- Blueprint prefixes: `app/api/base.py:L11` (`/api`), `app/auth/base.py:L4` (`/auth`),
+  `app/dashboard/base.py:L6` (`/dashboard`), `app/developer/base.py:L6` (`/developer`),
+  `app/discover/base.py:L6` (`/discover`), `app/internal/base.py:L6` (`/internal`),
+  `app/monitor/base.py:L3` (`/` — the discrepancy), `app/oauth/base.py:L4` (`/oauth`),
+  `app/onboarding/base.py:L6` (`/onboarding`), `app/phone/base.py:L6` (`/phone`).
 
 ### Observed vs Inferred
 
-- **Observed:** the port 7777 loopback bind, the 292-rule live table above, every blueprint prefix,
-  every direct route, the `/oauth`+`/oauth2` double registration, and the `monitor_bp`-at-root
-  read-vs-run discrepancy (`/git`, `/live`, `/exception`; no `/monitor/*` rule exists).
-- **Inferred:** the production `0.0.0.0:7777` bind (gunicorn, from `Dockerfile:L47`) — not run.
-
----
+- **Observed:** the single loopback listener on `127.0.0.1:7777` (raw `/proc/net/tcp` line); the
+  `/health` `200`/`success`; the exact route count **292** and the complete route map, stable across
+  two independent `create_app()` builds; the `monitor_bp` `/`-prefix producing `/git`, `/live`,
+  `/exception`; and `oauth_bp` being registered twice (`/oauth` + `/oauth2`).
+- **Inferred:** the production `gunicorn` bind to `0.0.0.0:7777` — read from the `Dockerfile`, not
+  run. The route map above is the dev app from `create_app()`; production uses the **same** factory
+  (`wsgi.py:L3`), so the route set is expected to be identical, but that was not separately run.
 
 ## Q5 — How is a single authenticated request handled? (PRIMARY)
 
-This is the primary concern. It is answered in three explicit sub-parts — **(a)** where a
-request first enters the app, **(b)** how the user's identity is determined at runtime, and
-**(c)** how the authentication context is propagated — and **both** real authentication paths
-are exercised: the **web-session** path (Flask-Login) and the **API** path (the
-`Authentication` header). The anonymous/401 edges and **both** session backends are also
-exercised.
-
 ### Direct answer (Observed)
 
-A request enters through the `ProxyFix` WSGI wrapper, then two `before_request` hooks
-(`make_session_permanent`, then the timing hook that sets `g.start_time`). Identity is then
-resolved by one of two mechanisms:
+A request first reaches the app through the WSGI middleware `ProxyFix(app.wsgi_app, x_for=1,
+x_host=1)` (`server.py:L142`), which rewrites `request.remote_addr` from `X-Forwarded-For` and the
+URL host from `X-Forwarded-Host` (both proven below). Flask then runs the **three app-wide
+`before_request` hooks in this observed order** — `[0] Limiter.__check_request_limit` (Flask-Limiter),
+`[1] set_index_page.<locals>.before_request` (`server.py:L258`, which stamps `g.start_time`),
+`[2] make_session_permanent` (`server.py:L205`) — before dispatching to the view.
 
-- **Web:** Flask-Login reads `session["_user_id"]` and calls the `user_loader`
-  `load_user(alternative_id)` (`server.py:L220-222`), which does `User.get_by(alternative_id=...)`.
-  Crucially, `session["_user_id"]` holds the user's **`alternative_id` (a UUID4)**, *not* the
-  numeric primary key, because `User.get_id()` returns `alternative_id` when set
-  (`app/models.py:L595-599`). The resolved user is exposed as `current_user`.
-- **API:** `authorize_request()` (`app/api/base.py:L16-42`) reads the `Authentication` header,
-  looks up the `ApiKey`, and sets `g.user = api_key.user`; if the header is absent/invalid but a
-  web session exists, it falls through to `g.user = current_user`; otherwise it returns
-  `401 {"error": "Wrong api key"}`.
+**Identity is determined by one of two independent mechanisms**, chosen by how the request
+authenticates:
 
-Both paths converge in `get_current_user()` (`server.py:L332-336`), which returns `g.user` if set
-else `current_user`. After the view runs, an `after_request` hook logs one line per request, and
-`teardown_appcontext` calls `Session.remove()`.
+- **Web session (Flask-Login).** The signed session carries `_user_id`, whose value is the user's
+  `alternative_id` **UUID** (not the integer primary key) because `User.get_id()` returns
+  `alternative_id` when set (`app/models.py:L595-599`). On each request Flask-Login calls
+  `load_user(alternative_id)` (`server.py:L221`), which does `User.get_by(alternative_id=...)`, sets
+  the Sentry user identity (`L224` `sentry_sdk.set_user({"email": ..., "id": ...})`), and returns
+  `None` if the user is `disabled` (`L225-226`) or not `is_active()` (`L227-228`), otherwise
+  populating the `current_user` proxy.
+  Observed: after login, `_user_id = bfb8024e-6c00-4c33-ac2c-e60bf3b7003d`, which equals john's
+  `alternative_id` in the DB (`1|bfb8024e-6c00-4c33-ac2c-e60bf3b7003d`).
+- **API key (`Authentication` header).** `authorize_request()` (`app/api/base.py:L16`) reads the
+  `Authentication` header (`L17`), looks up `ApiKey.get_by(code=...)` (`L18`); on a valid key it
+  **first updates usage stats** (`last_used = arrow.now()`, `times += 1`, `Session.commit()`,
+  `L30-32`) and **only then** enforces guards (`disabled → 403`, `not is_active() → 401`), finally
+  setting `g.user = api_key.user` (`L34`). With no/invalid key it falls back to the web session
+  (`if current_user.is_authenticated:` `L21` → `g.user = current_user` `L25`) or returns
+  `401 {"error": "Wrong api key"}` (`L27`). `g.api_key` is assigned for both branches (`L42`), so it
+  is `None` on the session-fallback path.
 
-### (a) Entry point
+**Propagation:** web view handlers read `current_user` (the Flask-Login proxy, backed by the session
++ `load_user`); the API view `/api/user_info` reads `g.user`. The helper `get_current_user()`
+(`server.py:L332-336`) returns `g.user` else `current_user`, but at runtime its **only** consumer is
+the 429 rate-limit logger (`server.py:L367`) — it is *not* the general convergence point for normal
+requests. Each non-excluded request ends with the `after_request` logger (`server.py:L273-296`,
+`LOG.d(` at `L284`) emitting one `SL` line, then `teardown_appcontext` runs `Session.remove()`.
 
-**Command / grounding:** the common entry chain, confirmed live:
+**Session storage has two backends, both exercised.** With `MEM_STORE_URI` set (`server.py:L163-165`
+→ `initialize_redis_services`), a server-side `RedisSessionStore` keeps the data under
+`session:<id>` and the cookie carries only the **signed session id**; anonymous sessions get
+`ttl=300`, authenticated sessions `ttl=604800` (7 days). With `MEM_STORE_URI` unset, Flask's default
+**signed-cookie** backend stores the whole session payload *inside the cookie*, zlib-compressed and
+HMAC-signed — readable with **no secret key** (⇒ signed/tamper-evident, **not** encrypted); the
+`_user_id` there is the same `alternative_id` UUID.
 
-- `app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_host=1)` `server.py:L142` (the app runs behind
-  NGINX in prod; `x_for`/`x_host` trust one proxy hop).
-- `@app.before_request def make_session_permanent(): session.permanent = True; app.permanent_session_lifetime = timedelta(days=7)`
-  `server.py:L204-207`.
-- `@app.before_request def before_request(): ... g.start_time = time.time()` `server.py:L258-269`
-  (the timestamp read at L263 is what the per-request log line's `takes` is computed against).
+### Command(s) run
 
-**Observed evidence:** every captured `after_request` line begins with `remote_addr = 127.0.0.1`,
-confirming the request traversed `ProxyFix` and the `before_request` timing hook (the timing that
-produces `takes` below).
+All web/API evidence below comes from one bounded server run, **RUN-Q5-REDIS** (Redis backend,
+`parent=5660 child=5673`); a supplementary run captured the `X-Forwarded-Host` proof
+(`parent=5844 child=5856`); and the signed-cookie backend was exercised twice as **RUN-Q5-COOKIE**
+(`MEM_STORE_URI=""`). Every server is launched through the canonical dev entry point
+`/app/venv/bin/python server.py`. Disposable users D1 (disabled), D2 (`delete_on` in the future) and
+D3 (web login-then-mutate) were created solely for the guard tests and are deleted at the end of the
+phase; **john@wick.com is never mutated**.
 
-### (b) Identity determination
+```bash
+# ---- prefix sourced in every command (per setup) ----
+cd /app && set -a && . /tmp/sl_env.sh && set +a && unset EVENT_WEBHOOK_DISABLE \
+  && export GNUPGHOME=/tmp/sl_clean_gnupg
+BASE=http://localhost:7777
 
-#### Web-session path (Flask-Login) — exercised with a real login
+# (A) app-wide before_request hook ORDER (same factory local_main() uses):
+/app/venv/bin/python - <<'PY'
+from server import create_app
+app = create_app()
+print("app.before_request_funcs (None key = app-wide, runs for every request):")
+for key, funcs in app.before_request_funcs.items():
+    print("  blueprint key:", key)
+    for i, fn in enumerate(funcs):
+        print("    [%d] %s  (module %s)" % (i, getattr(fn,"__qualname__",fn.__name__), fn.__module__))
+PY
 
-**Commands run** (driven only through real HTTP to `localhost:7777` with a cookie jar; the
-Redis session backend is active because `MEM_STORE_URI=redis://localhost`):
+# (A) ProxyFix proof on a LOGGED endpoint (X-Forwarded-For + X-Forwarded-Host):
+curl -s -D - -o /dev/null -H 'X-Forwarded-For: 203.0.113.7' \
+  -H 'X-Forwarded-Host: proxied.example.test' "$BASE/auth/login"          # -> proxyfix_headers.txt
+# supplementary anonymous /dashboard/ with forwarded host (redirect host proves x_host=1):
+curl -s -D - -o /dev/null -H 'X-Forwarded-For: 198.51.100.9' \
+  -H 'X-Forwarded-Host: proxied.example.test' "$BASE/dashboard/"          # -> proxyfix_xhost_headers.txt
 
-```
-# 1) anonymous GET to obtain a session + CSRF token
-# 2) POST /auth/login with the seeded credentials john@wick.com / password (+ csrf_token)
-# 3) authenticated GET /dashboard/
-# Redis session contents were dumped at each step via redis-cli KEYS/TTL and the store's serializer
-```
+# (B) WEB PATH (john@wick.com / password) with a disposable cookie jar:
+curl -s -D web_get_login_headers.txt -o body.html -c cj_john.txt "$BASE/auth/login"   # anon GET -> CSRF + anon session
+CSRF=$(grep -oE 'name="csrf_token"[^>]*value="[^"]+"' body.html | head -1 | sed -E 's/.*value="([^"]+)".*/\1/')
+# (Redis session dump BEFORE login) -> redis_anon.txt
+curl -s -D web_post_login_headers.txt -o /dev/null -b cj_john.txt -c cj_john.txt \
+  --data-urlencode "email=john@wick.com" --data-urlencode "password=password" \
+  --data-urlencode "csrf_token=$CSRF" "$BASE/auth/login"                  # POST -> 302 /dashboard/
+# (Redis session dump AFTER login) -> redis_auth.txt
+psql -h localhost -U test -d test -t -A -F'|' \
+  -c "select id, alternative_id from users where email='john@wick.com';"  # -> db_john_identity.txt
+curl -s -D web_dashboard_headers.txt -o /dev/null -b cj_john.txt "$BASE/dashboard/"    # authenticated GET -> 200
 
-**Complete, unedited output** (Redis session state at each step):
+# (C) API PATH:
+curl -s -i -H 'Content-Type: application/json' \
+  -d '{"email":"john@wick.com","password":"password","device":"blitzy-q5-device"}' \
+  "$BASE/api/auth/login"                                                  # canonical key acquisition -> api_auth_login.txt
+curl -s -i -H 'Authentication: code'                "$BASE/api/user_info" # [A] valid  -> 200  (+ stats before/after)
+curl -s -i -H 'Authentication: this-is-a-wrong-key' "$BASE/api/user_info" # [B] wrong  -> 401
+curl -s -i                                          "$BASE/api/user_info" # [C] absent -> 401
+curl -s -i -b cj_john.txt                           "$BASE/api/user_info" # [D] session fallback -> 200 (g.api_key=None)
+curl -s -i -H "Authentication: $D1KEY"              "$BASE/api/user_info" # disabled  -> 403
+curl -s -i -H "Authentication: $D2KEY"              "$BASE/api/user_info" # inactive  -> 401
 
-```
-[1] anonymous GET /auth/login -> 200
-    Set-Cookie: slapp=2c77513d-5e18-4fba-a630-11bac9beea7a.NsrMRDAROp2XMWbfUkHSVFCck0E; ...
-    redis key: session:2c77513d-5e18-4fba-a630-11bac9beea7a   ttl=300
-    session dict keys: ['_permanent', '_fresh', 'csrf_token']    _user_id=None
+# (D) WEB load_user guards (D3 login, then mutate the row and re-request /dashboard/):
+psql ... "update users set disabled=true  where id=5;"   # -> 302 login
+psql ... "update users set disabled=false where id=5;"   # -> 200
+psql ... "update users set delete_on=(now() + interval '7 days') where id=5;"  # -> 302 login
 
-[2] POST /auth/login (john@wick.com / password + csrf) -> 302  Location: http://localhost:7777/dashboard/
-    (same session id retained)
-    redis key: session:2c77513d-5e18-4fba-a630-11bac9beea7a   ttl=604800
-    session dict keys: ['_permanent', '_fresh', 'csrf_token', '_user_id', '_id', 'sudo_time']
-    _user_id = '01330a11-6c00-4031-86c4-d3846f0ce7e9'
-
-[3] GET /dashboard/ (authenticated) -> 200   <title>Alias | SimpleLogin</title>  (763485 bytes)
-```
-
-The decisive identity fact — `session["_user_id"]` equals the user's `alternative_id`, **not**
-the primary key — cross-checked directly against the database:
-
-```
-$ psql ... -c "select id, alternative_id from users where email='john@wick.com'"
- id |            alternative_id
-----+--------------------------------------
-  1 | 01330a11-6c00-4031-86c4-d3846f0ce7e9
-
-# session _user_id observed above = 01330a11-6c00-4031-86c4-d3846f0ce7e9  (== alternative_id, != id 1)
-```
-
-**Reproducibility (2 runs):** the **session id is variable** (Run 1 `2c77513d-...`, Run 2
-`328fbc0c-2e52-44b6-84bb-7d414555f255`), but the stored `_user_id` was **identical and stable**
-across both runs (`01330a11-6c00-4031-86c4-d3846f0ce7e9`), and the authenticated TTL was `604800`
-both times. The `alternative_id` is persisted in the DB, so it is stable unless `flask dummy-data`
-regenerates it.
-
-**File:line grounding (web identity):**
-
-- `@login_manager.user_loader` / `def load_user(alternative_id):` `server.py:L220-221`, body
-  `return User.get_by(alternative_id=alternative_id)` (L222).
-- `def get_id(self): if self.alternative_id: return self.alternative_id else: return str(self.id)`
-  `app/models.py:L595-599` — Flask-Login stores this in `session["_user_id"]`, which is why the
-  UUID (not `1`) is stored.
-- `alternative_id = sa.Column(sa.String(128), unique=True, nullable=True)` `app/models.py:L482`;
-  generated `user.alternative_id = str(uuid.uuid4())` `app/models.py:L617`.
-- `login_manager.session_protection = "strong"` `app/extensions.py:L8`.
-- Login view `@auth_bp.route("/login", methods=["GET", "POST"])` `app/auth/views/login.py:L21`,
-  `def login()` (L25), `User.get_by(email=...)` (L43), `user.check_password(...)` (L45),
-  `after_login(user, next_url)` (L72); `after_login` `app/auth/views/login_utils.py:L12` calls
-  `login_user(user)` (L36).
-
-#### API path (`Authentication` header) — exercised with a real key
-
-**Commands run** (the seeded API key `code` belongs to `john@wick.com`, user_id 1):
-
-```
-# [A] valid key
-curl -s -o - -w '\n%{http_code}\n' -H 'Authentication: code'          http://localhost:7777/api/user_info
-# [B] wrong key, no session
-curl -s -o - -w '\n%{http_code}\n' -H 'Authentication: WRONG_KEY_xyz' http://localhost:7777/api/user_info
-# [C] no header, no session
-curl -s -o - -w '\n%{http_code}\n'                                     http://localhost:7777/api/user_info
-# [D] no header but a valid web-session cookie -> fall-through to current_user
-curl -s -o - -w '\n%{http_code}\n' -b jar                              http://localhost:7777/api/user_info
-```
-
-**Complete, unedited output:**
-
-```
-[A] Authentication: code  ->
-{"can_create_reverse_alias":true,"connected_proton_address":null,"email":"john@wick.com","in_trial":false,"is_premium":true,"max_alias_free_plan":3,"name":"John Wick","profile_picture_url":"http://localhost:7777/static/upload/profile_pic.svg"}
-200
-
-[B] Authentication: WRONG_KEY_xyz  ->
-{"error":"Wrong api key"}
-401
-
-[C] (no Authentication header)  ->
-{"error":"Wrong api key"}
-401
-
-[D] (no header, valid session cookie)  ->
-{"can_create_reverse_alias":true,"connected_proton_address":null,"email":"john@wick.com","in_trial":false,"is_premium":true,"max_alias_free_plan":3,"name":"John Wick","profile_picture_url":"http://localhost:7777/static/upload/profile_pic.svg"}
-200
+# (F) signed-cookie backend (twice): disable Redis sessions, log in, decode the cookie:
+export MEM_STORE_URI=""              # Flask default signed-cookie interface
+/app/venv/bin/python server.py &     # RUN-Q5-COOKIE-N
+# ... web login as above; then decode the 'slapp' cookie with base64url+zlib and NO secret key.
 ```
 
-**File:line grounding (API identity):**
 
-- `authorize_request()` `app/api/base.py:L16`; `api_code = request.headers.get("Authentication")` (L17);
-  `api_key = ApiKey.get_by(code=api_code)` (L18).
-- Fall-through when no key but a session exists: `if not api_key: if current_user.is_authenticated: g.user = current_user`
-  `app/api/base.py:L20-25` (lines 22-24 are commented-out cookie-header logic, so the assignment
-  `g.user = current_user` lands at L25); else `return jsonify(error="Wrong api key"), 401` (L26-27).
-- Valid key: `g.user = api_key.user` (L34); disabled account → `jsonify(error="Disabled account"), 403` (L36-37);
-  inactive → `jsonify(error="Account does not exist"), 401` (L39-40); `g.api_key = api_key` (L42).
-- The `/api/*` view decorator `require_api_auth` `app/api/base.py:L52-58` calls `authorize_request()`
-  (L55) and returns its error tuple directly when truthy. Corroborated by `docs/api.md:L73,L202,L236`
-  (the `Authentication` header contract).
+### Complete, unedited output
 
-### (c) Auth-context propagation / convergence
+> HTTP header blocks below are shown LF-normalized (`tr -d '\r'`) per the global note in the
+> *Investigation environment* section; the on-disk captures use CRLF line endings as curl emitted them.
 
-The two paths deliberately converge in a single accessor:
+#### (A) Common entry — `before_request` hook order + `ProxyFix`
 
-```
-# server.py:L332-336
-def get_current_user():
-    try:
-        return g.user
-    except AttributeError:
-        return current_user
+`before_request_funcs.txt` (the app-wide hooks, in run order, from the same `create_app()` factory
+`local_main()` uses):
+
+```text
+>>> URL: http://localhost
+Upload files to local dir
+>>> init logging <<<
+2026-07-13 18:54:39,065 - SL - DEBUG - 5688 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+app.before_request_funcs (None key = app-wide, runs for every request):
+  blueprint key: None
+    [0] Limiter.__check_request_limit  (module flask_limiter.extension)
+    [1] set_index_page.<locals>.before_request  (module server)
+    [2] create_app.<locals>.make_session_permanent  (module server)
 ```
 
-- **Web** requests never set `g.user`, so `get_current_user()` raises `AttributeError` internally
-  and returns `current_user` (the Flask-Login proxy).
-- **API** requests set `g.user` in `authorize_request()`, so `get_current_user()` returns it.
-- Case **[D]** above is the explicit unification point: with no API key but a valid session,
-  `authorize_request()` sets `g.user = current_user`, so both mechanisms end at the same object.
+`ProxyFix` proof #1 — `proxyfix_headers.txt` (request carried `X-Forwarded-For: 203.0.113.7`); the
+corresponding `SL` log line (below, PID 5673) shows `remote_addr = 203.0.113.7`, so `x_for=1` is
+honored:
 
-**File:line grounding:** `get_current_user()` `server.py:L332-336`.
-
-### Per-request log line (`after_request`)
-
-**Grounding:** `@app.after_request def after_request(res): ... LOG.d("%s %s %s %s %s, takes %s", ...)`
-`server.py:L273-296` (the format string is at L285; the runtime record shows lineno 284 /
-`after_request()`). The tuple is `remote_addr, method, path, args, status_code, (time.time()-start_time)`.
-It is skipped for `/static`, `/admin/static`, `/_debug_toolbar`, `/git`, `/favicon.ico`, `/health`
-(`server.py:L276-282`).
-
-**Complete, unedited output** (actual emitted lines for the requests above):
-
-```
-127.0.0.1 GET /auth/login ImmutableMultiDict([]) 200, takes 0.10316872596740723
-127.0.0.1 POST /auth/login ImmutableMultiDict([]) 302, takes 0.2468411922454834
-127.0.0.1 GET /dashboard/ ImmutableMultiDict([]) 200, takes 0.35060882568359375
-127.0.0.1 GET /api/user_info ImmutableMultiDict([]) 200, takes 0.024179458618164062
-127.0.0.1 GET /api/user_info ImmutableMultiDict([]) 401, takes 0.0020406246185302734   (wrong key)
-127.0.0.1 GET /api/user_info ImmutableMultiDict([]) 401, takes 0.0018086433410644531   (no header)
-127.0.0.1 GET /api/user_info ImmutableMultiDict([]) 200, takes 0.010299205780029297   (session fall-through)
-127.0.0.1 GET /dashboard/ ImmutableMultiDict([]) 302, takes 0.000652313232421875   (unauth redirect)
-127.0.0.1 GET /api/aliases ImmutableMultiDict([]) 401, takes 0.001813650131225586
+```text
+HTTP/1.0 200 OK
+Content-Type: text/html; charset=utf-8
+Content-Length: 342103
+Set-Cookie: slapp=24878969-dfd3-4f8a-9717-2a376213144a.IFTONUorOuOdsv-DLoys6_F6hK8; Expires=Mon, 20-Jul-2026 18:54:40 GMT; HttpOnly; Path=/; SameSite=Lax
+Server: Werkzeug/1.0.1 Python/3.10.18
+Date: Mon, 13 Jul 2026 18:54:40 GMT
 ```
 
-The `takes` value is **run-to-run variable** (it is a wall-clock delta); the rest of each line is
-stable.
+`ProxyFix` proof #2 — `proxyfix_xhost_headers.txt` (anonymous `GET /dashboard/` with
+`X-Forwarded-Host: proxied.example.test`); the `302` redirect `Location` host is
+`proxied.example.test`, so `x_host=1` is honored (the redirect itself is Flask-Login's
+`unauthorized()` → `login_view=auth.login`):
 
-### 401 / unauthenticated edge (both variants)
-
-**Commands run:**
-
-```
-curl -s -i http://localhost:7777/dashboard/    # protected web page, no session
-curl -s -i http://localhost:7777/api/aliases   # protected API endpoint, no auth
-```
-
-**Complete, unedited output:**
-
-```
-[E] GET /dashboard/ (no session) -> 302
-    Location: http://localhost:7777/auth/login?next=%2Fdashboard%2F%3F
-
-[F] GET /api/aliases (no auth) -> 401
-    Content-Type: application/json
-    {"error":"Wrong api key"}
+```text
+HTTP/1.0 302 FOUND
+Content-Type: text/html; charset=utf-8
+Content-Length: 277
+Location: http://proxied.example.test/auth/login?next=%2Fdashboard%2F%3F
+Set-Cookie: slapp=08dc93ff-1093-4b51-a64d-e088e1e9527c.5c2Xzjv5S8NkC5DR7Z-F2vxt9i4; Expires=Mon, 20-Jul-2026 18:56:48 GMT; HttpOnly; Path=/; SameSite=Lax
+Server: Werkzeug/1.0.1 Python/3.10.18
+Date: Mon, 13 Jul 2026 18:56:48 GMT
 ```
 
-**File:line grounding:** the 401 handler `unauthorized` inside `setup_error_page()` is at
-`server.py:L347-352`: for `/api/` paths it returns `jsonify(error="Unauthorized"), 401`, otherwise
-it flashes "You need to login to see this page" and `redirect(url_for("auth.login", next=request.full_path))`
-(hence `next=%2Fdashboard%2F%3F`, i.e. `/dashboard/?` url-encoded). **Nuance:** SimpleLogin's `/api/*`
-views use `@require_api_auth`, which **returns** `{"error":"Wrong api key"}, 401` rather than calling
-`abort(401)`; that is why the observed `/api` body is `Wrong api key`. The `jsonify(error="Unauthorized")`
-body would only be produced on an actual `abort(401)` within an `/api/` path.
+#### (B) Web-session path — identity determination & propagation
 
-### Two session backends (both exercised)
+**(b-1) Anonymous `GET /auth/login`** — `web_get_login_headers.txt`. A fresh `slapp` cookie is set
+(value = `session_id.signature`; the data lives server-side in Redis):
 
-**(1) Server-side `RedisSessionStore`** (active because `MEM_STORE_URI=redis://localhost`): the
-`slapp` cookie is only a short pointer `<uuid>.<itsdangerous-sig>`; the session dict lives in the
-Redis key `session:<uuid>`. TTL is `int(app.permanent_session_lifetime.total_seconds())` = **604800 s
-(7 days)** once `_user_id` is present, and **300 s** while anonymous. The transition `300 -> 604800`
-on login is shown in the sub-part (b) capture above.
-
-```
-# app/session.py
-ttl = int(app.permanent_session_lifetime.total_seconds())     # L92  -> 604800 (7 days)
-if "_user_id" not in session:                                 # L95
-    ttl = 300                                                 # L96  -> anonymous
+```text
+HTTP/1.0 200 OK
+Content-Type: text/html; charset=utf-8
+Content-Length: 215139
+Set-Cookie: slapp=83213b1a-73bf-4dc8-85d5-47896a8f8307.blSCI-SXCkkHo8GQdXAH_lEq4uw; Expires=Mon, 20-Jul-2026 18:54:40 GMT; HttpOnly; Path=/; SameSite=Lax
+Server: Werkzeug/1.0.1 Python/3.10.18
+Date: Mon, 13 Jul 2026 18:54:40 GMT
 ```
 
-**(2) Flask default signed cookie** (server launched with `MEM_STORE_URI=""`): the entire session
-lives **client-side** in the `slapp` cookie (base64(payload) + timestamp + HMAC signature; a leading
-`.` marks a zlib-compressed payload). Decoded anonymous payload:
+Redis session state **BEFORE** login — `redis_anon.txt` (both anonymous sessions carry only
+`csrf_token`, no `_user_id`, and `ttl=300`):
 
+```text
+session:24878969-dfd3-4f8a-9717-2a376213144a  ttl=300
+    decoded: {'_permanent': True, '_fresh': False, 'csrf_token': '5e907ac917b9cbc5c90b7536661a308e7ac8ffdb'}
+session:83213b1a-73bf-4dc8-85d5-47896a8f8307  ttl=300
+    decoded: {'_permanent': True, '_fresh': False, 'csrf_token': 'e6ce673f3d27b03633e32a4fbdf00651255cbbf1'}
 ```
-# server launched with MEM_STORE_URI="" ; anonymous Set-Cookie: slapp=eyJfZnJlc2gi...  (self-contained)
-decoded payload = {"_fresh": false, "_permanent": true, "csrf_token": "6546e9a824b6a6fd6d24cc104ad20d2b90a53929"}
-# after login the cookie grows to 322 chars with a leading '.' (zlib-compressed) — no server-side key
+
+**(b-2) `POST /auth/login`** (john@wick.com / password) — `web_post_login_headers.txt`. `302` to
+`/dashboard/`, the **same** `slapp` session id is retained:
+
+```text
+HTTP/1.0 302 FOUND
+Content-Type: text/html; charset=utf-8
+Content-Length: 229
+Location: http://localhost:7777/dashboard/
+Set-Cookie: slapp=83213b1a-73bf-4dc8-85d5-47896a8f8307.blSCI-SXCkkHo8GQdXAH_lEq4uw; Expires=Mon, 20-Jul-2026 18:54:40 GMT; HttpOnly; Path=/; SameSite=Lax
+Server: Werkzeug/1.0.1 Python/3.10.18
+Date: Mon, 13 Jul 2026 18:54:40 GMT
 ```
 
-**File:line grounding (sessions):** `SESSION_PREFIX = "session"` `app/session.py:L18`;
-`class RedisSessionStore(...)` (L31); key `f"{SESSION_PREFIX}:{...}"` (L45); `save_session` (L82);
-TTL logic (`ttl = int(...)` L92, `if "_user_id" not in session:` L95, `ttl = 300` L96); installed by `initialize_redis_services()` `app/redis_services.py:L9`,
-`app.session_interface = RedisSessionStore(...)` (L12). Cookie name `SESSION_COOKIE_NAME = "slapp"`
-`app/config.py:L199`; `SESSION_COOKIE_SAMESITE = "Lax"` `server.py:L162` (observed `SameSite=Lax`,
-`HttpOnly`, `Path=/`, 7-day `Expires`).
+Redis session state **AFTER** login — `redis_auth.txt`. The **same** session id `83213b1a…`
+transitioned `ttl=300 → ttl=604800` (7 days) and gained `_user_id`, `_fresh: True`, `_id`,
+`sudo_time`; the untouched anon session `24878969…` merely ticked down to `ttl=299`:
 
-### Rate limiting & teardown (context)
+```text
+session:24878969-dfd3-4f8a-9717-2a376213144a  ttl=299
+    decoded: {'_permanent': True, '_fresh': False, 'csrf_token': '5e907ac917b9cbc5c90b7536661a308e7ac8ffdb'}
+session:83213b1a-73bf-4dc8-85d5-47896a8f8307  ttl=604800
+    decoded: {'_permanent': True, '_fresh': True, 'csrf_token': 'e6ce673f3d27b03633e32a4fbdf00651255cbbf1', '_user_id': 'bfb8024e-6c00-4c33-ac2c-e60bf3b7003d', '_id': 'b03643a8a515eae10966eb5799d0b928b1fae8daeb0b0a33ba33f35b5fd7e09d574a2b38cd3af3ce53bdb464d28d2c515533674c8b087cba7d49abfa2cc9de57', 'sudo_time': 1783968880}
+```
 
-`Flask-Limiter`'s key is `userid:{current_user.id}` when authenticated else `ip:{ip_addr}`
-(`app/extensions.py:L14-19`), and it is disabled here because `DISABLE_RATE_LIMIT=1`
-(`disable_rate_limit` `app/extensions.py:L26-28`). Per request, `@app.teardown_appcontext def cleanup(...): Session.remove()`
-(`server.py:L209-211`) releases the scoped SQLAlchemy session.
+**Identity proof** — `db_john_identity.txt` (`select id, alternative_id …`). The session's
+`_user_id` (`bfb8024e-…-003d`) equals john's **`alternative_id`**, confirming `get_id()` stores the
+UUID, **not** the integer primary key `1`:
+
+```text
+1|bfb8024e-6c00-4c33-ac2c-e60bf3b7003d
+```
+
+**(b-3) Authenticated `GET /dashboard/`** — `web_dashboard_headers.txt` (`200`; `current_user` is
+john, resolved via `load_user`):
+
+```text
+HTTP/1.0 200 OK
+Content-Type: text/html; charset=utf-8
+Content-Length: 762858
+Set-Cookie: slapp=83213b1a-73bf-4dc8-85d5-47896a8f8307.blSCI-SXCkkHo8GQdXAH_lEq4uw; Expires=Mon, 20-Jul-2026 18:54:41 GMT; HttpOnly; Path=/; SameSite=Lax
+Server: Werkzeug/1.0.1 Python/3.10.18
+Date: Mon, 13 Jul 2026 18:54:41 GMT
+```
+
+
+#### (C) API path — `Authentication` header
+
+**(c-1) Canonical key acquisition** `POST /api/auth/login` — `api_auth_login.txt`. The response is
+pretty-printed JSON (note the genuine trailing spaces after each comma — real bytes, not edited):
+
+```text
+HTTP/1.0 200 OK
+Content-Type: application/json
+Content-Length: 178
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=491f6af4-c9cd-4dae-a8de-93227c898d21.ZdU-skYix6XVhpWZIS0k06jCMoo; Expires=Mon, 20-Jul-2026 18:54:41 GMT; HttpOnly; Path=/; SameSite=Lax
+Server: Werkzeug/1.0.1 Python/3.10.18
+Date: Mon, 13 Jul 2026 18:54:41 GMT
+
+{
+  "api_key": "rvysrxelwpmbbwjzinneattbqhtuoamnticocsddssvljnzjteegfptwfnef", 
+  "email": "john@wick.com", 
+  "mfa_enabled": false, 
+  "mfa_key": null, 
+  "name": "John Wick"
+}
+```
+
+**(c-2) `[A]` valid key + stats side effect** — the seeded key `code` is used so the before/after
+usage counters land on a known row. `api_stats_before.txt` then `api_valid.txt` (`200`) then
+`api_stats_after.txt`. The stats row moved `times 0 → 1` and `last_used ∅ → 2026-07-13
+18:54:41.483957`, confirming the commit happens **before** the guards:
+
+```text
+1|code|0|
+```
+```text
+HTTP/1.0 200 OK
+Content-Type: application/json
+Content-Length: 279
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=0b692651-8010-4892-8a4c-7aedb594c26d.yWCvP90LM6xsvUBICyltxU9G40c; Expires=Mon, 20-Jul-2026 18:54:41 GMT; HttpOnly; Path=/; SameSite=Lax
+Server: Werkzeug/1.0.1 Python/3.10.18
+Date: Mon, 13 Jul 2026 18:54:41 GMT
+
+{
+  "can_create_reverse_alias": true, 
+  "connected_proton_address": null, 
+  "email": "john@wick.com", 
+  "in_trial": false, 
+  "is_premium": true, 
+  "max_alias_free_plan": 3, 
+  "name": "John Wick", 
+  "profile_picture_url": "http://localhost/static/upload/profile_pic.svg"
+}
+```
+```text
+1|code|1|2026-07-13 18:54:41.483957
+```
+
+**(c-3) `[B]` wrong key** — `api_wrong.txt` (`401`, body from `app/api/base.py:L27`, **not** the
+generic 401 errorhandler which would say `"Unauthorized"`):
+
+```text
+HTTP/1.0 401 UNAUTHORIZED
+Content-Type: application/json
+Content-Length: 31
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=5bc49879-7749-4ef1-95a1-0f1e0b2bb86d.xbxR-3JJfdAqYzPfdfItCGYY7J4; Expires=Mon, 20-Jul-2026 18:54:41 GMT; HttpOnly; Path=/; SameSite=Lax
+Server: Werkzeug/1.0.1 Python/3.10.18
+Date: Mon, 13 Jul 2026 18:54:41 GMT
+
+{
+  "error": "Wrong api key"
+}
+```
+
+**(c-4) `[C]` absent** (no header, no cookie) — `api_absent.txt` (`401`, same `Wrong api key`):
+
+```text
+HTTP/1.0 401 UNAUTHORIZED
+Content-Type: application/json
+Content-Length: 31
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=cdf09b42-9f22-4741-bd30-b5a7357533b7.l7-xtgKkXIQC74xJt3yMvltgn7A; Expires=Mon, 20-Jul-2026 18:54:41 GMT; HttpOnly; Path=/; SameSite=Lax
+Server: Werkzeug/1.0.1 Python/3.10.18
+Date: Mon, 13 Jul 2026 18:54:41 GMT
+
+{
+  "error": "Wrong api key"
+}
+```
+
+**(c-5) `[D]` session fallback** (no `Authentication` header, **with** john's web cookie) —
+`api_session_fallback.txt` (`200`; `g.user = current_user`, and `g.api_key = None` because the
+valid-key branch that would set it never ran):
+
+```text
+HTTP/1.0 200 OK
+Content-Type: application/json
+Content-Length: 279
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=83213b1a-73bf-4dc8-85d5-47896a8f8307.blSCI-SXCkkHo8GQdXAH_lEq4uw; Expires=Mon, 20-Jul-2026 18:54:41 GMT; HttpOnly; Path=/; SameSite=Lax
+Server: Werkzeug/1.0.1 Python/3.10.18
+Date: Mon, 13 Jul 2026 18:54:41 GMT
+
+{
+  "can_create_reverse_alias": true, 
+  "connected_proton_address": null, 
+  "email": "john@wick.com", 
+  "in_trial": false, 
+  "is_premium": true, 
+  "max_alias_free_plan": 3, 
+  "name": "John Wick", 
+  "profile_picture_url": "http://localhost/static/upload/profile_pic.svg"
+}
+```
+
+#### (D) Account guards — API (`authorize_request`) and web (`load_user`)
+
+**(d-1) API disabled account** (D1 key) — `api_disabled.txt` (`403 {"error": "Disabled account"}`,
+`app/api/base.py:L37`):
+
+```text
+HTTP/1.0 403 FORBIDDEN
+Content-Type: application/json
+Content-Length: 34
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=3860bfb9-8a64-415d-882b-b7b93152bfbc.XzaNgT6QWqiE09YYuxl51i0kApg; Expires=Mon, 20-Jul-2026 18:54:41 GMT; HttpOnly; Path=/; SameSite=Lax
+Server: Werkzeug/1.0.1 Python/3.10.18
+Date: Mon, 13 Jul 2026 18:54:41 GMT
+
+{
+  "error": "Disabled account"
+}
+```
+
+**(d-2) API inactive account** (D2 key, future `delete_on`) — `api_inactive.txt`
+(`401 {"error": "Account does not exist"}`, `app/api/base.py:L40`):
+
+```text
+HTTP/1.0 401 UNAUTHORIZED
+Content-Type: application/json
+Content-Length: 40
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=af52c895-f954-448a-890f-578d96f893b3.sEyqqYKrDVilToTh2jkrbeA_BJc; Expires=Mon, 20-Jul-2026 18:54:41 GMT; HttpOnly; Path=/; SameSite=Lax
+Server: Werkzeug/1.0.1 Python/3.10.18
+Date: Mon, 13 Jul 2026 18:54:41 GMT
+
+{
+  "error": "Account does not exist"
+}
+```
+
+**(d-3) Web `load_user` guards** — D3 logs in, then the DB row is mutated between identical
+`GET /dashboard/` requests on the same cookie jar. `load_user` returns `None` when the user is
+`disabled` (`server.py:L225-226`) or not `is_active()` (`L227-228`), which Flask-Login turns into a
+`302` to the login page; restoring the row returns `200`. The five blocks below are the complete,
+unedited responses (`curl -s -D <file>`) in sequence — the disposable D3 login, then the
+baseline / disabled / restored / inactive `GET /dashboard/` on the same cookie jar. The `slapp`
+cookie is the same disposable Redis session throughout (`b8c1f1f6-…`, flushed in the end-of-phase
+cleanup); the interpretation of each block is stated in the prose line preceding it.
+
+D3 login → `302` to `/dashboard/` (`d3_post_login_headers.txt`):
+
+```text
+HTTP/1.0 302 FOUND
+Content-Type: text/html; charset=utf-8
+Content-Length: 229
+Location: http://localhost:7777/dashboard/
+Set-Cookie: slapp=b8c1f1f6-d45a-48cc-b900-105a22c08b5b.AXBxN7c87oXpd3fxhsNXwoYvO1Q; Expires=Mon, 20-Jul-2026 18:54:41 GMT; HttpOnly; Path=/; SameSite=Lax
+Server: Werkzeug/1.0.1 Python/3.10.18
+Date: Mon, 13 Jul 2026 18:54:41 GMT
+```
+
+Baseline — row active → `load_user` returns the user → `200 OK` (`d3_before_headers.txt`):
+
+```text
+HTTP/1.0 200 OK
+Content-Type: text/html; charset=utf-8
+Content-Length: 683139
+Set-Cookie: slapp=b8c1f1f6-d45a-48cc-b900-105a22c08b5b.AXBxN7c87oXpd3fxhsNXwoYvO1Q; Expires=Mon, 20-Jul-2026 18:54:42 GMT; HttpOnly; Path=/; SameSite=Lax
+Server: Werkzeug/1.0.1 Python/3.10.18
+Date: Mon, 13 Jul 2026 18:54:42 GMT
+```
+
+`update users set disabled=true where id=5` → `load_user` returns `None` (`server.py:L225-226`) →
+`302` to `auth.login` (`d3_disabled_headers.txt`):
+
+```text
+HTTP/1.0 302 FOUND
+Content-Type: text/html; charset=utf-8
+Content-Length: 277
+Location: http://localhost:7777/auth/login?next=%2Fdashboard%2F%3F
+Set-Cookie: slapp=b8c1f1f6-d45a-48cc-b900-105a22c08b5b.AXBxN7c87oXpd3fxhsNXwoYvO1Q; Expires=Mon, 20-Jul-2026 18:54:42 GMT; HttpOnly; Path=/; SameSite=Lax
+Server: Werkzeug/1.0.1 Python/3.10.18
+Date: Mon, 13 Jul 2026 18:54:42 GMT
+```
+
+`update users set disabled=false where id=5` (restored) → `200 OK` (`d3_restored_headers.txt`):
+
+```text
+HTTP/1.0 200 OK
+Content-Type: text/html; charset=utf-8
+Content-Length: 559418
+Set-Cookie: slapp=b8c1f1f6-d45a-48cc-b900-105a22c08b5b.AXBxN7c87oXpd3fxhsNXwoYvO1Q; Expires=Mon, 20-Jul-2026 18:54:42 GMT; HttpOnly; Path=/; SameSite=Lax
+Server: Werkzeug/1.0.1 Python/3.10.18
+Date: Mon, 13 Jul 2026 18:54:42 GMT
+```
+
+`update users set delete_on=(now() + interval '7 days') where id=5` → `is_active()` false
+(`server.py:L227-228`) → `302` to `auth.login` (`d3_inactive_headers.txt`):
+
+```text
+HTTP/1.0 302 FOUND
+Content-Type: text/html; charset=utf-8
+Content-Length: 277
+Location: http://localhost:7777/auth/login?next=%2Fdashboard%2F%3F
+Set-Cookie: slapp=b8c1f1f6-d45a-48cc-b900-105a22c08b5b.AXBxN7c87oXpd3fxhsNXwoYvO1Q; Expires=Mon, 20-Jul-2026 18:54:42 GMT; HttpOnly; Path=/; SameSite=Lax
+Server: Werkzeug/1.0.1 Python/3.10.18
+Date: Mon, 13 Jul 2026 18:54:42 GMT
+```
+
+
+#### (E) The `SL` per-request log (`after_request`), correlated by PID 5673
+
+`sl_request_logs.txt` — every non-excluded request from RUN-Q5-REDIS in emission order, all bearing
+PID `5673`. Format: `<ts> - SL - DEBUG - <PID> - "/app/server.py:284" - after_request() -  -
+<remote_addr> <method> <path> <request.args> <status>, takes <seconds>`. `/health`, `/static`,
+`/git`, `/favicon.ico`, `/_debug_toolbar`, `/admin/static` never appear (excluded at
+`server.py:L276-281`). The first line's `203.0.113.7` is the `X-Forwarded-For` from the ProxyFix
+probe:
+
+```text
+2026-07-13 18:54:40,256 - SL - DEBUG - 5673 - "/app/server.py:284" - after_request() -  - 203.0.113.7 GET /auth/login ImmutableMultiDict([]) 200, takes 0.11127161979675293
+2026-07-13 18:54:40,290 - SL - DEBUG - 5673 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET /auth/login ImmutableMultiDict([]) 200, takes 0.021816015243530273
+2026-07-13 18:54:40,668 - SL - DEBUG - 5673 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /auth/login ImmutableMultiDict([]) 302, takes 0.24659156799316406
+2026-07-13 18:54:41,165 - SL - DEBUG - 5673 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET /dashboard/ ImmutableMultiDict([]) 200, takes 0.33506131172180176
+2026-07-13 18:54:41,429 - SL - DEBUG - 5673 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/auth/login ImmutableMultiDict([]) 200, takes 0.2528386116027832
+2026-07-13 18:54:41,494 - SL - DEBUG - 5673 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET /api/user_info ImmutableMultiDict([]) 200, takes 0.012177705764770508
+2026-07-13 18:54:41,547 - SL - DEBUG - 5673 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET /api/user_info ImmutableMultiDict([]) 401, takes 0.0029587745666503906
+2026-07-13 18:54:41,558 - SL - DEBUG - 5673 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET /api/user_info ImmutableMultiDict([]) 401, takes 0.002178668975830078
+2026-07-13 18:54:41,578 - SL - DEBUG - 5673 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET /api/user_info ImmutableMultiDict([]) 200, takes 0.010585308074951172
+2026-07-13 18:54:41,592 - SL - DEBUG - 5673 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET /api/user_info ImmutableMultiDict([]) 403, takes 0.005698442459106445
+2026-07-13 18:54:41,605 - SL - DEBUG - 5673 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET /api/user_info ImmutableMultiDict([]) 401, takes 0.005246400833129883
+2026-07-13 18:54:41,635 - SL - DEBUG - 5673 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET /auth/login ImmutableMultiDict([]) 200, takes 0.0214688777923584
+2026-07-13 18:54:41,887 - SL - DEBUG - 5673 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /auth/login ImmutableMultiDict([]) 302, takes 0.24013495445251465
+2026-07-13 18:54:42,064 - SL - DEBUG - 5673 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET /dashboard/ ImmutableMultiDict([]) 200, takes 0.1648879051208496
+2026-07-13 18:54:42,120 - SL - DEBUG - 5673 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET /dashboard/ ImmutableMultiDict([]) 302, takes 0.003975391387939453
+2026-07-13 18:54:42,306 - SL - DEBUG - 5673 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET /dashboard/ ImmutableMultiDict([]) 200, takes 0.13887619972229004
+2026-07-13 18:54:42,363 - SL - DEBUG - 5673 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET /dashboard/ ImmutableMultiDict([]) 302, takes 0.004217624664306641
+```
+
+The supplementary `X-Forwarded-Host` run (PID 5856) produced the matching log line with
+`remote_addr = 198.51.100.9` (its `X-Forwarded-For`), confirming `x_for=1` again:
+
+```text
+2026-07-13 18:56:48,236 - SL - DEBUG - 5856 - "/app/server.py:284" - after_request() -  - 198.51.100.9 GET /dashboard/ ImmutableMultiDict([]) 302, takes 0.0011358261108398438
+```
+
+#### (F) Session backends — Redis (server-side) vs signed cookie
+
+**Redis backend** (`MEM_STORE_URI=redis://localhost`): the `slapp` cookie is just the **signed
+session id** — the data is in Redis (shown in (b)). `cj_john.txt` (curl cookie jar):
+
+```text
+# Netscape HTTP Cookie File
+# https://curl.se/docs/http-cookies.html
+# This file was generated by libcurl! Edit at your own risk.
+
+#HttpOnly_localhost	FALSE	/	FALSE	1784573680	slapp	83213b1a-73bf-4dc8-85d5-47896a8f8307.blSCI-SXCkkHo8GQdXAH_lEq4uw
+```
+
+**Signed-cookie backend** (`MEM_STORE_URI=""`, RUN-Q5-COOKIE, twice): login still succeeds
+(`HTTP/1.0 302 FOUND`, `Location: http://localhost:7777/dashboard/`) but **no** Redis `session:*`
+key is created — the `session:*` count is unchanged across the login in both runs
+(`before == after == 10`; those 10 are stale keys left from RUN-Q5-REDIS and are cleaned up at the
+end of the phase):
+
+```text
+run 1: before=10 after=10
+run 2: before=10 after=10
+```
+
+The complete `POST /auth/login` response (`cookie_1_post_headers.txt`, RUN-Q5-COOKIE run 1) shows
+the full `slapp` payload being written in the `Set-Cookie` header — note `Vary: Cookie` (present
+here, absent from the Redis backend where the cookie is only an opaque id) and the leading `.` on
+the value marking a zlib-compressed payload. Run 2 is identical apart from the payload bytes,
+`Date`, and signature (its decoded form is shown below):
+
+```text
+HTTP/1.0 302 FOUND
+Content-Type: text/html; charset=utf-8
+Content-Length: 229
+Location: http://localhost:7777/dashboard/
+Vary: Cookie
+Set-Cookie: slapp=.eJw9jzluxDAQBP_C2AKGnOGlzwhzEV4YqzV0RAv_3QwMBx1WofodtnH4-RnW67j9I2wPC2sQwELIjXPMzh6hl-KSa-8G0lOTONibsQsIMKLMDcySh1WHbrkSJ8GmhjxQPaOYUCFLzZJOaUYslbQJtKrC1aizDE6q3TzXMEO-_Xjy7vv1n3affvz1DWmQyJeiAAsp4sKadPECMlAqANp06HmM7Xp9-T6ZDCTkCZIBj9Jb6nE0YY7eS22kMB9nEp_cedtrux5PD2usDXvpUPLPL4VZVvM.alU1KQ.kolOaZOiI2fuSUOl3doQxI2M7Q8; Expires=Mon, 20-Jul-2026 18:57:45 GMT; HttpOnly; Path=/; SameSite=Lax
+Server: Werkzeug/1.0.1 Python/3.10.18
+Date: Mon, 13 Jul 2026 18:57:45 GMT
+```
+
+Now the cookie carries the **whole session payload**. `cookie_1_jar.txt` (the leading `.` marks a
+zlib-compressed payload; the three dot-separated parts are `payload.timestamp.signature`):
+
+```text
+#HttpOnly_localhost	FALSE	/	FALSE	1784573865	slapp	.eJw9jzluxDAQBP_C2AKGnOGlzwhzEV4YqzV0RAv_3QwMBx1WofodtnH4-RnW67j9I2wPC2sQwELIjXPMzh6hl-KSa-8G0lOTONibsQsIMKLMDcySh1WHbrkSJ8GmhjxQPaOYUCFLzZJOaUYslbQJtKrC1aizDE6q3TzXMEO-_Xjy7vv1n3affvz1DWmQyJeiAAsp4sKadPECMlAqANp06HmM7Xp9-T6ZDCTkCZIBj9Jb6nE0YY7eS22kMB9nEp_cedtrux5PD2usDXvpUPLPL4VZVvM.alU1KQ.kolOaZOiI2fuSUOl3doQxI2M7Q8
+```
+
+Decoding the payload with **base64url + zlib and no secret key** yields readable JSON — proving the
+cookie is **signed (tamper-evident), not encrypted**. Both runs decode to the same `_user_id`
+(john's `alternative_id` UUID) and `_id`; the `csrf_token`/`sudo_time`/signature differ per login.
+`cookie_1_decoded.txt` and `cookie_2_decoded.txt`:
+
+```text
+raw cookie value: .eJw9jzluxDAQBP_C2AKGnOGlzwhzEV4YqzV0RAv_3QwMBx1WofodtnH4-RnW67j9I2wPC2sQwELIjXPMzh6hl-KSa-8G0lOTONibsQsIMKLMDcySh1WHbrkSJ8GmhjxQPaOYUCFLzZJOaUYslbQJtKrC1aizDE6q3TzXMEO-_Xjy7vv1n3affvz1DWmQyJeiAAsp4sKadPECMlAqANp06HmM7Xp9-T6ZDCTkCZIBj9Jb6nE0YY7eS22kMB9nEp_cedtrux5PD2usDXvpUPLPL4VZVvM.alU1KQ.kolOaZOiI2fuSUOl3doQxI2M7Q8
+zlib_compressed: True
+base64-decoded payload (no secret key used => readable => signed, NOT encrypted):
+{"_fresh":true,"_id":"b03643a8a515eae10966eb5799d0b928b1fae8daeb0b0a33ba33f35b5fd7e09d574a2b38cd3af3ce53bdb464d28d2c515533674c8b087cba7d49abfa2cc9de57","_permanent":true,"_user_id":"bfb8024e-6c00-4c33-ac2c-e60bf3b7003d","csrf_token":"504b4e202d0af698291f8baa1e96784c064354be","sudo_time":1783969065}
+```
+```text
+raw cookie value: .eJw9jklqAzEQAP-icwZaanVL8meG3kRMsB1mOYX8PRMIOdSxivpK69xif0-3YzvjLa13T7ekgFxRulCmkMgwmEOpjeGgo3TNU6K7hIKCIOrFRFKa3gKGU6tSFLs5ykQLQnWtXL10L3ZFCZFbta7Qm6k0r0N0SjEbHtTSNfIZ20Oe8Tz-1849tr-_qR1KjYUNYKmGuIgVW4JBJ2oDQL8atm9zPV4f8fx1hKflwsGVRGbJ1Bwy8hzUueTWehFTp8vbT3-tx_0R6ZZbx8EDGn7_AJRYVyI.alU1MQ.IXkvOuSUoAdQU5RGkhwKp8Oa9ac
+zlib_compressed: True
+base64-decoded payload (no secret key used => readable => signed, NOT encrypted):
+{"_fresh":true,"_id":"b03643a8a515eae10966eb5799d0b928b1fae8daeb0b0a33ba33f35b5fd7e09d574a2b38cd3af3ce53bdb464d28d2c515533674c8b087cba7d49abfa2cc9de57","_permanent":true,"_user_id":"bfb8024e-6c00-4c33-ac2c-e60bf3b7003d","csrf_token":"ba6fc126e645aaf2157d0136f9586217782acbd5","sudo_time":1783969073}
+```
+
+
+### File:line grounding
+
+- **Entry / middleware:** `server.py:L142` `app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_host=1)`
+  (import at `L28`).
+- **App-wide `before_request` hooks (observed order):**
+  `[0]` Flask-Limiter `Limiter.__check_request_limit`; `[1]` `set_index_page.<locals>.before_request`
+  defined at `server.py:L258` (inside `set_index_page(app)` `L249`, sets `g.start_time`);
+  `[2]` `make_session_permanent` at `server.py:L205`.
+- **Rate-limit keying / disable:** `app/extensions.py:L14-19` `__key_func` (userid when
+  `current_user.is_authenticated`, else IP), `L23` `limiter = Limiter(key_func=__key_func)`,
+  `L26-28` `disable_rate_limit` returns `config.DISABLE_RATE_LIMIT` (set to `1` here).
+- **Web login manager:** `app/extensions.py:L7` `login_manager = LoginManager()`, `L8`
+  `login_manager.session_protection = "strong"`.
+- **Web login view → `login_user`:** `app/auth/views/login.py:L21-25` route + `L40`
+  `form.validate_on_submit()`; `app/auth/views/login_utils.py:L12` `after_login(...)`, `L36`
+  `login_user(user)` (stores `get_id()` in `session["_user_id"]`).
+- **Identity token:** `app/models.py:L595-599` `get_id(self)` returns `self.alternative_id` when set
+  else `str(self.id)`; `alternative_id` column at `app/models.py:L482`.
+- **Web per-request identity:** `server.py:L221` `def load_user(alternative_id):` →
+  `User.get_by(alternative_id=alternative_id)` (`L222`); when a user is found (`if user:` `L223`) it
+  **sets the Sentry user identity** `sentry_sdk.set_user({"email": user.email, "id": user.id})`
+  (`L224`), then returns `None` if `user.disabled` (`L225-226`) or `not user.is_active()`
+  (`L227-228`); `is_active` at `app/models.py:L766` (`True` iff `delete_on is None` or in the future).
+- **API auth:** `app/api/base.py:L16` `def authorize_request()`; `L17`
+  `api_code = request.headers.get("Authentication")`; `L18` `api_key = ApiKey.get_by(code=api_code)`;
+  no-key branch `L20-27` (`if current_user.is_authenticated:` `L21` → `g.user = current_user` `L25`,
+  else `return jsonify(error="Wrong api key"), 401` `L27`); valid-key stats `L30-32`
+  (`last_used`, `times += 1`, `Session.commit()`); guards `L36-37` (`disabled → 403`),
+  `L39-40` (`not is_active() → 401`); `L34` `g.user = api_key.user`; `L42` `g.api_key = api_key`.
+- **Propagation helper (correction):** `server.py:L332-336` `get_current_user()` returns `g.user`
+  else `current_user`; its **only** runtime consumer is the 429 handler `server.py:L367`
+  (`LOG.w(..., get_current_user())`). Normal web views use `current_user`; `/api/user_info`
+  (`app/api/user_info.py:L50-51`, `@require_api_auth`) reads `g.user`.
+- **Per-request log + teardown:** `server.py:L273` `def after_request(res):`; the `LOG.d(` call opens
+  at `L284` (hence the emitted `"/app/server.py:284"`); skip-list `L276-281`; `teardown_appcontext`
+  runs `Session.remove()` (`server.py:L209-211`).
+- **Session backend selection:** `server.py:L163` `if MEM_STORE_URI:` → `L165`
+  `initialize_redis_services(app, MEM_STORE_URI)` (`app/redis_services.py:L9`, which sets
+  `app.session_interface = RedisSessionStore(...)`).
+- **`RedisSessionStore`:** `app/session.py:L18` `SESSION_PREFIX = "session"`; `L31` class;
+  `L38` `_get_signer` (`itsdangerous.Signer(..., salt="session", key_derivation="hmac")`);
+  `L45` key = `session:<id>`; `L82` `save_session`; `L92`
+  `ttl = int(app.permanent_session_lifetime.total_seconds())`; `L95-96`
+  `if "_user_id" not in session: ttl = 300`; `L97` `setex`; `L102` `sign(...)` (cookie = signed id).
+- **401/403 errorhandlers (distinct from the API bodies above):** `server.py:L347-353`
+  `unauthorized(e)` — the `/api/*` branch returns `jsonify(error="Unauthorized"), 401` (`L350`),
+  while the web branch returns `redirect(url_for("auth.login", next=request.full_path))` (**`L353`**,
+  the exact redirect the review flagged); `server.py:L355-360` `forbidden(e)` — `/api/*` →
+  `jsonify(error="Forbidden"), 403` (`L358`), web → `render_template("error/403.html"), 403` (`L360`).
 
 ### Observed vs Inferred
 
-- **Observed:** the full entry chain (via `remote_addr=127.0.0.1`); the web login flow and the
-  `_user_id == alternative_id` (UUID4, not `1`) fact cross-checked against the DB; the anonymous→authenticated
-  Redis TTL transition (300→604800); all four API cases [A]–[D]; the convergence via case [D]; the exact
-  `after_request` lines; both 401 edges [E]/[F]; and both session backends (Redis pointer vs self-contained
-  signed cookie, decoded).
-- **Inferred:** the `jsonify(error="Unauthorized"), 401` body for `/api/` — it is reachable only via
-  `abort(401)`, which SimpleLogin's `/api` views do not use (they return `Wrong api key`); this variant
-  was not produced at runtime and is therefore labeled inferred.
+- **Observed:** the three-hook `before_request` order; ProxyFix honoring both `X-Forwarded-For`
+  (`remote_addr` 203.0.113.7 / 198.51.100.9 in the `SL` log) and `X-Forwarded-Host` (redirect
+  `Location` host `proxied.example.test`); the full web login flow (anon `ttl=300` → authenticated
+  `ttl=604800`, `_user_id` = john's `alternative_id` UUID, DB-confirmed); the API flow — canonical
+  key acquisition, valid (`200` + stats `times 0→1`, `last_used` set), wrong (`401`), absent
+  (`401`), session fallback (`200`); both API guards (`403 Disabled account`, `401 Account does not
+  exist`); both web `load_user` guards (disabled → `302`, inactive → `302`, restore → `200`); the 17
+  correlated `SL` request-log lines (PID 5673) with `/health`, `/static`, `/git`, `/favicon.ico`
+  excluded; and both session backends (Redis server-side vs signed-cookie, the latter creating no
+  Redis key and decoding — without any secret — to the same `_user_id`).
+- **Inferred:** the generic 401/403 **errorhandler** bodies `{"error": "Unauthorized"}` /
+  `{"error": "Forbidden"}` (`server.py:L350,L358`) were **not** triggered here — the API returns its
+  own `authorize_request` JSON directly, so those handler bodies are read from source, not observed.
+  The New Relic custom-event recording in `after_request` (`server.py`) is present in source but not
+  independently verified (no New Relic backend in dev).
 
----
 
 ## Q6 — Does the webapp auto-start any background jobs or schedulers?
 
 ### Direct answer (Observed)
 
-**No.** Starting the webapp (`python3 server.py`) spawns **no** scheduler thread and **no**
-background job process. The scheduled/background work lives in four **independent** scripts —
-`cron.py`, `job_runner.py`, `event_listener.py`, and `email_handler.py` — each guarded by its own
-`if __name__ == "__main__":` block and **not imported by `server.py`**. They are launched
-separately (by an external `yacron`/OS cron, or manually), not by the web process.
+**No.** Starting the webapp the canonical way (`python3 server.py`) starts **no** scheduler, cron,
+or job-runner thread. Observed at runtime: after `create_app()`, **none** of the background-job
+modules (`cron`, `job_runner`, `event_listener`, `email_handler`) are present in `sys.modules`, and
+`server.py` contains **no import** of any of them. The running dev server has exactly two OS threads
+in its worker (child) process and one in the reloader (parent) process, and **both worker threads
+belong to the Werkzeug dev-server/reloader machinery, not to any application scheduler**:
+
+- **Parent (reloader) process** — `NLWP=1`: blocked in `WerkzeugReloaderLoop.restart_with_reloader()`
+  waiting on the subprocess.
+- **Child (worker) process** — `NLWP=2`: per `werkzeug/_reloader.py:run_with_reloader` (L325), when
+  `WERKZEUG_RUN_MAIN == "true"` (L332) the actual WSGI server (`main_func`) is started in a **daemon
+  thread** (`threading.Thread(target=main_func)`, L334; `setDaemon(True)`, L335) while
+  `reloader.run()` — the file-watching stat loop — runs in the **main thread** (L337). Neither is an
+  APScheduler/cron/job thread.
+
+The scheduled work lives in **separate processes with their own `if __name__ == "__main__"` guards**,
+run independently (and, in production, driven by an external `yacron` reading `crontab.yml` — see
+below): `cron.py`, `job_runner.py`, `email_handler.py`, and `event_listener.py`. The first three
+build a lightweight app context via `create_light_app()`; `event_listener.py` does **not** use
+`create_light_app` at all (it dispatches `LISTENER`/`DEAD_LETTER`/`debug`/`run` subcommands).
 
 ### Command(s) run
 
-```
-# 1) does server.py import any of the background scripts?
-grep -nE "import (cron|job_runner|event_listener|email_handler)|from (cron|job_runner|event_listener|email_handler)" server.py ; echo GREP_EXIT=$?
+```bash
+cd /app && set -a && . /tmp/sl_env.sh && set +a && unset EVENT_WEBHOOK_DISABLE \
+  && export GNUPGHOME=/tmp/sl_clean_gnupg
 
-# 2) each background script's __main__ guard
-grep -n '__name__ == "__main__"' cron.py job_runner.py event_listener.py email_handler.py
+# (1) bounded lifecycle: launch, probe /health, inspect threads TWICE, terminate by exact PID.
+/app/venv/bin/python server.py > q6_server.log 2>&1 &
+PARENT=$!; sleep 6
+CHILD=$(ps -eo pid,ppid,args | awk -v p="$PARENT" '$2==p && /server.py/{print $1}')
+curl -s -o /dev/null -w "health_http=%{http_code}\n" http://localhost:7777/health
+ps -o pid,ppid,nlwp,args -p "$PARENT","$CHILD"        # NLWP = OS thread count
+for t in /proc/$CHILD/task/*; do echo "tid=$(basename "$t") comm=$(cat "$t/comm")"; done
+# (repeat the two lines above after 2s = inspection #2)
+kill -TERM $CHILD $PARENT; sleep 1; kill -KILL $CHILD $PARENT
 
-# 3) runtime: launch the webapp, confirm /health, enumerate its process tree + threads,
-#    and scan the startup log for any scheduler/cron activity
-setsid /app/venv/bin/python server.py >/tmp/startup.log 2>&1 &   # then poll /health
-ps -eo pid,ppid,args | grep "[s]erver.py"
-ls /proc/<serving_child_pid>/task | wc -l
-grep -nE "cron|job_runner|event_listener|scheduler|APScheduler|Start running cronjob|Take job" /tmp/startup.log
+# (2) runtime import check — are any job modules pulled in by the webapp?
+/app/venv/bin/python - <<'PY'
+import sys
+from server import create_app
+app = create_app()
+mods = [m for m in ("cron","job_runner","event_listener","email_handler") if m in sys.modules]
+print("background-job modules present in sys.modules after create_app():", mods if mods else "NONE")
+PY
 
-# 4) documentation corroboration
-grep -nE "cron\.py|job_runner\.py|event_listener\.py|email_handler\.py|server\.py" CONTRIBUTING.md
+# (3) does server.py import any job module? per-script __main__ guard + create_light_app usage:
+grep -nE '^import (cron|job_runner|event_listener|email_handler)|^from (cron|job_runner|event_listener|email_handler)' server.py
+for f in cron.py job_runner.py email_handler.py event_listener.py; do
+  grep -n '__main__' "$f"; grep -n 'create_light_app' "$f"; done
+
+# (4) external scheduler config (read by yacron in production, not by the webapp):
+cat crontab.yml
 ```
 
 ### Complete, unedited output
 
-**(1) `server.py` imports none of them** (grep exit 1 = zero matches):
+**(1) Lifecycle — `pids.txt`, `health.txt`, `threads.txt`, `port_after.txt`** (RUN-Q6):
 
+```text
+RUN-Q6 parent=6768 child=6780
 ```
-GREP_EXIT=1
+```text
+health_http=200
 ```
-
-**(2) each is a standalone `__main__` entry point:**
-
+```text
+=== inspection #1 ===
+    PID    PPID NLWP COMMAND
+   6768    6761    1 /app/venv/bin/python server.py
+   6780    6768    2 /app/venv/bin/python /app/server.py
+-- parent thread names (/proc/6768/task/*/comm) --
+  tid=6768 comm=python
+-- child thread names (/proc/6780/task/*/comm) --
+  tid=6780 comm=python
+  tid=6791 comm=python
+=== inspection #2 (after 2s) ===
+    PID    PPID NLWP COMMAND
+   6768    6761    1 /app/venv/bin/python server.py
+   6780    6768    2 /app/venv/bin/python /app/server.py
+-- parent thread names (/proc/6768/task/*/comm) --
+  tid=6768 comm=python
+-- child thread names (/proc/6780/task/*/comm) --
+  tid=6780 comm=python
+  tid=6791 comm=python
 ```
-cron.py:1262:if __name__ == "__main__":
-job_runner.py:329:if __name__ == "__main__":
-event_listener.py:94:if __name__ == "__main__":
-email_handler.py:2396:if __name__ == "__main__":
-```
-
-Context confirming independence (each builds its own app context / loop / listener):
-
-```
-# cron.py L1262+           argparse -j/--job ; with create_light_app().app_context(): <dispatch job>
-# job_runner.py L329-330   if __name__ == "__main__":  /  while True:   (polls get_jobs_to_run(), process_job(job))
-# event_listener.py L94+   argv subcommand dispatch (LISTENER / DEAD_LETTER / debug / run)
-# email_handler.py L2396+  argparse -p/--port (default 20381) ; main(port=args.port)  (SMTP/LMTP listener)
-```
-
-**(3) runtime — the webapp process tree and threads (no scheduler):**
-
-```
-READY=1 (waited 5 half-seconds)   # /health returned 200
-
-# process tree: only the reloader parent and its serving child
-   3999    3992 /app/venv/bin/python server.py
-   4023    3999 /app/venv/bin/python /app/server.py
-
-# threads of the serving child (pid 4023):
-thread count (tids): 2
-  tid=4023 comm=python
-  tid=4036 comm=python
-# threads of the reloader parent (pid 3999):
-thread count (tids): 1
-
-# scan of the startup log for scheduler/cron/job activity:
-  (NONE - webapp emitted no scheduler activity)
+```text
+PORT FREE
 ```
 
-The serving child has exactly **2 threads**, both belonging to Werkzeug's own development server
-(the request-serving thread and the reloader's stat-polling loop — in Werkzeug 1.0.1
-`run_with_reloader` runs `main_func` in a daemon thread and `reloader.run()` in the main thread).
-Neither is an application job scheduler.
+The thread counts are identical across both inspections (parent `NLWP=1`, child `NLWP=2`), i.e. no
+scheduler thread appears over time; after killing the exact PIDs the `:7777` listener is gone.
 
-**(4) `CONTRIBUTING.md` corroboration** (these are listed as *separate* entry points, and cron is
-invoked as its own process):
+**(2) Runtime import check — `import_check.txt`:**
 
-```
-106:alembic upgrade head && flask dummy-data && python3 server.py
-145:- wsgi.py and server.py: the webapp.
-146:- email_handler.py: the email handler.
-147:- cron.py: the cronjob.
-212:python email_handler.py
-228:python job_runner.py
+```text
+>>> URL: http://localhost
+Upload files to local dir
+>>> init logging <<<
+2026-07-13 19:12:10,177 - SL - DEBUG - 6812 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+background-job modules present in sys.modules after create_app(): NONE
 ```
 
-`crontab.yml` schedules the cron jobs as external processes, e.g.
-`command: python /code/cron.py -j stats` on `schedule: "0 0 * * *"` (15 such jobs);
-`crontab-all-hosts.yml` schedules `python /code/cron.py -j send_undelivered_mails` on `"*/5 * * * *"`.
-These are run by an external `yacron`, not by the web process.
+
+**(3) `server.py` imports + per-script `__main__`/`create_light_app` — `scripts_arch.txt`:**
+
+```text
+########## server.py: does it import the 4 job modules? ##########
+(no imports of cron/job_runner/event_listener/email_handler in server.py)
+
+########## cron.py : __main__ guard ##########
+1262:if __name__ == "__main__":
+----- cron.py : create_light_app usage -----
+65:from server import create_light_app
+1273:    with create_light_app().app_context():
+
+########## job_runner.py : __main__ guard ##########
+329:if __name__ == "__main__":
+----- job_runner.py : create_light_app usage -----
+24:from server import create_light_app
+332:        with create_light_app().app_context():
+
+########## email_handler.py : __main__ guard ##########
+2396:if __name__ == "__main__":
+----- email_handler.py : create_light_app usage -----
+177:from server import create_light_app
+2352:        with create_light_app().app_context():
+
+########## event_listener.py : __main__ guard ##########
+94:if __name__ == "__main__":
+----- event_listener.py : create_light_app usage -----
+  (does NOT use create_light_app)
+```
+
+`event_listener.py`'s `__main__` block (it parses a subcommand rather than building an app context)
+— `eventlistener_cron.txt`:
+
+```text
+if __name__ == "__main__":
+    if len(argv) < 2:
+        print("Invalid usage. Pass a valid subcommand as argument")
+        exit(1)
+
+    args = args()
+
+    if args.command in [Mode.LISTENER.value, Mode.DEAD_LETTER.value]:
+        main(
+            mode=Mode.from_str(args.command),
+            dry_run=args.dry_run,
+            max_retries=args.max_retries,
+        )
+    elif args.command == "debug":
+        debug_event(args.event_id)
+    elif args.command == "run":
+        run_event(args.event_id, args.delete_on_success)
+    else:
+        print("Invalid command")
+        exit(1)
+```
+
+**(4) External scheduler config — `crontab.yml`** (each job shells out to `python /code/cron.py -j
+<job>` on a cron schedule; production runs this under `yacron`, entirely outside the webapp process):
+
+```yaml
+jobs:
+  - name: SimpleLogin growth stats
+    command: python /code/cron.py -j stats
+    shell: /bin/bash
+    schedule: "0 0 * * *"
+    captureStderr: true
+
+  - name: SimpleLogin Delete Old Monitoring records
+    command: python /code/cron.py -j delete_old_monitoring
+    shell: /bin/bash
+    schedule: "15 1 * * *"
+    captureStderr: true
+
+  - name: SimpleLogin Custom Domain check
+    command: python /code/cron.py -j check_custom_domain
+    shell: /bin/bash
+    schedule: "15 2 * * *"
+    captureStderr: true
+
+  - name: SimpleLogin HIBP check
+    command: python /code/cron.py -j check_hibp
+    shell: /bin/bash
+    schedule: "15 3 * * *"
+    captureStderr: true
+    concurrencyPolicy: Forbid
+
+  - name: SimpleLogin Notify HIBP breaches
+    command: python /code/cron.py -j notify_hibp
+    shell: /bin/bash
+    schedule: "15 4 * * *"
+    captureStderr: true
+    concurrencyPolicy: Forbid
+
+  - name: SimpleLogin Delete Logs
+    command: python /code/cron.py -j delete_logs
+    shell: /bin/bash
+    schedule: "15 5 * * *"
+    captureStderr: true
+
+  - name: SimpleLogin Delete Old data
+    command: python /code/cron.py -j delete_old_data
+    shell: /bin/bash
+    schedule: "30 5 * * *"
+    captureStderr: true
+
+  - name: SimpleLogin Poll Apple Subscriptions
+    command: python /code/cron.py -j poll_apple_subscription
+    shell: /bin/bash
+    schedule: "15 6 * * *"
+    captureStderr: true
+
+  - name: SimpleLogin Notify Trial Ends
+    command: python /code/cron.py -j notify_trial_end
+    shell: /bin/bash
+    schedule: "15 8 * * *"
+    captureStderr: true
+
+  - name: SimpleLogin Notify Manual Subscription Ends
+    command: python /code/cron.py -j notify_manual_subscription_end
+    shell: /bin/bash
+    schedule: "15 9 * * *"
+    captureStderr: true
+
+  - name: SimpleLogin Notify Premium Ends
+    command: python /code/cron.py -j notify_premium_end
+    shell: /bin/bash
+    schedule: "15 10 * * *"
+    captureStderr: true
+
+  - name: SimpleLogin delete users scheduled to be deleted
+    command: python /code/cron.py -j delete_scheduled_users
+    shell: /bin/bash
+    schedule: "15 11 * * *"
+    captureStderr: true
+    concurrencyPolicy: Forbid
+
+  - name: SimpleLogin send unsent emails
+    command: python /code/cron.py -j send_undelivered_mails
+    shell: /bin/bash
+    schedule: "*/5 * * * *"
+    captureStderr: true
+    concurrencyPolicy: Forbid
+
+  - name: SimpleLogin clear alias_audit_log old entries
+    command: python /code/cron.py -j clear_alias_audit_log
+    shell: /bin/bash
+    schedule: "0 * * * *" # Once every hour
+    captureStderr: true
+    concurrencyPolicy: Forbid
+
+  - name: SimpleLogin clear user_audit_log old entries
+    command: python /code/cron.py -j clear_user_audit_log
+    shell: /bin/bash
+    schedule: "0 * * * *" # Once every hour
+    captureStderr: true
+    concurrencyPolicy: Forbid
+```
 
 ### File:line grounding
 
-- `server.py` contains **no** `import cron / job_runner / event_listener / email_handler` (grep exit 1).
-- `if __name__ == "__main__":` guards: `cron.py:L1262`, `job_runner.py:L329` (loop `while True:` at L330),
-  `event_listener.py:L94`, `email_handler.py:L2396`.
-- The webapp factory is `create_app()` `server.py:L139`; the background scripts instead use
-  `create_light_app()` `server.py:L127` (its own teardown `shutdown_session` at L132-134) — a different,
-  request-less app used only for a CLI/loop app-context.
-- Entry-point list `CONTRIBUTING.md:L145-147`; run commands `CONTRIBUTING.md:L212,L228`.
+- **No import in the webapp:** `server.py` has no `import cron|job_runner|event_listener|email_handler`
+  (grep above); confirmed at runtime by `sys.modules` after `create_app()` = `NONE`.
+- **Thread model (library source):** `werkzeug/_reloader.py:L325` `run_with_reloader(main_func, …)`;
+  `L332` `if os.environ.get("WERKZEUG_RUN_MAIN") == "true":`; `L334`
+  `t = threading.Thread(target=main_func, args=())`; `L335` `t.setDaemon(True)`; `L337`
+  `reloader.run()`; parent branch `L339` `sys.exit(reloader.restart_with_reloader())`;
+  `WERKZEUG_RUN_MAIN` is set for the child at `werkzeug/_reloader.py:L182`.
+- **Background scripts are independent processes:**
+  `cron.py:L1262` `if __name__ == "__main__":`, `create_light_app` import `L65`, context `L1273`;
+  `job_runner.py:L329` guard, import `L24`, context `L332`;
+  `email_handler.py:L2396` guard, import `L177`, context `L2352`;
+  `event_listener.py:L94` guard — **no** `create_light_app`; dispatches
+  `Mode.LISTENER`/`Mode.DEAD_LETTER`/`debug`/`run`.
+- **External scheduling:** `crontab.yml` — 15 jobs, each `command: python /code/cron.py -j <job>` on
+  a cron `schedule`, run by `yacron` (a separate process), not by the Flask app.
 
 ### Observed vs Inferred
 
-- **Observed:** `server.py` imports none of the four scripts; each has its own `__main__` guard; the
-  running webapp's process tree and thread set contain no scheduler; the startup log contains no cron/job
-  activity; `crontab.yml`/`crontab-all-hosts.yml` invoke `cron.py` as external processes.
-- **Inferred:** none.
+- **Observed:** the webapp starting with no job module in `sys.modules`; the stable
+  parent(`NLWP=1`)/child(`NLWP=2`) thread counts across two inspections; `/health = 200`; the port
+  freeing after termination; `server.py` importing none of the four scripts; and each script's
+  `__main__` guard and `create_light_app` usage (or absence, for `event_listener.py`).
+- **Inferred:** the *identity* of the two child threads (daemon server thread + `reloader.run()` main
+  thread) is read from Werkzeug 1.0.1 source (`_reloader.py`), not from thread names (which all read
+  `comm=python`); the production use of `yacron` to execute `crontab.yml` is read from the config
+  file, not run here (no `yacron` in this dev container).
 
----
 
-## Q7 — Anything else going on (import-time side effects)?
+## Q7 — Anything else going on? (import-time side effects)
 
 ### Direct answer (Observed)
 
-Beyond request handling, the app has notable **import-time** and **per-request** side effects:
+Beyond request handling, starting the app has four notable **import-time** side effects:
 
-1. **A PostgreSQL connection is opened at import time.** `app/db.py` calls `engine.connect()` at module
-   top level, so merely importing the app (through the canonical package) opens a live DB connection whose
-   `application_name` is `webapp`. If Postgres is unreachable, the **import itself** fails fast.
-2. **An environment flag is set at import.** `server.py:L124` sets
-   `os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"` (permits OAuth over plain HTTP in dev).
-3. **Per request, `Session.remove()` runs** in a `teardown_appcontext` hook (`server.py:L209-211`).
-4. **The Werkzeug reloader double-imports the module** (because `debug=True` with no `use_reloader=False`),
-   so all import-time `print` banners appear **twice** (see Q1).
+1. **A PostgreSQL connection is opened at import.** `app/db.py:L12` runs `connection =
+   engine.connect()` at module import (not lazily), so merely importing the app opens a real DB
+   connection with `application_name = "webapp"` (`config.DB_CONN_NAME`, `app/config.py:L193`).
+2. **That connection happens *twice* under the dev reloader.** Because `debug=True` enables the
+   Werkzeug reloader, the app module is imported in **both** the reloader (parent) process **and** the
+   worker (child) process — so `pg_stat_activity` shows **two** `webapp` connections while the dev
+   server is up, and the import-time `print` banners appear **twice** in the startup stream (with the
+   Flask/Werkzeug `* Serving … * Environment: production … * Debug mode: on` banner in between).
+3. **`OAUTHLIB_INSECURE_TRANSPORT` is force-set to `"1"` at import.** `server.py:L124`
+   (`os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"`) is an **unconditional module-level**
+   statement — it runs on *any* import of `server`, including the production `wsgi.py` import, not
+   just in dev. Observed: the variable is `None` before importing `server` and `'1'` after. Its
+   purpose (comment `server.py:L123`) is that the app is served behind nginx over http, i.e. it is a
+   trusted-proxy framing — not a claim that public traffic is plaintext.
+4. **Import fails fast if the DB is unreachable.** Because the connect is at import, pointing
+   `DB_URI` at a dead port makes `python server.py` abort during import with a full
+   `sqlalchemy.exc.OperationalError` traceback and exit code `1` — the server never binds a port.
 
 ### Command(s) run
 
-```
-# import-time DB connect (positive): import app.db, then ask Postgres about ourselves
-cat > /tmp/blitzy_q7_db.py <<'PY'
-import os
-print("OAUTHLIB_INSECURE_TRANSPORT before importing server:", repr(os.environ.get("OAUTHLIB_INSECURE_TRANSPORT")))
-import app.db as d                     # app/db.py L9-14 runs engine.connect() at IMPORT
-rows = d.connection.execute(
-    "select pid, application_name, state, backend_type from pg_stat_activity where application_name = %(n)s",
-    {"n": "webapp"}).fetchall()
-print("import-time connections with application_name=webapp:")
-for r in rows: print("  ", dict(r))
-import app.config as c
-print("config.DB_CONN_NAME =", repr(c.DB_CONN_NAME)); print("config.DB_URI =", repr(c.DB_URI))
-import server                          # noqa
-print("OAUTHLIB_INSECURE_TRANSPORT after importing server :", repr(os.environ.get("OAUTHLIB_INSECURE_TRANSPORT")))
-PY
-PYTHONPATH=/app /app/venv/bin/python /tmp/blitzy_q7_db.py
+```bash
+cd /app && set -a && . /tmp/sl_env.sh && set +a && unset EVENT_WEBHOOK_DISABLE \
+  && export GNUPGHOME=/tmp/sl_clean_gnupg
+PSQL="psql -h localhost -U test -d test -A -F| -P pager=off"
 
-# import-time DB connect (fail-fast): point DB_URI at a dead port and import app.db
-DB_URI="postgresql://test:test@localhost:5999/test" PYTHONPATH=/app /app/venv/bin/python -c "import app.db" ; echo EXIT=$?
+# (1) canonical: launch the real server, count webapp DB connections before / during / after:
+PGPASSWORD=test $PSQL -c "select count(*) as webapp_conns_before from pg_stat_activity where application_name='webapp';"
+/app/venv/bin/python server.py > q7_server.log 2>&1 &   # reloader => parent + child both import app.db
+PARENT=$!; sleep 6
+CHILD=$(ps -eo pid,ppid,args | awk -v p="$PARENT" '$2==p && /server.py/{print $1}')   # RUN-Q7 parent=7067 child=7079
+PGPASSWORD=test $PSQL -c "select pid, application_name, state, backend_type, client_addr, client_port from pg_stat_activity where application_name='webapp' order by pid;"
+kill -TERM $CHILD $PARENT 2>/dev/null; sleep 1; kill -KILL $CHILD $PARENT 2>/dev/null; sleep 2
+PGPASSWORD=test $PSQL -c "select count(*) as webapp_conns_after from pg_stat_activity where application_name='webapp';"
+
+# (2) NON-CANONICAL helper: prove the connect happens at IMPORT of app.db:
+/app/venv/bin/python -c "import app.db; print('app.db imported; connection =', app.db.connection); print('closed?', app.db.connection.closed)"
+
+# (3) OAUTHLIB flag flips None -> '1' by importing server (server.py:L124):
+/app/venv/bin/python -c "import os; print('before import server:', repr(os.environ.get('OAUTHLIB_INSECURE_TRANSPORT'))); import server; print('after  import server:', repr(os.environ.get('OAUTHLIB_INSECURE_TRANSPORT')))"
+
+# (4) fail-fast: canonical entry point with DB_URI on a dead port (15432 = nothing listening):
+export DB_URI="postgresql://test:test@localhost:15432/test"
+/app/venv/bin/python server.py    # aborts at import with full traceback, exit 1
 ```
 
 ### Complete, unedited output
 
-**Import-time DB connect (positive) + OAUTHLIB flag flip:**
+**(1) `webapp` DB connections before / during / after — `pg_before.txt`, `pids.txt`,
+`pg_during.txt`, `pg_after.txt`** (RUN-Q7). Two connections while up (one per process — the PG `pid`
+column is the server-side backend pid, and the two `client_port`s distinguish the reloader parent
+and worker child); zero before and after:
 
+```text
+webapp_conns_before
+0
+(1 row)
 ```
-OAUTHLIB_INSECURE_TRANSPORT before importing server: None
->>> URL: http://localhost:7777
+```text
+RUN-Q7 parent=7067 child=7079
+```
+```text
+pid|application_name|state|backend_type|client_addr|client_port
+7069|webapp|idle|client backend|::1|51390
+7080|webapp|idle|client backend|::1|51400
+(2 rows)
+```
+```text
+webapp_conns_after
+0
+(1 row)
+```
+
+**(2) Reloader double-import — `q7_server.log`.** The import-time markers (`>>> URL: …`,
+`Upload files to local dir`, `>>> init logging <<<`, the `SL` "load words file" line) print **once
+for the parent (PID 7067)**, then the Flask/Werkzeug banner, then **again for the child (PID 7079)**:
+
+```text
+>>> URL: http://localhost
 Upload files to local dir
-import-time connections with application_name=webapp:
-   {'pid': 4110, 'application_name': 'webapp', 'state': 'active', 'backend_type': 'client backend'}
-config.DB_CONN_NAME = 'webapp'
-config.DB_URI       = 'postgresql://test:test@localhost:5432/test'
 >>> init logging <<<
-2026-07-13 17:29:30,940 - SL - DEBUG - 4109 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
-OAUTHLIB_INSECURE_TRANSPORT after importing server : '1'
+2026-07-13 19:17:05,546 - SL - DEBUG - 7067 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+ * Serving Flask app "server" (lazy loading)
+ * Environment: production
+   WARNING: This is a development server. Do not use it in a production deployment.
+   Use a production WSGI server instead.
+ * Debug mode: on
+>>> URL: http://localhost
+Upload files to local dir
+>>> init logging <<<
+2026-07-13 19:17:07,082 - SL - DEBUG - 7079 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
 ```
 
-**Import-time DB connect (fail-fast) — importing against a dead port raises at import:**
+**(3) Connect-at-import (NON-CANONICAL helper) — `import_probe.txt`.** This is *not* the canonical
+entry point; it is a bare `python -c "import app.db"` used only to isolate the import-time connect.
+The connection object exists and is open (`closed? False`) purely from importing the module:
 
+```text
+>>> URL: http://localhost
+Upload files to local dir
+app.db imported; connection = <sqlalchemy.engine.base.Connection object at 0x7954ddb8a5f0>
+closed? False
 ```
-sqlalchemy.exc.OperationalError: (psycopg2.OperationalError) connection to server at "localhost" (::1), port 5999 failed: Connection refused
+
+**(4) `OAUTHLIB_INSECURE_TRANSPORT` flip — `oauthlib.txt`** (`None` before importing `server`, `'1'`
+after):
+
+```text
+before import server: None
+>>> URL: http://localhost
+Upload files to local dir
+>>> init logging <<<
+2026-07-13 19:17:14,831 - SL - DEBUG - 7103 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+after  import server: '1'
+```
+
+
+**(5) Fail-fast on unreachable DB — `failfast.txt`** (canonical `python server.py`, `DB_URI` pointed
+at dead port 15432). The complete, unedited traceback; the direct cause chain ends at
+`app/db.py:L12 connection = engine.connect()`, and the process exits `1` without ever binding a port:
+
+```text
+>>> URL: http://localhost
+Upload files to local dir
+>>> init logging <<<
+Traceback (most recent call last):
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/base.py", line 2336, in _wrap_pool_connect
+    return fn()
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/base.py", line 304, in unique_connection
+    return _ConnectionFairy._checkout(self)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/base.py", line 778, in _checkout
+    fairy = _ConnectionRecord.checkout(pool)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/base.py", line 495, in checkout
+    rec = pool._do_get()
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/impl.py", line 139, in _do_get
+    with util.safe_reraise():
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/util/langhelpers.py", line 68, in __exit__
+    compat.raise_(
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/util/compat.py", line 182, in raise_
+    raise exception
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/impl.py", line 137, in _do_get
+    return self._create_connection()
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/base.py", line 309, in _create_connection
+    return _ConnectionRecord(self)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/base.py", line 440, in __init__
+    self.__connect(first_connect_check=True)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/base.py", line 660, in __connect
+    with util.safe_reraise():
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/util/langhelpers.py", line 68, in __exit__
+    compat.raise_(
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/util/compat.py", line 182, in raise_
+    raise exception
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/base.py", line 656, in __connect
+    connection = pool._invoke_creator(self)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/strategies.py", line 114, in connect
+    return dialect.connect(*cargs, **cparams)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/default.py", line 508, in connect
+    return self.dbapi.connect(*cargs, **cparams)
+  File "/app/venv/lib/python3.10/site-packages/psycopg2/__init__.py", line 122, in connect
+    conn = _connect(dsn, connection_factory=connection_factory, **kwasync)
+psycopg2.OperationalError: connection to server at "localhost" (::1), port 15432 failed: Connection refused
 	Is the server running on that host and accepting TCP/IP connections?
-connection to server at "localhost" (127.0.0.1), port 5999 failed: Connection refused
+connection to server at "localhost" (127.0.0.1), port 15432 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
+
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/app/server.py", line 31, in <module>
+    from app.admin_model import (
+  File "/app/app/admin_model.py", line 11, in <module>
+    from app import models, s3
+  File "/app/app/models.py", line 32, in <module>
+    from app.db import Session
+  File "/app/app/db.py", line 12, in <module>
+    connection = engine.connect()
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/base.py", line 2263, in connect
+    return self._connection_cls(self, **kwargs)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/base.py", line 104, in __init__
+    else engine.raw_connection()
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/base.py", line 2369, in raw_connection
+    return self._wrap_pool_connect(
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/base.py", line 2339, in _wrap_pool_connect
+    Connection._handle_dbapi_exception_noconnection(
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/base.py", line 1583, in _handle_dbapi_exception_noconnection
+    util.raise_(
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/util/compat.py", line 182, in raise_
+    raise exception
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/base.py", line 2336, in _wrap_pool_connect
+    return fn()
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/base.py", line 304, in unique_connection
+    return _ConnectionFairy._checkout(self)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/base.py", line 778, in _checkout
+    fairy = _ConnectionRecord.checkout(pool)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/base.py", line 495, in checkout
+    rec = pool._do_get()
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/impl.py", line 139, in _do_get
+    with util.safe_reraise():
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/util/langhelpers.py", line 68, in __exit__
+    compat.raise_(
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/util/compat.py", line 182, in raise_
+    raise exception
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/impl.py", line 137, in _do_get
+    return self._create_connection()
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/base.py", line 309, in _create_connection
+    return _ConnectionRecord(self)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/base.py", line 440, in __init__
+    self.__connect(first_connect_check=True)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/base.py", line 660, in __connect
+    with util.safe_reraise():
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/util/langhelpers.py", line 68, in __exit__
+    compat.raise_(
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/util/compat.py", line 182, in raise_
+    raise exception
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/pool/base.py", line 656, in __connect
+    connection = pool._invoke_creator(self)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/strategies.py", line 114, in connect
+    return dialect.connect(*cargs, **cparams)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/default.py", line 508, in connect
+    return self.dbapi.connect(*cargs, **cparams)
+  File "/app/venv/lib/python3.10/site-packages/psycopg2/__init__.py", line 122, in connect
+    conn = _connect(dsn, connection_factory=connection_factory, **kwasync)
+sqlalchemy.exc.OperationalError: (psycopg2.OperationalError) connection to server at "localhost" (::1), port 15432 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
+connection to server at "localhost" (127.0.0.1), port 15432 failed: Connection refused
 	Is the server running on that host and accepting TCP/IP connections?
 
 (Background on this error at: http://sqlalche.me/e/13/e3q8)
->>> URL: http://localhost:7777
-Upload files to local dir
-EXIT=1
+exit_code=1
 ```
-
-The reloader double-import is visible in the Q1 startup stream (the `>>> URL:` / `Upload files to local dir`
-/ `>>> init logging <<<` / SL "load words file" block appears **twice**).
 
 ### File:line grounding
 
-- `engine = create_engine(config.DB_URI, connect_args={"application_name": config.DB_CONN_NAME})`
-  `app/db.py:L9-11`; `connection = engine.connect()` `app/db.py:L12`;
-  `Session = scoped_session(sessionmaker(bind=connection))` `app/db.py:L14`. The connection is opened at
-  **module import**, not lazily — proven by the fail-fast import above.
-- `DB_CONN_NAME = os.environ.get("DB_CONN_NAME", "webapp")` `app/config.py:L193` (hence
-  `application_name = 'webapp'`).
-- `os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"` `server.py:L124` (observed `None` → `'1'` across the
-  `import server`).
-- `@app.teardown_appcontext def cleanup(resp_or_exc): Session.remove()` `server.py:L209-211` (per request).
-- Reloader double-import: consequence of `app.run(debug=True, port=7777)` `server.py:L588` with no
-  `use_reloader=False` — see Q1.
+- **DB connect at import:** `app/db.py:L9-11` `engine = create_engine(config.DB_URI,
+  connect_args={"application_name": config.DB_CONN_NAME})`; `app/db.py:L12` `connection =
+  engine.connect()` (executed at import, not lazily); `app/db.py:L14` `Session =
+  scoped_session(sessionmaker(bind=connection))`. `application_name` value: `config.DB_CONN_NAME`
+  = `os.environ.get("DB_CONN_NAME", "webapp")` (`app/config.py:L193`) = `"webapp"` (observed).
+- **Import chain that triggers it (from the traceback):** `server.py:L31` `from app.admin_model
+  import (…)` → `app/admin_model.py:L11` `from app import models, s3` → `app/models.py:L32`
+  `from app.db import Session` → `app/db.py:L12` `connection = engine.connect()`.
+- **Reloader double-import:** the module is imported once in the reloader parent and once in the
+  worker child (`WERKZEUG_RUN_MAIN`); see Q6 grounding (`werkzeug/_reloader.py:L182,L325-339`) and
+  the two `SL` "load words file" lines (PID 7067 then 7079) above.
+- **`OAUTHLIB_INSECURE_TRANSPORT`:** `server.py:L124`
+  `os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"` — unconditional, module-level (preceding comment
+  `server.py:L123` "the app is served behind nginx which uses http and not https"). It therefore
+  also runs when `wsgi.py` imports `server` in production (`wsgi.py:L1,L3`).
 
 ### Observed vs Inferred
 
-- **Observed:** the import-time DB connection (`application_name='webapp'`, pid 4110, `active`) opened by a
-  bare `import app.db`; the fail-fast import against a dead port (`OperationalError ... Connection refused`,
-  `EXIT=1`), which proves the connect is eager at import; the `OAUTHLIB_INSECURE_TRANSPORT` flip `None`→`'1'`;
-  and the reloader double-import (from Q1).
-- **Inferred:** the per-request `Session.remove()` is grounded in code and runs on every
-  `teardown_appcontext`; it was observed indirectly (each request in Q5 completed and released its scoped
-  session) rather than by printing from inside the teardown hook.
+- **Observed:** the two `webapp` connections while the dev server is up (and zero before/after); the
+  import-time banners printing twice with distinct PIDs (7067 parent, 7079 child); the connection
+  being open immediately after a bare `import app.db`; the `OAUTHLIB_INSECURE_TRANSPORT` flip
+  `None → '1'`; and the complete fail-fast traceback with exit code `1` when `DB_URI` points at a
+  dead port.
+- **Inferred:** that `OAUTHLIB_INSECURE_TRANSPORT` is likewise set on the production `wsgi.py` import
+  path — read from the unconditional placement at `server.py:L124` (production `wsgi` was not run
+  here). The bare `import app.db` probe in (3) is explicitly **non-canonical** (not the
+  `python server.py` entry point); it is used only to isolate the connect-at-import, whose canonical
+  manifestation is the two `pg_stat_activity` rows in (1).
 
----
 
-## Coverage-Pass Checklist
+## Coverage-pass checklist
 
-A final pass re-reading each question and confirming every distinct thing and every named item is
-answered with a concrete value, a `file:line`, observed evidence, sibling variants, and a cause→effect.
+Final pass re-reading each question and every named item. Each box is checked **only** where the
+body contains observed runtime evidence for it (with the section that carries the evidence).
 
-**Q1 — Startup (dev):**
-- [x] Canonical entry `python3 server.py` → `local_main()` `server.py:L572-595`, guard L598-599 — *Observed*.
-- [x] Sequence: `COLOR_LOG=True` (L573) → `create_app()` (L574) → DebugToolbar (L577/582) → `app.debug=True` (L581) → `app.run(debug=True, port=7777)` (L588). Cause→effect: `debug=True` ⇒ reloader ⇒ double import — *Observed*.
-- [x] Port 7777 (see Q4); prod contrast `wsgi.py`+gunicorn `Dockerfile:L47` — *Inferred*.
+**Q1 — startup in dev mode**
+- [x] Canonical entry `python3 server.py` → `local_main()` runs — Q1 output (RUN‑A/RUN‑B)
+- [x] `config.COLOR_LOG = True` set by `local_main` — Q1/Q3 grounding + Q3 colorlog probe
+- [x] `create_app()` builds the app — Q1 grounding (`server.py:L574`)
+- [x] Flask‑DebugToolbar enabled, `app.debug = True` — Q1 grounding (`server.py:L577,L581-582`)
+- [x] `app.run(debug=True, port=7777)` — Q1 output + Q4 port evidence
 
-**Q2 — Config loading (both branches):**
-- [x] `CONFIG` branch prints `load config file ...` (`app/config.py:L68`) — *Observed*.
-- [x] Default `./.env` branch, silent `load_dotenv()` (L71), resolved values — *Observed*.
-- [x] Missing required var → `KeyError: 'URL'` at import (`app/config.py:L79`) — *Observed*.
-- [x] Empty `FLASK_SECRET` → `RuntimeError` (`app/config.py:L197-198`) — *Observed*.
-- [x] Required set: `URL`(L79),`EMAIL_DOMAIN`(L92),`SUPPORT_EMAIL`(L93),`DB_URI`(L192),`FLASK_SECRET`(L196) — *Observed*.
+**Q2 — configuration loading**
+- [x] `CONFIG` env var branch (`load config file …` print) — Q2 output (`full.env` run)
+- [x] Default `./.env` branch (`load_dotenv()`) — Q2 output (default import)
+- [x] `python-dotenv` `override=False` precedence (shell env wins) — Q2 output (URL precedence)
+- [x] Required‑var hard‑fail for `URL`, `EMAIL_DOMAIN`, `SUPPORT_EMAIL`, `DB_URI`, `FLASK_SECRET` — Q2 output (5 KeyError runs)
+- [x] Present‑but‑empty `FLASK_SECRET` → `RuntimeError` — Q2 output
+- [x] `EMAIL_SERVERS_WITH_PRIORITY` (sixth required, `sl_getenv`) → `TypeError` — Q2 output
 
-**Q3 — Readiness logs (version-dependent):**
-- [x] Surviving markers: `>>> URL:` (`app/config.py:L80`), `>>> init logging <<<` (`app/log.py:L67`), Flask CLI banner (`click.echo`) — *Observed*.
-- [x] Suppressed banner (`* Running on`, `Press CTRL+C`, `* Restarting with stat`, `* Debugger is active!`, `* Debugger PIN`) because `log.disabled=True` (`app/log.py:L71`) on Werkzeug 1.0.1 / Flask 1.1.2 — *Observed*.
-- [x] Direct answer: no explicit readiness line; `/health`→200 is the practical signal; Debugger PIN's absence is stable cross-run — *Observed*.
+**Q3 — readiness log messages**
+- [x] `>>> init logging <<<` — Q3 output
+- [x] `>>> URL: http://localhost` — Q3 output
+- [x] `werkzeug` logger disabled → standard access log suppressed — Q3 grounding + startup stream
+- [x] Werkzeug `* Serving … * Environment … * Debug mode: on` banner (what actually appears) — Q3/Q1 output
+- [x] `/health` is a request‑time probe, not a startup marker — Q3 output (out‑of‑band probe)
 
-**Q4 — Ports & endpoints:**
-- [x] Port 7777 loopback bind (`/proc/net/tcp` `0100007F:1E61` state `0A`; `server.py:L588`, `Dockerfile:L44`) — *Observed*.
-- [x] 292 live rules dumped in full — *Observed*.
-- [x] Every blueprint prefix: `/auth`,`/`(monitor),`/dashboard`,`/developer`,`/phone`,`/oauth`,`/oauth2`,`/onboarding`,`/discover`,`/internal`,`/api` (`server.py:L233-246`; `app/api/base.py:L11`); `/admin` (Flask-Admin, 122) — *Observed*.
-- [x] Direct routes: `/`,`/health`,`/favicon.ico`,`/dnt`,`/.well-known/openid-configuration`,`/jwks`,`/coinbase`,`/paddle`,`/paddle_coupon`,`/static` — *Observed*.
-- [x] `monitor_bp` at root `/` (routes `/git`,`/live`,`/exception`; no `/monitor/*`) — read-vs-run discrepancy, `app/monitor/base.py:L3` — *Observed*.
-- [x] `/oauth`+`/oauth2` double registration (`server.py:L240-241`) — *Observed*.
+**Q4 — ports and endpoints**
+- [x] Listening port `127.0.0.1:7777` (raw `/proc/net/tcp`) — Q4 output
+- [x] `/health` → `200 success` — Q4 output
+- [x] All 10 blueprints + prefixes (`auth`,`api`,`dashboard`,`developer`,`phone`,`monitor`@`/`,`oauth`,`oauth2`,`onboarding`,`discover`,`internal`) — Q4 route dump + grounding
+- [x] Direct routes (`/`, `/health`, `/favicon.ico`, `/dnt`, `/.well-known/openid-configuration`, `/jwks`) and `/admin` mount — Q4 route dump
+- [x] Exact live route count (292) stable across two builds — Q4 output
+- [x] `monitor_bp` `/` discrepancy noted — Q4 grounding
 
-**Q5 — Authenticated request (PRIMARY):**
-- [x] (a) Entry: `ProxyFix` (L142) → `make_session_permanent` (L204-207) → `before_request` `g.start_time` (L258-269); `remote_addr=127.0.0.1` — *Observed*.
-- [x] (b) Web identity: `load_user(alternative_id)` (`server.py:L220-222`); `session["_user_id"]`=`01330a11-…` == `alternative_id` (UUID4) ≠ `id`(1); `get_id()` (`app/models.py:L595-599`); `session_protection="strong"` (`app/extensions.py:L8`) — *Observed*, stable across 2 runs (session id variable).
-- [x] (b) API identity: `authorize_request()` (`app/api/base.py:L16-42`); cases [A] valid→200, [B] wrong→401, [C] none→401, [D] session fall-through→200 — *Observed*.
-- [x] (c) Convergence: `get_current_user()` (`server.py:L332-336`), `g.user` (API) vs `current_user` (web); [D] unifies — *Observed*.
-- [x] `after_request` line format `remote_addr method path args status, takes t` (`server.py:L285`, skip list L276-282); `takes` variable — *Observed*.
-- [x] 401 edges: [E] web → 302 `Location .../auth/login?next=%2Fdashboard%2F%3F`; [F] api → 401 `{"error":"Wrong api key"}` (`server.py:L347-352`) — *Observed*; `Unauthorized` abort-body — *Inferred*.
-- [x] Two backends: Redis pointer cookie + server key `session:<uuid>` TTL 604800/300 (`app/session.py:L92,95-96`); signed-cookie self-contained `slapp` decoded (`app/config.py:L199`, `SameSite=Lax` `server.py:L162`) — *Observed*.
-- [x] Rate-limit key `userid`/`ip` (`app/extensions.py:L14-19`, disabled L26-28); teardown `Session.remove()` (`server.py:L209-211`) — *Observed*/grounded.
+**Q5 — authenticated request (PRIMARY)**
+- [x] (a) entry: `ProxyFix` + the three `before_request` hooks in order — Q5 (A)
+- [x] `ProxyFix` `x_for` and `x_host` both honored — Q5 (A)
+- [x] (b) identity, web: `_user_id` = `alternative_id` UUID via `load_user` — Q5 (B) + DB proof
+- [x] (b) identity, API: `Authentication` header → `authorize_request` → `g.user` — Q5 (C)
+- [x] API valid / wrong / absent / session‑fallback — Q5 (C)
+- [x] API usage‑stats side effect (commit before guards); `g.api_key=None` on fallback — Q5 (C)
+- [x] Account guards: API disabled(403)/inactive(401); web `load_user` disabled/inactive(302) — Q5 (D)
+- [x] (c) propagation: `current_user` (web) / `g.user` (API); `get_current_user()` only in 429 handler — Q5 (E) + grounding
+- [x] Per‑request `after_request` `SL` log, `/health` & `/static` excluded — Q5 (E)
+- [x] Both session backends (Redis server‑side vs signed cookie); before/intermediate/after TTLs — Q5 (B),(F)
+- [x] Signed cookie is signed (readable w/o secret), not encrypted — Q5 (F)
+- [x] 401 edge: web → 302 login redirect; API JSON — Q5 (A),(C) + grounding
 
-**Q6 — Background jobs:**
-- [x] Direct answer: webapp starts none — *Observed*.
-- [x] `server.py` imports none of the four scripts (grep exit 1) — *Observed*.
-- [x] `__main__` guards: `cron.py:L1262`, `job_runner.py:L329`(+`while True` L330), `event_listener.py:L94`, `email_handler.py:L2396` — *Observed*.
-- [x] Runtime: process tree (reloader parent + serving child), serving child = 2 Werkzeug threads, no scheduler; startup log has no cron/job activity — *Observed*.
-- [x] `CONTRIBUTING.md:L145-147` entry points; `crontab.yml`/`crontab-all-hosts.yml` invoke `cron.py` externally — *Observed*.
+**Q6 — background jobs / schedulers**
+- [x] Webapp starts no scheduler thread (thread counts, `sys.modules` = NONE) — Q6 output
+- [x] `cron.py`, `job_runner.py`, `email_handler.py`, `event_listener.py` independent `__main__` — Q6 output
+- [x] `create_light_app` used by first three; not by `event_listener.py` — Q6 output
+- [x] External `crontab.yml` scheduling (yacron) — Q6 output
 
-**Q7 — Anything else (side effects):**
-- [x] Import-time DB connect (`app/db.py:L9-14`), `application_name='webapp'` (`app/config.py:L193`), positive + fail-fast — *Observed*.
-- [x] `OAUTHLIB_INSECURE_TRANSPORT="1"` at import (`server.py:L124`), `None`→`'1'` — *Observed*.
-- [x] Per-request teardown `Session.remove()` (`server.py:L209-211`) — grounded, observed indirectly.
-- [x] Reloader double-import (`server.py:L588`, `debug=True`) — prints appear twice, cross-ref Q1 — *Observed*.
+**Q7 — anything else (import‑time side effects)**
+- [x] DB connection opened at import (`app/db.py:L12`) — Q7 output (pg_stat + probe)
+- [x] Reloader double‑import → two `webapp` DB connections + doubled banners — Q7 output
+- [x] `OAUTHLIB_INSECURE_TRANSPORT` set to `"1"` at import, unconditional (prod too) — Q7 output
+- [x] Fail‑fast on unreachable DB (full traceback, exit 1) — Q7 output
 
-_All seven questions and every named sub-item are answered above with a direct answer first,
-the exact command(s), the complete unedited output, live `file:line` grounding, and an
-Observed/Inferred label._
 
+## Cleanup and read-only guarantee
+
+The investigation was run-first and strictly read-only: the only tracked change is this answer
+document. All observation was performed inside the throwaway container, and all temporary artifacts
+lived under the container's ephemeral `/tmp/blitzy_cap/` (never inside the tracked repository tree).
+
+**Runtime state after the investigation** (no lingering server, no server-side session state, and
+the disposable guard-test users removed — `john@wick.com` was never mutated):
+
+```text
+server_processes=0
+port_7777=FREE
+redis_session_keys=0
+```
+```text
+1|john@wick.com
+2|winston@continental.com
+```
+
+**Bearer-material invalidation.** The flushed Redis sessions (`redis_session_keys=0` above) make
+every captured `slapp` **session-id** cookie and its paired CSRF token dead. The one API key
+acquired canonically during Q5 (`blitzy-q5-device` — the `rvysrxel…` value shown in
+`api_auth_login.txt`) was deleted at completion; re-running the exact lookup `authorize_request`
+performs — `ApiKey.get_by(code="rvysrxel…")` (`app/api/base.py:L18`) — now returns `None`, so any
+request bearing that key takes the `Wrong api key` `401` path (`app/api/base.py:L27`) and the key is
+non-reusable:
+
+```text
+before delete: ApiKey.get_by(code=rvys...) => FOUND id=5 name=blitzy-q5-device
+after  delete: ApiKey.get_by(code=rvys...) => None
+remaining john api_keys: [(1, 'Chrome', 'code', 1), (2, 'Firefox', 'codeFF', 0)]
+```
+
+The seeded `code`/`codeFF` keys remain as standard `flask dummy-data` seed values (`code` still
+shows `times=1` from the intentional stats side-effect demonstrated in Q5 (C)); they are disposable
+DEVELOPMENT-only credentials in the git-ignored throwaway dev database, never production material.
+
+**Read-only proof — the host repository has exactly one modified path, this document**, on the
+working branch:
+
+```bash
+git rev-parse --abbrev-ref HEAD      # blitzy-a91b3111-6deb-4252-be6e-91d062c6ed20
+git status --porcelain
+git status --porcelain | wc -l
+```
+```text
+ M blitzy/documentation/app_2cd6ee777f8c.md
+1
+```
+
+**Note on `git diff --check`.** The terminal blank line at EOF flagged by the original review has
+been removed (one final newline is retained). The remaining `git diff --check` notices are all
+**trailing spaces that exist inside verbatim evidence blocks**, and come from three distinct
+tool-emitted sources: (1) `psql` column padding in the seeded-account verification (the `\x`
+expanded `delete_on      |` NULL field and the aligned `api_key` table header in the
+Investigation-environment section); (2) the kernel's fixed-width column padding in the
+`/proc/net/tcp` listener dump (Q4); and (3) the trailing space after each field in SimpleLogin's
+**pretty-printed** API JSON (Q5, e.g. `"email": "john@wick.com", `). These bytes are reproduced
+exactly as the tools emitted them; stripping them would violate the complete-and-unedited evidence
+rule (and would re-introduce the very "compact vs pretty-print" gap the review called out). They are
+therefore preserved intentionally.
+
+Temporary observation scripts and capture files under `/tmp/blitzy_cap/` in the container are
+deleted at completion; because they never resided in the tracked tree, their removal leaves the
+repository byte-for-byte unchanged apart from this document.
