@@ -818,7 +818,7 @@ docker exec sl-app-0 rm -rf /tmp/blitzy_evidence
 rm -rf /tmp/blitzy_evidence_host /tmp/doc_build
 ```
 
-No `blitzy_adhoc_test_*` files, build artifacts, or virtualenvs were created inside the repository at any point.
+This investigation created no `blitzy_adhoc_test_*` files, build artifacts, or virtualenvs inside the repository checkout — every temporary observation script lived **outside** it (Phase K), so none could appear in `git status`. The git-tracked repository is left byte-for-byte unchanged apart from this single document. (Python bytecode caches under `__pycache__/` are gitignored by `.gitignore`'s `*.pyc` rule and are excluded from git tracking; any such cache left in the working tree by a setup- or platform-phase `pytest` collection — for example a `tests/__pycache__/*.pyc` — never appears in `git status`/`git diff` and does not affect this byte-for-byte guarantee.)
 
 ### J.2 Repository-cleanliness verification
 
