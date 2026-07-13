@@ -1,45 +1,54 @@
 # SimpleLogin Reply-Resolution Investigation — How an Inbound Reply Resolves to a Contact and Forwarding Destination (and Why It Can Forward to the Wrong User)
 
-> **Scope:** Read-only root-cause investigation. This document is the *only* persistent artifact produced. No product/source/migration/test/configuration file was modified, and no remediation was performed. All temporary observation scripts were removed afterward (see §12 Repository Invariant).
+> **Scope.** Read-only, run-first root-cause investigation. This Markdown file is the *only* persistent artifact produced. No product, source, model, migration, test, configuration, or manifest file was modified, and **no remediation** (no `UNIQUE` constraint, no `ORDER BY`, no atomic generator, no lock/retry) was performed. All temporary observation scripts live **outside** the repository (in `/tmp`) and were removed afterward, with explicit absence proof in §13.
 >
-> **Methodology:** Run-first. Every behavioral claim below is backed by the *actual, complete, unedited* output of a command that exercised the **canonical** inbound reply entry point `email_handler.handle_reply(envelope, msg, rcpt_to)` in the canonical Docker runtime (Python 3.10 + PostgreSQL 15 + Redis). Factual claims are grounded in a specific `file:line`. Statements not directly observed are labeled **`[inferred]`**; values obtained by bypassing the entry point are labeled **`[non-canonical]`**.
+> **Methodology.** Every behavioral claim is backed by the *actual, complete, unedited* output of a command that exercised the **canonical** inbound reply path — `email_handler.handle_reply(envelope, msg, rcpt_to)` (`email_handler.py:966`), and, for the routing claim, the real routing hub `email_handler.handle(envelope, msg)` (`email_handler.py:1945`) — inside the canonical Docker runtime (Python 3.10 + PostgreSQL 15 + Redis). Factual claims are grounded in a specific `file:line`. Values obtained by bypassing the entry point (direct ORM/helper calls) are labeled **`[non-canonical]`**; the per-alias spoof-check-disabled path is labeled **`[non-canonical]` fallback**; statements not directly observed are labeled **`[inferred]`**.
+>
+> **Evidence fidelity note.** Each command and its output are reproduced from the exact files captured at runtime (saved with combined `stdout`+`stderr`, i.e. `2>&1` — no stream is suppressed). The **only** transformation applied when embedding them here is the removal of *trailing* whitespace at line ends (present solely in `psql`'s column-padding) and the normalization of the final newline, so that `git diff --check` reports no warnings (§7.4, §13). No value, identifier, count, log line, ordering, or structural content was altered. Every behavioral section shows the command that produced the output and was confirmed stable across **≥2 runs** (run 1 is shown; run 2 is byte-identical modulo the intentionally varied Message-ID prefix / random reverse-alias token / timestamps, as noted per section).
 
 ---
-
 ## 1. Lead Answer (Executive Summary)
 
-**How an inbound reply resolves.** When a user replies to a *reverse-alias*, the inbound SMTP recipient (`rcpt_to`) is taken verbatim as the reply address (`reply_email = rcpt_to` — `email_handler.py:972`). It is gated against the service domain (`if not reply_email.endswith(EMAIL_DOMAIN)` — `email_handler.py:977`; falling back to an `SLDomain` lookup — `email_handler.py:978`; else `status.E501` — `email_handler.py:981`), then normalized (`reply_email = normalize_reply_email(reply_email)` — `email_handler.py:984`). The normalized value is used to resolve a single `Contact`: `contact = Contact.get_by(reply_email=reply_email)` (`email_handler.py:986`). The **forwarding destination is derived entirely from that resolved contact**: `alias = contact.alias` (`email_handler.py:994`), `user = alias.user` (`email_handler.py:1004`), and `mailbox = get_mailbox_from_mail_from(mail_from, alias)` (`email_handler.py:1019`). On success the resolution is persisted as `EmailLog.create(contact_id=contact.id, alias_id=contact.alias_id, is_reply=True, user_id=contact.user_id, mailbox_id=mailbox.id, ...)` (`email_handler.py:1042-1050`).
+**How an inbound reply resolves to a contact and a forwarding destination.** When a user replies to a *reverse-alias*, the inbound SMTP recipient (`rcpt_to`) is taken verbatim as the reply address: `reply_email = rcpt_to` (`email_handler.py:972`). It is gated against the service domain — `if not reply_email.endswith(EMAIL_DOMAIN)` (`email_handler.py:977`), falling back to an `SLDomain` lookup (`email_handler.py:978`) and returning `status.E501` if neither matches (`email_handler.py:980-981`). It is then normalized: `reply_email = normalize_reply_email(reply_email)` (`email_handler.py:984`). The normalized value resolves a **single** `Contact`: `contact = Contact.get_by(reply_email=reply_email)` (`email_handler.py:986`). The **forwarding destination is derived entirely from that resolved contact**: `alias = contact.alias` (`email_handler.py:994`), `user = alias.user` (`email_handler.py:1001`), and the sender mailbox is chosen by `mailbox = get_mailbox_from_mail_from(mail_from, alias)` (`email_handler.py:1019`). On the authorized path the resolution is persisted as `EmailLog.create(contact_id=contact.id, alias_id=contact.alias_id, is_reply=True, user_id=contact.user_id, mailbox_id=mailbox.id, ...)` (`email_handler.py:1042-1050`).
 
-**Why it can forward to the wrong user.** The lookup `Contact.get_by(reply_email=...)` delegates to `ModelMixin.get_by()`, whose entire body is `return Session.query(cls).filter_by(**kw).first()` — a `.first()` with **no `ORDER BY`** (`app/models.py:83-84`). The `reply_email` column carries **no `UNIQUE` constraint**: the only unique constraint on `Contact` is `uq_contact` on `(alias_id, website_email)` (`app/models.py:1875`); `reply_email` is merely `index=True` (`app/models.py:1899`), and the migration that created its index sets `unique=False` (`migrations/versions/2021_071310_78403c7b8089_.py:22`). Generation-time uniqueness is only a best-effort, non-atomic TOCTOU check (`available_sl_email()` — `app/models.py:1425-1432`) that non-generator write paths bypass entirely. Consequently, **two `Contact` rows owned by different users can share one `reply_email`**, and on such a multi-row match `.first()` returns an **arbitrary, physical/plan-order-dependent** row. Because the alias and user are derived from that row, the reply is routed to — and logged against — **whichever user's contact the database happened to return first**, not necessarily the alias owner whose mailbox actually sent the reply.
+**Why it *can* forward to the wrong user.** The lookup `Contact.get_by(reply_email=...)` delegates to the shared `ModelMixin.get_by()`, whose entire body is `return Session.query(cls).filter_by(**kw).first()` — a `.first()` with **no `ORDER BY`** (`app/models.py:82-84`). The `reply_email` column carries **no `UNIQUE` constraint**: the only unique constraint on `Contact` is `uq_contact` on `(alias_id, website_email)` (`app/models.py:1875`); `reply_email` is merely `index=True` (`app/models.py:1899`), and the migration that created its index sets `unique=False` (`migrations/versions/2021_071310_78403c7b8089_.py:22`). Generation-time uniqueness is only a best-effort, non-atomic time-of-check-to-time-of-use (TOCTOU) guard, `available_sl_email()` (`app/models.py:1425-1432`), which non-generator write paths (a direct `Contact.create(...)`) bypass entirely. Consequently, **two `Contact` rows owned by different users can share one `reply_email`**, and on such a multi-row match `.first()` returns one row **without any application-specified order**. Because the alias and user are derived from that row, the reply is routed to — and, on the authorized path, logged against — **whichever contact the database returned**, not necessarily the alias owner whose mailbox actually sent the reply.
 
-**Headline observed evidence.** Seeding two contacts that share one `reply_email` and then driving the *identical* canonical input `N=100` times:
+**What the runtime evidence actually shows (and the important distinction the default access control enforces).** Seeding two contacts that share one `reply_email` on aliases owned by different users, then driving the *identical* canonical input against those same persisted rows, the resolved contact — and therefore the alias, user, and mailbox derived from it — is determined by which row `.first()` returns, which in turn tracks the contacts' **insertion order** under the active query plan (§7):
 
-- Insertion order **A-then-B** → **100/100** resolved to the first-inserted contact, `user_A`.
-- Insertion order **B-then-A** (identical `mail_from = user_A`'s mailbox, identical `rcpt_to`) → **100/100** resolved to `user_B` — **the different user**. The persisted `EmailLog.user_id` recorded `user_B` for all 100 events.
+- Insertion order **A-then-B** → **20/20** events (× 2 runs) resolved to the first-inserted contact, `user_A` (the correct owner of the sending mailbox). Result: **E200**, `EmailLog.user_id = 1`.
+- Insertion order **B-then-A**, with the **identical** `mail_from` (user_A's mailbox) and `rcpt_to` → `.first()` resolves `user_B`'s contact — **a different user than the sending mailbox owner**. What happens next depends on the alias's spoof-check setting:
+  - **Default control (`disable_email_spoofing_check = False`, the out-of-the-box behavior)** → `get_mailbox_from_mail_from()` returns `None` (user_A's mailbox is not authorized for user_B's alias), so `handle_reply()` calls `handle_unknown_mailbox()` and returns **`status.E214`** (`email_handler.py:1032-1034`). The reply is **rejected before any `EmailLog` is created and before any forward**; the only outbound message is an *alert* to `user_B` warning that someone tried to use their alias. This is an **access-control boundary**, not a wrong-user delivery. Observed **20/20** (× 2 runs): `code = '250 SL E214 Unauthorized for using reverse alias'`, `EmailLog = None`.
+  - **`[non-canonical]` fallback (`disable_email_spoofing_check = True`, a non-default per-alias flag)** → the spoof check is skipped (`email_handler.py:1023`), the sender mailbox falls back to `alias.mailbox`, and the reply is **selected, logged, and a send request is enqueued under the wrong user**: **E200**, `EmailLog.user_id = 2 (user_B)`, external target `b@nowhere.net`. Observed **20/20** (× 2 runs). This is the condition under which a reply is actually *forwarded* under the wrong user.
 
-The resolved user is governed **purely by physical row order**, not by the alias owner or the sender. This is the wrong-user condition, reproduced directly. Full outputs are in §7; the causal chain is in §6.
+**Two clarifications the evidence makes precise.** (1) *Application acceptance is not confirmed external delivery.* The harness runs with `NOT_SEND_EMAIL=true`, so `mail_sender.send()` logs and returns success **without** calling the SMTP transport (`app/mail_sender.py:130-136`); an observed `'250 Message accepted for delivery'` and a stored `SendRequest` prove *selection, logging, and enqueue*, not a confirmed outbound SMTP hand-off. (2) *The resolved row is not attributable to a specified ordering.* The application specifies no `ORDER BY`; the row the database returns depends on the active plan and physical layout (§7.4). Within each fixed layout the result was **stable** (20/20 across 2 runs), not random per call; that a *different* plan or layout could return the other row is **`[inferred]`** from the absence of an `ORDER BY` plus the official SQLAlchemy/PostgreSQL semantics cited in §4.1 and §9.
+
+Full outputs and commands are in §3–§8; the complete causal chain is in §6; the cross-event distribution (every seed and every run) is in §7.
 
 ---
-
 ## 2. Environment & Methodology
 
-### 2.1 Canonical runtime
+### 2.1 Canonical runtime (Python 3.10 + PostgreSQL 15 + Redis)
 
-All observations were produced inside the canonical Docker container `sl_app` (image `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_simple-login_app_1.0`), which contains the SimpleLogin repository at commit `2cd6ee777f8c` — the same commit the assigned filename encodes.
+All observations were produced inside the canonical Docker container `sl_app` (image `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_simple-login_app_1.0`), which contains the SimpleLogin repository at commit `2cd6ee777f8c` — the commit the assigned filename encodes (branch grounding in §2.3). The command below prints each fact under its own explicit label so that the shown output is exactly what the command emits (each separator line — `--- python (system) ---`, `--- postgres ---`, `--- redis ---` — is produced by an `echo` in the command itself).
 
 **Command:**
 
 ```
-docker exec sl_app bash -lc 'python --version 2>&1; echo "---"; . /app/venv/bin/activate; python --version 2>&1'
-docker exec sl_app bash -lc 'pg_isready 2>&1; su postgres -c "psql -tAc \"select version();\"" 2>/dev/null | head -1'
-docker exec sl_app bash -lc 'redis-cli ping 2>&1'
+docker exec sl_app bash -lc '
+echo "--- python (system) ---"; python --version 2>&1
+. /app/venv/bin/activate
+echo "--- python (venv) ---"; python --version 2>&1
+echo "--- postgres ---"; pg_isready 2>&1; su postgres -c "psql -tAc \"select version();\"" 2>&1 | head -1
+echo "--- redis ---"; redis-cli ping 2>&1
+'
 ```
 
-**Output (complete, unedited):**
+**Output (complete, unedited; stable across run 1 and run 2):**
 
 ```
+--- python (system) ---
 Python 3.10.18
----
+--- python (venv) ---
 Python 3.10.18
 --- postgres ---
 /var/run/postgresql:5432 - accepting connections
@@ -48,72 +57,197 @@ PostgreSQL 15.13 (Debian 15.13-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gc
 PONG
 ```
 
-This matches the AAP's canonical configuration (Python 3.10, PostgreSQL, Redis).
+This matches the AAP's canonical configuration: **Python 3.10.18**, **PostgreSQL 15.13**, and **Redis** (`PONG`). The venv Python equals the system Python (3.10.18), so activation does not change the interpreter version.
 
-### 2.2 Canonical configuration values
+### 2.2 Canonical configuration values (and the dotenv precedence that governs `DB_URI`)
 
-The reply path depends on `EMAIL_DOMAIN` (the reply-domain gate) and `DB_URI`. These are sourced from the environment recipe `/tmp/sl_env.sh` derived from `tests/test.env`.
+The reply path depends on `EMAIL_DOMAIN` (the reply-domain gate at `email_handler.py:977`) and `DB_URI` (the datastore). The runtime recipe `/tmp/sl_env.sh` (sourced from `tests/test.env` during image build) exports these into the environment *before* the app imports its config.
 
 **Command:**
 
 ```
-docker exec sl_app bash -lc 'set -a && . /tmp/sl_env.sh && set +a; echo "CONFIG=$CONFIG"; echo "DB_URI=$DB_URI"; echo "EMAIL_DOMAIN=$EMAIL_DOMAIN"; echo "MEM_STORE_URI=$MEM_STORE_URI"'
-docker exec sl_app bash -lc 'cd /app; grep -n "^EMAIL_DOMAIN" tests/test.env; grep -n "^DB_URI" tests/test.env; grep -n "EMAIL_DOMAIN=sl.local" example.env'
+docker exec sl_app bash -lc '
+cd /app
+echo "--- effective runtime env (from /tmp/sl_env.sh) ---"
+set -a && . /tmp/sl_env.sh && set +a
+echo "CONFIG=$CONFIG"; echo "DB_URI=$DB_URI"; echo "EMAIL_DOMAIN=$EMAIL_DOMAIN"; echo "NOT_SEND_EMAIL=$NOT_SEND_EMAIL"
+echo "--- source lines: tests/test.env ---"
+grep -n "^EMAIL_DOMAIN\|^DB_URI" tests/test.env
+echo "--- source line: example.env ---"
+grep -n "^EMAIL_DOMAIN" example.env
+echo "--- dotenv precedence grounding: app/config.py load_dotenv call ---"
+grep -n "load_dotenv" app/config.py
+echo "--- NOT_SEND_EMAIL grounding: app/config.py ---"
+grep -n "NOT_SEND_EMAIL" app/config.py
+'
 ```
 
-**Output (complete, unedited):**
+**Output (complete, unedited; stable across run 1 and run 2):**
 
 ```
+--- effective runtime env (from /tmp/sl_env.sh) ---
 CONFIG=/app/tests/test.env
 DB_URI=postgresql://test:test@localhost:5432/test
 EMAIL_DOMAIN=sl.local
-MEM_STORE_URI=redis://localhost
+NOT_SEND_EMAIL=true
+--- source lines: tests/test.env ---
 8:EMAIL_DOMAIN=sl.local
 17:DB_URI=postgresql://test:test@localhost:15432/test
+--- source line: example.env ---
 22:EMAIL_DOMAIN=sl.local
+--- dotenv precedence grounding: app/config.py load_dotenv call ---
+9:from dotenv import load_dotenv
+69:    load_dotenv(get_abs_path(config_file))
+71:    load_dotenv()
+--- NOT_SEND_EMAIL grounding: app/config.py ---
+91:NOT_SEND_EMAIL = "NOT_SEND_EMAIL" in os.environ
 ```
 
-- `EMAIL_DOMAIN=sl.local` is declared at `tests/test.env:8` and `example.env:22`.
-- **Note on `DB_URI`:** `tests/test.env:17` declares port **15432**, but the runtime recipe `/tmp/sl_env.sh` exports `DB_URI=...@localhost:5432/test`. Because `app/config.py` loads the dotenv **without override**, the already-exported `5432` value wins, so the app connects directly to the in-container PostgreSQL on `5432` (no `socat` bridge needed). This is a runtime detail of the harness, not a code change.
+- `EMAIL_DOMAIN=sl.local` is declared at `tests/test.env:8` and `example.env:22`, and is the effective runtime value.
+- **`DB_URI` precedence (grounded, not asserted):** `tests/test.env:17` declares port **15432**, but the effective runtime value is `...@localhost:5432/test`. The reason is grounded in source: `app/config.py` calls `load_dotenv(get_abs_path(config_file))` (`app/config.py:69`) or `load_dotenv()` (`app/config.py:71`). Python-dotenv's `load_dotenv()` does **not** override variables already present in the environment (its `override` parameter defaults to `False`); because `/tmp/sl_env.sh` already exported `DB_URI=...5432`, the exported value wins and the app connects directly to the in-container PostgreSQL on `5432` (no `socat` bridge needed). This is a harness/runtime detail, not a code change. The `5432` value is a member of the disposable-DB allowlist the harnesses enforce before any write (§2.7, §7).
+- `NOT_SEND_EMAIL=true` is in effect; it is read at `app/config.py:91` as `NOT_SEND_EMAIL = "NOT_SEND_EMAIL" in os.environ`. Its consequence for "delivery" claims is made precise throughout (§4.2, §7): success codes prove application acceptance and enqueue, not confirmed SMTP hand-off.
 
-### 2.3 How the app was booted (mirroring `tests/conftest.py`)
+### 2.3 Runtime branch / HEAD confirmation (and honest disclosure of the detached, setup-dirty container)
 
-Each temporary harness boots a *real* Flask app exactly as the canonical test fixture does:
+The mandated filename `app_2cd6ee777f8c.md` is derived from the **source branch** `app_2cd6ee777f8c`. The runtime container's `/app` checkout is **detached** at the corresponding commit (it is not on a named branch), so the branch name is grounded from the commit and the destination repository — not asserted from a container symbolic ref. Both are shown, and the container's setup-time dirtiness is disclosed.
 
-1. `CONFIG` is set to `tests/test.env` (via `/tmp/sl_env.sh`) **before** importing app modules (`tests/conftest.py:8`).
-2. `from server import create_app` (`tests/conftest.py:20`; `server.py` `def create_app() -> Flask`), then `app = create_app()` (`tests/conftest.py:23`).
-3. The `pg_trgm` extension is (re)created (`tests/conftest.py:28-35`); dropping it while dependent objects exist prints `pg_trgm can't be dropped, ignore` and is harmless (mirrors conftest).
-4. `from init_app import add_sl_domains, add_proton_partner` (`tests/conftest.py:21`); `add_sl_domains()` (`tests/conftest.py:38`) seeds the `SLDomain` rows the domain gate needs (including `sl.local`); `add_proton_partner()` (`tests/conftest.py:39`).
-5. The ORM session is `from app.db import Session` (`shell.py:7`); all seeding/observation runs inside `app.app_context()`.
-6. `mail_sender.store_emails_instead_of_sending(True)` (`app/mail_sender.py:102`) captures outbound mail instead of performing real SMTP on the success path.
-
-### 2.4 Seeding the real data condition
-
-Using the canonical helpers exactly as the tests do (`tests/test_email_handler.py`, `tests/utils.py`):
-
-- `create_new_user()` creates a `User` whose **default mailbox email equals the user's email** (`tests/utils.py`), so `get_mailbox_from_mail_from(user.email, alias)` matches that mailbox.
-- `Alias.create_new_random(user)` creates one alias per user.
-- Two `Contact` rows are created on aliases owned by **different** users but with the **same** `reply_email`, via direct `Contact.create(...)`. This is accepted because there is no `UNIQUE` constraint on `reply_email` (proof in §6) and because `Contact.create` (`app/models.py:1938`) only guards that `website_email` is not itself a reverse-alias — it does **not** check `reply_email` uniqueness.
-
-### 2.5 Canonical vs non-canonical, and scale
-
-- **Canonical** observations drive `email_handler.handle_reply(envelope, msg, rcpt_to)` (`email_handler.py:966`) directly — the real inbound reply entry point. Routing to this handler is confirmed via `is_reverse_alias()` (`app/email_utils.py:1156-1158`), which is how `email_handler.handle()` dispatches replies.
-- **`[non-canonical]`** corroboration (a direct `Contact.get_by(reply_email=...)` call) is explicitly labeled wherever used; it demonstrates the underlying `.first()` mechanism but bypasses the entry point.
-- **Scale:** the cross-event experiment runs the identical input at **N=100** and is repeated across **≥2 independent runs** (§7). Where within-dataset stability is observed, the *cause* of that stability is labeled `[inferred]`; the A-vs-B ordering-dependence itself is directly **observed**.
-
-### 2.6 Temporary harness scripts
-
-Five throwaway scripts were used, all living **outside** the repository at `/tmp/observe_*.py` and all removed afterward (§12). Their full source is reproduced in the Evidence Appendix (§10) so the results remain reproducible after deletion. The invocation pattern was:
+**Command:**
 
 ```
-docker exec sl_app bash -lc 'cd /app; . venv/bin/activate; set -a && . /tmp/sl_env.sh && set +a; python /tmp/observe_<name>.py [args]'
+echo "=== CONTAINER /app checkout (canonical runtime source) ==="
+docker exec sl_app bash -lc 'cd /app; echo "HEAD commit:"; git rev-parse HEAD; echo "symbolic-ref (branch):"; git symbolic-ref -q HEAD || echo "(none: DETACHED HEAD)"; echo "describe:"; git describe --all --always 2>&1; echo "dirty (git status --porcelain):"; git status --porcelain'
+echo ""
+echo "=== DESTINATION repo (host working tree; where the deliverable lives) ==="
+cd /tmp/blitzy/app/blitzy-3fc9b061-bac4-42a9-b984-8eaab62d81e6_193781
+echo "branch:"; git rev-parse --abbrev-ref HEAD
+echo "HEAD commit:"; git rev-parse HEAD
+```
+
+**Output (complete, unedited; stable across run 1 and run 2):**
+
+```
+=== CONTAINER /app checkout (canonical runtime source) ===
+HEAD commit:
+2cd6ee777f8c2d3531559588bcfb18627ffb5d2c
+symbolic-ref (branch):
+(none: DETACHED HEAD)
+describe:
+tags/v4.53.2-6-g2cd6ee77
+dirty (git status --porcelain):
+ M app/spamassassin_utils.py
+ M local_data/jwtRS256.key
+ M local_data/jwtRS256.key.pub
+ M local_data/test_words.txt
+ M static/package-lock.json
+
+=== DESTINATION repo (host working tree; where the deliverable lives) ===
+branch:
+blitzy-3fc9b061-bac4-42a9-b984-8eaab62d81e6
+HEAD commit:
+864d5041fd239b020b0a73ba87a60a3a8d577564
+```
+
+- **Container `/app` (canonical runtime source):** `HEAD = 2cd6ee777f8c2d3531559588bcfb18627ffb5d2c`, **DETACHED HEAD** (no symbolic ref), `git describe = tags/v4.53.2-6-g2cd6ee77`. It is **dirty in exactly five setup-generated files** — `app/spamassassin_utils.py`, `local_data/jwtRS256.key`, `local_data/jwtRS256.key.pub`, `local_data/test_words.txt`, `static/package-lock.json` — none of which is on the reply-resolution path or touched by this investigation. This is a property of the pre-built image's bring-up (documented in the setup notes), disclosed here for reproducibility.
+- **Destination repository (host working tree; where this deliverable lives):** branch `blitzy-3fc9b061-bac4-42a9-b984-8eaab62d81e6`, `HEAD = 864d5041...`. **All repository-integrity claims in this document are scoped to this destination repository** (§13): the sole change here is the creation of this one Markdown file.
+
+### 2.4 How the app was booted (mirroring `tests/conftest.py`)
+
+Each temporary harness boots a *real* Flask app exactly as the canonical test fixture does, then works inside `app.app_context()`:
+
+1. `CONFIG` points to `tests/test.env` (via `/tmp/sl_env.sh`) and is exported **before** app modules are imported (matching `tests/conftest.py`), so `app/config.py`'s `load_dotenv` sees the canonical values.
+2. `from server import create_app` (`server.py:139` — `def create_app() -> Flask:`), then `app = create_app()`.
+3. `CREATE EXTENSION IF NOT EXISTS pg_trgm` is executed idempotently (the `pg_trgm` extension backs SimpleLogin's trigram indexes). The harnesses **never** `DROP` the extension (contrast with the conftest teardown), avoiding privileged destructive DDL (§2.7 safety).
+4. `from init_app import add_sl_domains, add_proton_partner`; `add_sl_domains()` seeds the `SLDomain` rows the domain gate needs (including `sl.local` — visible in the boot logs of every run, e.g. `Add sl.local to SL domain`); `add_proton_partner()` seeds the Proton partner.
+5. The ORM session is `from app.db import Session, engine`.
+6. `mail_sender.store_emails_instead_of_sending(True)` (`app/mail_sender.py`) captures outbound messages as in-memory `SendRequest` objects on the success path instead of performing SMTP; combined with `NOT_SEND_EMAIL=true` this is why success proves enqueue, not SMTP hand-off.
+
+### 2.5 Seeding the real data condition
+
+Using the canonical helpers exactly as the tests do (`tests/utils.py: create_new_user`, `Alias.create_new_random`, `Contact.create`):
+
+- `create_new_user(email=...)` creates a `User` whose **default mailbox email equals the user's email**. This behavior is implemented by `User.create` itself: it creates `mb = Mailbox.create(user_id=user.id, email=user.email, verified=True)` (`app/models.py:611`) and sets `user.default_mailbox_id = mb.id` (`app/models.py:613`). Consequently `get_mailbox_from_mail_from(user.email, alias)` matches that mailbox when — and only when — the alias belongs to that same user.
+- `Alias.create_new_random(user)` creates one alias per user (the boot logs show the generated alias emails, e.g. `generate email test_test113@sl.local`).
+- Two `Contact` rows are created on aliases owned by **different** users but with the **same** `reply_email`, via direct `Contact.create(...)`. This is accepted because there is no `UNIQUE` constraint on `reply_email` (proof in §6.1) and because `Contact.create` guards only that `website_email` is not itself a reverse-alias — it does **not** check `reply_email` uniqueness.
+
+### 2.6 Observation classes: canonical, `[non-canonical]`, `[inferred]`
+
+- **Canonical** observations drive the real inbound reply entry point `email_handler.handle_reply(envelope, msg, rcpt_to)` (`email_handler.py:966`); the routing claim is additionally proven by invoking the real hub `email_handler.handle(envelope, msg)` (`email_handler.py:1945`), which detects the reverse-alias and dispatches to `handle_reply()` (§7 is driven through `handle_reply`; §3–§5 use `handle_reply`, and the routing proof in §4.3 uses `handle()`).
+- **`[non-canonical]`** observations — a direct `Contact.get_by(reply_email=...)`, a direct `is_reverse_alias(...)` predicate call, or the per-alias **spoof-check-disabled fallback** — are explicitly labeled `[non-canonical]` wherever they appear. They corroborate the underlying `.first()` mechanism or the selection/logging behavior but do not, by themselves, represent default canonical delivery.
+- **`[inferred]`** statements (e.g., "a different query plan or physical layout could return the other row") are labeled as such and grounded in the official semantics cited in §4.1 and §9.
+- **Scale.** The cross-event experiment drives the identical input **N=20** per run and repeats **each condition across 2 independent drive runs** against the **same** persisted rows (§7). Every seed and every drive run performed against the clean-slate database is disclosed in §7 — none is omitted.
+
+### 2.7 Temporary harness scripts (nine), safety, and the reproducible-command convention
+
+Nine throwaway scripts were used. They live **outside** the repository at `/tmp/harness/` on the host (copied into the container's `/tmp/`), and all were removed afterward with per-file absence proof (§13). Their **full source is reproduced in §11.3** so results remain reproducible after deletion:
+
+- `_bootstrap.py` — shared fail-fast bootstrap (documented below).
+- `observe_reply.py` — canonical happy-path single call (§3–§5).
+- `observe_wronguser.py` — CRITICAL default-control vs `[non-canonical]` fallback (§10).
+- `observe_handle.py` — canonical routing through `handle()` (§4.3).
+- `observe_dist.py` — same-unchanged-input distribution, seed-once/drive-many (§7).
+- `observe_edge.py` — E501 / E502(no-contact) / E502(inactive-user) / `is_reverse_alias` (§8.1).
+- `observe_norm.py` — inbound normalization / exact-equality lookup (§8.2).
+- `observe_avail.py` — exact `available_sl_email` body, call sites, guard bypass (§6.2).
+- `observe_second.py` — the second lookup site `replace_header_when_reply()` (§8.3).
+
+**Fail-fast safety (addresses the disposable-target concern).** Because exported env values override dotenv (§2.2), every harness **refuses to run** unless `DB_URI` is one of a small allowlist of disposable localhost test DSNs, **and** re-checks `current_database() == 'test'` after `create_app()`, **before** any schema or data write. It uses `CREATE EXTENSION IF NOT EXISTS` (never `DROP EXTENSION`). The shared fragment (reproduced verbatim; full per-harness copies in §11.3):
+
+```python
+# Shared corrected bootstrap fragment (documented inline in each harness).
+import os
+import sys
+
+_ALLOWED_DSNS = {
+    "postgresql://test:test@localhost:5432/test",
+    "postgresql://test:test@localhost:15432/test",
+    "postgresql://test:test@127.0.0.1:5432/test",
+}
+_DSN = os.environ.get("DB_URI", "")
+if _DSN not in _ALLOWED_DSNS:
+    sys.stderr.write(f"REFUSING TO RUN: DB_URI={_DSN!r} is not an allowlisted disposable test DB\n")
+    sys.exit(3)
+
+from server import create_app
+from app.db import Session, engine
+
+app = create_app()
+
+with engine.connect() as _c:
+    _dbname = _c.execute("select current_database()").scalar()
+if _dbname != "test":
+    sys.stderr.write(f"REFUSING TO RUN: current_database()={_dbname!r} != 'test'\n")
+    sys.exit(3)
+
+with engine.begin() as _c:
+    _c.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+
+
+def truncate_clean_slate():
+    """Clean slate (deterministic IDs, only this run's rows). Safe: allowlist +
+    current_database() guards already ran. Uses engine.begin() so the TRUNCATE
+    commits and holds no lingering lock."""
+    Session.close()
+    with engine.begin() as c:
+        c.execute(
+            "DO $$DECLARE r RECORD; BEGIN "
+            "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public' "
+            "AND tablename<>'alembic_version') LOOP "
+            "EXECUTE 'TRUNCATE TABLE '||quote_ident(r.tablename)||' RESTART IDENTITY CASCADE'; "
+            "END LOOP; END$$;"
+        )
+```
+
+**Reproducible-command convention.** Each behavioral section below shows the **exact** command that produced its output. The following generic form is a **template only (not a literal reproducible command)** — the concrete, runnable commands (with real script names and arguments) appear inline in §3–§8 and §11:
+
+```
+# TEMPLATE (illustrative only — see each section for the exact command):
+docker exec sl_app bash -lc 'cd /app; . venv/bin/activate; set -a && . /tmp/sl_env.sh && set +a; python /tmp/observe_<name>.py [args] 2>&1'
 ```
 
 ---
-
 ## 3. Reply-address derivation
 
-The reply address is the inbound SMTP recipient, taken verbatim, then domain-gated and normalized. The exact code (canonical source, re-confirmed at runtime):
+The reply address is the inbound SMTP recipient, taken verbatim, then domain-gated and normalized. The exact code (canonical source at commit `2cd6ee777f8c`, re-confirmed at runtime):
 
 ```
 email_handler.py:966   def handle_reply(envelope, msg: Message, rcpt_to: str) -> (bool, str):
@@ -121,54 +255,35 @@ email_handler.py:972       reply_email = rcpt_to
 email_handler.py:974       reply_domain = get_email_domain_part(reply_email)
 email_handler.py:977       if not reply_email.endswith(EMAIL_DOMAIN):
 email_handler.py:978           sl_domain: SLDomain = SLDomain.get_by(domain=reply_domain)
+email_handler.py:980               LOG.w("Reply email %s has wrong domain", reply_email)
 email_handler.py:981               return False, status.E501
 email_handler.py:984       reply_email = normalize_reply_email(reply_email)
 email_handler.py:986       contact = Contact.get_by(reply_email=reply_email)
 ```
 
 - **Extraction:** `reply_email = rcpt_to` (`email_handler.py:972`). The reply address is *literally* the envelope recipient — no transformation at this step.
-- **Domain gate:** `if not reply_email.endswith(EMAIL_DOMAIN)` (`email_handler.py:977`). If the address does not end with `EMAIL_DOMAIN` (`sl.local`), the handler falls back to an `SLDomain` lookup on the domain part (`email_handler.py:978`) and returns `status.E501` if that also fails (`email_handler.py:981`). See §8 for the observed E501.
-- **Normalization:** `reply_email = normalize_reply_email(reply_email)` (`email_handler.py:984`). `normalize_reply_email()` (`app/email_validation.py:25`) first routes non-ASCII input through `convert_to_id()` (`app/email_validation.py:27-28`), then replaces any character not in `_ALLOWED_CHARS` (`app/email_validation.py:9`) with `_` (`app/email_validation.py:33`). This is a **many-to-one** mapping (see §8 collision).
+- **Domain gate:** `if not reply_email.endswith(EMAIL_DOMAIN)` (`email_handler.py:977`). If the address does not end with `EMAIL_DOMAIN` (`sl.local`), the handler falls back to an `SLDomain` lookup on the domain part (`email_handler.py:978`) and returns `status.E501` if that also fails (`email_handler.py:981`). The observed E501 is in §8.1.
+- **Normalization:** `reply_email = normalize_reply_email(reply_email)` (`email_handler.py:984`). `normalize_reply_email()` (`app/email_validation.py:25`) first routes non-ASCII input through `convert_to_id()`, then replaces any character **not** in `_ALLOWED_CHARS` (`app/email_validation.py:9`) with `_`. This is a **many-to-one** mapping applied to the **inbound** string only (its precise semantics, and what it does and does not imply for multi-row matches, are established with runtime evidence in §8.2).
 
-### 3.1 Observed extracted/normalized value (canonical)
-
-From the canonical single-call run (harness `observe_reply.py`, token `5jvdsvfg`):
-
-**Command:**
-
-```
-docker exec sl_app bash -lc 'cd /app; . venv/bin/activate; set -a && . /tmp/sl_env.sh && set +a; python /tmp/observe_reply.py 2>&1'
-```
-
-**Relevant excerpt of the (complete, unedited) output — full output in §4.2:**
-
-```
-=== reply-address derivation values ===
-rcpt_to (raw)              = 'dup-reply-5jvdsvfg@sl.local'
-endswith(EMAIL_DOMAIN)     = True
-normalize_reply_email(...) = 'dup-reply-5jvdsvfg@sl.local'
-```
-
-- **Extracted `rcpt_to`:** `'dup-reply-5jvdsvfg@sl.local'`.
-- **Domain gate passes:** `endswith(EMAIL_DOMAIN) = True`.
-- **Normalized value:** `'dup-reply-5jvdsvfg@sl.local'` — unchanged here, because every character is already in `_ALLOWED_CHARS`. (The normalization *does* alter and collide other inputs; see §8.)
+The observed extracted/normalized value for the canonical happy-path call appears inline in §4.2 (fields `rcpt_to (raw)`, `endswith(EMAIL_DOMAIN)`, `normalize_reply_email(...)`).
 
 ---
-
 ## 4. Contact resolution & `.first()` semantics
 
 ### 4.1 The lookup and its underlying `.first()`
 
-The normalized reply address is resolved to a single `Contact`:
+The normalized reply address resolves a **single** `Contact`:
 
 ```
 email_handler.py:986   contact = Contact.get_by(reply_email=reply_email)
+email_handler.py:988       LOG.w("No contact with %s as reverse alias", reply_email)
 email_handler.py:989       return False, status.E502            # when no contact is found
 email_handler.py:990   if not contact.user.is_active():
+email_handler.py:991       LOG.w("User %s has been soft deleted", contact.user)
 email_handler.py:992       return False, status.E502
 ```
 
-`Contact.get_by(...)` is the inherited `ModelMixin.get_by()` helper. Its **entire body** is a `.first()` with **no `ORDER BY`**:
+`Contact.get_by(...)` is the inherited `ModelMixin.get_by()` helper. Its **entire body** is a `.first()` with **no `ORDER BY`** (verbatim via `inspect.getsource` in §6.2):
 
 ```
 app/models.py:82      @classmethod
@@ -176,11 +291,11 @@ app/models.py:83      def get_by(cls, **kw):
 app/models.py:84          return Session.query(cls).filter_by(**kw).first()
 ```
 
-**Consequence:** when more than one `Contact` row matches the given `reply_email`, `.first()` returns whichever row the database yields first. Because the query carries no `ORDER BY`, that row is **arbitrary and ordering/plan-dependent** — not a code-guaranteed choice. **`[inferred]`** (framework semantics): under SQLAlchemy 1.3.24 (pinned), `Query.first()` emits `LIMIT 1` with no ordering, so the returned row is not guaranteed stable across executions or across physical layouts. The direct runtime consequence (which row is returned, and that reversing insertion order flips it) is **observed** in §7.
+**Framework semantics (official, for the pinned SQLAlchemy 1.3.24).** `Query.first()` applies a `LIMIT 1` and returns the first row the database yields ([SQLAlchemy 1.3 Query API — `Query.first()`](https://docs.sqlalchemy.org/en/13/orm/query.html)). When no `ORDER BY` is present and more than one row matches, which row is "first" is **not deterministic**: the SQLAlchemy FAQ states that "*when ORDER BY is not used ... the relational database is free to return matched rows in any arbitrary order*" and that "*any query that limits rows using LIMIT ... will not be deterministic in terms of what result row is returned, assuming there's more than one row that matches*," recommending an `ORDER BY` on a unique column (the primary key) as the remedy ([SQLAlchemy FAQ — "Why is ORDER BY recommended with LIMIT"](https://docs.sqlalchemy.org/en/13/faq/ormconfiguration.html#faq-query-deduplicating)). SimpleLogin's `get_by()` specifies no such order, so on a multi-row `reply_email` match the resolved `Contact` is unordered at the application level (the PostgreSQL-level determinant is analyzed with `EXPLAIN`/`ctid` evidence in §7.4).
 
-### 4.2 Observed resolved contact (canonical, full output)
+### 4.2 Observed resolved contact — the canonical happy-path call (complete, unedited output)
 
-The canonical single-call run seeds two contacts sharing one `reply_email` (owned by different users), proves the duplicate persisted, then drives `handle_reply` once.
+The harness `observe_reply.py` seeds two contacts sharing one `reply_email` on aliases owned by different users, proves the duplicate persisted, prints the reply-address derivation values, then drives the **canonical** `email_handler.handle_reply(envelope, msg, shared_reply)` **once** with `mail_from = user_A`'s mailbox (the owner of the first-inserted contact's alias). Direct ORM/predicate corroboration is explicitly `[non-canonical]`.
 
 **Command:**
 
@@ -188,653 +303,949 @@ The canonical single-call run seeds two contacts sharing one `reply_email` (owne
 docker exec sl_app bash -lc 'cd /app; . venv/bin/activate; set -a && . /tmp/sl_env.sh && set +a; python /tmp/observe_reply.py 2>&1'
 ```
 
-**Output (complete, unedited):**
+**Output (complete, unedited; run 1 of 2 — run 2 is byte-identical modulo per-run-varying fields only: logger timestamps/PID and the randomly-generated alias local-parts / reverse-alias token in the stored `SendRequest`):**
 
 ```
 load config file /app/tests/test.env
 >>> URL: http://localhost
 Upload files to local dir
 >>> init logging <<<
-2026-07-13 17:26:52,517 - SL - DEBUG - 4553 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
->>> pg_trgm can't be dropped, ignore
-2026-07-13 17:26:53,312 - SL - DEBUG - 4553 - "/app/init_app.py:42" - add_sl_domains() -  - d1.test is already a SL domain
-2026-07-13 17:26:53,313 - SL - DEBUG - 4553 - "/app/init_app.py:42" - add_sl_domains() -  - d2.test is already a SL domain
-2026-07-13 17:26:53,314 - SL - DEBUG - 4553 - "/app/init_app.py:42" - add_sl_domains() -  - sl.local is already a SL domain
-2026-07-13 17:26:53,315 - SL - DEBUG - 4553 - "/app/init_app.py:42" - add_sl_domains() -  - sl.local is already a SL domain
-BOOT OK: <Flask 'server'>
-DB_URI: postgresql://test:test@localhost:5432/test
-2026-07-13 17:26:53,612 - SL - INFO - 4553 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
-2026-07-13 17:26:53,872 - SL - INFO - 4553 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
-2026-07-13 17:26:53,887 - SL - DEBUG - 4553 - "/app/app/models.py:1459" - generate_random_alias_email() -  - generate email word_list209@sl.local
-2026-07-13 17:26:53,894 - SL - INFO - 4553 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
-2026-07-13 17:26:53,904 - SL - DEBUG - 4553 - "/app/app/models.py:1459" - generate_random_alias_email() -  - generate email list_word440@sl.local
-2026-07-13 17:26:53,911 - SL - INFO - 4553 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
-=== SEED ===
-EMAIL_DOMAIN='sl.local'
-shared_reply='dup-reply-5jvdsvfg@sl.local'
-user_a.id=27 email='user_zom563s8s3@mailbox.test' alias_a.id=55 alias_a.email='word_list209@sl.local'
-user_b.id=28 email='user_dokyueg5wz@mailbox.test' alias_b.id=56 alias_b.email='list_word440@sl.local'
-contact_a.id=28 (alias_a, user_a)   contact_b.id=29 (alias_b, user_b)
+2026-07-13 18:24:49,097 - SL - DEBUG - 5735 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+2026-07-13 18:24:53,376 - SL - INFO - 5735 - "/app/init_app.py:44" - add_sl_domains() -  - Add d1.test to SL domain
+2026-07-13 18:24:53,379 - SL - INFO - 5735 - "/app/init_app.py:44" - add_sl_domains() -  - Add d2.test to SL domain
+2026-07-13 18:24:53,381 - SL - INFO - 5735 - "/app/init_app.py:44" - add_sl_domains() -  - Add sl.local to SL domain
+2026-07-13 18:24:53,382 - SL - DEBUG - 5735 - "/app/init_app.py:42" - add_sl_domains() -  - sl.local is already a SL domain
+2026-07-13 18:24:53,665 - SL - INFO - 5735 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
+2026-07-13 18:24:53,926 - SL - INFO - 5735 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
+2026-07-13 18:24:53,939 - SL - DEBUG - 5735 - "/app/app/models.py:1459" - generate_random_alias_email() -  - generate email test_test113@sl.local
+2026-07-13 18:24:53,946 - SL - INFO - 5735 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
+2026-07-13 18:24:53,955 - SL - DEBUG - 5735 - "/app/app/models.py:1459" - generate_random_alias_email() -  - generate email test_test759@sl.local
+2026-07-13 18:24:53,962 - SL - INFO - 5735 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
+=== SEED (insertion order A-then-B) ===
+EMAIL_DOMAIN='sl.local'  NOT_SEND_EMAIL=True
+shared_reply='dup-reply-core@sl.local'
+user_a.id=1 email='usera@mailbox.test' alias_a.id=3 alias_a.email='test_test113@sl.local'
+user_b.id=2 email='userb@mailbox.test' alias_b.id=4 alias_b.email='test_test759@sl.local'
+contact_a.id=1 (alias_a,user_a)  contact_b.id=2 (alias_b,user_b)
 === PROVE DUPLICATE PERSISTED (no UNIQUE constraint blocked it) ===
-rows sharing reply_email='dup-reply-5jvdsvfg@sl.local': count=2
-  Contact id=28 alias_id=55 user_id=27 website_email='a@nowhere.net'
-  Contact id=29 alias_id=56 user_id=28 website_email='b@nowhere.net'
-=== reply-address derivation values ===
-rcpt_to (raw)              = 'dup-reply-5jvdsvfg@sl.local'
+rows sharing reply_email='dup-reply-core@sl.local': count=2
+  Contact id=1 alias_id=3 user_id=1 website_email='a@nowhere.net'
+  Contact id=2 alias_id=4 user_id=2 website_email='b@nowhere.net'
+=== reply-address derivation values (email_handler.py:972,977,984) ===
+rcpt_to (raw)              = 'dup-reply-core@sl.local'
 endswith(EMAIL_DOMAIN)     = True
-normalize_reply_email(...) = 'dup-reply-5jvdsvfg@sl.local'
-=== routing predicate ===
-is_reverse_alias('dup-reply-5jvdsvfg@sl.local') = True
-=== [non-canonical] direct Contact.get_by(reply_email=...) ===
-[non-canonical] returned Contact id=28 alias_id=55 user_id=27
+normalize_reply_email(...) = 'dup-reply-core@sl.local'
+=== [non-canonical] routing predicate + direct lookup (BYPASS the entry point) ===
+[non-canonical] is_reverse_alias('dup-reply-core@sl.local') = True
+[non-canonical] Contact.get_by(reply_email=...) -> id=1 alias_id=3 user_id=1
 === CANONICAL CALL: email_handler.handle_reply(envelope, msg, shared_reply) ===
-envelope.mail_from='user_zom563s8s3@mailbox.test' envelope.rcpt_tos=['dup-reply-5jvdsvfg@sl.local'] Message-ID='<obs-5jvdsvfg-0@sl.local>'
-2026-07-13 17:26:53,931 - SL - INFO - 4553 - "/app/app/handler/dmarc.py:159" - apply_dmarc_policy_for_reply_phase() -  - DMARC check disabled
-2026-07-13 17:26:53,937 - SL - DEBUG - 4553 - "/app/email_handler.py:1051" - handle_reply() -  - Create <EmailLog 507> for <Contact 28 a@nowhere.net 55>, <User 27 Test User user_zom563s8s3@mailbox.test>, <Mailbox 27 user_zom563s8s3@mailbox.test>
-2026-07-13 17:26:53,942 - SL - DEBUG - 4553 - "/app/email_handler.py:1171" - handle_reply() -  - From header is word_list209@sl.local
-2026-07-13 17:26:53,943 - SL - DEBUG - 4553 - "/app/email_handler.py:383" - replace_header_when_reply() -  - delete the To header. Old value word_list209@sl.local
-2026-07-13 17:26:53,943 - SL - DEBUG - 4553 - "/app/email_handler.py:383" - replace_header_when_reply() -  - delete the Cc header. Old value None
-2026-07-13 17:26:53,945 - SL - DEBUG - 4553 - "/app/email_handler.py:1314" - replace_original_message_id() -  - create a new sl_message_id <178396361394.4553.11592256382378005378.507@sl.local>
-2026-07-13 17:26:53,949 - SL - WARNING - 4553 - "/app/email_handler.py:1206" - handle_reply() -  - missing date header, add one
-2026-07-13 17:26:53,951 - SL - DEBUG - 4553 - "/app/email_handler.py:1212" - handle_reply() -  - send email from word_list209@sl.local to a@nowhere.net, mail_options:[],rcpt_options:[]
-2026-07-13 17:26:53,955 - SL - DEBUG - 4553 - "/app/app/mail_sender.py:131" - send() -  - send email with subject 'reply subject', from 'word_list209@sl.local' to 'None'
+envelope.mail_from='usera@mailbox.test' envelope.rcpt_tos=['dup-reply-core@sl.local'] Message-ID='<obs-core-0@sl.local>'
+2026-07-13 18:24:53,982 - SL - INFO - 5735 - "/app/app/handler/dmarc.py:159" - apply_dmarc_policy_for_reply_phase() -  - DMARC check disabled
+2026-07-13 18:24:53,988 - SL - DEBUG - 5735 - "/app/email_handler.py:1051" - handle_reply() -  - Create <EmailLog 1> for <Contact 1 a@nowhere.net 3>, <User 1 Test User usera@mailbox.test>, <Mailbox 1 usera@mailbox.test>
+2026-07-13 18:24:53,993 - SL - DEBUG - 5735 - "/app/email_handler.py:1171" - handle_reply() -  - From header is test_test113@sl.local
+2026-07-13 18:24:53,994 - SL - DEBUG - 5735 - "/app/email_handler.py:383" - replace_header_when_reply() -  - delete the To header. Old value test_test113@sl.local
+2026-07-13 18:24:53,994 - SL - DEBUG - 5735 - "/app/email_handler.py:383" - replace_header_when_reply() -  - delete the Cc header. Old value None
+2026-07-13 18:24:53,996 - SL - DEBUG - 5735 - "/app/email_handler.py:1314" - replace_original_message_id() -  - create a new sl_message_id <178396709399.5735.1120116079739055429.1@sl.local>
+2026-07-13 18:24:54,000 - SL - WARNING - 5735 - "/app/email_handler.py:1206" - handle_reply() -  - missing date header, add one
+2026-07-13 18:24:54,002 - SL - DEBUG - 5735 - "/app/email_handler.py:1212" - handle_reply() -  - send email from test_test113@sl.local to a@nowhere.net, mail_options:[],rcpt_options:[]
+2026-07-13 18:24:54,006 - SL - DEBUG - 5735 - "/app/app/mail_sender.py:131" - send() -  - send email with subject 'reply subject', from 'test_test113@sl.local' to 'None'
 RESULT delivered=True code='250 Message accepted for delivery'
-code==status.E200? True  code==status.E214? False  code==status.E502? False
-PERSISTED EmailLog id=507 contact_id=28 alias_id=55 user_id=27 mailbox_id=27 is_reply=True message_id='<obs-5jvdsvfg-0@sl.local>'
-  -> forwarding user_id=27 (user_a.id=27, user_b.id=28)
+code==status.E200? True  ==E214? False  ==E502? False
+PERSISTED EmailLog (message_id='<obs-core-0@sl.local>'): id=1 contact_id=1 alias_id=3 user_id=1 mailbox_id=1 is_reply=True
+  -> forwarding user_id=1 (user_a.id=1, user_b.id=2)
+stored SendRequest count = 1
+  SendRequest envelope_from='sl.lmysyibrfqqdemzygi4dmnc5.x4uis64jqu3wi@sl.local' envelope_to='a@nowhere.net' msg[From]='test_test113@sl.local' msg[To]=None
+NOTE: NOT_SEND_EMAIL=True => mail_sender.send() logs and returns True WITHOUT calling _send_to_smtp; no external SMTP delivery is confirmed (app/mail_sender.py:130-136).
 NEW SentAlert rows during call: 0
 DONE
 ```
 
-**Reading the output:**
+**Reading the output (each value grounded):**
 
-- **Duplicate persisted:** `count=2` rows share `reply_email='dup-reply-5jvdsvfg@sl.local'` — `Contact id=28 (alias 55, user 27)` and `Contact id=29 (alias 56, user 28)`. No `UNIQUE` constraint blocked the second insert.
-- **Resolved `Contact` (`id`, `alias_id`, `user_id`):** the canonical path resolved to **`Contact id=28`, `alias_id=55`, `user_id=27`** (the first-inserted / lowest-id row). The `[non-canonical]` direct `Contact.get_by` returned the *same* row (`id=28`), corroborating the `.first()` mechanism.
-- The resolved contact's `reply_email` is the shared value `'dup-reply-5jvdsvfg@sl.local'`.
+- **Duplicate persisted (no `UNIQUE` blocked it):** `rows sharing reply_email='dup-reply-core@sl.local': count=2` — `Contact id=1` (`alias_id=3`, `user_id=1`, `a@nowhere.net`) and `Contact id=2` (`alias_id=4`, `user_id=2`, `b@nowhere.net`). This is the real data condition the whole investigation rests on, and it is accepted by the schema (§6.1).
+- **Reply-address derivation (`email_handler.py:972,977,984`):** `rcpt_to (raw) = 'dup-reply-core@sl.local'`, `endswith(EMAIL_DOMAIN) = True`, `normalize_reply_email(...) = 'dup-reply-core@sl.local'` (unchanged — every character is already in `_ALLOWED_CHARS`; the collision behavior for other inputs is in §8.2).
+- **`[non-canonical]` corroboration (bypasses the entry point, labeled):** `is_reverse_alias('dup-reply-core@sl.local') = True`; `Contact.get_by(reply_email=...) -> id=1 alias_id=3 user_id=1`.
+- **Canonical resolution:** the real `handle_reply()` call resolves `Contact 1` and logs at `email_handler.py:1051`: `Create <EmailLog 1> for <Contact 1 a@nowhere.net 3>, <User 1 ... usera@mailbox.test>, <Mailbox 1 usera@mailbox.test>`.
+- **Persisted `EmailLog`, correlated by exact Message-ID** (`<obs-core-0@sl.local>`): `id=1 contact_id=1 alias_id=3 user_id=1 mailbox_id=1 is_reply=True` → forwarding `user_id=1` (the correct owner).
+- **Application acceptance vs. delivery:** `delivered=True code='250 Message accepted for delivery'` (`==status.E200? True`). One `SendRequest` was stored: `envelope_from='sl.l...@sl.local' envelope_to='a@nowhere.net' msg[From]='test_test113@sl.local' msg[To]=None`. The explicit `NOTE` records that with `NOT_SEND_EMAIL=True`, `mail_sender.send()` logs and returns `True` **without** calling `_send_to_smtp` (`app/mail_sender.py:130-136`) — so no external SMTP delivery is confirmed. `NEW SentAlert rows during call: 0`.
+
+**Two diagnostics explained (so the log is not misread):**
+
+- **`missing date header, add one` (`email_handler.py:1206`, `WARNING`).** The synthetic reply message carries no `Date:` header, so `handle_reply()` adds one before sending. It is an expected normalization for a hand-constructed message, not an error.
+- **`send email ... to 'None'` (`app/mail_sender.py:131`) while `envelope_to='a@nowhere.net'`.** These refer to *different* things. The mail-sender log prints the **message header** `To:` (`msg[headers.TO]`), which is `None` here because `replace_header_when_reply()` deleted the reverse-alias `To` header (`email_handler.py:383` — `delete the To header`) since the original `To` was the reverse-alias itself. The **SMTP envelope recipient** is separate and is the real contact address: `SendRequest.envelope_to='a@nowhere.net'` (`= contact.website_email`). In other words, the *message header* being `None` and the *envelope recipient* being the contact are simultaneously correct and non-contradictory.
+
+### 4.3 Canonical routing proof — `email_handler.handle()` dispatches to `handle_reply()`
+
+To prove the routing claim rather than merely corroborate it from source, `observe_handle.py` invokes the **real routing hub** `email_handler.handle(envelope, msg)` (not `handle_reply` directly) with a reverse-alias recipient, and observes the hub detect the reverse-alias and dispatch into the reply phase.
+
+**Command:**
+
+```
+docker exec sl_app bash -lc 'cd /app; . venv/bin/activate; set -a && . /tmp/sl_env.sh && set +a; python /tmp/observe_handle.py 2>&1'
+```
+
+**Output (complete, unedited; run 1 of 2 — run 2 byte-identical modulo per-run-varying fields only: logger timestamps/PID, the randomly-generated alias local-parts, and the generated `sl_message_id`):**
+
+```
+load config file /app/tests/test.env
+>>> URL: http://localhost
+Upload files to local dir
+>>> init logging <<<
+2026-07-13 18:28:49,954 - SL - DEBUG - 5885 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+2026-07-13 18:28:54,270 - SL - INFO - 5885 - "/app/init_app.py:44" - add_sl_domains() -  - Add d1.test to SL domain
+2026-07-13 18:28:54,273 - SL - INFO - 5885 - "/app/init_app.py:44" - add_sl_domains() -  - Add d2.test to SL domain
+2026-07-13 18:28:54,275 - SL - INFO - 5885 - "/app/init_app.py:44" - add_sl_domains() -  - Add sl.local to SL domain
+2026-07-13 18:28:54,276 - SL - DEBUG - 5885 - "/app/init_app.py:42" - add_sl_domains() -  - sl.local is already a SL domain
+2026-07-13 18:28:54,565 - SL - INFO - 5885 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
+2026-07-13 18:28:54,582 - SL - DEBUG - 5885 - "/app/app/models.py:1459" - generate_random_alias_email() -  - generate email list_list813@sl.local
+2026-07-13 18:28:54,589 - SL - INFO - 5885 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
+=== CANONICAL ROUTING: email_handler.handle(envelope, msg) (NOT handle_reply directly) ===
+reply_email(reverse-alias)='route-check@sl.local'  mail_from='usera@mailbox.test'  Message-ID='<route-0@sl.local>'
+2026-07-13 18:28:54,598 - SL - DEBUG - 5885 - "/app/email_handler.py:1963" - handle() -  - Cannot parse Postfix queue ID from None None
+2026-07-13 18:28:54,599 - SL - DEBUG - 5885 - "/app/email_handler.py:1980" - handle() -  - ==>> Handle mail_from:usera@mailbox.test, rcpt_tos:['route-check@sl.local'], header_from:a@nowhere.net, header_to:route-check@sl.local, cc:None, reply-to:None, message_id:<route-0@sl.local>, client_ip:None, headers:[('From', 'a@nowhere.net'), ('To', 'route-check@sl.local'), ('Message-ID', '<route-0@sl.local>'), ('Subject', 'reply via handle()'), ('Date', 'Mon, 13 Jul 2026 00:00:00 +0000'), ('Content-Type', 'text/plain; charset="utf-8"'), ('Content-Transfer-Encoding', '7bit'), ('MIME-Version', '1.0')], mail_options:[], rcpt_options:[]
+2026-07-13 18:28:54,603 - SL - DEBUG - 5885 - "/app/email_handler.py:2196" - handle() -  - Reply phase usera@mailbox.test(a@nowhere.net) -> route-check@sl.local
+2026-07-13 18:28:54,605 - SL - INFO - 5885 - "/app/app/handler/dmarc.py:159" - apply_dmarc_policy_for_reply_phase() -  - DMARC check disabled
+2026-07-13 18:28:54,610 - SL - DEBUG - 5885 - "/app/email_handler.py:1051" - handle_reply() -  - Create <EmailLog 1> for <Contact 1 a@nowhere.net 2>, <User 1 Test User usera@mailbox.test>, <Mailbox 1 usera@mailbox.test>
+2026-07-13 18:28:54,617 - SL - DEBUG - 5885 - "/app/email_handler.py:1171" - handle_reply() -  - From header is list_list813@sl.local
+2026-07-13 18:28:54,618 - SL - DEBUG - 5885 - "/app/email_handler.py:380" - replace_header_when_reply() -  - Replace To header, old: route-check@sl.local, new: A <a@nowhere.net>
+2026-07-13 18:28:54,619 - SL - DEBUG - 5885 - "/app/email_handler.py:383" - replace_header_when_reply() -  - delete the Cc header. Old value None
+2026-07-13 18:28:54,621 - SL - DEBUG - 5885 - "/app/email_handler.py:1314" - replace_original_message_id() -  - create a new sl_message_id <178396733462.5885.12396735564806354028.1@sl.local>
+2026-07-13 18:28:54,627 - SL - DEBUG - 5885 - "/app/email_handler.py:1212" - handle_reply() -  - send email from list_list813@sl.local to a@nowhere.net, mail_options:[],rcpt_options:[]
+2026-07-13 18:28:54,631 - SL - DEBUG - 5885 - "/app/app/mail_sender.py:131" - send() -  - send email with subject 'reply via handle()', from 'list_list813@sl.local' to 'A <a@nowhere.net>'
+handle() returned SMTP status = '250 Message accepted for delivery'  (==E200? True)
+handle() routed to handle_reply -> EmailLog id=1 contact_id=1 alias_id=2 user_id=1 is_reply=True
+DONE
+```
+
+- The hub logs `==>> Handle mail_from:usera@mailbox.test, rcpt_tos:['route-check@sl.local'] ...` (`email_handler.py:1980`), then `Reply phase usera@mailbox.test(a@nowhere.net) -> route-check@sl.local` (`email_handler.py:2196`) — this is where `handle()` classifies the recipient as a reverse-alias and enters the reply phase — and dispatches to `handle_reply()`.
+- Result: `handle() returned SMTP status = '250 Message accepted for delivery'` (`==E200? True`), and `handle_reply` created `EmailLog id=1 contact_id=1 alias_id=2 user_id=1 is_reply=True`. Routing is therefore **exercised**, not just inferred.
 
 ---
-
 ## 5. Forwarding-destination selection
 
-Once the contact is resolved, the alias, user, and mailbox are derived from it:
+The forwarding destination (alias, owning user, and sender mailbox) is derived **entirely from the resolved contact**. The exact code:
 
 ```
 email_handler.py:994    alias = contact.alias
-email_handler.py:995    alias_address: str = contact.alias.email
-email_handler.py:1004   user = alias.user
-email_handler.py:1005   mail_from = envelope.mail_from
+email_handler.py:1000       ... (E503 sanity: alias/domain consistency)
+email_handler.py:1001   user = alias.user
+email_handler.py:1007   if not user.can_send_or_receive():        # -> E504 when the user cannot send/receive
 email_handler.py:1019   mailbox = get_mailbox_from_mail_from(mail_from, alias)
-email_handler.py:1032       handle_unknown_mailbox(envelope, msg, reply_email, user, alias, contact)
-email_handler.py:1034       return False, status.E214
-```
-
-- `alias = contact.alias` (`email_handler.py:994`) — the forwarding alias is the resolved contact's alias.
-- `user = alias.user` (`email_handler.py:1004`) — the forwarding user is that alias's owner. The `Alias.user` relationship is `orm.relationship(User, foreign_keys=[user_id])` (`app/models.py:1576`).
-- `mailbox = get_mailbox_from_mail_from(mail_from, alias)` (`email_handler.py:1019`, defined at `email_handler.py:1364`) — iterates `alias.mailboxes` and returns the mailbox whose email (or authorized address) matches `mail_from`, else `None`. When it returns `None` (unauthorized sender, spoof-check on), `handle_unknown_mailbox(...)` (`email_handler.py:1032`) is called and the handler returns `status.E214` (`email_handler.py:1034`).
-- On success, the resolution is persisted:
-
-```
+email_handler.py:1023       if alias.disable_email_spoofing_check:  # [non-canonical] fallback path
+email_handler.py:1032       else: handle_unknown_mailbox(...)       # default control
+email_handler.py:1034           return False, status.E214
 email_handler.py:1042   email_log = EmailLog.create(
-email_handler.py:1043       contact_id=contact.id,
-email_handler.py:1044       alias_id=contact.alias_id,
-email_handler.py:1045       is_reply=True,
-email_handler.py:1046       user_id=contact.user_id,
-email_handler.py:1047       mailbox_id=mailbox.id,
-email_handler.py:1048       message_id=msg[headers.MESSAGE_ID],
-email_handler.py:1049       commit=True,
-email_handler.py:1050   )
+email_handler.py:1043       contact_id=contact.id, alias_id=contact.alias_id, is_reply=True,
+email_handler.py:1050       user_id=contact.user_id, mailbox_id=mailbox.id, ... )
 ```
 
-### 5.1 Observed forwarding destination (canonical)
+- **Alias** — `alias = contact.alias` (`email_handler.py:994`): the alias is whatever the resolved contact points at, via the `Contact.alias_id` foreign key.
+- **User** — `user = alias.user` (`email_handler.py:1001`): the owning user is derived transitively from that alias. The persisted `EmailLog.user_id` is taken directly from `contact.user_id` (`email_handler.py:1050`), so the log records the **resolved contact's** owner regardless of who actually sent the reply.
+- **Mailbox** — `mailbox = get_mailbox_from_mail_from(mail_from, alias)` (`email_handler.py:1019`): the sender mailbox is looked up by matching the SMTP `mail_from` against mailboxes **authorized for that alias**. If the alias belongs to a *different* user than the sender's mailbox, this returns `None`, and the spoof-check branch (`email_handler.py:1019-1034`) decides the outcome:
+  - **Default (`disable_email_spoofing_check = False`):** `handle_unknown_mailbox(...)` is called and the handler returns `status.E214` (`email_handler.py:1032-1034`) — the reply is rejected **before** `EmailLog.create` (§7 shows this as the default-control result for the wrong-user data condition).
+  - **`[non-canonical]` fallback (`disable_email_spoofing_check = True`):** the check is skipped (log `ignore unknown sender ...` at `email_handler.py:1023`), the mailbox falls back to `alias.mailbox`, and the reply proceeds to `EmailLog.create` and a stored send request — under the resolved (possibly wrong) user.
 
-From the same canonical run (§4.2, token `5jvdsvfg`), the internal LOG line and the persisted `EmailLog` reveal the full destination:
-
-- Internal creation LOG (`email_handler.py:1051`): `Create <EmailLog 507> for <Contact 28 a@nowhere.net 55>, <User 27 Test User user_zom563s8s3@mailbox.test>, <Mailbox 27 user_zom563s8s3@mailbox.test>`.
-- Rewritten `From` header (`email_handler.py:1171`): `From header is word_list209@sl.local` (i.e. `alias_a.email`).
-- Outbound send (`email_handler.py:1212`): `send email from word_list209@sl.local to a@nowhere.net` (the alias to the contact's real address).
-- **Persisted `EmailLog`:** `id=507 contact_id=28 alias_id=55 user_id=27 mailbox_id=27 is_reply=True`.
-
-So the forwarding destination is **alias `word_list209@sl.local` (id 55), user `27`, mailbox `27`** — all derived from resolved `Contact id=28`. `RESULT delivered=True code='250 Message accepted for delivery'` (`== status.E200`), and **0** new `SentAlert` rows (clean success path). In this dataset the first-inserted contact happens to be `user_A`'s, so the resolution is correct; §7 shows that reversing the row order makes the *identical* input resolve to a different user.
-
+**Observed forwarding destination (canonical happy path).** The values are in the §4.2 output block: `alias_id=3` (`test_test113@sl.local`), `user_id=1`, `mailbox_id=1` (`usera@mailbox.test`), and the rewritten `From` header `From header is test_test113@sl.local` (`email_handler.py:1171`). The `From` is rewritten to the alias so the recipient sees the alias, not the mailbox — matching the SimpleLogin reverse-alias contract (§9). The wrong-user variants of this selection (E214 default vs. `[non-canonical]` fallback forward) are shown with complete output in §7 and §10.
 
 ---
-
 ## 6. Uniqueness / race / timing root cause
 
-This section states the causal chain, each link grounded in `file:line` and/or observed output. The wrong-user behavior is **not** a vague environmental effect — it is a concrete consequence of an unenforced uniqueness invariant combined with an unordered `.first()`.
+The wrong-user outcome is not one bug but a chain: a permissive schema (no `UNIQUE`), a best-effort non-atomic generation-time guard (TOCTOU) that non-generator writes bypass, and an unordered `.first()` lookup that propagates the resolved row into the alias, user, mailbox, and log.
 
-### 6.1 Proof: `reply_email` has NO `UNIQUE` constraint
+### 6.1 `reply_email` has **no** `UNIQUE` constraint (repository-wide search + runtime catalog proof)
 
-**Model (`app/models.py`).** The only unique constraint on `Contact` is on `(alias_id, website_email)`, and `reply_email` is only indexed:
-
-```
-app/models.py:1875           sa.UniqueConstraint("alias_id", "website_email", name="uq_contact"),
-app/models.py:1899       reply_email = sa.Column(sa.String(512), nullable=False, index=True)
-```
-
-- `uq_contact` (`app/models.py:1875`) is on `(alias_id, website_email)` — **not** `reply_email`.
-- `reply_email` (`app/models.py:1899`) is `index=True` but **not** `unique=True`.
-
-**Migration (`migrations/versions/2021_071310_78403c7b8089_.py`).** The index that backs `reply_email` was created with `unique=False`:
-
-```
-migrations/versions/2021_071310_78403c7b8089_.py:22       op.create_index(op.f('ix_contact_reply_email'), 'contact', ['reply_email'], unique=False)
-```
-
-No migration anywhere adds a `UNIQUE` constraint on `reply_email`.
-
-**Observed consequence.** The §4.2 output shows two rows with the same `reply_email` persisting successfully (`count=2`), which is only possible because no `UNIQUE` constraint exists.
-
-### 6.2 The generation-time guard is best-effort TOCTOU (and bypassable)
-
-Uniqueness is only enforced *at generation time*, non-atomically:
-
-```
-app/models.py:1425   def available_sl_email(email: str) -> bool:
-app/models.py:1426-1432   return not (
-                              Alias.get_by(email=email)
-                              or Contact.get_by(reply_email=email)
-                              or DeletedAlias.get_by(email=email)
-                              or ...
-                          )
-```
-
-- `available_sl_email()` (`app/models.py:1425-1432`) is a read-only OR-check with no locking — a classic **time-of-check-to-time-of-use (TOCTOU)** pattern. **`[inferred]`** (from the code + the confirmed absence of a `UNIQUE` constraint): under concurrency, two generator calls can both observe "available" and both insert the same `reply_email`; nothing at the DB level prevents it. A deterministic live reproduction of this concurrency window was not attempted (labeled inferred).
-- It is invoked only from the generator `generate_reply_email()` (`app/email_utils.py:1103`) at the check `if available_sl_email(reply_email):` (`app/email_utils.py:1150`).
-- **Non-generator write paths bypass it entirely.** Direct `Contact.create(reply_email=...)` never calls `available_sl_email()`. **Observed** (§8): `available_sl_email('ra_x...@sl.local') = False` for an address already in use, yet a direct `Contact.create` with that same address still succeeded — the guard is simply not on that path.
-
-### 6.3 The lookup returns an arbitrary row
-
-`Contact.get_by(reply_email=...)` (`email_handler.py:986`) → `ModelMixin.get_by()` → `Session.query(cls).filter_by(**kw).first()` with **no `ORDER BY`** (`app/models.py:83-84`). On a multi-row match the returned row is arbitrary/ordering-dependent — **observed** in §7 (reversing insertion order flips the result 100/100).
-
-### 6.4 A wrong contact yields a wrong alias, user, and persisted log
-
-- `alias = contact.alias` (`email_handler.py:994`) and `user = alias.user` (`email_handler.py:1004`) are derived *directly* from the resolved contact.
-- The resolved user is persisted: `EmailLog.create(..., user_id=contact.user_id, ...)` (`email_handler.py:1042-1050`). So a reply is not only *routed* under the wrong user, it is *recorded* against that user. **Observed** in §7 (BA run: `EmailLog.user_id = user_B` for all 100 events).
-
-### 6.5 The same non-unique lookup gates multiple decisions
-
-`Contact.get_by(reply_email=...)` is reused at several decision points, all inheriting the same arbitrary-on-multi-match behavior:
-
-- `replace_header_when_reply()` at `email_handler.py:364` (restores original contact addresses in CC/To) — **observed** executing in §8.
-- Routing/bounce lookups: `email_handler.py:1998` (`reply_email=mail_from`), `email_handler.py:2009` (`reply_email=from_header_address`), `email_handler.py:2167` (`reply_email=rcpt_tos[0]`). **`[inferred]`** (grounded by `file:line`): these call the identical `ModelMixin.get_by().first()` and therefore exhibit the same arbitrary selection on a multi-row match; they were not each driven to a multi-row condition at runtime.
-- `is_reverse_alias()` at `app/email_utils.py:1158` (`if Contact.get_by(reply_email=address): return True`) — the routing predicate that dispatches to `handle_reply` — **observed** returning `True` in §4.2 and §8.
-
-### 6.6 Normalization widens the collision surface
-
-`normalize_reply_email()` (`app/email_validation.py:25-38`) is many-to-one: distinct stored `reply_email` values can collapse to the same lookup key, increasing the chance of a multi-row match at lookup time. **Observed** in §8 (three distinct inputs normalize to one key; a canonical reply whose `rcpt_to` normalizes onto a stored value resolves to it).
-
-### 6.7 Forward-phase minting (where `reply_email` originates)
-
-A contact's `reply_email` is originally minted in the forward phase:
-
-```
-email_handler.py:299    reply_email=generate_reply_email(contact_email, alias),   # inside Contact.create(...)
-```
-
-`generate_reply_email()` (`app/email_utils.py:1103`) loops (up to 1000 attempts) calling the TOCTOU `available_sl_email()` (`app/email_utils.py:1150`). The seeded scenario uses direct `Contact.create(reply_email=...)`, which — like any non-generator path — does **not** pass through this guard, which is precisely why duplicates are possible.
-
----
-
-## 7. Cross-event behavior (distribution across ≥2 runs)
-
-**Question:** does the *same* reply email ever resolve to *different* contacts/users? **Answer (observed):** within a fixed dataset the resolution is stable at the first-inserted / lowest-`ctid` row (100/100); but the resolved **user is determined purely by physical row order** — reversing the insertion order of the two duplicate rows flips the resolved user from A to B (100/100) under the *identical* canonical input.
-
-The harness `observe_dist.py` seeds two users/aliases, sets `disable_email_spoofing_check = True` on both aliases **only so that every iteration reaches `EmailLog.create` and records the chosen `user_id`** (this does **not** influence which row `.first()` selects — it merely lets the choice be *recorded* each time), inserts two `Contact` rows sharing `shared_reply` in a given order, then issues **N=100 identical** `handle_reply` calls (same `mail_from = user_A`'s mailbox, same `rcpt_to = shared_reply`; only the transient `Message-ID` varies). It reads the resolved identity from the `EmailLog` persisted by each call and reports a `Counter` distribution. It also prints `EXPLAIN ANALYZE` of the exact equality lookup (`LIMIT 1`, no `ORDER BY`).
-
-### 7.1 Run 1 — insertion order A-then-B (N=100)
+**(a) Repository-wide search across migrations and the model.** Every `reply_email` reference in migrations and the only `Contact` unique constraint in the model:
 
 **Command:**
 
 ```
-docker exec sl_app bash -lc 'cd /app; . venv/bin/activate; set -a && . /tmp/sl_env.sh && set +a; python /tmp/observe_dist.py ab 100 2>/dev/null'
+docker exec sl_app bash -lc '
+cd /app
+echo "=== (1) All migration references to reply_email (text files only) ==="
+grep -rn --include="*.py" "reply_email" migrations/versions/
+echo ""
+echo "=== (2) Any UNIQUE/unique constraint mentioning reply_email across migrations + models (case-insensitive) ==="
+grep -rni --include="*.py" "reply_email" migrations/ app/models.py | grep -i "unique" || echo "(no line pairs reply_email with unique=True / UniqueConstraint)"
+echo ""
+echo "=== (3) The Contact reply_email column + the only Contact UniqueConstraint in the model ==="
+grep -n "reply_email = sa.Column" app/models.py
+grep -n "UniqueConstraint" app/models.py | grep -i "contact\|uq_contact"
+'
 ```
 
-**Output (complete, unedited):**
+**Output (complete, unedited; stable across run 1 and run 2):**
 
 ```
-load config file /app/tests/test.env
->>> URL: http://localhost
-Upload files to local dir
->>> init logging <<<
-2026-07-13 17:27:06,696 - SL - DEBUG - 4574 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
-2026-07-13 17:27:07,479 - SL - DEBUG - 4574 - "/app/init_app.py:42" - add_sl_domains() -  - d1.test is already a SL domain
-2026-07-13 17:27:07,480 - SL - DEBUG - 4574 - "/app/init_app.py:42" - add_sl_domains() -  - d2.test is already a SL domain
-2026-07-13 17:27:07,480 - SL - DEBUG - 4574 - "/app/init_app.py:42" - add_sl_domains() -  - sl.local is already a SL domain
-2026-07-13 17:27:07,481 - SL - DEBUG - 4574 - "/app/init_app.py:42" - add_sl_domains() -  - sl.local is already a SL domain
-2026-07-13 17:27:07,777 - SL - INFO - 4574 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
-2026-07-13 17:27:08,036 - SL - INFO - 4574 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
-2026-07-13 17:27:08,050 - SL - DEBUG - 4574 - "/app/app/models.py:1459" - generate_random_alias_email() -  - generate email test_list367@sl.local
-2026-07-13 17:27:08,057 - SL - INFO - 4574 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
-2026-07-13 17:27:08,066 - SL - DEBUG - 4574 - "/app/app/models.py:1459" - generate_random_alias_email() -  - generate email word_word010@sl.local
-2026-07-13 17:27:08,073 - SL - INFO - 4574 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
-=== DIST EXPERIMENT order=ab N=100 tok=ceyu31ut ===
-shared_reply='dup-reply-ceyu31ut@sl.local'
-mail_from (IDENTICAL every call) = user_a.email = 'user_k1g14fv1aj@mailbox.test'
-user_a.id=29 alias_a.id=59 | user_b.id=30 alias_b.id=60
-INSERTION ORDER: 1st=Contact id=30 user_id=29 ; 2nd=Contact id=31 user_id=30
---- EXPLAIN ANALYZE of the equality lookup that .first() runs (LIMIT 1, NO ORDER BY) ---
-    Limit  (cost=0.14..8.16 rows=1 width=1954) (actual time=0.006..0.007 rows=1 loops=1)
-      ->  Index Scan using ix_contact_reply_email on contact  (cost=0.14..8.16 rows=1 width=1954) (actual time=0.006..0.006 rows=1 loops=1)
-            Index Cond: ((reply_email)::text = 'dup-reply-ceyu31ut@sl.local'::text)
-    Planning Time: 0.030 ms
-    Execution Time: 0.015 ms
---- DISTRIBUTION over N=100 IDENTICAL calls (mail_from='user_k1g14fv1aj@mailbox.test', rcpt_to='dup-reply-ceyu31ut@sl.local') ---
-resolved Contact.id : {(30, 'FIRST_INSERTED'): 100}
-resolved user_id    : {(29, 'user_A(alias-owner-matching-mail_from)'): 100}
-DONE
+=== (1) All migration references to reply_email (text files only) ===
+migrations/versions/2021_071310_78403c7b8089_.py:22:    op.create_index(op.f('ix_contact_reply_email'), 'contact', ['reply_email'], unique=False)
+migrations/versions/2021_071310_78403c7b8089_.py:28:    op.drop_index(op.f('ix_contact_reply_email'), table_name='contact')
+migrations/versions/5fa68bafae72_.py:28:    sa.Column('reply_email', sa.String(length=128), nullable=False),
+
+=== (2) Any UNIQUE/unique constraint mentioning reply_email across migrations + models (case-insensitive) ===
+migrations/versions/2021_071310_78403c7b8089_.py:22:    op.create_index(op.f('ix_contact_reply_email'), 'contact', ['reply_email'], unique=False)
+
+=== (3) The Contact reply_email column + the only Contact UniqueConstraint in the model ===
+1899:    reply_email = sa.Column(sa.String(512), nullable=False, index=True)
+1875:        sa.UniqueConstraint("alias_id", "website_email", name="uq_contact"),
 ```
 
-**Result:** all **100/100** resolved to `Contact id=30` (FIRST_INSERTED), `user_id=29` (user_A). The lookup plan is `Index Scan using ix_contact_reply_email` under `Limit ... rows=1` — **no `Sort` node**.
+- The only index ever created on `reply_email` is `ix_contact_reply_email` with **`unique=False`** (`migrations/versions/2021_071310_78403c7b8089_.py:22`); the same migration drops it on downgrade (`:28`); the table-creating migration declares the column `nullable=False` with **no** unique flag (`migrations/versions/5fa68bafae72_.py:28`).
+- The case-insensitive `reply_email`×`unique` cross-search returns **only** that `unique=False` index line — i.e., **no** `UniqueConstraint`/`unique=True` mentioning `reply_email` exists anywhere in migrations or the model.
+- The model column is `reply_email = sa.Column(sa.String(512), nullable=False, index=True)` (`app/models.py:1899`) — indexed, not unique. The **only** `Contact` unique constraint is `sa.UniqueConstraint("alias_id", "website_email", name="uq_contact")` (`app/models.py:1875`).
 
-### 7.2 Run 2 — insertion order A-then-B, independent re-seed (N=100)
+**(b) Runtime catalog proof (`pg_indexes` + `pg_constraint`).** The live database confirms the same fact, run fail-fast with `-v ON_ERROR_STOP=1`:
 
 **Command:**
 
 ```
-docker exec sl_app bash -lc 'cd /app; . venv/bin/activate; set -a && . /tmp/sl_env.sh && set +a; python /tmp/observe_dist.py ab 100 2>/dev/null'
+docker exec sl_app bash -lc 'su postgres -c "psql -d test -v ON_ERROR_STOP=1 -f /tmp/contact_schema.sql"; echo "psql_exit=$?"'
 ```
 
-**Output (complete, unedited):**
-
-```
-load config file /app/tests/test.env
->>> URL: http://localhost
-Upload files to local dir
->>> init logging <<<
-2026-07-13 17:27:11,548 - SL - DEBUG - 4594 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
-2026-07-13 17:27:12,342 - SL - DEBUG - 4594 - "/app/init_app.py:42" - add_sl_domains() -  - d1.test is already a SL domain
-2026-07-13 17:27:12,343 - SL - DEBUG - 4594 - "/app/init_app.py:42" - add_sl_domains() -  - d2.test is already a SL domain
-2026-07-13 17:27:12,344 - SL - DEBUG - 4594 - "/app/init_app.py:42" - add_sl_domains() -  - sl.local is already a SL domain
-2026-07-13 17:27:12,345 - SL - DEBUG - 4594 - "/app/init_app.py:42" - add_sl_domains() -  - sl.local is already a SL domain
-2026-07-13 17:27:12,641 - SL - INFO - 4594 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
-2026-07-13 17:27:12,901 - SL - INFO - 4594 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
-2026-07-13 17:27:12,915 - SL - DEBUG - 4594 - "/app/app/models.py:1459" - generate_random_alias_email() -  - generate email test_list950@sl.local
-2026-07-13 17:27:12,922 - SL - INFO - 4594 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
-2026-07-13 17:27:12,931 - SL - DEBUG - 4594 - "/app/app/models.py:1459" - generate_random_alias_email() -  - generate email test_list373@sl.local
-2026-07-13 17:27:12,939 - SL - INFO - 4594 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
-=== DIST EXPERIMENT order=ab N=100 tok=8k5kuet1 ===
-shared_reply='dup-reply-8k5kuet1@sl.local'
-mail_from (IDENTICAL every call) = user_a.email = 'user_0ec7i060fk@mailbox.test'
-user_a.id=31 alias_a.id=63 | user_b.id=32 alias_b.id=64
-INSERTION ORDER: 1st=Contact id=32 user_id=31 ; 2nd=Contact id=33 user_id=32
---- EXPLAIN ANALYZE of the equality lookup that .first() runs (LIMIT 1, NO ORDER BY) ---
-    Limit  (cost=0.14..8.16 rows=1 width=1954) (actual time=0.008..0.009 rows=1 loops=1)
-      ->  Index Scan using ix_contact_reply_email on contact  (cost=0.14..8.16 rows=1 width=1954) (actual time=0.008..0.008 rows=1 loops=1)
-            Index Cond: ((reply_email)::text = 'dup-reply-8k5kuet1@sl.local'::text)
-    Planning Time: 0.047 ms
-    Execution Time: 0.021 ms
---- DISTRIBUTION over N=100 IDENTICAL calls (mail_from='user_0ec7i060fk@mailbox.test', rcpt_to='dup-reply-8k5kuet1@sl.local') ---
-resolved Contact.id : {(32, 'FIRST_INSERTED'): 100}
-resolved user_id    : {(31, 'user_A(alias-owner-matching-mail_from)'): 100}
-DONE
-```
-
-**Result:** again **100/100** → `Contact id=32` (FIRST_INSERTED), `user_id=31` (user_A). **Stable across the two independent A-then-B runs.**
-
-### 7.3 Run 3 — REVERSED insertion order B-then-A, identical input (N=100) — the wrong-user proof
-
-**Command:**
-
-```
-docker exec sl_app bash -lc 'cd /app; . venv/bin/activate; set -a && . /tmp/sl_env.sh && set +a; python /tmp/observe_dist.py ba 100 2>/dev/null'
-```
-
-**Output (complete, unedited):**
-
-```
-load config file /app/tests/test.env
->>> URL: http://localhost
-Upload files to local dir
->>> init logging <<<
-2026-07-13 17:27:24,239 - SL - DEBUG - 4616 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
-2026-07-13 17:27:25,019 - SL - DEBUG - 4616 - "/app/init_app.py:42" - add_sl_domains() -  - d1.test is already a SL domain
-2026-07-13 17:27:25,020 - SL - DEBUG - 4616 - "/app/init_app.py:42" - add_sl_domains() -  - d2.test is already a SL domain
-2026-07-13 17:27:25,021 - SL - DEBUG - 4616 - "/app/init_app.py:42" - add_sl_domains() -  - sl.local is already a SL domain
-2026-07-13 17:27:25,022 - SL - DEBUG - 4616 - "/app/init_app.py:42" - add_sl_domains() -  - sl.local is already a SL domain
-2026-07-13 17:27:25,317 - SL - INFO - 4616 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
-2026-07-13 17:27:25,578 - SL - INFO - 4616 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
-2026-07-13 17:27:25,592 - SL - DEBUG - 4616 - "/app/app/models.py:1459" - generate_random_alias_email() -  - generate email word_word807@sl.local
-2026-07-13 17:27:25,599 - SL - INFO - 4616 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
-2026-07-13 17:27:25,608 - SL - DEBUG - 4616 - "/app/app/models.py:1459" - generate_random_alias_email() -  - generate email test_word965@sl.local
-2026-07-13 17:27:25,615 - SL - INFO - 4616 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
-=== DIST EXPERIMENT order=ba N=100 tok=7bxcb1wz ===
-shared_reply='dup-reply-7bxcb1wz@sl.local'
-mail_from (IDENTICAL every call) = user_a.email = 'user_hpc4r2ln0n@mailbox.test'
-user_a.id=33 alias_a.id=67 | user_b.id=34 alias_b.id=68
-INSERTION ORDER: 1st=Contact id=34 user_id=34 ; 2nd=Contact id=35 user_id=33
---- EXPLAIN ANALYZE of the equality lookup that .first() runs (LIMIT 1, NO ORDER BY) ---
-    Limit  (cost=0.14..8.16 rows=1 width=1954) (actual time=0.006..0.006 rows=1 loops=1)
-      ->  Index Scan using ix_contact_reply_email on contact  (cost=0.14..8.16 rows=1 width=1954) (actual time=0.005..0.005 rows=1 loops=1)
-            Index Cond: ((reply_email)::text = 'dup-reply-7bxcb1wz@sl.local'::text)
-    Planning Time: 0.029 ms
-    Execution Time: 0.014 ms
---- DISTRIBUTION over N=100 IDENTICAL calls (mail_from='user_hpc4r2ln0n@mailbox.test', rcpt_to='dup-reply-7bxcb1wz@sl.local') ---
-resolved Contact.id : {(34, 'FIRST_INSERTED'): 100}
-resolved user_id    : {(34, 'user_B(different-user)'): 100}
-DONE
-```
-
-**Result — WRONG USER:** with the **identical** input (`mail_from = user_A`'s mailbox `user_hpc4r2ln0n@mailbox.test`, `rcpt_to = dup-reply-7bxcb1wz@sl.local`), all **100/100** resolved to `Contact id=34`, whose `user_id=34` is **`user_B` — the different user**, not the sender/alias-owner `user_A` (id 33). The only thing changed versus §7.1–7.2 is the *pre-existing physical order* of the two duplicate rows. `EmailLog.user_id` recorded `user_B` for all 100 events.
-
-### 7.4 psql corroboration: physical order (`ctid`) and plan-dependence
-
-To show *why* `.first()` returned that row, the persisted BA dataset was inspected directly.
-
-**Command:**
-
-```
-docker exec sl_app bash -lc 'su postgres -c "psql -d test <<SQL
-\pset pager off
-SELECT id, alias_id, user_id, website_email, ctid FROM contact WHERE reply_email = ''dup-reply-7bxcb1wz@sl.local'' ORDER BY ctid;
-EXPLAIN (ANALYZE, COSTS OFF) SELECT * FROM contact WHERE reply_email = ''dup-reply-7bxcb1wz@sl.local'' LIMIT 1;
-SELECT id, user_id FROM contact WHERE reply_email = ''dup-reply-7bxcb1wz@sl.local'' LIMIT 1;
-BEGIN;
-SET LOCAL enable_indexscan = off;
-SET LOCAL enable_bitmapscan = off;
-EXPLAIN (ANALYZE, COSTS OFF) SELECT * FROM contact WHERE reply_email = ''dup-reply-7bxcb1wz@sl.local'' LIMIT 1;
-COMMIT;
-SQL"'
-```
-
-**Output (complete, unedited):**
+**Output (complete, unedited; stable across run 1 and run 2):**
 
 ```
 Pager usage is off.
- id | alias_id | user_id | website_email |  ctid  
-----+----------+---------+---------------+--------
- 34 |       68 |      34 | b@nowhere.net | (0,34)
- 35 |       67 |      33 | a@nowhere.net | (0,35)
-(2 rows)
-
-                                             QUERY PLAN                                             
-----------------------------------------------------------------------------------------------------
- Limit (actual time=0.007..0.007 rows=1 loops=1)
-   ->  Index Scan using ix_contact_reply_email on contact (actual time=0.006..0.006 rows=1 loops=1)
-         Index Cond: ((reply_email)::text = 'dup-reply-7bxcb1wz@sl.local'::text)
- Planning Time: 0.044 ms
- Execution Time: 0.016 ms
-(5 rows)
-
- id | user_id 
-----+---------
- 34 |      34
+=== indexes on contact (pg_indexes) ===
+       indexname        |                                    indexdef
+------------------------+---------------------------------------------------------------------------------
+ ix_contact_reply_email | CREATE INDEX ix_contact_reply_email ON public.contact USING btree (reply_email)
 (1 row)
 
-BEGIN
-SET
-SET
-                                 QUERY PLAN                                  
------------------------------------------------------------------------------
- Limit (actual time=0.012..0.012 rows=1 loops=1)
-   ->  Seq Scan on contact (actual time=0.011..0.011 rows=1 loops=1)
-         Filter: ((reply_email)::text = 'dup-reply-7bxcb1wz@sl.local'::text)
-         Rows Removed by Filter: 33
- Planning Time: 0.026 ms
- Execution Time: 0.019 ms
-(6 rows)
+=== constraints on contact (pg_constraint) ===
+        conname        | contype |                              def
+-----------------------+---------+---------------------------------------------------------------
+ contact_alias_id_fkey | f       | FOREIGN KEY (alias_id) REFERENCES alias(id) ON DELETE CASCADE
+ contact_user_id_fkey  | f       | FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+ forward_email_pkey    | p       | PRIMARY KEY (id)
+ uq_contact            | u       | UNIQUE (alias_id, website_email)
+(4 rows)
 
-COMMIT
+=== is there ANY unique index/constraint covering reply_email? ===
+ unique_on_reply_email
+-----------------------
+                     0
+(1 row)
+
+psql_exit=0
 ```
 
-**Interpretation:**
+- The only index on `contact` touching `reply_email` is the **non-unique** `ix_contact_reply_email` (`USING btree (reply_email)` — no `UNIQUE`).
+- The `contact` constraints are two foreign keys, the primary key `forward_email_pkey`, and exactly one unique constraint `uq_contact = UNIQUE (alias_id, website_email)`.
+- The explicit count query answers the question directly: `unique_on_reply_email = 0`. The script exits `psql_exit=0` (no `ON_ERROR_STOP` abort).
 
-- `ctid (0,34)` for `id=34` and `(0,35)` for `id=35` show that **physical row order equals insertion order** (in the BA run, `user_B`'s contact `id=34` was inserted first).
-- The **default** plan is `Index Scan using ix_contact_reply_email` under `Limit rows=1`, and it returns `id=34, user_id=34` — matching the 100/100 distribution.
-- **Plan-dependence:** forcing `enable_indexscan=off; enable_bitmapscan=off` makes the planner switch to `Seq Scan on contact` for the *same* query. This demonstrates the row is served by whatever plan/physical order the engine chooses — **nothing pins the order because there is no `ORDER BY`**.
+### 6.2 The generation-time guard is a best-effort TOCTOU check — and a direct write bypasses it
+
+`available_sl_email()` is the only application-level uniqueness gate for a new reverse-alias value. Its **exact body** (via `inspect.getsource`, so no check is hidden behind an ellipsis), the exact body of `ModelMixin.get_by()`, the exact **two-clause** body of `is_reverse_alias()`, and a direct-write bypass demonstration:
+
+**Command:**
+
+```
+docker exec sl_app bash -lc 'cd /app; . venv/bin/activate; set -a && . /tmp/sl_env.sh && set +a; python /tmp/observe_avail.py 2>&1'
+```
+
+**Output (complete, unedited; stable across run 1 and run 2):**
+
+```
+########## observe_avail.py RUN 1 ##########
+=== EXACT body of available_sl_email() [app/models.py] (inspect.getsource) ===
+  1425: def available_sl_email(email: str) -> bool:
+  1426:     if (
+  1427:         Alias.get_by(email=email)
+  1428:         or Contact.get_by(reply_email=email)
+  1429:         or DeletedAlias.get_by(email=email)
+  1430:     ):
+  1431:         return False
+  1432:     return True
+=== EXACT body of ModelMixin.get_by() (the .first() with no ORDER BY) ===
+  82:     @classmethod
+  83:     def get_by(cls, **kw):
+  84:         return Session.query(cls).filter_by(**kw).first()
+=== EXACT body of is_reverse_alias() [app/email_utils.py] ===
+  1156: def is_reverse_alias(address: str) -> bool:
+  1157:     # to take into account the new reverse-alias that doesn't start with "ra+"
+  1158:     if Contact.get_by(reply_email=address):
+  1159:         return True
+  1160:
+  1161:     return address.endswith(f"@{config.EMAIL_DOMAIN}") and (
+  1162:         address.startswith("reply+") or address.startswith("ra+")
+  1163:     )
+=== guard bypass: direct Contact.create() ignores available_sl_email() ===
+before any contact: available_sl_email('dupe-guard@sl.local') = True
+after 1st Contact.create: available_sl_email('dupe-guard@sl.local') = False (guard would now block the GENERATOR from choosing this value)
+direct 2nd Contact.create with SAME reply_email SUCCEEDED: c1.id=1 c2.id=2; rows sharing reply_email=2
+=> available_sl_email() is a generation-time TOCTOU check only; a direct write bypasses it and no DB UNIQUE constraint prevents the duplicate.
+DONE
+```
+
+- **Exactly three checks.** `available_sl_email(email)` returns `False` if **any** of `Alias.get_by(email=email)`, `Contact.get_by(reply_email=email)`, or `DeletedAlias.get_by(email=email)` matches, else `True` (`app/models.py:1425-1432`). There is no fourth, elided check — the earlier report's `or ...` paraphrase is corrected here to the verbatim body.
+- **`is_reverse_alias()` has two clauses** (`app/email_utils.py:1156-1163`): it returns `True` if `Contact.get_by(reply_email=address)` matches, **otherwise** returns `address.endswith(f"@{config.EMAIL_DOMAIN}") and (address.startswith("reply+") or address.startswith("ra+"))`. Both clauses matter: routing can treat an address as a reverse-alias by suffix/prefix even when no contact row exists.
+- **TOCTOU + bypass.** `available_sl_email('dupe-guard@sl.local')` is `True` before any contact, then `False` after the first `Contact.create` — i.e., the guard *would* stop the **generator** from re-choosing that value. But a **direct** second `Contact.create(...)` with the **same** `reply_email` **succeeds** (`c1.id=1 c2.id=2; rows sharing reply_email=2`). The guard is only consulted inside the generation loop and is read-then-act (non-atomic); it is **not** backed by a DB constraint, so any non-generator write path (or a concurrent generator, `[inferred]`) can create the duplicate. This is the proof — via a **duplicate seed**, not a reversed chronology — that direct creation bypasses the guard.
+
+**Call sites of `available_sl_email()` (enumerated, not assumed to be only the generator):**
+
+```
+===== available_sl_email call sites (grep) =====
+app/email_utils.py:1150:        if available_sl_email(reply_email):
+app/models.py:1458:    if available_sl_email(random_email):
+app/models.py:1706:            if available_sl_email(email):
+
+===== email_handler.py:1163,1185 (TO/CC replace conditions) =====
+            # return 421 so the client can retry later
+            return False, status.E402
+
+    Session.commit()
+
+    recipient_name = get_alias_recipient_name(alias)
+    if recipient_name.message:
+        LOG.d(recipient_name.message)
+    LOG.d("From header is %s", recipient_name.name)
+    add_or_replace_header(msg, headers.FROM, recipient_name.name)
+
+    try:
+        if str(msg[headers.TO]).lower() == "undisclosed-recipients:;":
+            # no need to replace TO header
+            LOG.d("email is sent in BCC mode")
+        else:
+            replace_header_when_reply(msg, alias, headers.TO)
+
+        replace_header_when_reply(msg, alias, headers.CC)
+    except NonReverseAliasInReplyPhase as e:
+        LOG.w("non reverse-alias in reply %s %s %s", e, contact, alias)
+
+        # the email is ignored, delete the email log
+```
+
+- `available_sl_email()` is called from **three** places: the reverse-alias generator `generate_reply_email()` (`app/email_utils.py:1150`), random-alias generation (`app/models.py:1458`), and custom-alias generation (`app/models.py:1706`). The claim is therefore scoped precisely: within the **reply-email creation path**, uniqueness is guarded only by the `email_utils.py:1150` call — and only best-effort, as shown above. (The appended `email_handler.py` excerpt shows the `TO`/`CC` replace conditions relevant to §8.3.)
+
+### 6.3 The lookup returns a row with no application-specified order
+
+`Contact.get_by(reply_email=...)` → `Session.query(Contact).filter_by(reply_email=...).first()` (`app/models.py:82-84`) emits `LIMIT 1` with **no `ORDER BY`**. Per the official semantics (§4.1, §9): with more than one matching row and no `ORDER BY`, SQLAlchemy returns whatever the database yields first, and PostgreSQL returns rows in an **unspecified order** that "*depend[s] on the scan and join plan types and the order on disk*" and "*must not be relied on*." The application thus imposes **no** determinism on which of several same-`reply_email` contacts is chosen. The concrete PostgreSQL determinant for the seeded two-row case (plan + physical `ctid`) is analyzed with `EXPLAIN`/`ctid` evidence in §7.4; the honest bound is stated there and in the coverage pass (§12).
+
+### 6.4 A wrong contact yields a wrong alias, user, mailbox, and persisted log
+
+Because `alias = contact.alias` (`:994`), `user = alias.user` (`:1001`), and `EmailLog.create(..., user_id=contact.user_id, ...)` (`:1042-1050`) all derive from the resolved contact, resolving the *other* same-`reply_email` contact propagates end-to-end: a different alias, a different owning user, a different candidate mailbox, and — on the authorized/fallback path — a log row attributing the reply to the wrong user (`EmailLog.user_id`). §7 shows this propagation directly: flipping only the contacts' insertion order flips the resolved `user_id` from `1` to `2` under the identical input.
+
+### 6.5 The same non-unique lookup gates multiple routing decisions
+
+`Contact.get_by(reply_email=...)` (and its `is_reverse_alias()` wrapper) is reused beyond the primary resolution: the second header-rewrite lookup in `replace_header_when_reply()` (`email_handler.py:364`, exercised in §8.3), and the routing/bounce predicates in `handle()` (`is_reverse_alias()` is called at `email_handler.py:2166` and `:2195`). Every one of these decisions inherits the same non-unique, unordered `.first()` semantics. Direct `Contact.get_by`/`is_reverse_alias` calls used purely to corroborate are labeled `[non-canonical]`; the routing itself is exercised canonically through `handle()` in §4.3.
+
+### 6.6 Normalization widens the *inbound* match surface (but does not, by itself, create multi-row matches)
+
+`normalize_reply_email()` is applied to the **inbound** `rcpt_to` only; the stored `Contact.reply_email` values are compared by **exact equality** in the query. So multiple inbound *spellings* collapse onto **one** stored key (many-to-one on input), but a **multi-row** match still requires **more than one stored row** holding that same exact normalized key. This corrects the earlier conflation; the runtime exact-equality proof is in §8.2.
+
+### 6.7 Forward-phase minting (where a contact's `reply_email` originates)
+
+In the forward phase, a contact's `reply_email` is minted by `generate_reply_email(...)` (`app/email_utils.py:1103`), which loops choosing a candidate and calling `available_sl_email(reply_email)` (`app/email_utils.py:1150`) until it passes — the best-effort guard analyzed in §6.2. The official reverse-alias contract intends this value to be unique per `(alias, contact)` pair (§9); the schema does not enforce that intent, which is the root permissiveness this investigation documents.
+
+---
+## 7. Cross-event behavior (same unchanged input, every run disclosed)
+
+### 7.0 Methodology (seed once, drive the identical input many times)
+
+The question "does the same reply resolve differently over time?" requires driving the **same unchanged input against the same persisted rows** — not regenerating users/aliases/contacts/IDs per run. `observe_dist.py` therefore separates **seed** from **drive**:
+
+- **`seed <ab|ba> <on|off>`** truncates to a clean slate, seeds a **fixed** dataset (user_A `usera@mailbox.test`, user_B `userb@mailbox.test`, one alias each, and **two** `Contact` rows sharing `reply_email='dist-shared@sl.local'` with fixed `website_email`s `a-dist@nowhere.net` / `b-dist@nowhere.net`), sets both aliases' `disable_email_spoofing_check` per `on|off`, prints the physical `ctid` order and `EXPLAIN` of the exact lookup, then **stops**. `ab` vs `ba` controls only the contacts' **insertion order**.
+- **`drive <N> <mid_prefix>`** does **not** reseed. It asserts exactly two contacts share the `reply_email` (else exits `3`), then drives the **canonical** `email_handler.handle_reply()` `N=20` times with an **identical** envelope — fixed `mail_from='usera@mailbox.test'` (user_A's mailbox) and fixed `rcpt_to='dist-shared@sl.local'` — where **only the Message-ID varies** (`<mid_prefix>-i@sl.local`). Every event is correlated to its own `EmailLog` by **exact Message-ID** (`EmailLog.get_by(message_id=mid)`), asserting `contact_id`/`alias_id`/`user_id`/`mailbox_id`/`is_reply` and the return `code`. All `N` events are aggregated into two distribution counters (by return code, and by resolved contact/alias/user or non-forward reason); for readability the harness prints the first three events and the last event as a **sample**, and the counters (which sum to `N=20`) are the authoritative full distribution. Argument bounds are validated (`order ∈ {ab,ba}`, `spoof ∈ {on,off}`, `N ∈ 1..1000`, `mid_prefix` matches `[A-Za-z0-9_.-]+`), with non-zero exits on invalid input.
+
+**Every run performed against the clean-slate database is disclosed below** — four seeds and eight drive runs (each of the four conditions driven twice) — none omitted. The four conditions are the cross product of insertion order (`ab`/`ba`) and spoof control (`off` = **default**; `on` = **`[non-canonical]` fallback**).
+
+The runner used for every invocation:
+
+```
+# /tmp/run_dist.sh <args>  (host-side wrapper; sources the canonical env, then runs the harness)
+docker exec sl_app bash -lc 'cd /app; . venv/bin/activate; set -a; . /tmp/sl_env.sh; set +a; python /tmp/observe_dist.py '"$1"' 2>&1'
+```
+
+### 7.1 Condition `ab` / `off` — default control, sender owns the first-inserted contact (correct user)
+
+**Seed** (`/tmp/run_dist.sh "seed ab off"`):
+
+```
+2026-07-13 18:34:57,992 - SL - INFO - 6084 - "/app/init_app.py:44" - add_sl_domains() -  - Add d1.test to SL domain
+2026-07-13 18:34:57,996 - SL - INFO - 6084 - "/app/init_app.py:44" - add_sl_domains() -  - Add d2.test to SL domain
+2026-07-13 18:34:57,997 - SL - INFO - 6084 - "/app/init_app.py:44" - add_sl_domains() -  - Add sl.local to SL domain
+=== SEED mode order=ab spoof=off (disable_email_spoofing_check=False) ===
+shared reply_email='dist-shared@sl.local'  FIXED_MAIL_FROM='usera@mailbox.test'
+user_a.id=1 alias_a.id=3  user_b.id=2 alias_b.id=4
+insertion #1 -> Contact id=1 alias_id=3 user_id=1 website='a-dist@nowhere.net'
+insertion #2 -> Contact id=2 alias_id=4 user_id=2 website='b-dist@nowhere.net'
+--- physical order (ctid) of rows sharing reply_email ---
+  ctid=(0,1) id=1 alias_id=3 user_id=1 website='a-dist@nowhere.net'
+  ctid=(0,2) id=2 alias_id=4 user_id=2 website='b-dist@nowhere.net'
+--- EXPLAIN (default plan) of the lookup: filter_by(reply_email=...).first() ---
+  Limit  (cost=0.14..4.16 rows=1 width=4)
+    ->  Index Scan using ix_contact_reply_email on contact  (cost=0.14..4.16 rows=1 width=4)
+          Index Cond: ((reply_email)::text = 'dist-shared@sl.local'::text)
+--- EXPLAIN with index/bitmap scans DISABLED (forced Seq Scan), same query ---
+  Limit  (cost=0.00..11.00 rows=1 width=4)
+    ->  Seq Scan on contact  (cost=0.00..11.00 rows=1 width=4)
+          Filter: ((reply_email)::text = 'dist-shared@sl.local'::text)
+SEED DONE (persisted; run 'drive' next)
+```
+
+First-inserted `Contact id=1` (`user_A`) is at `ctid=(0,1)`; second at `ctid=(0,2)`. **Drive run 1** (`/tmp/run_dist.sh "drive 20 abD1"`) and **drive run 2** (`/tmp/run_dist.sh "drive 20 abD2"`), same persisted rows:
+
+```
+########## DRIVE run1 (N=20) — dataset ab/off ##########
+=== DRIVE mode N=20 mid_prefix='abD1' (dataset NOT reseeded) ===
+[non-canonical] direct Contact.get_by(reply_email='dist-shared@sl.local') -> id=1 alias_id=3 user_id=1 website='a-dist@nowhere.net'
+driving handle_reply() 20x with IDENTICAL mail_from='usera@mailbox.test', rcpt_to='dist-shared@sl.local'; ONLY Message-ID varies
+  event mid=<abD1-0@sl.local> delivered=True code='250 Message accepted for delivery' EmailLog(mid match=True) contact_id=1 alias_id=3 user_id=1 mailbox_id=1 is_reply=True
+  event mid=<abD1-1@sl.local> delivered=True code='250 Message accepted for delivery' EmailLog(mid match=True) contact_id=1 alias_id=3 user_id=1 mailbox_id=1 is_reply=True
+  event mid=<abD1-2@sl.local> delivered=True code='250 Message accepted for delivery' EmailLog(mid match=True) contact_id=1 alias_id=3 user_id=1 mailbox_id=1 is_reply=True
+  event mid=<abD1-19@sl.local> delivered=True code='250 Message accepted for delivery' EmailLog(mid match=True) contact_id=1 alias_id=3 user_id=1 mailbox_id=1 is_reply=True
+--- distribution by return code ---
+  code='250 Message accepted for delivery': 20
+--- distribution by resolved (EmailLog) / non-forward ---
+  contact_id=1,alias_id=3,user_id=1: 20
+DRIVE DONE
+```
+
+```
+########## DRIVE run2 (N=20, SAME persisted rows) — dataset ab/off ##########
+=== DRIVE mode N=20 mid_prefix='abD2' (dataset NOT reseeded) ===
+[non-canonical] direct Contact.get_by(reply_email='dist-shared@sl.local') -> id=1 alias_id=3 user_id=1 website='a-dist@nowhere.net'
+driving handle_reply() 20x with IDENTICAL mail_from='usera@mailbox.test', rcpt_to='dist-shared@sl.local'; ONLY Message-ID varies
+  event mid=<abD2-0@sl.local> delivered=True code='250 Message accepted for delivery' EmailLog(mid match=True) contact_id=1 alias_id=3 user_id=1 mailbox_id=1 is_reply=True
+  event mid=<abD2-1@sl.local> delivered=True code='250 Message accepted for delivery' EmailLog(mid match=True) contact_id=1 alias_id=3 user_id=1 mailbox_id=1 is_reply=True
+  event mid=<abD2-2@sl.local> delivered=True code='250 Message accepted for delivery' EmailLog(mid match=True) contact_id=1 alias_id=3 user_id=1 mailbox_id=1 is_reply=True
+  event mid=<abD2-19@sl.local> delivered=True code='250 Message accepted for delivery' EmailLog(mid match=True) contact_id=1 alias_id=3 user_id=1 mailbox_id=1 is_reply=True
+--- distribution by return code ---
+  code='250 Message accepted for delivery': 20
+--- distribution by resolved (EmailLog) / non-forward ---
+  contact_id=1,alias_id=3,user_id=1: 20
+DRIVE DONE
+```
+
+**Result:** both runs **20/20** `code='250 Message accepted for delivery'`, all resolved `contact_id=1,alias_id=3,user_id=1` — the correct owner (user_A). Stable across the two runs.
+
+### 7.2 Condition `ba` / `off` — default control, `.first()` resolves user_B → **E214 access-control rejection (no forward)**
+
+**Seed** (`/tmp/run_dist.sh "seed ba off"`) — insertion order reversed, so `Contact id=1` is now `user_B`'s (at `ctid=(0,1)`):
+
+```
+########## SEED ba off ##########
+=== SEED mode order=ba spoof=off (disable_email_spoofing_check=False) ===
+shared reply_email='dist-shared@sl.local'  FIXED_MAIL_FROM='usera@mailbox.test'
+user_a.id=1 alias_a.id=3  user_b.id=2 alias_b.id=4
+insertion #1 -> Contact id=1 alias_id=4 user_id=2 website='b-dist@nowhere.net'
+insertion #2 -> Contact id=2 alias_id=3 user_id=1 website='a-dist@nowhere.net'
+  ctid=(0,1) id=1 alias_id=4 user_id=2 website='b-dist@nowhere.net'
+  ctid=(0,2) id=2 alias_id=3 user_id=1 website='a-dist@nowhere.net'
+--- EXPLAIN (default plan) of the lookup: filter_by(reply_email=...).first() ---
+  Limit  (cost=0.14..4.16 rows=1 width=4)
+    ->  Index Scan using ix_contact_reply_email on contact  (cost=0.14..4.16 rows=1 width=4)
+--- EXPLAIN with index/bitmap scans DISABLED (forced Seq Scan), same query ---
+  Limit  (cost=0.00..11.00 rows=1 width=4)
+    ->  Seq Scan on contact  (cost=0.00..11.00 rows=1 width=4)
+SEED DONE (persisted; run 'drive' next)
+```
+
+**Drive run 1** (`drive 20 baD1`) and **drive run 2** (`drive 20 baD2`), same persisted rows, **identical** `mail_from='usera@mailbox.test'`:
+
+```
+########## DRIVE run1 (N=20) — dataset ba/off ##########
+=== DRIVE mode N=20 mid_prefix='baD1' (dataset NOT reseeded) ===
+[non-canonical] direct Contact.get_by(reply_email='dist-shared@sl.local') -> id=1 alias_id=4 user_id=2 website='b-dist@nowhere.net'
+driving handle_reply() 20x with IDENTICAL mail_from='usera@mailbox.test', rcpt_to='dist-shared@sl.local'; ONLY Message-ID varies
+  event mid=<baD1-0@sl.local> delivered=False code='250 SL E214 Unauthorized for using reverse alias' EmailLog=None (resolved contact unauthorized for mail_from -> E214, no forward)
+  event mid=<baD1-1@sl.local> delivered=False code='250 SL E214 Unauthorized for using reverse alias' EmailLog=None (resolved contact unauthorized for mail_from -> E214, no forward)
+  event mid=<baD1-2@sl.local> delivered=False code='250 SL E214 Unauthorized for using reverse alias' EmailLog=None (resolved contact unauthorized for mail_from -> E214, no forward)
+  event mid=<baD1-19@sl.local> delivered=False code='250 SL E214 Unauthorized for using reverse alias' EmailLog=None (resolved contact unauthorized for mail_from -> E214, no forward)
+--- distribution by return code ---
+  code='250 SL E214 Unauthorized for using reverse alias': 20
+--- distribution by resolved (EmailLog) / non-forward ---
+  NO_EmailLog(code=250 SL E214 Unauthorized for using reverse alias): 20
+DRIVE DONE
+```
+
+```
+########## DRIVE run2 (N=20, SAME persisted rows) — dataset ba/off ##########
+=== DRIVE mode N=20 mid_prefix='baD2' (dataset NOT reseeded) ===
+[non-canonical] direct Contact.get_by(reply_email='dist-shared@sl.local') -> id=1 alias_id=4 user_id=2 website='b-dist@nowhere.net'
+driving handle_reply() 20x with IDENTICAL mail_from='usera@mailbox.test', rcpt_to='dist-shared@sl.local'; ONLY Message-ID varies
+  event mid=<baD2-0@sl.local> delivered=False code='250 SL E214 Unauthorized for using reverse alias' EmailLog=None (resolved contact unauthorized for mail_from -> E214, no forward)
+  event mid=<baD2-1@sl.local> delivered=False code='250 SL E214 Unauthorized for using reverse alias' EmailLog=None (resolved contact unauthorized for mail_from -> E214, no forward)
+  event mid=<baD2-2@sl.local> delivered=False code='250 SL E214 Unauthorized for using reverse alias' EmailLog=None (resolved contact unauthorized for mail_from -> E214, no forward)
+  event mid=<baD2-19@sl.local> delivered=False code='250 SL E214 Unauthorized for using reverse alias' EmailLog=None (resolved contact unauthorized for mail_from -> E214, no forward)
+--- distribution by return code ---
+  code='250 SL E214 Unauthorized for using reverse alias': 20
+--- distribution by resolved (EmailLog) / non-forward ---
+  NO_EmailLog(code=250 SL E214 Unauthorized for using reverse alias): 20
+DRIVE DONE
+```
+
+**Result:** both runs **20/20** `code='250 SL E214 Unauthorized for using reverse alias'`, `EmailLog=None`. The identical input now resolves `user_B`'s contact (via `.first()` at `ctid=(0,1)`), user_A's mailbox is **not** authorized for user_B's alias, so under the **default** spoof control the reply is **rejected with E214 before any `EmailLog`/forward**. This is the crucial correction to the earlier draft: under default settings, wrong-user *resolution* manifests as an **access-control boundary**, not a wrong-user delivery.
+
+### 7.3 Conditions `ab`/`on` and `ba`/`on` — `[non-canonical]` fallback (spoof check disabled) → the actual wrong-user forward
+
+With `disable_email_spoofing_check = True` on both aliases (a **non-default** per-alias flag; labeled `[non-canonical]` fallback), the unauthorized-mailbox branch is skipped and the reply proceeds under the resolved contact's user.
+
+**`ab`/`on` seed** and **drives** (`seed ab on`, `drive 20 abonD1`, `drive 20 abonD2`):
+
+```
+########## SEED ab on ([non-canonical] spoof disabled) ##########
+=== SEED mode order=ab spoof=on (disable_email_spoofing_check=True) ===
+shared reply_email='dist-shared@sl.local'  FIXED_MAIL_FROM='usera@mailbox.test'
+user_a.id=1 alias_a.id=3  user_b.id=2 alias_b.id=4
+insertion #1 -> Contact id=1 alias_id=3 user_id=1 website='a-dist@nowhere.net'
+insertion #2 -> Contact id=2 alias_id=4 user_id=2 website='b-dist@nowhere.net'
+  ctid=(0,1) id=1 alias_id=3 user_id=1 website='a-dist@nowhere.net'
+  ctid=(0,2) id=2 alias_id=4 user_id=2 website='b-dist@nowhere.net'
+--- EXPLAIN (default plan) of the lookup: filter_by(reply_email=...).first() ---
+  Limit  (cost=0.14..4.16 rows=1 width=4)
+    ->  Index Scan using ix_contact_reply_email on contact  (cost=0.14..4.16 rows=1 width=4)
+--- EXPLAIN with index/bitmap scans DISABLED (forced Seq Scan), same query ---
+  Limit  (cost=0.00..11.00 rows=1 width=4)
+    ->  Seq Scan on contact  (cost=0.00..11.00 rows=1 width=4)
+SEED DONE (persisted; run 'drive' next)
+```
+
+```
+########## DRIVE run1 (N=20) — dataset ab/on ##########
+=== DRIVE mode N=20 mid_prefix='abonD1' (dataset NOT reseeded) ===
+[non-canonical] direct Contact.get_by(reply_email='dist-shared@sl.local') -> id=1 alias_id=3 user_id=1 website='a-dist@nowhere.net'
+driving handle_reply() 20x with IDENTICAL mail_from='usera@mailbox.test', rcpt_to='dist-shared@sl.local'; ONLY Message-ID varies
+  event mid=<abonD1-0@sl.local> delivered=True code='250 Message accepted for delivery' EmailLog(mid match=True) contact_id=1 alias_id=3 user_id=1 mailbox_id=1 is_reply=True
+  event mid=<abonD1-1@sl.local> delivered=True code='250 Message accepted for delivery' EmailLog(mid match=True) contact_id=1 alias_id=3 user_id=1 mailbox_id=1 is_reply=True
+  event mid=<abonD1-2@sl.local> delivered=True code='250 Message accepted for delivery' EmailLog(mid match=True) contact_id=1 alias_id=3 user_id=1 mailbox_id=1 is_reply=True
+  event mid=<abonD1-19@sl.local> delivered=True code='250 Message accepted for delivery' EmailLog(mid match=True) contact_id=1 alias_id=3 user_id=1 mailbox_id=1 is_reply=True
+--- distribution by return code ---
+  code='250 Message accepted for delivery': 20
+--- distribution by resolved (EmailLog) / non-forward ---
+  contact_id=1,alias_id=3,user_id=1: 20
+DRIVE DONE
+```
+
+```
+########## DRIVE run2 (N=20, SAME persisted rows) — dataset ab/on ##########
+=== DRIVE mode N=20 mid_prefix='abonD2' (dataset NOT reseeded) ===
+[non-canonical] direct Contact.get_by(reply_email='dist-shared@sl.local') -> id=1 alias_id=3 user_id=1 website='a-dist@nowhere.net'
+driving handle_reply() 20x with IDENTICAL mail_from='usera@mailbox.test', rcpt_to='dist-shared@sl.local'; ONLY Message-ID varies
+  event mid=<abonD2-0@sl.local> delivered=True code='250 Message accepted for delivery' EmailLog(mid match=True) contact_id=1 alias_id=3 user_id=1 mailbox_id=1 is_reply=True
+  event mid=<abonD2-1@sl.local> delivered=True code='250 Message accepted for delivery' EmailLog(mid match=True) contact_id=1 alias_id=3 user_id=1 mailbox_id=1 is_reply=True
+  event mid=<abonD2-2@sl.local> delivered=True code='250 Message accepted for delivery' EmailLog(mid match=True) contact_id=1 alias_id=3 user_id=1 mailbox_id=1 is_reply=True
+  event mid=<abonD2-19@sl.local> delivered=True code='250 Message accepted for delivery' EmailLog(mid match=True) contact_id=1 alias_id=3 user_id=1 mailbox_id=1 is_reply=True
+--- distribution by return code ---
+  code='250 Message accepted for delivery': 20
+--- distribution by resolved (EmailLog) / non-forward ---
+  contact_id=1,alias_id=3,user_id=1: 20
+DRIVE DONE
+```
+
+**`ba`/`on` seed** and **drives** (`seed ba on`, `drive 20 baonD1`, `drive 20 baonD2`) — the wrong-user forward:
+
+```
+########## SEED ba on ([non-canonical] spoof disabled) ##########
+=== SEED mode order=ba spoof=on (disable_email_spoofing_check=True) ===
+shared reply_email='dist-shared@sl.local'  FIXED_MAIL_FROM='usera@mailbox.test'
+user_a.id=1 alias_a.id=3  user_b.id=2 alias_b.id=4
+insertion #1 -> Contact id=1 alias_id=4 user_id=2 website='b-dist@nowhere.net'
+insertion #2 -> Contact id=2 alias_id=3 user_id=1 website='a-dist@nowhere.net'
+  ctid=(0,1) id=1 alias_id=4 user_id=2 website='b-dist@nowhere.net'
+  ctid=(0,2) id=2 alias_id=3 user_id=1 website='a-dist@nowhere.net'
+--- EXPLAIN (default plan) of the lookup: filter_by(reply_email=...).first() ---
+  Limit  (cost=0.14..4.16 rows=1 width=4)
+    ->  Index Scan using ix_contact_reply_email on contact  (cost=0.14..4.16 rows=1 width=4)
+--- EXPLAIN with index/bitmap scans DISABLED (forced Seq Scan), same query ---
+  Limit  (cost=0.00..11.00 rows=1 width=4)
+    ->  Seq Scan on contact  (cost=0.00..11.00 rows=1 width=4)
+SEED DONE (persisted; run 'drive' next)
+```
+
+```
+########## DRIVE run1 (N=20) — dataset ba/on ##########
+=== DRIVE mode N=20 mid_prefix='baonD1' (dataset NOT reseeded) ===
+[non-canonical] direct Contact.get_by(reply_email='dist-shared@sl.local') -> id=1 alias_id=4 user_id=2 website='b-dist@nowhere.net'
+driving handle_reply() 20x with IDENTICAL mail_from='usera@mailbox.test', rcpt_to='dist-shared@sl.local'; ONLY Message-ID varies
+  event mid=<baonD1-0@sl.local> delivered=True code='250 Message accepted for delivery' EmailLog(mid match=True) contact_id=1 alias_id=4 user_id=2 mailbox_id=2 is_reply=True
+  event mid=<baonD1-1@sl.local> delivered=True code='250 Message accepted for delivery' EmailLog(mid match=True) contact_id=1 alias_id=4 user_id=2 mailbox_id=2 is_reply=True
+  event mid=<baonD1-2@sl.local> delivered=True code='250 Message accepted for delivery' EmailLog(mid match=True) contact_id=1 alias_id=4 user_id=2 mailbox_id=2 is_reply=True
+  event mid=<baonD1-19@sl.local> delivered=True code='250 Message accepted for delivery' EmailLog(mid match=True) contact_id=1 alias_id=4 user_id=2 mailbox_id=2 is_reply=True
+--- distribution by return code ---
+  code='250 Message accepted for delivery': 20
+--- distribution by resolved (EmailLog) / non-forward ---
+  contact_id=1,alias_id=4,user_id=2: 20
+DRIVE DONE
+```
+
+```
+########## DRIVE run2 (N=20, SAME persisted rows) — dataset ba/on ##########
+=== DRIVE mode N=20 mid_prefix='baonD2' (dataset NOT reseeded) ===
+[non-canonical] direct Contact.get_by(reply_email='dist-shared@sl.local') -> id=1 alias_id=4 user_id=2 website='b-dist@nowhere.net'
+driving handle_reply() 20x with IDENTICAL mail_from='usera@mailbox.test', rcpt_to='dist-shared@sl.local'; ONLY Message-ID varies
+  event mid=<baonD2-0@sl.local> delivered=True code='250 Message accepted for delivery' EmailLog(mid match=True) contact_id=1 alias_id=4 user_id=2 mailbox_id=2 is_reply=True
+  event mid=<baonD2-1@sl.local> delivered=True code='250 Message accepted for delivery' EmailLog(mid match=True) contact_id=1 alias_id=4 user_id=2 mailbox_id=2 is_reply=True
+  event mid=<baonD2-2@sl.local> delivered=True code='250 Message accepted for delivery' EmailLog(mid match=True) contact_id=1 alias_id=4 user_id=2 mailbox_id=2 is_reply=True
+  event mid=<baonD2-19@sl.local> delivered=True code='250 Message accepted for delivery' EmailLog(mid match=True) contact_id=1 alias_id=4 user_id=2 mailbox_id=2 is_reply=True
+--- distribution by return code ---
+  code='250 Message accepted for delivery': 20
+--- distribution by resolved (EmailLog) / non-forward ---
+  contact_id=1,alias_id=4,user_id=2: 20
+DRIVE DONE
+```
+
+**Result:** `ab`/`on` → both runs **20/20** E200 resolving `contact_id=1,alias_id=3,user_id=1` (user_A). `ba`/`on` → both runs **20/20** E200 resolving `contact_id=1,alias_id=4,user_id=2` — **user_B, the wrong user** (not the owner of the sending mailbox). The `EmailLog` records `user_id=2` for all 20 events per run. This is the condition under which a reply is actually *selected, logged, and enqueued for forwarding under the wrong user*. (As always, `NOT_SEND_EMAIL=true` means no external SMTP hand-off is confirmed — application acceptance and a stored send request only.)
+
+### 7.4 PostgreSQL determinant: physical `ctid` and plan-dependence (bounded, honest interpretation)
+
+Each seed printed the physical `ctid` order and the `EXPLAIN` of the exact lookup `SELECT contact.id FROM contact WHERE contact.reply_email='dist-shared@sl.local' LIMIT 1`:
+
+- **Physical layout.** After a clean-slate truncate + fresh inserts, the two rows occupy the same page in insertion order: the first-inserted row is at `ctid=(0,1)`, the second at `ctid=(0,2)`. In condition `ab` the `(0,1)` row is user_A's; in `ba` it is user_B's.
+- **Plans observed.** The default plan is `Index Scan using ix_contact_reply_email ... Limit rows=1`; with `enable_indexscan/bitmapscan/indexonlyscan` disabled, the same query plans a `Seq Scan on contact ... Limit rows=1`.
+- **What this does and does not prove.** The application specifies **no `ORDER BY`**; PostgreSQL is therefore free to return the matching rows in an unspecified order that, per its documentation, "*depend[s] on the scan and join plan types and the order on disk*" and "*must not be relied on*" (§9). For this **specific** two-row, single-page, append-only layout, both the observed `Index Scan` and the forced `Seq Scan` return the lower-`ctid` (first-inserted) row first, which is why every drive was **stable at 20/20** within a fixed layout. I therefore state only the **observed** fact — *no application ordering is specified, and the database-selected row here tracks the first-inserted/lower-`ctid` row under the active plan* — and treat the **general** claim, that a different plan, index state, page layout, `VACUUM`/update churn, or concurrency could return the *other* row, as explicitly **`[inferred]`** from the absence of an `ORDER BY` plus the official SQLAlchemy/PostgreSQL semantics (§9). The forced `Seq Scan` `EXPLAIN` demonstrates the plan can change; it does **not**, on this tiny layout, demonstrate a changed *result row*, and I do not claim it does.
 
 ### 7.5 Verdict
 
-- **Within a fixed dataset:** resolution is **stable** (100/100) at the first-inserted / lowest-`ctid` row; confirmed across two independent A-then-B runs (§7.1, §7.2).
-- **Across datasets:** the resolved **user is governed purely by physical row order**, not by the alias owner or `mail_from`. Reversing only the insertion order of the two duplicate rows flips the resolved user **A → B (100/100)** under the identical canonical input (§7.3). This is the directly-reproducible, ordering-dependent wrong-user behavior.
-- **`[inferred]`** nuance: the within-dataset stability is an implementation artifact of PostgreSQL serving the equal-key lookup via the index in lowest-`ctid`-first order on an append-only static heap; because `ModelMixin.get_by` emits `LIMIT 1` with **no `ORDER BY`** (`app/models.py:83-84`), a different physical layout (`UPDATE`/`HOT`/`VACUUM`/bloat), a different plan (the forced `Seq Scan` above shows the planner *will* switch), or a different PG/SQLAlchemy build could return the other row. The "could differ under other physical/plan conditions" statement is `[inferred]` from PostgreSQL/SQLAlchemy 1.3.24 semantics plus the observed absence of a `Sort` node; the A-vs-B ordering-dependence is **observed**.
+Across every disclosed run, the resolved contact — and therefore the alias, owning user, and mailbox derived from it — is determined by **which same-`reply_email` row `.first()` returns**, which under the active plan tracked the contacts' **insertion order**:
 
+| Condition | Insertion order | `ctid=(0,1)` is | Spoof control | Drive result (run 1 / run 2, N=20 each) |
+|-----------|-----------------|-----------------|---------------|------------------------------------------|
+| `ab`/`off` | A-then-B | user_A (`id=1`) | **default** | 20/20 E200, `user_id=1` (correct) |
+| `ba`/`off` | B-then-A | user_B (`id=1`) | **default** | 20/20 **E214**, `EmailLog=None` (rejected, **no forward**) |
+| `ab`/`on` | A-then-B | user_A (`id=1`) | `[non-canonical]` | 20/20 E200, `user_id=1` (correct) |
+| `ba`/`on` | B-then-A | user_B (`id=1`) | `[non-canonical]` | 20/20 E200, **`user_id=2` (wrong user forward)** |
+
+- Within each fixed layout the outcome is **deterministic and stable** (20/20 across two runs) — it is *not* random per call.
+- The resolved **user flips with insertion order** under the identical input, which is the ordering-dependence the unordered `.first()` allows.
+- Under **default** settings the wrong-user resolution is caught as **E214** (no forward); the actual wrong-user **forward** is observed only under the **`[non-canonical]`** spoof-disabled fallback.
 
 ---
-
 ## 8. Edge / secondary conditions
 
-Every implied branch of the reply path was exercised. The consolidated harness `observe_edge.py` (source in §10) covers E501, E502 (no-contact and inactive-user), E214 (wrong-user alert), the `normalize_reply_email()` collision, the `available_sl_email()` guard, and `is_reverse_alias()`. Two focused harnesses (`observe_norm.py`, `observe_second.py`) capture the normalization-collision `EmailLog` persistence and the second lookup site.
+All edge conditions are exercised through the **canonical** `handle_reply()` entry point (or, for `is_reverse_alias`, the labeled `[non-canonical]` predicate), with combined `stdout`+`stderr` captured (no suppression).
 
-### 8.1 Consolidated edge harness
+### 8.1 E501, E502 (no contact), E502 (inactive user), and the `is_reverse_alias` predicate
 
 **Command:**
 
 ```
-docker exec sl_app bash -lc 'cd /app; . venv/bin/activate; set -a && . /tmp/sl_env.sh && set +a; python /tmp/observe_edge.py 2>/dev/null'
+docker exec sl_app bash -lc 'cd /app; . venv/bin/activate; set -a; . /tmp/sl_env.sh; set +a; python /tmp/observe_edge.py 2>&1'
 ```
 
-**Output (complete, unedited):**
+**Output (complete, unedited; run 1 of 2 — run 2 byte-identical modulo per-run-varying fields only: the `RUN 1`/`RUN 2` banner, logger timestamps/PID, and the computed `delete_on` timestamp in the inactive-user case):**
 
 ```
-load config file /app/tests/test.env
->>> URL: http://localhost
-Upload files to local dir
->>> init logging <<<
-2026-07-13 17:28:00,286 - SL - DEBUG - 4649 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
-2026-07-13 17:28:01,076 - SL - DEBUG - 4649 - "/app/init_app.py:42" - add_sl_domains() -  - d1.test is already a SL domain
-2026-07-13 17:28:01,077 - SL - DEBUG - 4649 - "/app/init_app.py:42" - add_sl_domains() -  - d2.test is already a SL domain
-2026-07-13 17:28:01,078 - SL - DEBUG - 4649 - "/app/init_app.py:42" - add_sl_domains() -  - sl.local is already a SL domain
-2026-07-13 17:28:01,078 - SL - DEBUG - 4649 - "/app/init_app.py:42" - add_sl_domains() -  - sl.local is already a SL domain
-========== E501: reply domain not EMAIL_DOMAIN and not an SLDomain ==========
-rcpt_to='whatever@not-sl-domain.example' -> delivered=False code='550 SL E501'  (status.E501='550 SL E501') match=True
-========== E502(a): rcpt_to ends with EMAIL_DOMAIN but NO Contact ==========
-rcpt_to='no-contact-dclmiu@sl.local' Contact.get_by->None -> delivered=False code='550 SL E502 Email not exist' (E502='550 SL E502 Email not exist') match=True
-========== E502(b): contact exists but contact.user is INACTIVE ==========
-user.id=35 is_active()=False (delete_on=2026-07-13T18:28:01.407555+00:00)
-rcpt_to='inactive-dclmiu@sl.local' -> delivered=False code='550 SL E502 Email not exist' (E502='550 SL E502 Email not exist') match=True
-========== E214 + WRONG-USER alert: duplicate reply_email, resolves to user_B, mail_from is user_A ==========
-mail_from(user_A)='user_px2u3iyq3x@mailbox.test'  user_A.id=36 user_B.id=37
-.first() resolved Contact id=37 alias_id=74 user_id=37 (=user_B)
--> delivered=False code='250 SL E214 Unauthorized for using reverse alias' (E214='250 SL E214 Unauthorized for using reverse alias') match=True
-   SentAlert id=4 user_id=37 to_email='user_vv5oe7dlsd@mailbox.test' alert_type='reverse_alias_unknown_mailbox'
-   ^ alert was sent to user_B though the reply came from user_A's mailbox => WRONG USER
-========== normalize_reply_email(): many-to-one collision ==========
-normalize_reply_email('ra#xdclmiu@sl.local')   = 'ra_xdclmiu@sl.local'
-normalize_reply_email('ra%xdclmiu@sl.local')   = 'ra_xdclmiu@sl.local'
-normalize_reply_email('ra_xdclmiu@sl.local') = 'ra_xdclmiu@sl.local'
-all three collide to same key? True
-canonical handle_reply(rcpt_to='ra#xdclmiu@sl.local') -> delivered=True code='250 Message accepted for delivery'; resolved EmailLog.contact_id=39 (stored contact id=39) match=True
-========== available_sl_email() best-effort guard (bypassed by direct Contact.create) ==========
-available_sl_email('ra_xdclmiu@sl.local') now that a Contact uses it = False  (False => generator would avoid it)
-available_sl_email('brand-new-dclmiu@sl.local') = True  (True => free)
-NOTE: direct Contact.create(reply_email=...) NEVER calls available_sl_email(); only generate_reply_email() does.
-========== is_reverse_alias() routing predicate on the shared key ==========
-is_reverse_alias('e214-dclmiu@sl.local') = True
+########## observe_edge.py RUN 1 ##########
+=== (1) E501: reply domain not EMAIL_DOMAIN and not an SLDomain ===
+2026-07-13 18:40:21,149 - SL - WARNING - 6391 - "/app/email_handler.py:980" - handle_reply() -  - Reply email reply@notsl.example has wrong domain
+rcpt_to='reply@notsl.example' -> delivered=False code='550 SL E501'  (==E501? True)
+=== (2) E502: no Contact matches the reply_email ===
+2026-07-13 18:40:21,156 - SL - WARNING - 6391 - "/app/email_handler.py:988" - handle_reply() -  - No contact with no-such-contact@sl.local as reverse alias
+rcpt_to='no-such-contact@sl.local' -> delivered=False code='550 SL E502 Email not exist'  (==E502? True)
+=== (3) E502: contact.user.is_active() is False (soft-deleted user) ===
+inactive user delete_on=2026-07-14T18:40:21.125255+00:00  is_active()=False
+2026-07-13 18:40:21,171 - SL - WARNING - 6391 - "/app/email_handler.py:991" - handle_reply() -  - User <User 2 Test User edge-inactive@mailbox.test> has been soft deleted
+rcpt_to='edge-inactive-reply@sl.local' -> delivered=False code='550 SL E502 Email not exist'  (==E502? True)
+=== (4) is_reverse_alias() predicate [app/email_utils.py:1156-1158] ===
+is_reverse_alias('edge-active@sl.local')            = True
+is_reverse_alias('not-a-reverse-alias@sl.local') = False
 DONE
 ```
 
-**Reading each condition (token `dclmiu`):**
+- **E501 — wrong reply domain.** `rcpt_to='reply@notsl.example'` does not end with `EMAIL_DOMAIN` and is not an `SLDomain`, so `handle_reply()` logs `Reply email reply@notsl.example has wrong domain` (`email_handler.py:980`) and returns `(False, '550 SL E501')`.
+- **E502 — no matching contact.** `rcpt_to='no-such-contact@sl.local'` passes the domain gate but resolves no contact, logging `No contact with no-such-contact@sl.local as reverse alias` (`email_handler.py:988`) and returning `'550 SL E502 Email not exist'`.
+- **E502 — inactive (soft-deleted) user.** A contact whose owning user has a future `delete_on` (so `User.is_active()` is `False` — `app/models.py:766-769`) resolves the contact but then fails the active-user gate, logging `User <...> has been soft deleted` (`email_handler.py:991`) and returning `'550 SL E502 Email not exist'`. The printed `delete_on=2026-07-14T...  is_active()=False` confirms the precondition.
+- **`is_reverse_alias()` predicate `[non-canonical]`.** `is_reverse_alias('edge-active@sl.local') = True` (a contact exists), `is_reverse_alias('not-a-reverse-alias@sl.local') = False` (no contact and the address does not match the `reply+`/`ra+` suffix clause). This is the two-clause predicate from §6.2.
 
-- **E501** (`email_handler.py:977-981`): `rcpt_to='whatever@not-sl-domain.example'` does not end with `EMAIL_DOMAIN` and is not an `SLDomain` → `delivered=False code='550 SL E501'` (`match=True`).
-- **E502(a) — no contact** (`email_handler.py:986-989`): `rcpt_to='no-contact-dclmiu@sl.local'` ends with `EMAIL_DOMAIN` but `Contact.get_by->None` → `delivered=False code='550 SL E502 Email not exist'` (`match=True`).
-- **E502(b) — inactive user** (`email_handler.py:990-992`; `User.is_active` at `app/models.py:766`): the contact exists but its user's `delete_on` is set to a future time, so `is_active()=False` → `code='550 SL E502 Email not exist'` (`match=True`).
-- **E214 — wrong-user alert** (`email_handler.py:1019-1034`): two contacts share `reply_email='e214-dclmiu@sl.local'` with `user_B`'s inserted first, so `.first()` resolved `Contact id=37, alias_id=74, user_id=37` (`user_B`). The sender `mail_from = user_A`'s mailbox is **not** authorized for `user_B`'s alias, so with the spoof-check ON, `get_mailbox_from_mail_from` returned `None`, `handle_unknown_mailbox` fired, and the handler returned `code='250 SL E214'` (`match=True`). Critically, `SentAlert id=4 user_id=37 to_email='user_vv5oe7dlsd@mailbox.test' alert_type='reverse_alias_unknown_mailbox'` — **the alert was sent to `user_B` even though the reply came from `user_A`'s mailbox**. This is a second, independent manifestation of the wrong-user condition (information about `user_A`'s reply attempt is surfaced to `user_B`).
-- **`normalize_reply_email()` many-to-one** (`app/email_validation.py:9,25-38`): `'ra#xdclmiu@sl.local'`, `'ra%xdclmiu@sl.local'`, and `'ra_xdclmiu@sl.local'` all normalize to `'ra_xdclmiu@sl.local'` (`#` and `%` are not in `_ALLOWED_CHARS`, so they become `_`). `all three collide to same key? True`. Driving the canonical `handle_reply(rcpt_to='ra#xdclmiu@sl.local')` delivered successfully and resolved `EmailLog.contact_id=39`, exactly the stored contact whose `reply_email` is `'ra_xdclmiu@sl.local'` (`match=True`) — i.e. an inbound address spelled with a disallowed character resolves onto a *different* stored value after normalization.
-- **`available_sl_email()`** (`app/models.py:1425-1432`): returns `False` for the in-use address and `True` for a brand-new one. Confirms the guard *would* steer the generator away from duplicates — but direct `Contact.create(reply_email=...)` never calls it.
-- **`is_reverse_alias()`** (`app/email_utils.py:1156-1158`): returns `True` on the shared key — the routing predicate that dispatches to `handle_reply`.
+### 8.2 Normalization semantics — inbound spelling aliasing vs. exact-equality lookup (corrected)
 
-### 8.2 Focused normalization-collision persistence (`observe_norm.py`)
+This experiment establishes the **precise** normalization semantics and corrects the earlier conflation: `normalize_reply_email()` transforms only the **inbound** `rcpt_to`; the stored `Contact.reply_email` is compared by **exact equality**. Multiple inbound spellings therefore collapse onto **one** stored key, but a **multi-row** match still requires **more than one stored row** holding that exact key.
 
 **Command:**
 
 ```
-docker exec sl_app bash -lc 'cd /app; . venv/bin/activate; set -a && . /tmp/sl_env.sh && set +a; python /tmp/observe_norm.py 2>/dev/null'
+docker exec sl_app bash -lc 'cd /app; . venv/bin/activate; set -a; . /tmp/sl_env.sh; set +a; python /tmp/observe_norm.py 2>&1'
 ```
 
-**Output (complete, unedited):**
+**Output (complete, unedited; run 1 of 2 — run 2 byte-identical modulo per-run-varying fields only: the `RUN 1`/`RUN 2` banner and logger timestamps/PID):**
 
 ```
-load config file /app/tests/test.env
->>> URL: http://localhost
-Upload files to local dir
->>> init logging <<<
-2026-07-13 17:28:14,011 - SL - DEBUG - 4669 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
-2026-07-13 17:28:14,790 - SL - DEBUG - 4669 - "/app/init_app.py:42" - add_sl_domains() -  - d1.test is already a SL domain
-2026-07-13 17:28:14,791 - SL - DEBUG - 4669 - "/app/init_app.py:42" - add_sl_domains() -  - d2.test is already a SL domain
-2026-07-13 17:28:14,792 - SL - DEBUG - 4669 - "/app/init_app.py:42" - add_sl_domains() -  - sl.local is already a SL domain
-2026-07-13 17:28:14,793 - SL - DEBUG - 4669 - "/app/init_app.py:42" - add_sl_domains() -  - sl.local is already a SL domain
-stored contact id 40 reply_email ra_xgw1mlc@sl.local
-normalize(in1)= ra_xgw1mlc@sl.local  Contact.get_by(normalized)= <Contact 40 cc-gw1mlc@nowhere.net 78>
-before max EmailLog.id = 808
-handle_reply(rcpt_to=in1) -> True '250 Message accepted for delivery'
-after max EmailLog.id = 809
-  NEW EmailLog id=809 contact_id=40 alias_id=78 user_id=39 message_id='<norm-gw1mlc@sl.local>'
+########## observe_norm.py RUN 1 ##########
+=== stored Contact.reply_email = 'norm_key@sl.local' (single row) ===
+--- normalize_reply_email() maps each INBOUND spelling onto the stored key ---
+  inbound='norm_key@sl.local'              -> normalize_reply_email -> 'norm_key@sl.local'  (==stored? True)
+  inbound='norm key@sl.local'              -> normalize_reply_email -> 'norm_key@sl.local'  (==stored? True)
+  inbound='norm#key@sl.local'              -> normalize_reply_email -> 'norm_key@sl.local'  (==stored? True)
+  inbound='norm~key@sl.local'              -> normalize_reply_email -> 'norm_key@sl.local'  (==stored? True)
+--- exact-equality proof: query uses normalized INBOUND vs raw STORED ---
+  Contact.get_by(reply_email='norm key@sl.local')            -> None
+  Contact.get_by(reply_email=normalize('norm key@sl.local')) -> <Contact 1 ext@nowhere.net 2>
+  inbound='norm_key@sl.local'              -> delivered=True code='250 Message accepted for delivery' EmailLog.contact_id=1
+  inbound='norm key@sl.local'              -> delivered=True code='250 Message accepted for delivery' EmailLog.contact_id=1
+  inbound='norm#key@sl.local'              -> delivered=True code='250 Message accepted for delivery' EmailLog.contact_id=1
+  inbound='norm~key@sl.local'              -> delivered=True code='250 Message accepted for delivery' EmailLog.contact_id=1
+--- rows sharing the stored key = 1 (multi-row match needs >1 STORED row with same key) ---
 DONE
 ```
 
-The stored contact (id 40) has `reply_email='ra_xgw1mlc@sl.local'`. An inbound `rcpt_to='ra#xgw1mlc@sl.local'` normalizes to `'ra_xgw1mlc@sl.local'`, and the canonical `handle_reply` persisted `EmailLog id=809 contact_id=40` — the collision resolved onto the stored contact through the real entry point.
+- **Inbound many-to-one.** A single stored `Contact.reply_email='norm_key@sl.local'`. Four distinct inbound spellings — `'norm_key@sl.local'`, `'norm key@sl.local'` (space), `'norm#key@sl.local'`, `'norm~key@sl.local'` — all normalize to `'norm_key@sl.local'` (`==stored? True`), because the disallowed characters (space, `#`, `~`) are each replaced by `_` (`app/email_validation.py:33`, using `_ALLOWED_CHARS` at `:9`).
+- **Exact-equality lookup (the correction).** `Contact.get_by(reply_email='norm key@sl.local') -> None` (the **raw** inbound spelling is *not* matched, because the query compares against the raw **stored** value), whereas `Contact.get_by(reply_email=normalize('norm key@sl.local')) -> <Contact 1>`. So the match happens **after** the caller normalizes the inbound value — the lookup itself does not normalize stored rows.
+- **Consequence for multi-row.** All four inbound spellings drive canonical `handle_reply()` to E200 resolving the same `contact_id=1`; and `rows sharing the stored key = 1`. A multi-row (hence order-dependent) match therefore requires **more than one stored row** with the same normalized key — exactly the duplicate condition seeded in §4.2/§7 — not merely different inbound spellings of one stored value.
 
-### 8.3 Second lookup site — `replace_header_when_reply()` (`observe_second.py`)
+### 8.3 Second lookup site — `replace_header_when_reply()` (`email_handler.py:364`)
+
+During the reply, `handle_reply()` calls `replace_header_when_reply()` for the `TO` header (`email_handler.py:1179`) and the `CC` header (`email_handler.py:1181`); that function performs a **second** `Contact.get_by(reply_email=...)` (`email_handler.py:364`) to restore each reverse-alias in the header back to the original contact address (or raises `NonReverseAliasInReplyPhase` if none matches). This is a second site subject to the same non-unique `.first()` semantics.
 
 **Command:**
 
 ```
-docker exec sl_app bash -lc 'cd /app; . venv/bin/activate; set -a && . /tmp/sl_env.sh && set +a; python /tmp/observe_second.py 2>&1'
+docker exec sl_app bash -lc 'cd /app; . venv/bin/activate; set -a; . /tmp/sl_env.sh; set +a; python /tmp/observe_second.py 2>&1'
 ```
 
-**Output (complete, unedited):**
+**Output (complete, unedited; run 1 of 2 — run 2 byte-identical modulo per-run-varying fields only: the `RUN 1`/`RUN 2` banner and logger timestamps/PID):**
+
+```
+########## observe_second.py RUN 1 ##########
+=== second lookup site: replace_header_when_reply() [email_handler.py:364] via TO & CC ===
+primary rcpt_to='second-r1@sl.local' (resolved at :986); TO header='second-r1@sl.local' -> contact c1.id=1 website='w1@nowhere.net'
+CC header='second-r2@sl.local' -> contact c2.id=2 website='w2@nowhere.net'
+2026-07-13 18:43:38,093 - SL - DEBUG - 6532 - "/app/email_handler.py:380" - replace_header_when_reply() -  - Replace To header, old: second-r1@sl.local, new: W1 <w1@nowhere.net>
+2026-07-13 18:43:38,095 - SL - DEBUG - 6532 - "/app/email_handler.py:380" - replace_header_when_reply() -  - Replace Cc header, old: second-r2@sl.local, new: W2 <w2@nowhere.net>
+handle_reply -> delivered=True code='250 Message accepted for delivery' (==E200? True)
+EmailLog id=1 contact_id=1 alias_id=2 user_id=1 is_reply=True
+rewritten msg[To] = 'W1 <w1@nowhere.net>'
+rewritten msg[Cc] = 'W2 <w2@nowhere.net>'
+DONE
+```
+
+- The canonical `handle_reply()` call carries a `TO` header `second-r1@sl.local` (resolving contact `c1.id=1`, `w1@nowhere.net`) and a `CC` header `second-r2@sl.local` (resolving contact `c2.id=2`, `w2@nowhere.net`). The second-site lookup rewrites both: `Replace To header, old: second-r1@sl.local, new: W1 <w1@nowhere.net>` and `Replace Cc header, old: second-r2@sl.local, new: W2 <w2@nowhere.net>` (`email_handler.py:380`).
+- Result: `delivered=True code='250 Message accepted for delivery'` (E200), `EmailLog id=1 contact_id=1 alias_id=2 user_id=1 is_reply=True`, and the rewritten `msg[To]='W1 <w1@nowhere.net>'`, `msg[Cc]='W2 <w2@nowhere.net>'`. Two **distinct** contacts are resolved through the second site in one reply, confirming the site is live on the canonical path.
+
+---
+## 9. SimpleLogin reverse-alias concept — intended invariant vs. schema reality
+
+The official SimpleLogin documentation defines the reverse-alias and its intended uniqueness:
+
+- "*A reverse-alias is unique for each sender and alias*" ([SimpleLogin Docs — Reverse alias](https://simplelogin.io/docs/getting-started/reverse-alias/)). This is the **intended invariant**: one `reply_email` corresponds to exactly one `(alias, contact)` pair.
+- "*When you send an email to a reverse-alias from your personal email, the email will be sent from your alias to the contact*" ([SimpleLogin FAQ](https://simplelogin.io/faq/)), and a reverse-alias "*is created for each alias you want to send email from and each contact you want to send email to*" — i.e., per `(alias, contact)` pair ([SimpleLogin Docs — Send emails from your alias](https://simplelogin.io/docs/getting-started/send-email/)).
+
+The reply path relies on this intended one-to-one mapping when it derives the alias/user/mailbox from the single contact returned by `Contact.get_by(reply_email=...)`. **But the database does not enforce that invariant** (§6.1): with no `UNIQUE` constraint on `reply_email`, two contacts on aliases owned by different users can share one `reply_email`, and the unordered `.first()` then resolves an application-unordered row (§4.1, §6.3). The gap between the documented intent (unique per sender+alias) and the unenforced schema (no `UNIQUE`) is precisely the crux of the wrong-user question.
+
+The framework/database semantics underpinning the ordering analysis are grounded in official sources:
+
+- **SQLAlchemy 1.3** — `Query.first()` emits `LIMIT 1` and returns the first yielded row ([Query API](https://docs.sqlalchemy.org/en/13/orm/query.html)); without `ORDER BY` on more than one match the result "*will not be deterministic*" and an `ORDER BY` on a unique column is recommended ([SQLAlchemy FAQ — ORDER BY with LIMIT](https://docs.sqlalchemy.org/en/13/faq/ormconfiguration.html#faq-query-deduplicating)).
+- **PostgreSQL 15** — "*If sorting is not chosen, the rows will be returned in an unspecified order. The actual order in that case will depend on the scan and join plan types and the order on disk, but it must not be relied on*" ([PostgreSQL 15 §7.5 Sorting Rows](https://www.postgresql.org/docs/15/queries-order.html)); a `SELECT` without `ORDER BY`/`LIMIT` has no guaranteed row order ([PostgreSQL 15 SELECT](https://www.postgresql.org/docs/15/sql-select.html)).
+
+---
+
+## 10. CRITICAL wrong-user scenario — default control vs. `[non-canonical]` fallback (complete, unedited output)
+
+This is the detailed evidence behind the Lead Answer (§1). `observe_wronguser.py` seeds the wrong-user data condition in insertion order **B-then-A** (so `.first()` resolves `user_B`'s contact), then drives the **canonical** `handle_reply()` twice against the **same** seeded rows with **identical** `mail_from = user_A`'s mailbox: once under the **default** spoof control, once under the **`[non-canonical]`** spoof-disabled fallback. Five facets are distinguished per case: (a) application acceptance, (b) reply forwarded?, (c) stored outbound / external target, (d) alert generation, (e) `EmailLog` persistence, (f) confirmed SMTP delivery.
+
+**Command:**
+
+```
+docker exec sl_app bash -lc 'cd /app; . venv/bin/activate; set -a && . /tmp/sl_env.sh && set +a; python /tmp/observe_wronguser.py 2>&1'
+```
+
+**Output (complete, unedited; run 1 of 2 — run 2 byte-identical modulo per-run-varying fields only: logger timestamps/PID and the randomly-generated alias local-parts):**
 
 ```
 load config file /app/tests/test.env
 >>> URL: http://localhost
 Upload files to local dir
 >>> init logging <<<
-2026-07-13 17:28:16,200 - SL - DEBUG - 4690 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
-2026-07-13 17:28:16,990 - SL - DEBUG - 4690 - "/app/init_app.py:42" - add_sl_domains() -  - d1.test is already a SL domain
-2026-07-13 17:28:16,991 - SL - DEBUG - 4690 - "/app/init_app.py:42" - add_sl_domains() -  - d2.test is already a SL domain
-2026-07-13 17:28:16,992 - SL - DEBUG - 4690 - "/app/init_app.py:42" - add_sl_domains() -  - sl.local is already a SL domain
-2026-07-13 17:28:16,993 - SL - DEBUG - 4690 - "/app/init_app.py:42" - add_sl_domains() -  - sl.local is already a SL domain
-2026-07-13 17:28:17,290 - SL - INFO - 4690 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
-2026-07-13 17:28:17,306 - SL - DEBUG - 4690 - "/app/app/models.py:1459" - generate_random_alias_email() -  - generate email test_test155@sl.local
-2026-07-13 17:28:17,313 - SL - INFO - 4690 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
-alias='test_test155@sl.local' c1.id=41(reply=rt-jicgid@sl.local) c2.id=42(reply=other-jicgid@sl.local)
-driving handle_reply: rcpt_to='rt-jicgid@sl.local'; To header contains reverse-alias r2='other-jicgid@sl.local'
-2026-07-13 17:28:17,329 - SL - INFO - 4690 - "/app/app/handler/dmarc.py:159" - apply_dmarc_policy_for_reply_phase() -  - DMARC check disabled
-2026-07-13 17:28:17,335 - SL - DEBUG - 4690 - "/app/email_handler.py:1051" - handle_reply() -  - Create <EmailLog 810> for <Contact 41 target-jicgid@nowhere.net 80>, <User 40 Test User user_j53j94nmd9@mailbox.test>, <Mailbox 40 user_j53j94nmd9@mailbox.test>
-2026-07-13 17:28:17,340 - SL - DEBUG - 4690 - "/app/email_handler.py:1171" - handle_reply() -  - From header is test_test155@sl.local
-2026-07-13 17:28:17,342 - SL - DEBUG - 4690 - "/app/email_handler.py:380" - replace_header_when_reply() -  - Replace To header, old: other-jicgid@sl.local, new: Cced <cced-jicgid@nowhere.net>
-2026-07-13 17:28:17,342 - SL - DEBUG - 4690 - "/app/email_handler.py:383" - replace_header_when_reply() -  - delete the Cc header. Old value None
-2026-07-13 17:28:17,344 - SL - DEBUG - 4690 - "/app/email_handler.py:1314" - replace_original_message_id() -  - create a new sl_message_id <178396369734.4690.6661809572661413553.810@sl.local>
-2026-07-13 17:28:17,348 - SL - WARNING - 4690 - "/app/email_handler.py:1206" - handle_reply() -  - missing date header, add one
-2026-07-13 17:28:17,350 - SL - DEBUG - 4690 - "/app/email_handler.py:1212" - handle_reply() -  - send email from test_test155@sl.local to target-jicgid@nowhere.net, mail_options:[],rcpt_options:[]
-2026-07-13 17:28:17,354 - SL - DEBUG - 4690 - "/app/app/mail_sender.py:131" - send() -  - send email with subject 's', from 'test_test155@sl.local' to 'Cced <cced-jicgid@nowhere.net>'
-result delivered=True code='250 Message accepted for delivery'
+2026-07-13 18:27:17,686 - SL - DEBUG - 5813 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+2026-07-13 18:27:21,897 - SL - INFO - 5813 - "/app/init_app.py:44" - add_sl_domains() -  - Add d1.test to SL domain
+2026-07-13 18:27:21,899 - SL - INFO - 5813 - "/app/init_app.py:44" - add_sl_domains() -  - Add d2.test to SL domain
+2026-07-13 18:27:21,901 - SL - INFO - 5813 - "/app/init_app.py:44" - add_sl_domains() -  - Add sl.local to SL domain
+2026-07-13 18:27:21,902 - SL - DEBUG - 5813 - "/app/init_app.py:42" - add_sl_domains() -  - sl.local is already a SL domain
+2026-07-13 18:27:22,183 - SL - INFO - 5813 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
+2026-07-13 18:27:22,444 - SL - INFO - 5813 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
+2026-07-13 18:27:22,458 - SL - DEBUG - 5813 - "/app/app/models.py:1459" - generate_random_alias_email() -  - generate email test_test874@sl.local
+2026-07-13 18:27:22,465 - SL - INFO - 5813 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
+2026-07-13 18:27:22,475 - SL - DEBUG - 5813 - "/app/app/models.py:1459" - generate_random_alias_email() -  - generate email list_word861@sl.local
+2026-07-13 18:27:22,482 - SL - INFO - 5813 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
+=== SEED (insertion order B-then-A; .first() should resolve user_B) ===
+shared_reply='dup-reply-wrong@sl.local'  mail_from will be user_A='usera@mailbox.test'
+user_a.id=1 alias_a.id=3 | user_b.id=2 alias_b.id=4
+1st-inserted contact_b.id=1 (user_B) ; 2nd-inserted contact_a.id=2 (user_A)
+[non-canonical] Contact.get_by(reply_email=...) -> id=1 user_id=2 (user_B)
+=== CASE 1 [canonical, DEFAULT control: alias.disable_email_spoofing_check=False] ===
+alias_b.disable_email_spoofing_check = False
+2026-07-13 18:27:22,501 - SL - INFO - 5813 - "/app/app/handler/dmarc.py:159" - apply_dmarc_policy_for_reply_phase() -  - DMARC check disabled
+2026-07-13 18:27:22,504 - SL - WARNING - 5813 - "/app/email_handler.py:1393" - handle_unknown_mailbox() -  - Reply email can only be used by mailbox. Actual mail_from: usera@mailbox.test. msg from header: sender@nowhere.net, reverse-alias dup-reply-wrong@sl.local, <Alias 4 list_word861@sl.local> <User 2 Test User userb@mailbox.test> <Contact 1 b@nowhere.net 4>
+2026-07-13 18:27:22,522 - SL - DEBUG - 5813 - "/app/app/email_utils.py:303" - send_email() -  - send email to userb@mailbox.test, subject 'Attempt to use your alias list_word861@sl.local from usera@mailbox.test'
+2026-07-13 18:27:22,529 - SL - DEBUG - 5813 - "/app/app/mail_sender.py:131" - send() -  - send email with subject 'Attempt to use your alias list_word861@sl.local from usera@mailbox.test', from '"noreply@sl.local" <noreply@sl.local>' to 'userb@mailbox.test'
+(a) application acceptance : delivered=False code='250 SL E214 Unauthorized for using reverse alias'  (==E214? True, ==E200? False)
+(b) reply forwarded?       : NO EmailLog and NO reply SendRequest to the external contact (path returned E214 before EmailLog.create/forward)
+(c) stored outbound (this run) count=1 -> the unknown-mailbox ALERT, NOT a reply forward:
+      ALERT SendRequest envelope_to='userb@mailbox.test' subject='Attempt to use your alias list_word861@sl.local from usera@mailbox.test'
+(d) alert generation       : new SentAlert rows=1
+      SentAlert id=1 user_id=2(user_B) to_email='userb@mailbox.test' alert_type='reverse_alias_unknown_mailbox'
+(e) EmailLog persisted?    : NO (path stopped at E214 before EmailLog.create)
+(f) confirmed SMTP delivery: NONE (NOT_SEND_EMAIL=True). The only outbound is the alert to user_B's mailbox; the reply itself is rejected, so user_A's reply is NOT forwarded to any external contact.
+=== CASE 2 [NON-CANONICAL fallback: alias_b.disable_email_spoofing_check=True] ===
+alias_b.disable_email_spoofing_check = True  (non-default per-alias flag)
+2026-07-13 18:27:22,545 - SL - INFO - 5813 - "/app/app/handler/dmarc.py:159" - apply_dmarc_policy_for_reply_phase() -  - DMARC check disabled
+2026-07-13 18:27:22,546 - SL - WARNING - 5813 - "/app/email_handler.py:1023" - handle_reply() -  - ignore unknown sender to reverse-alias usera@mailbox.test: <Alias 4 list_word861@sl.local> -> <Contact 1 b@nowhere.net 4>
+2026-07-13 18:27:22,549 - SL - DEBUG - 5813 - "/app/email_handler.py:1051" - handle_reply() -  - Create <EmailLog 1> for <Contact 1 b@nowhere.net 4>, <User 2 Test User userb@mailbox.test>, <Mailbox 2 userb@mailbox.test>
+2026-07-13 18:27:22,554 - SL - DEBUG - 5813 - "/app/email_handler.py:1171" - handle_reply() -  - From header is list_word861@sl.local
+2026-07-13 18:27:22,556 - SL - DEBUG - 5813 - "/app/email_handler.py:380" - replace_header_when_reply() -  - Replace To header, old: dup-reply-wrong@sl.local, new: B <b@nowhere.net>
+2026-07-13 18:27:22,556 - SL - DEBUG - 5813 - "/app/email_handler.py:383" - replace_header_when_reply() -  - delete the Cc header. Old value None
+2026-07-13 18:27:22,558 - SL - DEBUG - 5813 - "/app/email_handler.py:1314" - replace_original_message_id() -  - create a new sl_message_id <178396724255.5813.15871454277701825390.1@sl.local>
+2026-07-13 18:27:22,562 - SL - WARNING - 5813 - "/app/email_handler.py:1206" - handle_reply() -  - missing date header, add one
+2026-07-13 18:27:22,565 - SL - DEBUG - 5813 - "/app/email_handler.py:1212" - handle_reply() -  - send email from list_word861@sl.local to b@nowhere.net, mail_options:[],rcpt_options:[]
+2026-07-13 18:27:22,568 - SL - DEBUG - 5813 - "/app/app/mail_sender.py:131" - send() -  - send email with subject 'reply subject', from 'list_word861@sl.local' to 'B <b@nowhere.net>'
+(a) application acceptance : delivered=True code='250 Message accepted for delivery'  (==E200? True)
+(b) stored send request    : count=1
+      SendRequest envelope_from='sl.lmysyibrfqqdemzygi4dmn25.ddr6o3tn7t3do@sl.local' envelope_to='b@nowhere.net' msg[From]='list_word861@sl.local' msg[To]='B <b@nowhere.net>'
+(c) external Contact target: 'b@nowhere.net'  (contact_B.website_email='b@nowhere.net')
+(d) alert generation       : new SentAlert rows=0
+(e) EmailLog persisted?    : YES id=1 contact_id=1 alias_id=4 user_id=2(user_B(WRONG - not the sender/mail_from owner)) mailbox_id=2 is_reply=True
+(f) confirmed SMTP delivery: NONE — NOT_SEND_EMAIL=True: mail_sender.send() logs and returns True WITHOUT calling _send_to_smtp (app/mail_sender.py:130-136). '250 accepted' = application acceptance only.
+DONE
 ```
 
-The reply's `rcpt_to='rt-jicgid@sl.local'` resolves the primary contact (`EmailLog 810` for `Contact 41`), while the `To` header carries a *different* reverse-alias `other-jicgid@sl.local`. The LOG at `email_handler.py:380` — `Replace To header, old: other-jicgid@sl.local, new: Cced <cced-jicgid@nowhere.net>` — proves `replace_header_when_reply()`'s `Contact.get_by(reply_email=...)` at `email_handler.py:364` executed during the canonical reply and resolved that second reverse-alias to its contact via the same non-unique lookup.
+- **Seed.** `shared_reply='dup-reply-wrong@sl.local'`; insertion B-then-A makes `contact_b.id=1` (user_B) the first row; `[non-canonical] Contact.get_by(...) -> id=1 user_id=2 (user_B)` confirms which row `.first()` resolves.
+- **CASE 1 — default control (`disable_email_spoofing_check=False`) → E214, no forward.** `get_mailbox_from_mail_from()` finds no mailbox of user_A authorized for user_B's alias, so `handle_reply()` invokes `handle_unknown_mailbox()` (`email_handler.py:1393`) and returns `(a) delivered=False code='250 SL E214 Unauthorized for using reverse alias'`. `(b)` **no `EmailLog` and no reply send request** — the path returns E214 before `EmailLog.create`/forward. `(c)` the single stored outbound is the **unknown-mailbox alert** to `userb@mailbox.test` (subject `Attempt to use your alias ... from usera@mailbox.test`), **not** a reply forward. `(d)` a new `SentAlert` row is created (`id=1 user_id=2(user_B) alert_type='reverse_alias_unknown_mailbox'`). `(e)` **no `EmailLog`**. `(f)` no confirmed SMTP (`NOT_SEND_EMAIL=True`); the only outbound is the alert to user_B, and user_A's reply is **not** forwarded anywhere. This is an **access-control boundary**.
+- **CASE 2 — `[non-canonical]` fallback (`disable_email_spoofing_check=True`) → wrong-user selection, logging, and enqueue.** The spoof check is skipped: `ignore unknown sender ... <Alias 4 ...> -> <Contact 1 b@nowhere.net 4>` (`email_handler.py:1023`), then `Create <EmailLog 1> for <Contact 1 b@nowhere.net 4>, <User 2 ... userb@mailbox.test>, <Mailbox 2 ...>` (`email_handler.py:1051`), header rewrite (`:380`), and send (`:1212`). `(a) delivered=True code='250 Message accepted for delivery'` (E200). `(b)` one stored `SendRequest` with `envelope_to='b@nowhere.net'`. `(c)` external target `b@nowhere.net` = `contact_B.website_email`. `(d)` **no** new `SentAlert`. `(e)` **`EmailLog id=1 contact_id=1 alias_id=4 user_id=2 (user_B — WRONG, not the sending mailbox's owner) mailbox_id=2 is_reply=True`.** `(f)` no confirmed SMTP (`NOT_SEND_EMAIL=True`): the `'250 accepted'` is application acceptance and enqueue only.
+
+**Causal conclusion.** The wrong-user *resolution* is caused by the unordered `.first()` over a non-unique `reply_email` (§4.1, §6.1–§6.3). Whether that mis-resolution becomes a wrong-user **forward** depends on the alias's spoof control: **default** settings convert it into an E214 rejection plus an alert to the resolved (wrong) user (CASE 1); the **`[non-canonical]`** spoof-disabled fallback lets it become an actual forward logged against the wrong user (CASE 2). In neither case is external SMTP delivery confirmed under this harness configuration.
 
 ---
+## 11. Per-claim evidence appendix
 
-## 9. SimpleLogin reverse-alias concept (intended invariant vs. schema reality)
+### 11.1 Factual claims → `file:line` (canonical source at commit `2cd6ee777f8c`, re-confirmed at runtime)
 
-Background from the official SimpleLogin documentation (paraphrased; short quotations only):
-
-- A reverse-alias is generated **per `(alias, contact)` pair** — the docs state a reverse-alias is created "for each alias you want to send email from and each contact you want to send email to" (simplelogin.io).
-- It is "dynamically generated for each sender" and, on reply, SimpleLogin relays the message back so it appears to come from the alias while "your real mailbox address stays hidden" (simplelogin.io reverse-alias docs).
-- The forwarding service "redirects your response back to the original sender and replace your real email address with the email alias" (simplelogin.io/email-forwarding).
-
-**Intended invariant:** one `reply_email` (reverse-alias) should map to exactly one `(alias, contact)` pair, hence exactly one owning user.
-
-**Schema reality (the crux):** the database does **not** enforce this. There is no `UNIQUE` constraint on `contact.reply_email` (§6.1), so two contacts on aliases owned by different users can share one `reply_email`, and the unordered `.first()` lookup (§6.3) then resolves an arbitrary one. The web-confirmed design intent is precisely the invariant the schema fails to guarantee — which is the root of the wrong-user question. (Web facts are background only; the primary evidence is the runtime observations and `file:line` references above.)
-
-
----
-
-## 10. Per-claim Evidence Appendix
-
-### 10.1 Factual claims → `file:line` (re-confirmed at runtime, canonical source in `/app`)
-
-| Claim | Reference |
+| Claim | Grounding |
 |-------|-----------|
-| Reply entry point | `email_handler.py:966` `def handle_reply(envelope, msg: Message, rcpt_to: str)` |
-| Reply address = recipient | `email_handler.py:972` `reply_email = rcpt_to` |
-| Domain part | `email_handler.py:974` `reply_domain = get_email_domain_part(reply_email)` |
-| Domain gate | `email_handler.py:977` `if not reply_email.endswith(EMAIL_DOMAIN):` |
-| SLDomain fallback | `email_handler.py:978` `sl_domain: SLDomain = SLDomain.get_by(domain=reply_domain)` |
-| E501 return | `email_handler.py:981` `return False, status.E501` |
-| Normalization | `email_handler.py:984` `reply_email = normalize_reply_email(reply_email)` |
-| Contact resolution | `email_handler.py:986` `contact = Contact.get_by(reply_email=reply_email)` |
-| E502 (no contact) | `email_handler.py:989` `return False, status.E502` |
-| Inactive-user gate | `email_handler.py:990` `if not contact.user.is_active():` → `:992` E502 |
-| Alias from contact | `email_handler.py:994` `alias = contact.alias` |
-| Alias address | `email_handler.py:995` `alias_address: str = contact.alias.email` |
-| User from alias | `email_handler.py:1004` `user = alias.user` |
-| mail_from | `email_handler.py:1005` `mail_from = envelope.mail_from` |
-| Mailbox selection | `email_handler.py:1019` `mailbox = get_mailbox_from_mail_from(mail_from, alias)` (def `:1364`) |
-| Unknown-mailbox alert | `email_handler.py:1032` `handle_unknown_mailbox(envelope, msg, reply_email, user, alias, contact)` |
-| E214 return | `email_handler.py:1034` `return False, status.E214` |
-| Persisted resolution | `email_handler.py:1042-1050` `EmailLog.create(contact_id=..., alias_id=..., is_reply=True, user_id=contact.user_id, mailbox_id=..., ...)` |
-| `.first()` no ORDER BY | `app/models.py:83-84` `return Session.query(cls).filter_by(**kw).first()` |
-| Only unique constraint | `app/models.py:1875` `sa.UniqueConstraint("alias_id", "website_email", name="uq_contact")` |
-| reply_email indexed, not unique | `app/models.py:1899` `reply_email = sa.Column(sa.String(512), nullable=False, index=True)` |
-| Non-unique index (migration) | `migrations/versions/2021_071310_78403c7b8089_.py:22` `create_index(..., ['reply_email'], unique=False)` |
-| TOCTOU guard | `app/models.py:1425-1432` `def available_sl_email(email)` OR-read |
-| Alias.user relationship | `app/models.py:1576` `orm.relationship(User, foreign_keys=[user_id])` |
-| Alias.mailbox relationship | `app/models.py:1577` `orm.relationship("Mailbox", lazy="joined")` |
-| User.is_active | `app/models.py:766` |
-| Generator loop | `app/email_utils.py:1103` `def generate_reply_email(...)`; guard `:1150` `if available_sl_email(reply_email):` |
-| Routing predicate | `app/email_utils.py:1156-1158` `def is_reverse_alias(...)`; `if Contact.get_by(reply_email=address): return True` |
-| Normalization chars/loop | `app/email_validation.py:9` `_ALLOWED_CHARS`; `:25` `def normalize_reply_email`; `:27-28` non-ascii→convert_to_id; `:33` disallowed→`_` |
-| Second lookup site | `email_handler.py:345` `def replace_header_when_reply(...)`; `:364` `Contact.get_by(reply_email=reply_email)`; observed LOG `:380` |
-| Extra reuse sites | `email_handler.py:1998`, `:2009`, `:2167` `Contact.get_by(reply_email=...)` |
-| Forward-phase minting | `email_handler.py:299` `reply_email=generate_reply_email(contact_email, alias)` |
-| EMAIL_DOMAIN config | `tests/test.env:8`, `example.env:22` |
-| DB_URI config | `tests/test.env:17` |
-| Bootstrap | `tests/conftest.py:8,20,21,23,28-35,38,39`; `server.py` `create_app`; `shell.py:7` `from app.db import Session` |
+| Reply address = inbound recipient | `reply_email = rcpt_to` — `email_handler.py:972` |
+| Domain gate / E501 | `email_handler.py:977-981` (`endswith(EMAIL_DOMAIN)`, `SLDomain.get_by`, `status.E501`) |
+| Inbound normalization | `reply_email = normalize_reply_email(reply_email)` — `email_handler.py:984`; body `app/email_validation.py:25-38`; `_ALLOWED_CHARS` `app/email_validation.py:9` |
+| Primary contact lookup | `contact = Contact.get_by(reply_email=reply_email)` — `email_handler.py:986` |
+| E502 no contact / inactive user | `email_handler.py:988-989` / `990-992`; `User.is_active` `app/models.py:766-769` |
+| `.first()` with no `ORDER BY` | `ModelMixin.get_by` — `app/models.py:82-84` |
+| Alias/user/mailbox derived from contact | `alias = contact.alias` `:994`; `user = alias.user` `:1001`; `get_mailbox_from_mail_from` `:1019` |
+| Spoof branch (default E214 vs fallback) | `email_handler.py:1019-1034` (`disable_email_spoofing_check` `:1023`; `handle_unknown_mailbox` `:1032`; `status.E214` `:1034`); `handle_unknown_mailbox` def `:1390`, invoke `:1393` |
+| `EmailLog` fields incl. `user_id=contact.user_id` | `EmailLog.create(...)` — `email_handler.py:1042-1050` |
+| Second lookup site | `replace_header_when_reply` def `email_handler.py:345`; second `Contact.get_by` `:364`; invoked `:1179`(TO)/`:1181`(CC); log `:380/:383` |
+| Routing hub dispatch | `handle` def `email_handler.py:1945`; `==>> Handle` `:1980`; `Reply phase ...` `:2196`; `is_reverse_alias` reuse `:2166`/`:2195` |
+| No `UNIQUE` on `reply_email` | column `app/models.py:1899` (`index=True`); only `uq_contact(alias_id, website_email)` `app/models.py:1875`; index `unique=False` `migrations/versions/2021_071310_78403c7b8089_.py:22`; runtime `pg_constraint`/`pg_indexes` §6.1(b) |
+| Best-effort guard (exactly 3 checks) | `available_sl_email` — `app/models.py:1425-1432` |
+| Guard call sites (all three) | `app/email_utils.py:1150`, `app/models.py:1458`, `app/models.py:1706` |
+| `is_reverse_alias` two clauses | `app/email_utils.py:1156-1163` |
+| Reverse-alias minting | `generate_reply_email` — `app/email_utils.py:1103`; guard call `:1150` |
+| Default mailbox = user email | `User.create`: `mb = Mailbox.create(user_id=user.id, email=user.email, verified=True)` `app/models.py:611`; `user.default_mailbox_id = mb.id` `:613` |
+| App bootstrap | `create_app` — `server.py:139` |
+| dotenv precedence / `NOT_SEND_EMAIL` | `load_dotenv` `app/config.py:69/71` (override defaults False); `NOT_SEND_EMAIL` `app/config.py:91` |
+| Store-instead-of-send / no SMTP under `NOT_SEND_EMAIL` | `app/mail_sender.py:130-136` (send logs+returns without `_send_to_smtp`) |
 
-### 10.2 Behavioral claims → command + output (section cross-reference)
+### 11.2 Behavioral claims → command + output (cross-reference)
 
-| Behavioral claim | Where the command + complete unedited output appears |
-|------------------|-------------------------------------------------------|
-| Canonical runtime (Py 3.10 / PG 15 / Redis) | §2.1 |
-| Canonical config values | §2.2 |
-| Duplicate `reply_email` persists (no UNIQUE) | §4.2 (`count=2`) |
-| Extracted/normalized reply value | §3.1, §4.2 |
-| `is_reverse_alias` → True (routing) | §4.2, §8.1 |
-| Canonical resolution → contact/alias/user/mailbox + EmailLog | §4.2, §5.1 |
-| `[non-canonical]` direct `Contact.get_by` corroboration | §4.2 |
-| Stable 100/100 within dataset (A-then-B), ≥2 runs | §7.1, §7.2 |
-| Wrong-user 100/100 on reversed order (B-then-A) | §7.3 |
-| `ctid`/physical order + Index Scan + forced Seq Scan | §7.4 |
-| E501 | §8.1 |
-| E502 (no contact) | §8.1 |
-| E502 (inactive user) | §8.1 |
-| E214 + wrong-user alert (`SentAlert` to user_B) | §8.1 |
-| normalize many-to-one collision + canonical resolve | §8.1, §8.2 |
-| `available_sl_email` guard (bypassed by direct create) | §8.1 |
-| Second lookup site executes (LOG `:380`) | §8.3 |
+| Behavioral claim | Command shown in | Output block |
+|------------------|------------------|--------------|
+| Runtime = Python 3.10.18 / PostgreSQL 15.13 / Redis PONG | §2.1 | §2.1 |
+| Effective `EMAIL_DOMAIN`/`DB_URI`/`NOT_SEND_EMAIL` + dotenv grounding | §2.2 | §2.2 |
+| Container detached at `2cd6ee...` + 5 dirty files; destination branch/HEAD | §2.3 | §2.3 |
+| Duplicate `reply_email` persists (count=2); canonical happy-path resolution + EmailLog + SendRequest; diagnostics | §4.2 | §4.2 |
+| `handle()` routes reverse-alias → `handle_reply` (E200) | §4.3 | §4.3 |
+| No `UNIQUE`: repo-wide search + runtime catalog (exit 0) | §6.1 | §6.1(a)/(b) |
+| Exact `available_sl_email` body + `is_reverse_alias` two clauses + guard bypass via duplicate seed; 3 call sites | §6.2 | §6.2 |
+| Same-input distribution (4 seeds + 8 drives) incl. E214 default vs wrong-user fallback; ctid + EXPLAIN | §7.1–§7.4 | §7.1–§7.4 |
+| CRITICAL wrong-user: CASE 1 default E214 (+alert), CASE 2 fallback wrong-user log | §10 | §10 |
+| E501 / E502(no contact) / E502(inactive) / `is_reverse_alias` | §8.1 | §8.1 |
+| Normalization: inbound many-to-one + exact-equality lookup | §8.2 | §8.2 |
+| Second lookup site rewrites TO/CC to two distinct contacts | §8.3 | §8.3 |
 
-### 10.3 Temporary harness source (reproduced so results survive script deletion)
+### 11.3 Full source of every temporary harness (reproduced so results survive deletion)
 
-All scripts lived at `/tmp/observe_*.py` (outside the repository) and were deleted afterward (§12).
+All nine scripts are reproduced verbatim (they live outside the repository and were deleted afterward — absence proof in §13). Each shares the fail-fast bootstrap shown in §2.7. The exact invocation precedes each source.
 
-**`/tmp/observe_reply.py`** (canonical single call — §3.1, §4.2, §5.1):
+**`_bootstrap.py`** — shared allowlist/`current_database`/`pg_trgm` bootstrap (imported inline by the harnesses; shown once):
 
 ```python
-import os, sys, random, string
-from app.db import Session, engine
+# Shared corrected bootstrap fragment (documented inline in each harness).
+import os
+import sys
+
+_ALLOWED_DSNS = {
+    "postgresql://test:test@localhost:5432/test",
+    "postgresql://test:test@localhost:15432/test",
+    "postgresql://test:test@127.0.0.1:5432/test",
+}
+_DSN = os.environ.get("DB_URI", "")
+if _DSN not in _ALLOWED_DSNS:
+    sys.stderr.write(f"REFUSING TO RUN: DB_URI={_DSN!r} is not an allowlisted disposable test DB\n")
+    sys.exit(3)
+
 from server import create_app
-from init_app import add_sl_domains, add_proton_partner
+from app.db import Session, engine
+
 app = create_app()
-app.config["TESTING"] = True
-app.config["WTF_CSRF_ENABLED"] = False
-app.config["SERVER_NAME"] = "sl.test"
-import sqlalchemy
-from psycopg2 import errors
-from psycopg2.errorcodes import DEPENDENT_OBJECTS_STILL_EXIST
-with engine.connect() as conn:
-    try:
-        conn.execute("DROP EXTENSION if exists pg_trgm")
-        conn.execute("CREATE EXTENSION pg_trgm")
-    except sqlalchemy.exc.InternalError as e:
-        if isinstance(e.orig, errors.lookup(DEPENDENT_OBJECTS_STILL_EXIST)):
-            print(">>> pg_trgm can't be dropped, ignore")
-        conn.execute("Rollback")
-add_sl_domains()
-add_proton_partner()
-print("BOOT OK:", app)
-print("DB_URI:", os.environ.get("DB_URI"))
+
+with engine.connect() as _c:
+    _dbname = _c.execute("select current_database()").scalar()
+if _dbname != "test":
+    sys.stderr.write(f"REFUSING TO RUN: current_database()={_dbname!r} != 'test'\n")
+    sys.exit(3)
+
+with engine.begin() as _c:
+    _c.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+
+
+def truncate_clean_slate():
+    """Clean slate (deterministic IDs, only this run's rows). Safe: allowlist +
+    current_database() guards already ran. Uses engine.begin() so the TRUNCATE
+    commits and holds no lingering lock."""
+    Session.close()
+    with engine.begin() as c:
+        c.execute(
+            "DO $$DECLARE r RECORD; BEGIN "
+            "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public' "
+            "AND tablename<>'alembic_version') LOOP "
+            "EXECUTE 'TRUNCATE TABLE '||quote_ident(r.tablename)||' RESTART IDENTITY CASCADE'; "
+            "END LOOP; END$$;"
+        )
+```
+
+**`observe_reply.py`** — canonical happy-path single call (§3–§5). Invocation:
+```
+docker exec sl_app bash -lc 'cd /app; . venv/bin/activate; set -a && . /tmp/sl_env.sh && set +a; python /tmp/observe_reply.py 2>&1'
+```
+
+```python
+"""observe_reply.py — CANONICAL single-call baseline for the SimpleLogin reply path.
+
+Seeds two Contacts (owned by different users) sharing ONE reply_email, in
+insertion order A-then-B, then drives the real inbound entry point
+email_handler.handle_reply() once with mail_from = user_A's mailbox. First-inserted
+contact belongs to user_A and mail_from matches user_A's mailbox => CORRECT-resolution
+happy path. Captures the full per-event contract (derivation, resolved contact,
+alias/user/mailbox, EmailLog correlated by EXACT Message-ID, stored outbound
+SendRequest incl. its real external recipient). Runs inside the canonical container.
+"""
+import os
+import sys
+
+# (1) FAIL-FAST DISPOSABLE-DB ALLOWLIST — before importing app modules / any write.
+_ALLOWED_DSNS = {
+    "postgresql://test:test@localhost:5432/test",
+    "postgresql://test:test@localhost:15432/test",
+    "postgresql://test:test@127.0.0.1:5432/test",
+}
+_DSN = os.environ.get("DB_URI", "")
+if _DSN not in _ALLOWED_DSNS:
+    sys.stderr.write(f"REFUSING TO RUN: DB_URI={_DSN!r} is not an allowlisted disposable test DB\n")
+    sys.exit(3)
+
+from server import create_app
+from app.db import Session, engine
+
+app = create_app()
+
+# (2) Second fail-fast: the connected database must be the disposable 'test' DB.
+with engine.connect() as _c:
+    _dbname = _c.execute("select current_database()").scalar()
+if _dbname != "test":
+    sys.stderr.write(f"REFUSING TO RUN: current_database()={_dbname!r} != 'test'\n")
+    sys.exit(3)
+
+# (3) pg_trgm already exists (alembic); ensure idempotently WITHOUT DROP.
+with engine.begin() as _c:
+    _c.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+
 from aiosmtpd.smtp import Envelope
 from email.message import EmailMessage
 import email_handler
@@ -843,92 +1254,147 @@ from app.email import status, headers
 from app.email_utils import is_reverse_alias
 from app.email_validation import normalize_reply_email
 from app.mail_sender import mail_sender
-from app.config import EMAIL_DOMAIN
+from app.config import EMAIL_DOMAIN, NOT_SEND_EMAIL
+from init_app import add_sl_domains, add_proton_partner
 from tests.utils import create_new_user
+
+
+def truncate_clean_slate():
+    Session.close()
+    with engine.begin() as c:
+        c.execute(
+            "DO $$DECLARE r RECORD; BEGIN "
+            "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public' "
+            "AND tablename<>'alembic_version') LOOP "
+            "EXECUTE 'TRUNCATE TABLE '||quote_ident(r.tablename)||' RESTART IDENTITY CASCADE'; "
+            "END LOOP; END$$;"
+        )
+
+
 mail_sender.store_emails_instead_of_sending(True)
+
 with app.app_context():
-    tok = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
-    user_a = create_new_user()
-    user_b = create_new_user()
+    truncate_clean_slate()      # clean slate FIRST (before any Session query)
+    add_sl_domains()            # re-seed SLDomain rows (domain gate needs sl.local)
+    add_proton_partner()
+
+    shared_reply = f"dup-reply-core@{EMAIL_DOMAIN}"
+    user_a = create_new_user(email="usera@mailbox.test")
+    user_b = create_new_user(email="userb@mailbox.test")
     Session.commit()
     alias_a = Alias.create_new_random(user_a)
     alias_b = Alias.create_new_random(user_b)
     Session.commit()
-    shared_reply = f"dup-reply-{tok}@{EMAIL_DOMAIN}"
-    ca = Contact.create(user_id=alias_a.user_id, alias_id=alias_a.id,
-                        website_email="a@nowhere.net", name="A", reply_email=shared_reply)
-    cb = Contact.create(user_id=alias_b.user_id, alias_id=alias_b.id,
-                        website_email="b@nowhere.net", name="B", reply_email=shared_reply)
+
+    # INSERTION ORDER A-then-B: user_A's contact is inserted first.
+    contact_a = Contact.create(user_id=alias_a.user_id, alias_id=alias_a.id,
+                               website_email="a@nowhere.net", name="A", reply_email=shared_reply)
+    contact_b = Contact.create(user_id=alias_b.user_id, alias_id=alias_b.id,
+                               website_email="b@nowhere.net", name="B", reply_email=shared_reply)
     Session.commit()
-    print("=== SEED ===")
-    print(f"EMAIL_DOMAIN={EMAIL_DOMAIN!r}")
+
+    print("=== SEED (insertion order A-then-B) ===")
+    print(f"EMAIL_DOMAIN={EMAIL_DOMAIN!r}  NOT_SEND_EMAIL={NOT_SEND_EMAIL!r}")
     print(f"shared_reply={shared_reply!r}")
     print(f"user_a.id={user_a.id} email={user_a.email!r} alias_a.id={alias_a.id} alias_a.email={alias_a.email!r}")
     print(f"user_b.id={user_b.id} email={user_b.email!r} alias_b.id={alias_b.id} alias_b.email={alias_b.email!r}")
-    print(f"contact_a.id={ca.id} (alias_a, user_a)   contact_b.id={cb.id} (alias_b, user_b)")
+    print(f"contact_a.id={contact_a.id} (alias_a,user_a)  contact_b.id={contact_b.id} (alias_b,user_b)")
+
     print("=== PROVE DUPLICATE PERSISTED (no UNIQUE constraint blocked it) ===")
     rows = Contact.filter_by(reply_email=shared_reply).all()
     print(f"rows sharing reply_email={shared_reply!r}: count={len(rows)}")
     for r in rows:
         print(f"  Contact id={r.id} alias_id={r.alias_id} user_id={r.user_id} website_email={r.website_email!r}")
-    print("=== reply-address derivation values ===")
+
+    print("=== reply-address derivation values (email_handler.py:972,977,984) ===")
     print(f"rcpt_to (raw)              = {shared_reply!r}")
     print(f"endswith(EMAIL_DOMAIN)     = {shared_reply.endswith(EMAIL_DOMAIN)}")
     print(f"normalize_reply_email(...) = {normalize_reply_email(shared_reply)!r}")
-    print("=== routing predicate ===")
-    print(f"is_reverse_alias({shared_reply!r}) = {is_reverse_alias(shared_reply)}")
-    print("=== [non-canonical] direct Contact.get_by(reply_email=...) ===")
+
+    print("=== [non-canonical] routing predicate + direct lookup (BYPASS the entry point) ===")
+    print(f"[non-canonical] is_reverse_alias({shared_reply!r}) = {is_reverse_alias(shared_reply)}")
     d = Contact.get_by(reply_email=shared_reply)
-    print(f"[non-canonical] returned Contact id={d.id} alias_id={d.alias_id} user_id={d.user_id}")
-    def make_msg(i):
-        m = EmailMessage()
-        m["From"] = "a@nowhere.net"; m["To"] = alias_a.email
-        m["Message-ID"] = f"<obs-{tok}-{i}@sl.local>"; m["Subject"] = "reply subject"
-        m.set_content("hello body"); return m
-    envelope = Envelope(); envelope.mail_from = user_a.email; envelope.rcpt_tos = [shared_reply]
-    mid = f"<obs-{tok}-0@sl.local>"; msg = make_msg(0)
-    alert_max_before = Session.query(sqlalchemy.func.max(SentAlert.id)).scalar() or 0
+    print(f"[non-canonical] Contact.get_by(reply_email=...) -> id={d.id} alias_id={d.alias_id} user_id={d.user_id}")
+
+    mid = "<obs-core-0@sl.local>"
+    msg = EmailMessage()
+    msg["From"] = "a@nowhere.net"
+    msg["To"] = alias_a.email
+    msg["Message-ID"] = mid
+    msg["Subject"] = "reply subject"
+    msg.set_content("hello body")
+    envelope = Envelope()
+    envelope.mail_from = user_a.email
+    envelope.rcpt_tos = [shared_reply]
+
+    mail_sender.purge_stored_emails()
+    alert_before = Session.query(SentAlert).count()
+
     print("=== CANONICAL CALL: email_handler.handle_reply(envelope, msg, shared_reply) ===")
     print(f"envelope.mail_from={envelope.mail_from!r} envelope.rcpt_tos={envelope.rcpt_tos!r} Message-ID={mid!r}")
     delivered, code = email_handler.handle_reply(envelope, msg, shared_reply)
     print(f"RESULT delivered={delivered!r} code={code!r}")
-    print(f"code==status.E200? {code==status.E200}  code==status.E214? {code==status.E214}  code==status.E502? {code==status.E502}")
-    el = EmailLog.filter_by(message_id=mid).order_by(EmailLog.id.desc()).first()
+    print(f"code==status.E200? {code == status.E200}  ==E214? {code == status.E214}  ==E502? {code == status.E502}")
+
+    el = EmailLog.get_by(message_id=mid)
     if el:
-        print(f"PERSISTED EmailLog id={el.id} contact_id={el.contact_id} alias_id={el.alias_id} "
-              f"user_id={el.user_id} mailbox_id={el.mailbox_id} is_reply={el.is_reply} message_id={el.message_id!r}")
+        print(f"PERSISTED EmailLog (message_id={mid!r}): id={el.id} contact_id={el.contact_id} "
+              f"alias_id={el.alias_id} user_id={el.user_id} mailbox_id={el.mailbox_id} is_reply={el.is_reply}")
         print(f"  -> forwarding user_id={el.user_id} (user_a.id={user_a.id}, user_b.id={user_b.id})")
     else:
-        print("No EmailLog for this message_id (non-success path).")
-    new_alerts = SentAlert.filter_by().filter(SentAlert.id > alert_max_before).all()
-    print(f"NEW SentAlert rows during call: {len(new_alerts)}")
-    for a in new_alerts:
-        print(f"  SentAlert id={a.id} user_id={a.user_id} to_email={a.to_email!r} alert_type={a.alert_type!r}")
+        print(f"No EmailLog for message_id={mid!r} (non-success path).")
+
+    stored = mail_sender.get_stored_emails()
+    print(f"stored SendRequest count = {len(stored)}")
+    for sr in stored:
+        print(f"  SendRequest envelope_from={sr.envelope_from!r} envelope_to={sr.envelope_to!r} "
+              f"msg[From]={sr.msg[headers.FROM]!r} msg[To]={sr.msg[headers.TO]!r}")
+    print("NOTE: NOT_SEND_EMAIL=%r => mail_sender.send() logs and returns True WITHOUT calling _send_to_smtp;"
+          " no external SMTP delivery is confirmed (app/mail_sender.py:130-136)." % NOT_SEND_EMAIL)
+
+    alert_after = Session.query(SentAlert).count()
+    print(f"NEW SentAlert rows during call: {alert_after - alert_before}")
     print("DONE")
 ```
 
-**`/tmp/observe_dist.py`** (cross-event distribution — §7; usage `observe_dist.py <ab|ba> <N>`). Key logic: seed two users/aliases with `disable_email_spoofing_check=True`, insert two contacts sharing `shared_reply` in the given order, print `EXPLAIN ANALYZE` of `SELECT * FROM contact WHERE reply_email=:r LIMIT 1`, then issue `N` identical `handle_reply` calls (identical `mail_from`/`rcpt_to`, only `Message-ID` varies), reading the resolved identity from the newest `EmailLog` per call into a `Counter`:
+**`observe_handle.py`** — canonical routing through `email_handler.handle()` (§4.3). Invocation:
+```
+docker exec sl_app bash -lc 'cd /app; . venv/bin/activate; set -a && . /tmp/sl_env.sh && set +a; python /tmp/observe_handle.py 2>&1'
+```
 
 ```python
-import os, sys, random, string, logging
-from collections import Counter
-from app.db import Session, engine
+"""observe_handle.py — CANONICAL routing hub: email_handler.handle() dispatches a
+reverse-alias recipient to handle_reply().
+
+Seeds ONE clean contact (owned by user_A) and drives the real routing hub
+email_handler.handle(envelope, msg) — NOT handle_reply directly. handle() at
+email_handler.py:2195-2199 tests is_reverse_alias(rcpt_to) and, when True, logs
+"Reply phase ..." and calls handle_reply(). This proves the routing claim by
+actually invoking handle(), rather than asserting it from is_reverse_alias alone.
+"""
+import os
+import sys
+
+_ALLOWED_DSNS = {
+    "postgresql://test:test@localhost:5432/test",
+    "postgresql://test:test@localhost:15432/test",
+    "postgresql://test:test@127.0.0.1:5432/test",
+}
+if os.environ.get("DB_URI", "") not in _ALLOWED_DSNS:
+    sys.stderr.write(f"REFUSING TO RUN: DB_URI={os.environ.get('DB_URI','')!r} not in disposable allowlist\n")
+    sys.exit(3)
+
 from server import create_app
-from init_app import add_sl_domains, add_proton_partner
+from app.db import Session, engine
+
 app = create_app()
-app.config["TESTING"] = True; app.config["WTF_CSRF_ENABLED"] = False; app.config["SERVER_NAME"] = "sl.test"
-import sqlalchemy
-from sqlalchemy import func
-from psycopg2 import errors
-from psycopg2.errorcodes import DEPENDENT_OBJECTS_STILL_EXIST
-with engine.connect() as conn:
-    try:
-        conn.execute("DROP EXTENSION if exists pg_trgm"); conn.execute("CREATE EXTENSION pg_trgm")
-    except sqlalchemy.exc.InternalError as e:
-        if isinstance(e.orig, errors.lookup(DEPENDENT_OBJECTS_STILL_EXIST)):
-            pass
-        conn.execute("Rollback")
-add_sl_domains(); add_proton_partner()
+with engine.connect() as _c:
+    if _c.execute("select current_database()").scalar() != "test":
+        sys.stderr.write("REFUSING TO RUN: current_database() != 'test'\n")
+        sys.exit(3)
+with engine.begin() as _c:
+    _c.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+
 from aiosmtpd.smtp import Envelope
 from email.message import EmailMessage
 import email_handler
@@ -936,117 +1402,1051 @@ from app.models import Alias, Contact, EmailLog
 from app.email import status, headers
 from app.mail_sender import mail_sender
 from app.config import EMAIL_DOMAIN
+from init_app import add_sl_domains, add_proton_partner
 from tests.utils import create_new_user
+
+
+def truncate_clean_slate():
+    Session.close()
+    with engine.begin() as c:
+        c.execute(
+            "DO $$DECLARE r RECORD; BEGIN "
+            "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public' "
+            "AND tablename<>'alembic_version') LOOP "
+            "EXECUTE 'TRUNCATE TABLE '||quote_ident(r.tablename)||' RESTART IDENTITY CASCADE'; "
+            "END LOOP; END$$;"
+        )
+
+
 mail_sender.store_emails_instead_of_sending(True)
-order = sys.argv[1] if len(sys.argv) > 1 else "ab"
-N = int(sys.argv[2]) if len(sys.argv) > 2 else 100
+
 with app.app_context():
-    tok = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
-    user_a = create_new_user(); user_b = create_new_user(); Session.commit()
-    alias_a = Alias.create_new_random(user_a); alias_b = Alias.create_new_random(user_b)
-    alias_a.disable_email_spoofing_check = True; alias_b.disable_email_spoofing_check = True
+    truncate_clean_slate()
+    add_sl_domains()
+    add_proton_partner()
+
+    user_a = create_new_user(email="usera@mailbox.test")
     Session.commit()
-    shared_reply = f"dup-reply-{tok}@{EMAIL_DOMAIN}"
-    if order == "ab":
-        first = Contact.create(user_id=alias_a.user_id, alias_id=alias_a.id, website_email="a@nowhere.net", name="A", reply_email=shared_reply)
-        second = Contact.create(user_id=alias_b.user_id, alias_id=alias_b.id, website_email="b@nowhere.net", name="B", reply_email=shared_reply)
+    alias_a = Alias.create_new_random(user_a)
+    Session.commit()
+    reply_email = f"route-check@{EMAIL_DOMAIN}"
+    contact_a = Contact.create(user_id=alias_a.user_id, alias_id=alias_a.id,
+                               website_email="a@nowhere.net", name="A", reply_email=reply_email)
+    Session.commit()
+
+    mid = "<route-0@sl.local>"
+    msg = EmailMessage()
+    msg["From"] = "a@nowhere.net"
+    msg["To"] = reply_email
+    msg["Message-ID"] = mid
+    msg["Subject"] = "reply via handle()"
+    msg["Date"] = "Mon, 13 Jul 2026 00:00:00 +0000"
+    msg.set_content("hello via handle")
+    env = Envelope()
+    env.mail_from = user_a.email
+    env.rcpt_tos = [reply_email]
+
+    print("=== CANONICAL ROUTING: email_handler.handle(envelope, msg) (NOT handle_reply directly) ===")
+    print(f"reply_email(reverse-alias)={reply_email!r}  mail_from={env.mail_from!r}  Message-ID={mid!r}")
+    smtp_status = email_handler.handle(env, msg)
+    print(f"handle() returned SMTP status = {smtp_status!r}  (==E200? {smtp_status == status.E200})")
+    el = EmailLog.get_by(message_id=mid)
+    if el:
+        print(f"handle() routed to handle_reply -> EmailLog id={el.id} contact_id={el.contact_id} "
+              f"alias_id={el.alias_id} user_id={el.user_id} is_reply={el.is_reply}")
     else:
-        first = Contact.create(user_id=alias_b.user_id, alias_id=alias_b.id, website_email="b@nowhere.net", name="B", reply_email=shared_reply)
-        second = Contact.create(user_id=alias_a.user_id, alias_id=alias_a.id, website_email="a@nowhere.net", name="A", reply_email=shared_reply)
-    Session.commit()
-    owner_label = {user_a.id: "user_A(alias-owner-matching-mail_from)", user_b.id: "user_B(different-user)"}
-    cid_label = {first.id: "FIRST_INSERTED", second.id: "SECOND_INSERTED"}
-    print(f"=== DIST EXPERIMENT order={order} N={N} tok={tok} ===")
-    print(f"shared_reply={shared_reply!r}")
-    print(f"mail_from (IDENTICAL every call) = user_a.email = {user_a.email!r}")
-    print(f"user_a.id={user_a.id} alias_a.id={alias_a.id} | user_b.id={user_b.id} alias_b.id={alias_b.id}")
-    print(f"INSERTION ORDER: 1st=Contact id={first.id} user_id={first.user_id} ; 2nd=Contact id={second.id} user_id={second.user_id}")
-    print("--- EXPLAIN ANALYZE of the equality lookup that .first() runs (LIMIT 1, NO ORDER BY) ---")
-    res = Session.execute(sqlalchemy.text("EXPLAIN ANALYZE SELECT * FROM contact WHERE reply_email = :r LIMIT 1"), {"r": shared_reply})
-    for line in res:
-        print("   ", line[0])
-    logging.disable(logging.CRITICAL)
-    cid_dist = Counter(); user_dist = Counter()
-    for i in range(N):
-        before = Session.query(func.max(EmailLog.id)).scalar() or 0
-        m = EmailMessage(); m["From"] = user_a.email; m["To"] = shared_reply
-        m["Message-ID"] = f"<dist-{tok}-{i}@sl.local>"; m["Subject"] = "s"; m.set_content("b")
-        env = Envelope(); env.mail_from = user_a.email; env.rcpt_tos = [shared_reply]
-        delivered, code = email_handler.handle_reply(env, m, shared_reply)
-        el = (Session.query(EmailLog).filter(EmailLog.id > before).order_by(EmailLog.id.desc()).first())
-        if el:
-            cid_dist[(el.contact_id, cid_label.get(el.contact_id, "?"))] += 1
-            user_dist[(el.user_id, owner_label.get(el.user_id, "?"))] += 1
-        else:
-            cid_dist[("NO_EMAILLOG", code)] += 1
-    logging.disable(logging.NOTSET)
-    print(f"--- DISTRIBUTION over N={N} IDENTICAL calls (mail_from={user_a.email!r}, rcpt_to={shared_reply!r}) ---")
-    print(f"resolved Contact.id : {dict(cid_dist)}")
-    print(f"resolved user_id    : {dict(user_dist)}")
+        print("No EmailLog (routing did not reach a successful reply).")
     print("DONE")
 ```
 
-**`/tmp/observe_edge.py`** (E501/E502×2/E214/normalize/available_sl_email/is_reverse_alias — §8.1). Boots the app once; for each condition builds a minimal `EmailMessage`, an `aiosmtpd` `Envelope`, and calls `email_handler.handle_reply(env, msg, rcpt_to)`, asserting on the returned `(delivered, code)`, the newest `EmailLog`, and new `SentAlert` rows. The E214 block inserts `user_B`'s contact first (so `.first()` resolves `user_B`) with the spoof-check left ON and `mail_from = user_A`'s mailbox. The normalize block creates a contact whose stored `reply_email` contains `_` and drives `handle_reply` with a `rcpt_to` spelled using a disallowed character that normalizes onto it.
+**`observe_wronguser.py`** — CRITICAL default-control vs `[non-canonical]` fallback (§10). Invocation:
+```
+docker exec sl_app bash -lc 'cd /app; . venv/bin/activate; set -a && . /tmp/sl_env.sh && set +a; python /tmp/observe_wronguser.py 2>&1'
+```
 
-**`/tmp/observe_norm.py`** (focused normalize persistence — §8.2) and **`/tmp/observe_second.py`** (second lookup site — §8.3) follow the same bootstrap and drive `handle_reply` canonically; `observe_second.py` puts a second reverse-alias of the same alias in the `To` header to trigger `replace_header_when_reply()`.
+```python
+"""observe_wronguser.py — the WRONG-USER condition, DEFAULT control vs [non-canonical] fallback.
+
+Seeds two Contacts sharing one reply_email in insertion order B-then-A, so the
+unordered .first() resolves user_B's contact, while the reply is sent from
+user_A's mailbox (mail_from = user_A). Then drives the CANONICAL entry point
+email_handler.handle_reply() twice against the SAME seeded rows:
+
+  CASE 1 (DEFAULT control, spoof check ON): get_mailbox_from_mail_from() returns
+          None -> handle_unknown_mailbox() -> status.E214. The path STOPS before
+          EmailLog/send. This is the observed default-control result.
+  CASE 2 ([non-canonical] fallback, alias_b.disable_email_spoofing_check=True):
+          the None mailbox falls back to alias_b.mailbox (user_B's) -> EmailLog
+          logged under user_B -> a SendRequest is stored to contact_B's external
+          address. Labeled [non-canonical] because it disables a default control.
+
+The output separates FIVE distinct facets: (a) application acceptance,
+(b) stored send request, (c) external Contact target, (d) alert generation,
+(e) confirmed SMTP delivery (NONE: NOT_SEND_EMAIL=true short-circuits SMTP).
+"""
+import os
+import sys
+
+_ALLOWED_DSNS = {
+    "postgresql://test:test@localhost:5432/test",
+    "postgresql://test:test@localhost:15432/test",
+    "postgresql://test:test@127.0.0.1:5432/test",
+}
+_DSN = os.environ.get("DB_URI", "")
+if _DSN not in _ALLOWED_DSNS:
+    sys.stderr.write(f"REFUSING TO RUN: DB_URI={_DSN!r} is not an allowlisted disposable test DB\n")
+    sys.exit(3)
+
+from server import create_app
+from app.db import Session, engine
+
+app = create_app()
+
+with engine.connect() as _c:
+    _dbname = _c.execute("select current_database()").scalar()
+if _dbname != "test":
+    sys.stderr.write(f"REFUSING TO RUN: current_database()={_dbname!r} != 'test'\n")
+    sys.exit(3)
+
+with engine.begin() as _c:
+    _c.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+
+from aiosmtpd.smtp import Envelope
+from email.message import EmailMessage
+import email_handler
+from app.models import Alias, Contact, EmailLog, SentAlert
+from app.email import status, headers
+from app.mail_sender import mail_sender
+from app.config import EMAIL_DOMAIN, NOT_SEND_EMAIL
+from init_app import add_sl_domains, add_proton_partner
+from tests.utils import create_new_user
+
+
+def truncate_clean_slate():
+    Session.close()
+    with engine.begin() as c:
+        c.execute(
+            "DO $$DECLARE r RECORD; BEGIN "
+            "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public' "
+            "AND tablename<>'alembic_version') LOOP "
+            "EXECUTE 'TRUNCATE TABLE '||quote_ident(r.tablename)||' RESTART IDENTITY CASCADE'; "
+            "END LOOP; END$$;"
+        )
+
+
+def drive(mail_from, rcpt_to, mid):
+    msg = EmailMessage()
+    msg["From"] = "sender@nowhere.net"
+    msg["To"] = rcpt_to
+    msg["Message-ID"] = mid
+    msg["Subject"] = "reply subject"
+    msg.set_content("hello body")
+    env = Envelope()
+    env.mail_from = mail_from
+    env.rcpt_tos = [rcpt_to]
+    mail_sender.purge_stored_emails()
+    before = Session.query(SentAlert).count()
+    delivered, code = email_handler.handle_reply(env, msg, rcpt_to)
+    after = Session.query(SentAlert).count()
+    el = EmailLog.get_by(message_id=mid)
+    stored = mail_sender.get_stored_emails()
+    return delivered, code, el, stored, before, after
+
+
+mail_sender.store_emails_instead_of_sending(True)
+
+with app.app_context():
+    truncate_clean_slate()
+    add_sl_domains()
+    add_proton_partner()
+
+    shared_reply = f"dup-reply-wrong@{EMAIL_DOMAIN}"
+    user_a = create_new_user(email="usera@mailbox.test")
+    user_b = create_new_user(email="userb@mailbox.test")
+    Session.commit()
+    alias_a = Alias.create_new_random(user_a)
+    alias_b = Alias.create_new_random(user_b)
+    Session.commit()
+
+    # INSERTION ORDER B-then-A: user_B's contact inserted FIRST -> .first() resolves user_B.
+    contact_b = Contact.create(user_id=alias_b.user_id, alias_id=alias_b.id,
+                               website_email="b@nowhere.net", name="B", reply_email=shared_reply)
+    contact_a = Contact.create(user_id=alias_a.user_id, alias_id=alias_a.id,
+                               website_email="a@nowhere.net", name="A", reply_email=shared_reply)
+    Session.commit()
+
+    print("=== SEED (insertion order B-then-A; .first() should resolve user_B) ===")
+    print(f"shared_reply={shared_reply!r}  mail_from will be user_A={user_a.email!r}")
+    print(f"user_a.id={user_a.id} alias_a.id={alias_a.id} | user_b.id={user_b.id} alias_b.id={alias_b.id}")
+    print(f"1st-inserted contact_b.id={contact_b.id} (user_B) ; 2nd-inserted contact_a.id={contact_a.id} (user_A)")
+    d = Contact.get_by(reply_email=shared_reply)
+    print(f"[non-canonical] Contact.get_by(reply_email=...) -> id={d.id} user_id={d.user_id} "
+          f"({'user_B' if d.user_id == user_b.id else 'user_A'})")
+
+    # -------- CASE 1: DEFAULT control (spoof check ON) --------
+    print("=== CASE 1 [canonical, DEFAULT control: alias.disable_email_spoofing_check=False] ===")
+    print(f"alias_b.disable_email_spoofing_check = {alias_b.disable_email_spoofing_check}")
+    delivered, code, el, stored, sa_before, sa_after = drive(user_a.email, shared_reply, "<wrong-default-0@sl.local>")
+    print(f"(a) application acceptance : delivered={delivered!r} code={code!r}  "
+          f"(==E214? {code == status.E214}, ==E200? {code == status.E200})")
+    print(f"(b) reply forwarded?       : NO EmailLog and NO reply SendRequest to the external contact "
+          f"(path returned E214 before EmailLog.create/forward)")
+    print(f"(c) stored outbound (this run) count={len(stored)} -> the unknown-mailbox ALERT, NOT a reply forward:")
+    for sr in stored:
+        print(f"      ALERT SendRequest envelope_to={sr.envelope_to!r} subject={sr.msg[headers.SUBJECT]!r}")
+    print(f"(d) alert generation       : new SentAlert rows={sa_after - sa_before}")
+    for a in Session.query(SentAlert).all():
+        who = "user_B" if a.user_id == user_b.id else ("user_A" if a.user_id == user_a.id else "?")
+        print(f"      SentAlert id={a.id} user_id={a.user_id}({who}) to_email={a.to_email!r} alert_type={a.alert_type!r}")
+    print(f"(e) EmailLog persisted?    : {'YES id=%d user_id=%d' % (el.id, el.user_id) if el else 'NO (path stopped at E214 before EmailLog.create)'}")
+    print(f"(f) confirmed SMTP delivery: NONE (NOT_SEND_EMAIL={NOT_SEND_EMAIL}). The only outbound is the alert to "
+          f"user_B's mailbox; the reply itself is rejected, so user_A's reply is NOT forwarded to any external contact.")
+
+    # -------- CASE 2: [non-canonical] spoof-disabled fallback --------
+    print("=== CASE 2 [NON-CANONICAL fallback: alias_b.disable_email_spoofing_check=True] ===")
+    alias_b.disable_email_spoofing_check = True
+    Session.commit()
+    print(f"alias_b.disable_email_spoofing_check = {alias_b.disable_email_spoofing_check}  (non-default per-alias flag)")
+    delivered, code, el, stored, sa_before, sa_after = drive(user_a.email, shared_reply, "<wrong-fallback-0@sl.local>")
+    print(f"(a) application acceptance : delivered={delivered!r} code={code!r}  (==E200? {code == status.E200})")
+    print(f"(b) stored send request    : count={len(stored)}")
+    if stored:
+        sr = stored[0]
+        print(f"      SendRequest envelope_from={sr.envelope_from!r} envelope_to={sr.envelope_to!r} "
+              f"msg[From]={sr.msg[headers.FROM]!r} msg[To]={sr.msg[headers.TO]!r}")
+    _tgt = repr(stored[0].envelope_to) if stored else "(none)"
+    print(f"(c) external Contact target: {_tgt}  (contact_B.website_email={contact_b.website_email!r})")
+    print(f"(d) alert generation       : new SentAlert rows={sa_after - sa_before}")
+    if el:
+        who = "user_B(WRONG - not the sender/mail_from owner)" if el.user_id == user_b.id else "user_A"
+        print(f"(e) EmailLog persisted?    : YES id={el.id} contact_id={el.contact_id} alias_id={el.alias_id} "
+              f"user_id={el.user_id}({who}) mailbox_id={el.mailbox_id} is_reply={el.is_reply}")
+    else:
+        print("(e) EmailLog persisted?    : NO")
+    print(f"(f) confirmed SMTP delivery: NONE — NOT_SEND_EMAIL={NOT_SEND_EMAIL}: mail_sender.send() logs and returns "
+          f"True WITHOUT calling _send_to_smtp (app/mail_sender.py:130-136). '250 accepted' = application acceptance only.")
+    print("DONE")
+```
+
+**`observe_dist.py`** — same-unchanged-input distribution, seed-once/drive-many (§7). Invocations: `seed <ab|ba> <on|off>` and `drive <N> <mid_prefix>` via `/tmp/run_dist.sh` (§7.0).
+
+```python
+"""observe_dist.py — Cross-event distribution under the SAME UNCHANGED INPUT.
+
+Two modes, so the dataset is SEEDED ONCE and then the IDENTICAL input is DRIVEN
+many times against those same persisted rows (only Message-ID varies):
+
+  seed <ab|ba> <on|off>
+      Truncate (allowlist-guarded), seed a FIXED dataset: user_A/user_B, one alias
+      each, and TWO Contact rows sharing the SAME reply_email (fixed website_emails).
+      <ab|ba> controls contact INSERTION ORDER. <on|off> sets both aliases'
+      disable_email_spoofing_check. Prints ctid physical order + EXPLAIN (default and
+      forced Seq Scan) for the exact lookup query. Persists and STOPS.
+
+  drive <N> <mid_prefix>
+      Does NOT reseed. Asserts exactly two contacts share the reply_email (else exit 3).
+      Drives handle_reply() N times with an IDENTICAL envelope (fixed mail_from and
+      rcpt_to); ONLY Message-ID varies (= "<mid_prefix>-i@sl.local"). Correlates each
+      event by exact Message-ID via EmailLog and prints a full per-event contract plus
+      distribution counters.
+
+Arg validation (#25): invalid args exit non-zero (2 = bad args, 3 = data precondition).
+"""
+import os
+import re
+import sys
+
+_ALLOWED_DSNS = {
+    "postgresql://test:test@localhost:5432/test",
+    "postgresql://test:test@localhost:15432/test",
+    "postgresql://test:test@127.0.0.1:5432/test",
+}
+if os.environ.get("DB_URI", "") not in _ALLOWED_DSNS:
+    sys.stderr.write(f"REFUSING TO RUN: DB_URI={os.environ.get('DB_URI','')!r} not in disposable allowlist\n")
+    sys.exit(3)
+
+# ---- bounded/validated CLI parsing BEFORE any heavy import (#25) ----
+SHARED_REPLY = "dist-shared@sl.local"
+FIXED_MAIL_FROM = "usera@mailbox.test"   # user_A's mailbox (fixed across every event)
+WEB_A = "a-dist@nowhere.net"
+WEB_B = "b-dist@nowhere.net"
+
+def usage_exit():
+    sys.stderr.write(
+        "usage: observe_dist.py seed <ab|ba> <on|off> | drive <N:1..1000> <mid_prefix>\n"
+    )
+    sys.exit(2)
+
+if len(sys.argv) < 2:
+    usage_exit()
+MODE = sys.argv[1]
+if MODE == "seed":
+    if len(sys.argv) != 4:
+        usage_exit()
+    ORDER = sys.argv[2]
+    SPOOF = sys.argv[3]
+    if ORDER not in ("ab", "ba"):
+        sys.stderr.write(f"invalid order {ORDER!r}: must be 'ab' or 'ba'\n")
+        sys.exit(2)
+    if SPOOF not in ("on", "off"):
+        sys.stderr.write(f"invalid spoof {SPOOF!r}: must be 'on' or 'off'\n")
+        sys.exit(2)
+elif MODE == "drive":
+    if len(sys.argv) != 4:
+        usage_exit()
+    try:
+        N = int(sys.argv[2])
+    except ValueError:
+        sys.stderr.write(f"invalid N {sys.argv[2]!r}: must be an integer\n")
+        sys.exit(2)
+    if not (1 <= N <= 1000):
+        sys.stderr.write(f"invalid N {N}: must be within 1..1000\n")
+        sys.exit(2)
+    MID_PREFIX = sys.argv[3]
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", MID_PREFIX):
+        sys.stderr.write(f"invalid mid_prefix {MID_PREFIX!r}: must match [A-Za-z0-9_.-]+\n")
+        sys.exit(2)
+else:
+    usage_exit()
+
+from server import create_app
+from app.db import Session, engine
+
+app = create_app()
+with engine.connect() as _c:
+    if _c.execute("select current_database()").scalar() != "test":
+        sys.stderr.write("REFUSING TO RUN: current_database() != 'test'\n")
+        sys.exit(3)
+with engine.begin() as _c:
+    _c.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+
+from aiosmtpd.smtp import Envelope
+from email.message import EmailMessage
+import email_handler
+from app.models import Alias, Contact, EmailLog
+from app.email import status
+from app.mail_sender import mail_sender
+from init_app import add_sl_domains, add_proton_partner
+from tests.utils import create_new_user
+
+
+def truncate_clean_slate():
+    Session.close()
+    with engine.begin() as c:
+        c.execute(
+            "DO $$DECLARE r RECORD; BEGIN "
+            "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public' "
+            "AND tablename<>'alembic_version') LOOP "
+            "EXECUTE 'TRUNCATE TABLE '||quote_ident(r.tablename)||' RESTART IDENTITY CASCADE'; "
+            "END LOOP; END$$;"
+        )
+
+
+mail_sender.store_emails_instead_of_sending(True)
+
+
+def do_seed():
+    with app.app_context():
+        truncate_clean_slate()
+        add_sl_domains()
+        add_proton_partner()
+        user_a = create_new_user(email=FIXED_MAIL_FROM)
+        Session.commit()
+        user_b = create_new_user(email="userb@mailbox.test")
+        Session.commit()
+        alias_a = Alias.create_new_random(user_a)
+        alias_b = Alias.create_new_random(user_b)
+        Session.commit()
+        flag = (SPOOF == "on")
+        alias_a.disable_email_spoofing_check = flag
+        alias_b.disable_email_spoofing_check = flag
+        Session.commit()
+
+        def mk_a():
+            return Contact.create(user_id=alias_a.user_id, alias_id=alias_a.id,
+                                  website_email=WEB_A, name="A", reply_email=SHARED_REPLY)
+
+        def mk_b():
+            return Contact.create(user_id=alias_b.user_id, alias_id=alias_b.id,
+                                  website_email=WEB_B, name="B", reply_email=SHARED_REPLY)
+
+        if ORDER == "ab":
+            c1 = mk_a(); Session.commit()
+            c2 = mk_b(); Session.commit()
+        else:
+            c1 = mk_b(); Session.commit()
+            c2 = mk_a(); Session.commit()
+
+        print(f"=== SEED mode order={ORDER} spoof={SPOOF} (disable_email_spoofing_check={flag}) ===")
+        print(f"shared reply_email={SHARED_REPLY!r}  FIXED_MAIL_FROM={FIXED_MAIL_FROM!r}")
+        print(f"user_a.id={user_a.id} alias_a.id={alias_a.id}  user_b.id={user_b.id} alias_b.id={alias_b.id}")
+        print(f"insertion #1 -> Contact id={c1.id} alias_id={c1.alias_id} user_id={c1.user_id} website={c1.website_email!r}")
+        print(f"insertion #2 -> Contact id={c2.id} alias_id={c2.alias_id} user_id={c2.user_id} website={c2.website_email!r}")
+
+        print("--- physical order (ctid) of rows sharing reply_email ---")
+        rows = engine.execute(
+            "SELECT ctid, id, alias_id, user_id, website_email FROM contact "
+            "WHERE reply_email=%(r)s ORDER BY ctid", {"r": SHARED_REPLY}
+        ).fetchall()
+        for row in rows:
+            print(f"  ctid={row[0]} id={row[1]} alias_id={row[2]} user_id={row[3]} website={row[4]!r}")
+
+        print("--- EXPLAIN (default plan) of the lookup: filter_by(reply_email=...).first() ---")
+        for row in engine.execute(
+            "EXPLAIN SELECT contact.id FROM contact WHERE contact.reply_email=%(r)s LIMIT 1",
+            {"r": SHARED_REPLY}).fetchall():
+            print("  " + row[0])
+
+        print("--- EXPLAIN with index/bitmap scans DISABLED (forced Seq Scan), same query ---")
+        with engine.connect() as conn:
+            conn.execute("SET enable_indexscan=off")
+            conn.execute("SET enable_bitmapscan=off")
+            conn.execute("SET enable_indexonlyscan=off")
+            for row in conn.execute(
+                "EXPLAIN SELECT contact.id FROM contact WHERE contact.reply_email=%(r)s LIMIT 1",
+                {"r": SHARED_REPLY}).fetchall():
+                print("  " + row[0])
+        print("SEED DONE (persisted; run 'drive' next)")
+
+
+def do_drive():
+    with app.app_context():
+        n_rows = Session.query(Contact).filter(Contact.reply_email == SHARED_REPLY).count()
+        if n_rows != 2:
+            sys.stderr.write(f"DATA PRECONDITION FAILED: expected 2 contacts sharing reply_email, found {n_rows}. "
+                             f"Run 'seed' first.\n")
+            sys.exit(3)
+        purge = getattr(mail_sender, "purge_stored_emails", None)
+        if purge:
+            purge()
+
+        direct = Contact.get_by(reply_email=SHARED_REPLY)
+        print(f"=== DRIVE mode N={N} mid_prefix={MID_PREFIX!r} (dataset NOT reseeded) ===")
+        print(f"[non-canonical] direct Contact.get_by(reply_email={SHARED_REPLY!r}) -> "
+              f"id={direct.id} alias_id={direct.alias_id} user_id={direct.user_id} website={direct.website_email!r}")
+        print(f"driving handle_reply() {N}x with IDENTICAL mail_from={FIXED_MAIL_FROM!r}, "
+              f"rcpt_to={SHARED_REPLY!r}; ONLY Message-ID varies")
+
+        by_code = {}
+        by_contact = {}
+        for i in range(N):
+            mid = f"<{MID_PREFIX}-{i}@sl.local>"
+            msg = EmailMessage()
+            msg["From"] = "someone@nowhere.net"
+            msg["To"] = SHARED_REPLY
+            msg["Message-ID"] = mid
+            msg["Subject"] = f"dist {i}"
+            msg["Date"] = "Mon, 13 Jul 2026 00:00:00 +0000"
+            msg.set_content("body")
+            env = Envelope()
+            env.mail_from = FIXED_MAIL_FROM
+            env.rcpt_tos = [SHARED_REPLY]
+            delivered, code = email_handler.handle_reply(env, msg, SHARED_REPLY)
+            Session.commit()
+            by_code[code] = by_code.get(code, 0) + 1
+            el = EmailLog.get_by(message_id=mid)
+            if el:
+                key = f"contact_id={el.contact_id},alias_id={el.alias_id},user_id={el.user_id}"
+                by_contact[key] = by_contact.get(key, 0) + 1
+                if i < 3 or i == N - 1:
+                    print(f"  event mid={mid} delivered={delivered} code={code!r} "
+                          f"EmailLog(mid match={el.message_id==mid}) contact_id={el.contact_id} "
+                          f"alias_id={el.alias_id} user_id={el.user_id} mailbox_id={el.mailbox_id} is_reply={el.is_reply}")
+            else:
+                key = f"NO_EmailLog(code={code})"
+                by_contact[key] = by_contact.get(key, 0) + 1
+                if i < 3 or i == N - 1:
+                    print(f"  event mid={mid} delivered={delivered} code={code!r} EmailLog=None "
+                          f"(resolved contact unauthorized for mail_from -> E214, no forward)")
+
+        print("--- distribution by return code ---")
+        for k in sorted(by_code):
+            print(f"  code={k!r}: {by_code[k]}")
+        print("--- distribution by resolved (EmailLog) / non-forward ---")
+        for k in sorted(by_contact):
+            print(f"  {k}: {by_contact[k]}")
+        print("DRIVE DONE")
+
+
+if MODE == "seed":
+    do_seed()
+else:
+    do_drive()
+```
+
+**`observe_edge.py`** — E501 / E502(no contact) / E502(inactive) / `is_reverse_alias` (§8.1). Invocation:
+```
+docker exec sl_app bash -lc 'cd /app; . venv/bin/activate; set -a; . /tmp/sl_env.sh; set +a; python /tmp/observe_edge.py 2>&1'
+```
+
+```python
+"""observe_edge.py — Secondary/edge conditions of the reply-resolution path, all via
+the canonical handle_reply() entry point (no bypassing). Conditions:
+  (1) E501  reply domain not EMAIL_DOMAIN and not an SLDomain   [email_handler.py:977-981]
+  (2) E502  no Contact matches the reply_email                  [email_handler.py:986-989]
+  (3) E502  contact.user.is_active() is False (soft-deleted)    [email_handler.py:990-992; is_active models.py:766-769]
+  (4) is_reverse_alias() True for a seeded reply_email, False otherwise [app/email_utils.py:1156-1158]
+(E214 wrong-user alert under DEFAULT control is exercised in observe_wronguser.py CASE 1.)
+"""
+import os
+import sys
+
+_ALLOWED_DSNS = {
+    "postgresql://test:test@localhost:5432/test",
+    "postgresql://test:test@localhost:15432/test",
+    "postgresql://test:test@127.0.0.1:5432/test",
+}
+if os.environ.get("DB_URI", "") not in _ALLOWED_DSNS:
+    sys.stderr.write(f"REFUSING TO RUN: DB_URI={os.environ.get('DB_URI','')!r} not in disposable allowlist\n")
+    sys.exit(3)
+
+from server import create_app
+from app.db import Session, engine
+
+app = create_app()
+with engine.connect() as _c:
+    if _c.execute("select current_database()").scalar() != "test":
+        sys.stderr.write("REFUSING TO RUN: current_database() != 'test'\n")
+        sys.exit(3)
+with engine.begin() as _c:
+    _c.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+
+import arrow
+from aiosmtpd.smtp import Envelope
+from email.message import EmailMessage
+import email_handler
+from app.models import Alias, Contact
+from app.email import status
+from app.email_utils import is_reverse_alias
+from app.mail_sender import mail_sender
+from app.config import EMAIL_DOMAIN
+from init_app import add_sl_domains, add_proton_partner
+from tests.utils import create_new_user
+
+
+def truncate_clean_slate():
+    Session.close()
+    with engine.begin() as c:
+        c.execute(
+            "DO $$DECLARE r RECORD; BEGIN "
+            "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public' "
+            "AND tablename<>'alembic_version') LOOP "
+            "EXECUTE 'TRUNCATE TABLE '||quote_ident(r.tablename)||' RESTART IDENTITY CASCADE'; "
+            "END LOOP; END$$;"
+        )
+
+
+def mk_msg(mid):
+    msg = EmailMessage()
+    msg["From"] = "someone@nowhere.net"
+    msg["To"] = "x@sl.local"
+    msg["Message-ID"] = mid
+    msg["Subject"] = "edge"
+    msg["Date"] = "Mon, 13 Jul 2026 00:00:00 +0000"
+    msg.set_content("body")
+    return msg
+
+
+def mk_env(mail_from, rcpt_to):
+    env = Envelope()
+    env.mail_from = mail_from
+    env.rcpt_tos = [rcpt_to]
+    return env
+
+
+mail_sender.store_emails_instead_of_sending(True)
+
+with app.app_context():
+    truncate_clean_slate()
+    add_sl_domains()
+    add_proton_partner()
+
+    user = create_new_user(email="edge-user@mailbox.test")
+    Session.commit()
+    alias = Alias.create_new_random(user)
+    Session.commit()
+    active_reply = f"edge-active@{EMAIL_DOMAIN}"
+    Contact.create(user_id=alias.user_id, alias_id=alias.id, website_email="ext@nowhere.net",
+                   name="Ext", reply_email=active_reply)
+    Session.commit()
+
+    # a soft-deleted user (delete_on in the future -> is_active() False), own alias+contact
+    inactive_user = create_new_user(email="edge-inactive@mailbox.test")
+    Session.commit()
+    inactive_alias = Alias.create_new_random(inactive_user)
+    Session.commit()
+    inactive_reply = f"edge-inactive-reply@{EMAIL_DOMAIN}"
+    Contact.create(user_id=inactive_alias.user_id, alias_id=inactive_alias.id,
+                   website_email="ext2@nowhere.net", name="Ext2", reply_email=inactive_reply)
+    inactive_user.delete_on = arrow.now().shift(days=1)
+    Session.commit()
+
+    print("=== (1) E501: reply domain not EMAIL_DOMAIN and not an SLDomain ===")
+    rcpt = "reply@notsl.example"
+    d, code = email_handler.handle_reply(mk_env(user.email, rcpt), mk_msg("<edge-e501@sl.local>"), rcpt)
+    print(f"rcpt_to={rcpt!r} -> delivered={d} code={code!r}  (==E501? {code == status.E501})")
+
+    print("=== (2) E502: no Contact matches the reply_email ===")
+    rcpt = f"no-such-contact@{EMAIL_DOMAIN}"
+    d, code = email_handler.handle_reply(mk_env(user.email, rcpt), mk_msg("<edge-e502a@sl.local>"), rcpt)
+    print(f"rcpt_to={rcpt!r} -> delivered={d} code={code!r}  (==E502? {code == status.E502})")
+
+    print("=== (3) E502: contact.user.is_active() is False (soft-deleted user) ===")
+    iu = Contact.get_by(reply_email=inactive_reply).user
+    print(f"inactive user delete_on={iu.delete_on}  is_active()={iu.is_active()}")
+    d, code = email_handler.handle_reply(mk_env(inactive_user.email, inactive_reply),
+                                         mk_msg("<edge-e502b@sl.local>"), inactive_reply)
+    print(f"rcpt_to={inactive_reply!r} -> delivered={d} code={code!r}  (==E502? {code == status.E502})")
+
+    print("=== (4) is_reverse_alias() predicate [app/email_utils.py:1156-1158] ===")
+    print(f"is_reverse_alias({active_reply!r})            = {is_reverse_alias(active_reply)}")
+    print(f"is_reverse_alias('not-a-reverse-alias@{EMAIL_DOMAIN}') = "
+          f"{is_reverse_alias('not-a-reverse-alias@' + EMAIL_DOMAIN)}")
+    print("DONE")
+```
+
+**`observe_norm.py`** — inbound normalization / exact-equality lookup (§8.2). Invocation:
+```
+docker exec sl_app bash -lc 'cd /app; . venv/bin/activate; set -a; . /tmp/sl_env.sh; set +a; python /tmp/observe_norm.py 2>&1'
+```
+
+```python
+"""observe_norm.py — Corrected normalization semantics (#4).
+
+normalize_reply_email() [app/email_validation.py:25-38] is applied ONLY to the
+INBOUND rcpt_to string at email_handler.py:984; the stored Contact.reply_email is
+NOT normalized inside the query (email_handler.py:986 does exact-equality
+Contact.get_by(reply_email=<normalized-inbound>)). Therefore:
+  * MANY inbound spellings that differ only by disallowed characters collapse onto
+    ONE stored key (each disallowed char -> '_').
+  * A multi-row match still requires MULTIPLE STORED rows that already share the
+    same (normalized) key; inbound normalization alone does not create duplicates.
+"""
+import os
+import sys
+
+_ALLOWED_DSNS = {
+    "postgresql://test:test@localhost:5432/test",
+    "postgresql://test:test@localhost:15432/test",
+    "postgresql://test:test@127.0.0.1:5432/test",
+}
+if os.environ.get("DB_URI", "") not in _ALLOWED_DSNS:
+    sys.stderr.write(f"REFUSING TO RUN: DB_URI={os.environ.get('DB_URI','')!r} not in disposable allowlist\n")
+    sys.exit(3)
+
+from server import create_app
+from app.db import Session, engine
+
+app = create_app()
+with engine.connect() as _c:
+    if _c.execute("select current_database()").scalar() != "test":
+        sys.stderr.write("REFUSING TO RUN: current_database() != 'test'\n")
+        sys.exit(3)
+with engine.begin() as _c:
+    _c.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+
+from aiosmtpd.smtp import Envelope
+from email.message import EmailMessage
+import email_handler
+from app.models import Alias, Contact, EmailLog
+from app.email import status
+from app.email_validation import normalize_reply_email
+from app.mail_sender import mail_sender
+from app.config import EMAIL_DOMAIN
+from init_app import add_sl_domains, add_proton_partner
+from tests.utils import create_new_user
+
+
+def truncate_clean_slate():
+    Session.close()
+    with engine.begin() as c:
+        c.execute(
+            "DO $$DECLARE r RECORD; BEGIN "
+            "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public' "
+            "AND tablename<>'alembic_version') LOOP "
+            "EXECUTE 'TRUNCATE TABLE '||quote_ident(r.tablename)||' RESTART IDENTITY CASCADE'; "
+            "END LOOP; END$$;"
+        )
+
+
+mail_sender.store_emails_instead_of_sending(True)
+
+STORED = f"norm_key@{EMAIL_DOMAIN}"   # already-normalized: '_' is in _ALLOWED_CHARS
+INBOUND_VARIANTS = [
+    f"norm_key@{EMAIL_DOMAIN}",   # identity
+    f"norm key@{EMAIL_DOMAIN}",   # space  -> '_'
+    f"norm#key@{EMAIL_DOMAIN}",   # '#'    -> '_'
+    f"norm~key@{EMAIL_DOMAIN}",   # '~'    -> '_'
+]
+
+with app.app_context():
+    truncate_clean_slate()
+    add_sl_domains()
+    add_proton_partner()
+    user = create_new_user(email="norm-user@mailbox.test")
+    Session.commit()
+    alias = Alias.create_new_random(user)
+    Session.commit()
+    Contact.create(user_id=alias.user_id, alias_id=alias.id, website_email="ext@nowhere.net",
+                   name="Ext", reply_email=STORED)
+    Session.commit()
+
+    print(f"=== stored Contact.reply_email = {STORED!r} (single row) ===")
+    print("--- normalize_reply_email() maps each INBOUND spelling onto the stored key ---")
+    for v in INBOUND_VARIANTS:
+        nv = normalize_reply_email(v)
+        print(f"  inbound={v!r:32} -> normalize_reply_email -> {nv!r}  (==stored? {nv == STORED})")
+
+    print("--- exact-equality proof: query uses normalized INBOUND vs raw STORED ---")
+    raw = f"norm key@{EMAIL_DOMAIN}"
+    print(f"  Contact.get_by(reply_email={raw!r})            -> {Contact.get_by(reply_email=raw)}")
+    print(f"  Contact.get_by(reply_email=normalize({raw!r})) -> "
+          f"{Contact.get_by(reply_email=normalize_reply_email(raw))}")
+
+    print("--- canonical handle_reply() with each inbound spelling resolves the ONE stored contact ---")
+    for i, v in enumerate(INBOUND_VARIANTS):
+        mid = f"<norm-{i}@sl.local>"
+        msg = EmailMessage()
+        msg["From"] = "someone@nowhere.net"
+        msg["To"] = STORED
+        msg["Message-ID"] = mid
+        msg["Subject"] = f"norm {i}"
+        msg["Date"] = "Mon, 13 Jul 2026 00:00:00 +0000"
+        msg.set_content("body")
+        env = Envelope()
+        env.mail_from = user.email
+        env.rcpt_tos = [v]
+        d, code = email_handler.handle_reply(env, msg, v)
+        Session.commit()
+        el = EmailLog.get_by(message_id=mid)
+        cid = el.contact_id if el else None
+        print(f"  inbound={v!r:32} -> delivered={d} code={code!r} EmailLog.contact_id={cid}")
+
+    n = Session.query(Contact).filter(Contact.reply_email == STORED).count()
+    print(f"--- rows sharing the stored key = {n} (multi-row match needs >1 STORED row with same key) ---")
+    print("DONE")
+```
+
+**`observe_avail.py`** — exact `available_sl_email` body, call sites, guard bypass (§6.2). Invocation:
+```
+docker exec sl_app bash -lc 'cd /app; . venv/bin/activate; set -a && . /tmp/sl_env.sh && set +a; python /tmp/observe_avail.py 2>&1'
+```
+
+```python
+"""observe_avail.py — available_sl_email() guard evidence (#15, #20).
+
+(20) Reproduce the EXACT body of available_sl_email() (inspect.getsource) — it has
+     exactly THREE checks: Alias / Contact / DeletedAlias.
+(15) Enumerate ALL THREE call sites (grounded, not just the generator):
+       app/email_utils.py:1150  generate_reply_email()
+       app/models.py:1458       generate_random_alias_email()
+       app/models.py:1706       custom-alias creation
+     Then PROVE a direct Contact.create() BYPASSES the guard: seed one contact,
+     show available_sl_email(reply)==False (would block the generator), yet a direct
+     Contact.create() with the SAME reply_email succeeds -> two rows (no UNIQUE
+     constraint, guard is only consulted by the generator loop, not at write time).
+"""
+import os
+import sys
+import inspect
+
+_ALLOWED_DSNS = {
+    "postgresql://test:test@localhost:5432/test",
+    "postgresql://test:test@localhost:15432/test",
+    "postgresql://test:test@127.0.0.1:5432/test",
+}
+if os.environ.get("DB_URI", "") not in _ALLOWED_DSNS:
+    sys.stderr.write(f"REFUSING TO RUN: DB_URI={os.environ.get('DB_URI','')!r} not in disposable allowlist\n")
+    sys.exit(3)
+
+from server import create_app
+from app.db import Session, engine
+
+app = create_app()
+with engine.connect() as _c:
+    if _c.execute("select current_database()").scalar() != "test":
+        sys.stderr.write("REFUSING TO RUN: current_database() != 'test'\n")
+        sys.exit(3)
+with engine.begin() as _c:
+    _c.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+
+import app.models as models
+from app.models import Alias, Contact, available_sl_email, ModelMixin
+from app.email_utils import is_reverse_alias
+from app.mail_sender import mail_sender
+from app.config import EMAIL_DOMAIN
+from init_app import add_sl_domains, add_proton_partner
+from tests.utils import create_new_user
+
+
+def truncate_clean_slate():
+    Session.close()
+    with engine.begin() as c:
+        c.execute(
+            "DO $$DECLARE r RECORD; BEGIN "
+            "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public' "
+            "AND tablename<>'alembic_version') LOOP "
+            "EXECUTE 'TRUNCATE TABLE '||quote_ident(r.tablename)||' RESTART IDENTITY CASCADE'; "
+            "END LOOP; END$$;"
+        )
+
+
+mail_sender.store_emails_instead_of_sending(True)
+
+print("=== EXACT body of available_sl_email() [app/models.py] (inspect.getsource) ===")
+src, start = inspect.getsourcelines(available_sl_email)
+for off, line in enumerate(src):
+    print(f"  {start+off}: {line.rstrip()}")
+
+print("=== EXACT body of ModelMixin.get_by() (the .first() with no ORDER BY) ===")
+src, start = inspect.getsourcelines(ModelMixin.get_by.__func__)
+for off, line in enumerate(src):
+    print(f"  {start+off}: {line.rstrip()}")
+
+print("=== EXACT body of is_reverse_alias() [app/email_utils.py] ===")
+src, start = inspect.getsourcelines(is_reverse_alias)
+for off, line in enumerate(src):
+    print(f"  {start+off}: {line.rstrip()}")
+
+DUP = f"dupe-guard@{EMAIL_DOMAIN}"
+
+with app.app_context():
+    truncate_clean_slate()
+    add_sl_domains()
+    add_proton_partner()
+    user = create_new_user(email="avail-user@mailbox.test")
+    Session.commit()
+    alias = Alias.create_new_random(user)
+    Session.commit()
+
+    print("=== guard bypass: direct Contact.create() ignores available_sl_email() ===")
+    print(f"before any contact: available_sl_email({DUP!r}) = {available_sl_email(DUP)}")
+    c1 = Contact.create(user_id=alias.user_id, alias_id=alias.id, website_email="one@nowhere.net",
+                        name="One", reply_email=DUP)
+    Session.commit()
+    print(f"after 1st Contact.create: available_sl_email({DUP!r}) = {available_sl_email(DUP)} "
+          f"(guard would now block the GENERATOR from choosing this value)")
+    # direct create with the SAME reply_email despite guard==False -> no exception, no UNIQUE
+    c2 = Contact.create(user_id=alias.user_id, alias_id=alias.id, website_email="two@nowhere.net",
+                        name="Two", reply_email=DUP)
+    Session.commit()
+    n = Session.query(Contact).filter(Contact.reply_email == DUP).count()
+    print(f"direct 2nd Contact.create with SAME reply_email SUCCEEDED: c1.id={c1.id} c2.id={c2.id}; "
+          f"rows sharing reply_email={n}")
+    print("=> available_sl_email() is a generation-time TOCTOU check only; a direct write bypasses it "
+          "and no DB UNIQUE constraint prevents the duplicate.")
+    print("DONE")
+```
+
+**`observe_second.py`** — the second lookup site `replace_header_when_reply()` (§8.3). Invocation:
+```
+docker exec sl_app bash -lc 'cd /app; . venv/bin/activate; set -a; . /tmp/sl_env.sh; set +a; python /tmp/observe_second.py 2>&1'
+```
+
+```python
+"""observe_second.py — the SECOND Contact.get_by(reply_email=...) lookup site.
+
+handle_reply() calls replace_header_when_reply() for the TO header
+[email_handler.py:1179] and the CC header [email_handler.py:1181]; inside it, a
+SECOND lookup Contact.get_by(reply_email=reply_email) runs at email_handler.py:364
+(the primary reply lookup is at email_handler.py:986). This harness drives the
+canonical handle_reply() with TO and CC headers that each carry a DIFFERENT
+reverse-alias, and shows the second site resolving each to its contact and
+rewriting the header to that contact's real website_email.
+"""
+import os
+import sys
+
+_ALLOWED_DSNS = {
+    "postgresql://test:test@localhost:5432/test",
+    "postgresql://test:test@localhost:15432/test",
+    "postgresql://test:test@127.0.0.1:5432/test",
+}
+if os.environ.get("DB_URI", "") not in _ALLOWED_DSNS:
+    sys.stderr.write(f"REFUSING TO RUN: DB_URI={os.environ.get('DB_URI','')!r} not in disposable allowlist\n")
+    sys.exit(3)
+
+from server import create_app
+from app.db import Session, engine
+
+app = create_app()
+with engine.connect() as _c:
+    if _c.execute("select current_database()").scalar() != "test":
+        sys.stderr.write("REFUSING TO RUN: current_database() != 'test'\n")
+        sys.exit(3)
+with engine.begin() as _c:
+    _c.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+
+from aiosmtpd.smtp import Envelope
+from email.message import EmailMessage
+import email_handler
+from app.models import Alias, Contact, EmailLog
+from app.email import status, headers
+from app.mail_sender import mail_sender
+from app.config import EMAIL_DOMAIN
+from init_app import add_sl_domains, add_proton_partner
+from tests.utils import create_new_user
+
+
+def truncate_clean_slate():
+    Session.close()
+    with engine.begin() as c:
+        c.execute(
+            "DO $$DECLARE r RECORD; BEGIN "
+            "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public' "
+            "AND tablename<>'alembic_version') LOOP "
+            "EXECUTE 'TRUNCATE TABLE '||quote_ident(r.tablename)||' RESTART IDENTITY CASCADE'; "
+            "END LOOP; END$$;"
+        )
+
+
+mail_sender.store_emails_instead_of_sending(True)
+
+with app.app_context():
+    truncate_clean_slate()
+    add_sl_domains()
+    add_proton_partner()
+    user = create_new_user(email="second-user@mailbox.test")
+    Session.commit()
+    alias = Alias.create_new_random(user)
+    Session.commit()
+    r1 = f"second-r1@{EMAIL_DOMAIN}"
+    r2 = f"second-r2@{EMAIL_DOMAIN}"
+    c1 = Contact.create(user_id=alias.user_id, alias_id=alias.id, website_email="w1@nowhere.net",
+                        name="W1", reply_email=r1)
+    c2 = Contact.create(user_id=alias.user_id, alias_id=alias.id, website_email="w2@nowhere.net",
+                        name="W2", reply_email=r2)
+    Session.commit()
+
+    print("=== second lookup site: replace_header_when_reply() [email_handler.py:364] via TO & CC ===")
+    print(f"primary rcpt_to={r1!r} (resolved at :986); TO header={r1!r} -> contact c1.id={c1.id} website='w1@nowhere.net'")
+    print(f"CC header={r2!r} -> contact c2.id={c2.id} website='w2@nowhere.net'")
+    mid = "<second-0@sl.local>"
+    msg = EmailMessage()
+    msg["From"] = "w1@nowhere.net"
+    msg["To"] = r1
+    msg["Cc"] = r2
+    msg["Message-ID"] = mid
+    msg["Subject"] = "second-lookup"
+    msg["Date"] = "Mon, 13 Jul 2026 00:00:00 +0000"
+    msg.set_content("body")
+    env = Envelope()
+    env.mail_from = user.email
+    env.rcpt_tos = [r1]
+    d, code = email_handler.handle_reply(env, msg, r1)
+    Session.commit()
+    print(f"handle_reply -> delivered={d} code={code!r} (==E200? {code == status.E200})")
+    el = EmailLog.get_by(message_id=mid)
+    if el:
+        print(f"EmailLog id={el.id} contact_id={el.contact_id} alias_id={el.alias_id} user_id={el.user_id} is_reply={el.is_reply}")
+    print(f"rewritten msg[To] = {msg[headers.TO]!r}")
+    print(f"rewritten msg[Cc] = {msg[headers.CC]!r}")
+    print("DONE")
+```
+
+---
+## 12. Coverage pass (honest status of every question part and implied condition)
+
+Each row is marked **OBSERVED** (captured at runtime through the canonical entry point), **OBSERVED `[non-canonical]`** (captured but via a bypass/fallback, labeled as such), or **`[inferred]`** (not directly reproduced; grounded in source + official semantics). No row is marked complete beyond what the evidence supports.
+
+| # | Question part / implied condition | Status | Where |
+|---|-----------------------------------|--------|-------|
+| 1 | Derivation of the reply address (`rcpt_to` → domain gate → normalize) | **OBSERVED** | §3, §4.2 |
+| 2 | Contact resolution via `Contact.get_by(reply_email=...)` | **OBSERVED** | §4.2 |
+| 3 | Actual extracted/normalized reply-email value reported | **OBSERVED** | §4.2 |
+| 4 | Resolved `Contact` reported (`id`, `alias_id`, `user_id`) | **OBSERVED** | §4.2 |
+| 5 | Forwarding destination reported (alias, user, mailbox) | **OBSERVED** | §4.2, §5 |
+| 6 | Canonical entry point exercised (`handle_reply`) + routing via `handle()` | **OBSERVED** | §4.2, §4.3 |
+| 7 | Same reply resolves to different contacts across events? | **OBSERVED** (flips with insertion order; deterministic/stable within a fixed layout, 20/20 ×2) | §7 |
+| 8 | Reply fails to resolve (no contact) | **OBSERVED** (E502) | §8.1 |
+| 9 | Resolves correctly yet forwards to a different user? | **OBSERVED** — default control → **E214 (no forward)**; wrong-user **forward** only under **`[non-canonical]`** spoof-disabled fallback | §7.2, §7.3, §10 |
+| 10 | `reply_email` has no DB `UNIQUE` (model + migrations + runtime catalog) | **OBSERVED** | §6.1 |
+| 11 | `.first()` has no `ORDER BY`; row is application-unordered | **OBSERVED** (source + EXPLAIN/ctid) | §4.1, §6.3, §7.4 |
+| 12 | A *different* plan/layout could return the other row | **`[inferred]`** (grounded in absence of `ORDER BY` + official SQLAlchemy/PostgreSQL semantics; not directly reproduced on the 2-row layout) | §7.4, §9 |
+| 13 | Uniqueness assumption: generation-time TOCTOU guard, exact 3 checks | **OBSERVED** | §6.2 |
+| 14 | Direct write bypasses the guard (duplicate persists) | **OBSERVED** (duplicate seed) | §6.2, §4.2 |
+| 15 | Concurrency/race widening the TOCTOU window | **`[inferred]`** (not reproduced live; grounded in non-atomic read-then-act + no `UNIQUE`) | §6.2 |
+| 16 | Wrong contact → wrong alias/user/mailbox/log propagation | **OBSERVED** | §6.4, §7, §10 |
+| 17 | Other lookup reuse sites (second header rewrite; routing predicates) | **OBSERVED** (`replace_header_when_reply` canonical; routing via `handle()`) | §8.3, §4.3, §6.5 |
+| 18 | Normalization semantics (inbound many-to-one; exact-equality lookup; multi-row needs >1 stored row) | **OBSERVED** | §8.2, §6.6 |
+| 19 | E501 (wrong reply domain) | **OBSERVED** | §8.1 |
+| 20 | E502 (inactive/soft-deleted user) | **OBSERVED** | §8.1 |
+| 21 | E214 (unknown mailbox) + alert to resolved user | **OBSERVED** | §10 |
+| 22 | Forward-phase minting (`generate_reply_email` + guard) | **OBSERVED** (source + guard behavior) | §6.7, §6.2 |
+| 23 | Official reverse-alias concept (intended unique per sender+alias) | **OBSERVED** (cited) | §9 |
+| 24 | Official SQLAlchemy 1.3 / PostgreSQL 15 ordering semantics | **OBSERVED** (cited) | §4.1, §9 |
+| 25 | Confirmed external SMTP delivery | **NOT confirmed** — `NOT_SEND_EMAIL=true`; success = application acceptance + enqueue only (explicitly bounded, not claimed) | §2.2, §4.2, §7.3, §10 |
+| 26 | Same-unchanged-input, ≥2 runs per condition, every run disclosed | **OBSERVED** | §7 |
+| 27 | Temporary harness cleanup (per-file absence proof) | **OBSERVED** | §13 |
+
+**Net:** every part of the question is answered from runtime observation, with two items explicitly bounded as `[inferred]` (a different plan/layout returning the other row; a live concurrency race) and one explicitly **not** claimed (confirmed external SMTP delivery under `NOT_SEND_EMAIL=true`). These bounds are stated wherever the related claims appear, not only here.
 
 ---
 
-## 11. Coverage Pass
+## 13. Repository invariant & cleanup proof
 
-Every requirement and named item from the prompt/AAP, mapped to the section that answers it:
-
-| Requirement / named item | Section(s) | Status |
-|---------------------------|------------|--------|
-| Reply-address derivation (`rcpt_to` → domain gate → `normalize_reply_email`) | §3, §3.1 | ✅ |
-| Contact resolution via `Contact.get_by(reply_email=...)` | §4.1, §4.2 | ✅ |
-| `ModelMixin.get_by()` `.first()` no-`ORDER BY` semantics | §4.1, §6.3, §7.5 | ✅ |
-| Extracted/normalized reply value (actual runtime value) | §3.1, §4.2 | ✅ |
-| Resolved `Contact` `id` / `alias_id` / `user_id` | §4.2 | ✅ |
-| Forwarding destination (alias / user / mailbox) | §5, §5.1 | ✅ |
-| Resulting `EmailLog` (`contact_id`/`alias_id`/`user_id`/`mailbox_id`) | §5.1, §4.2 | ✅ |
-| Cross-event behavior: same reply → different users over time | §7.1–§7.3, §7.5 | ✅ |
-| Root cause — uniqueness (no `UNIQUE` on `reply_email`) | §6.1 | ✅ |
-| Root cause — race/TOCTOU (`available_sl_email`) | §6.2 | ✅ (concurrency window `[inferred]`) |
-| Root cause — timing/ordering (`.first()` arbitrary row) | §6.3, §7.4, §7.5 | ✅ (observed) |
-| Wrong-user causally explained (cause → effect) | §6.3–§6.4, §7.3 | ✅ |
-| E501 (reply domain not `EMAIL_DOMAIN`/`SLDomain`) | §8.1 | ✅ |
-| E502 — no contact | §8.1 | ✅ |
-| E502 — inactive/soft-deleted user | §8.1 | ✅ |
-| E214 — unknown mailbox + alert to resolved owner | §8.1 | ✅ |
-| `normalize_reply_email()` many-to-one collision | §8.1, §8.2 | ✅ |
-| Second lookup site `replace_header_when_reply()` (`:364`/`:380`) | §8.3 | ✅ |
-| Routing/bounce lookups (`:1998`, `:2009`, `:2167`) | §6.5 | ✅ (`file:line`; `[inferred]` reuse) |
-| Forward-phase minting (`:299`) + `generate_reply_email` | §6.7 | ✅ |
-| `is_reverse_alias()` routing predicate | §4.2, §8.1, §6.5 | ✅ |
-| Uniqueness proof (model `:1875`/`:1899` + migration `:22`) | §6.1 | ✅ |
-| Reverse-alias intended invariant (web) vs schema reality | §9 | ✅ |
-| Canonical vs non-canonical distinction | §2.5, §4.2 | ✅ |
-| Scale stated (N=100) + stability across ≥2 runs | §2.5, §7.1–§7.3 | ✅ |
-| Repository left unchanged (only this doc) | §12 | ✅ |
-
-**Labeling summary:** the ordering-dependent wrong-user behavior, the duplicate persistence, the resolved values, all error codes, the normalization collision, and the second lookup are **observed**. The TOCTOU *concurrency* window and the "could resolve differently under other physical/plan conditions" nuance are **`[inferred]`** (grounded in code + confirmed absence of a `UNIQUE` constraint + the forced-plan `EXPLAIN`). The direct `Contact.get_by` corroboration in §4.2 is **`[non-canonical]`**.
-
-
----
-
-## 12. Repository Invariant
-
-The investigation was read-only. All temporary observation scripts (`/tmp/observe_reply.py`, `/tmp/observe_dist.py`, `/tmp/observe_edge.py`, `/tmp/observe_norm.py`, `/tmp/observe_second.py`) lived **outside** the repository tree and were deleted after the observations were captured. No product/source/migration/test/configuration file was modified, and no remediation (no `UNIQUE` constraint, no `ORDER BY`, no atomic guard, no migration, no refactor) was performed.
-
-The closing check below confirms the working tree contains **only** this new answer document.
+**Cleanup — explicit per-file absence proof.** Every temporary harness lived in `/tmp` (host `/tmp/harness/`, container `/tmp/`), outside the repository. After capturing evidence they were removed; a bounded `test ! -e` per named script confirms absence (the command prints `ABSENT` for each and exits 0), alongside a `find` that returns nothing:
 
 **Command:**
 
 ```
-git status --porcelain -uall
+for f in _bootstrap observe_reply observe_handle observe_wronguser observe_dist \
+         observe_edge observe_norm observe_avail observe_second; do
+  test ! -e "/tmp/harness/$f.py" && echo "ABSENT(host): /tmp/harness/$f.py" || echo "PRESENT(host): /tmp/harness/$f.py"
+  docker exec sl_app bash -lc "test ! -e /tmp/$f.py && echo 'ABSENT(container): /tmp/$f.py' || echo 'PRESENT(container): /tmp/$f.py'"
+done
+echo "--- find (host) ---"; find /tmp/harness -maxdepth 1 \( -name 'observe_*.py' -o -name '_bootstrap.py' \) 2>&1 | sort
+echo "--- ls (container) ---"; docker exec sl_app bash -lc "ls /tmp/observe_*.py /tmp/_bootstrap.py 2>&1 | sort"
 ```
 
-**Output (complete, unedited):**
+**Output (complete, unedited; captured immediately after the harnesses were deleted):**
 
 ```
-?? blitzy/documentation/app_2cd6ee777f8c.md
+ABSENT(host): /tmp/harness/_bootstrap.py
+ABSENT(container): /tmp/_bootstrap.py
+ABSENT(host): /tmp/harness/observe_reply.py
+ABSENT(container): /tmp/observe_reply.py
+ABSENT(host): /tmp/harness/observe_handle.py
+ABSENT(container): /tmp/observe_handle.py
+ABSENT(host): /tmp/harness/observe_wronguser.py
+ABSENT(container): /tmp/observe_wronguser.py
+ABSENT(host): /tmp/harness/observe_dist.py
+ABSENT(container): /tmp/observe_dist.py
+ABSENT(host): /tmp/harness/observe_edge.py
+ABSENT(container): /tmp/observe_edge.py
+ABSENT(host): /tmp/harness/observe_norm.py
+ABSENT(container): /tmp/observe_norm.py
+ABSENT(host): /tmp/harness/observe_avail.py
+ABSENT(container): /tmp/observe_avail.py
+ABSENT(host): /tmp/harness/observe_second.py
+ABSENT(container): /tmp/observe_second.py
+--- find (host) ---
+--- ls (container) ---
+ls: cannot access '/tmp/_bootstrap.py': No such file or directory
+ls: cannot access '/tmp/observe_*.py': No such file or directory
 ```
 
-`git status` shows a single untracked file — `blitzy/documentation/app_2cd6ee777f8c.md` — and nothing else. (`-uall` lists individual untracked files; the empty `blitzy/screenshots/` and `blitzy/screen_recordings/` directories contain no files and are therefore not reported by git.) The repository is otherwise pristine; the temporary observation scripts under `/tmp/` were removed.
+**Repository integrity — scoped to the destination repository.** All integrity claims are scoped to the **destination** repository (branch `blitzy-3fc9b061-bac4-42a9-b984-8eaab62d81e6`, §2.3); the canonical container's `/app` is a separate, detached, setup-dirty checkout (§2.3) and is used only as the read-only runtime. In the destination repository, the sole change is the creation of this one Markdown file:
 
+**Command + output (complete, unedited):**
+
+```
+$ git status --porcelain
+ M blitzy/documentation/app_2cd6ee777f8c.md
+$ git diff --check; echo "exit=$?"
+exit=0
+```
+
+No product, source, model, migration, test, configuration, or manifest file was modified; no dependency or lockfile entry was added, updated, or removed; and no defect remediation was performed. The investigated condition (a `reply_email` with no `UNIQUE` constraint resolved by an unordered `.first()`) is documented, not fixed — by design and per scope.
+
+---
+
+## References (resolvable citations)
+
+- SimpleLogin Docs — Reverse alias: https://simplelogin.io/docs/getting-started/reverse-alias/
+- SimpleLogin Docs — Send emails from your alias: https://simplelogin.io/docs/getting-started/send-email/
+- SimpleLogin FAQ: https://simplelogin.io/faq/
+- SQLAlchemy 1.3 — Query API (`Query.first()`): https://docs.sqlalchemy.org/en/13/orm/query.html
+- SQLAlchemy FAQ — Why is ORDER BY recommended with LIMIT: https://docs.sqlalchemy.org/en/13/faq/ormconfiguration.html#faq-query-deduplicating
+- PostgreSQL 15 — §7.5 Sorting Rows (ORDER BY): https://www.postgresql.org/docs/15/queries-order.html
+- PostgreSQL 15 — SELECT: https://www.postgresql.org/docs/15/sql-select.html
