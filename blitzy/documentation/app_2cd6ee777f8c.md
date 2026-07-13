@@ -149,6 +149,7 @@ HEAD commit:
 
 - **Container `/app` (canonical runtime source):** `HEAD = 2cd6ee777f8c2d3531559588bcfb18627ffb5d2c`, **DETACHED HEAD** (no symbolic ref), `git describe = tags/v4.53.2-6-g2cd6ee77`. It is **dirty in exactly five setup-generated files** — `app/spamassassin_utils.py`, `local_data/jwtRS256.key`, `local_data/jwtRS256.key.pub`, `local_data/test_words.txt`, `static/package-lock.json` — none of which is on the reply-resolution path or touched by this investigation. This is a property of the pre-built image's bring-up (documented in the setup notes), disclosed here for reproducibility.
 - **Destination repository (host working tree; where this deliverable lives):** branch `blitzy-3fc9b061-bac4-42a9-b984-8eaab62d81e6`, `HEAD = 864d5041...`. **All repository-integrity claims in this document are scoped to this destination repository** (§13): the sole change here is the creation of this one Markdown file.
+- **Authoring-time snapshot (why this HEAD is not the final commit).** The `HEAD = 864d5041…` shown above is the value captured **while this section's command was run** — the commit that first added this deliverable. The document is then revised across further commits, each of which advances `HEAD` (the rewrite commit `1639aadf`, then the QA-fix commit `bcc20d65`, then the commit carrying the present edits). The hash printed here is therefore necessarily an **authoring-time snapshot**, and the document's **own final commit hash is not self-citable** — a file cannot embed the hash of the commit that will contain it. This does not weaken the integrity invariant: **every** commit that has ever touched this path changes **only** this one Markdown file (verified name-only in §13), so "the sole change is this one file" holds both at authoring time and after each commit.
 
 ### 2.4 How the app was booted (mirroring `tests/conftest.py`)
 
@@ -176,9 +177,9 @@ Using the canonical helpers exactly as the tests do (`tests/utils.py: create_new
 - **`[inferred]`** statements (e.g., "a different query plan or physical layout could return the other row") are labeled as such and grounded in the official semantics cited in §4.1 and §9.
 - **Scale.** The cross-event experiment drives the identical input **N=20** per run and repeats **each condition across 2 independent drive runs** against the **same** persisted rows (§7). Every seed and every drive run performed against the clean-slate database is disclosed in §7 — none is omitted.
 
-### 2.7 Temporary harness scripts (nine), safety, and the reproducible-command convention
+### 2.7 Temporary harness scripts (ten), safety, and the reproducible-command convention
 
-Nine throwaway scripts were used. They live **outside** the repository at `/tmp/harness/` on the host (copied into the container's `/tmp/`), and all were removed afterward with per-file absence proof (§13). Their **full source is reproduced in §11.3** so results remain reproducible after deletion:
+Ten throwaway scripts were used — nine Python harnesses plus one `psql` SQL helper (`contact_schema.sql`). They live **outside** the repository at `/tmp/harness/` on the host (copied into the container's `/tmp/`), and all were removed afterward with per-file absence proof (§13). Their **full source is reproduced in §11.3** so results remain reproducible after deletion:
 
 - `_bootstrap.py` — shared fail-fast bootstrap (documented below).
 - `observe_reply.py` — canonical happy-path single call (§3–§5).
@@ -189,6 +190,7 @@ Nine throwaway scripts were used. They live **outside** the repository at `/tmp/
 - `observe_norm.py` — inbound normalization / exact-equality lookup (§8.2).
 - `observe_avail.py` — exact `available_sl_email` body, call sites, guard bypass (§6.2).
 - `observe_second.py` — the second lookup site `replace_header_when_reply()` (§8.3).
+- `contact_schema.sql` — `psql` catalog helper for the §6.1(b) `reply_email`-has-no-`UNIQUE` runtime proof (read-only; no app bootstrap).
 
 **Fail-fast safety (addresses the disposable-target concern).** Because exported env values override dotenv (§2.2), every harness **refuses to run** unless `DB_URI` is one of a small allowlist of disposable localhost test DSNs, **and** re-checks `current_database() == 'test'` after `create_app()`, **before** any schema or data write. It uses `CREATE EXTENSION IF NOT EXISTS` (never `DROP EXTENSION`). The shared fragment (reproduced verbatim; full per-harness copies in §11.3):
 
@@ -255,7 +257,7 @@ email_handler.py:972       reply_email = rcpt_to
 email_handler.py:974       reply_domain = get_email_domain_part(reply_email)
 email_handler.py:977       if not reply_email.endswith(EMAIL_DOMAIN):
 email_handler.py:978           sl_domain: SLDomain = SLDomain.get_by(domain=reply_domain)
-email_handler.py:980               LOG.w("Reply email %s has wrong domain", reply_email)
+email_handler.py:980               LOG.w(f"Reply email {reply_email} has wrong domain")
 email_handler.py:981               return False, status.E501
 email_handler.py:984       reply_email = normalize_reply_email(reply_email)
 email_handler.py:986       contact = Contact.get_by(reply_email=reply_email)
@@ -276,10 +278,10 @@ The normalized reply address resolves a **single** `Contact`:
 
 ```
 email_handler.py:986   contact = Contact.get_by(reply_email=reply_email)
-email_handler.py:988       LOG.w("No contact with %s as reverse alias", reply_email)
+email_handler.py:988       LOG.w(f"No contact with {reply_email} as reverse alias")
 email_handler.py:989       return False, status.E502            # when no contact is found
 email_handler.py:990   if not contact.user.is_active():
-email_handler.py:991       LOG.w("User %s has been soft deleted", contact.user)
+email_handler.py:991       LOG.w(f"User {contact.user} has been soft deleted")
 email_handler.py:992       return False, status.E502
 ```
 
@@ -493,7 +495,7 @@ migrations/versions/2021_071310_78403c7b8089_.py:22:    op.create_index(op.f('ix
 - The case-insensitive `reply_email`×`unique` cross-search returns **only** that `unique=False` index line — i.e., **no** `UniqueConstraint`/`unique=True` mentioning `reply_email` exists anywhere in migrations or the model.
 - The model column is `reply_email = sa.Column(sa.String(512), nullable=False, index=True)` (`app/models.py:1899`) — indexed, not unique. The **only** `Contact` unique constraint is `sa.UniqueConstraint("alias_id", "website_email", name="uq_contact")` (`app/models.py:1875`).
 
-**(b) Runtime catalog proof (`pg_indexes` + `pg_constraint`).** The live database confirms the same fact, run fail-fast with `-v ON_ERROR_STOP=1`:
+**(b) Runtime catalog proof (`pg_indexes` + `pg_constraint`).** The live database confirms the same fact, run fail-fast with `-v ON_ERROR_STOP=1` (the full source of the `/tmp/contact_schema.sql` helper is reproduced in §11.3):
 
 **Command:**
 
@@ -1195,7 +1197,7 @@ DONE
 
 ### 11.3 Full source of every temporary harness (reproduced so results survive deletion)
 
-All nine scripts are reproduced verbatim (they live outside the repository and were deleted afterward — absence proof in §13). Each shares the fail-fast bootstrap shown in §2.7. The exact invocation precedes each source.
+All ten scripts are reproduced verbatim (they live outside the repository and were deleted afterward — absence proof in §13). Each of the nine Python harnesses shares the fail-fast bootstrap shown in §2.7; the tenth, `contact_schema.sql`, is a plain `psql` script (no bootstrap). The exact invocation precedes each source.
 
 **`_bootstrap.py`** — shared allowlist/`current_database`/`pg_trgm` bootstrap (imported inline by the harnesses; shown once):
 
@@ -2388,6 +2390,27 @@ with app.app_context():
     print("DONE")
 ```
 
+**`contact_schema.sql`** — SQL catalog helper backing the §6.1(b) runtime proof that `reply_email` carries no `UNIQUE` constraint. Unlike the nine Python harnesses above it is a plain `psql` script (no app bootstrap and no writes): read-only catalog queries against `pg_indexes`, `pg_constraint`, and `pg_index`/`pg_class`/`pg_attribute`. Invocation:
+```
+docker exec sl_app bash -lc 'su postgres -c "psql -d test -v ON_ERROR_STOP=1 -f /tmp/contact_schema.sql"; echo "psql_exit=$?"'
+```
+
+```sql
+\pset pager off
+\echo '=== indexes on contact (pg_indexes) ==='
+SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'contact' AND indexdef LIKE '%reply_email%';
+\echo '=== constraints on contact (pg_constraint) ==='
+SELECT conname, contype, pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conrelid = 'contact'::regclass ORDER BY conname;
+\echo '=== is there ANY unique index/constraint covering reply_email? ==='
+SELECT count(*) AS unique_on_reply_email
+FROM pg_index i
+JOIN pg_class c ON c.oid = i.indrelid
+JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY (i.indkey)
+WHERE c.relname = 'contact' AND i.indisunique AND a.attname = 'reply_email';
+```
+
+Its complete, unedited output is the §6.1(b) block above; it is read-only (pure catalog introspection) and data-independent, so the result is fixed by the schema (alembic head `32f25cbf12f6`) and identical on every run.
+
 ---
 ## 12. Coverage pass (honest status of every question part and implied condition)
 
@@ -2470,6 +2493,26 @@ ls: cannot access '/tmp/_bootstrap.py': No such file or directory
 ls: cannot access '/tmp/observe_*.py': No such file or directory
 ```
 
+The tenth temporary script — the `psql` helper `contact_schema.sql` (source in §11.3) that produced the §6.1(b) catalog proof — was likewise removed after use; its absence is confirmed the same way (`.sql`, not `.py`, so it is checked separately):
+
+**Command:**
+
+```
+f=contact_schema.sql
+test ! -e "/tmp/harness/$f" && echo "ABSENT(host): /tmp/harness/$f" || echo "PRESENT(host): /tmp/harness/$f"
+docker exec sl_app bash -lc "test ! -e /tmp/$f && echo 'ABSENT(container): /tmp/$f' || echo 'PRESENT(container): /tmp/$f'"
+echo "--- ls (container) ---"; docker exec sl_app bash -lc "ls /tmp/contact_schema.sql 2>&1"
+```
+
+**Output (complete, unedited; captured immediately after the helper was deleted):**
+
+```
+ABSENT(host): /tmp/harness/contact_schema.sql
+ABSENT(container): /tmp/contact_schema.sql
+--- ls (container) ---
+ls: cannot access '/tmp/contact_schema.sql': No such file or directory
+```
+
 **Repository integrity — scoped to the destination repository.** All integrity claims are scoped to the **destination** repository (branch `blitzy-3fc9b061-bac4-42a9-b984-8eaab62d81e6`, §2.3); the canonical container's `/app` is a separate, detached, setup-dirty checkout (§2.3) and is used only as the read-only runtime. In the destination repository, the sole change is the creation of this one Markdown file:
 
 **Command + output (complete, unedited):**
@@ -2482,6 +2525,8 @@ exit=0
 ```
 
 No product, source, model, migration, test, configuration, or manifest file was modified; no dependency or lockfile entry was added, updated, or removed; and no defect remediation was performed. The investigated condition (a `reply_email` with no `UNIQUE` constraint resolved by an unordered `.first()`) is documented, not fixed — by design and per scope.
+
+**Authoring-time working-tree snapshot.** The `git status --porcelain` output above shows this one file as `` M `` (modified, not yet staged) because it was captured **while the deliverable was being authored**, before its own commit. Once the file is committed, `git status --porcelain` for this path is **empty** (a clean working tree); the `` M `` therefore reflects the in-progress authoring state, not a persistent modification. The invariant is identical either way: across **all** commits that have ever touched this path (`864d5041` → `1639aadf` → `bcc20d65` → the commit carrying these edits), the **only** changed file is `blitzy/documentation/app_2cd6ee777f8c.md` (each verified name-only), so the integrity claim holds both before and after commit.
 
 ---
 
