@@ -1175,7 +1175,9 @@ authenticates:
 (`server.py:L332-336`) returns `g.user` else `current_user`, but at runtime its **only** consumer is
 the 429 rate-limit logger (`server.py:L367`) — it is *not* the general convergence point for normal
 requests. Each non-excluded request ends with the `after_request` logger (`server.py:L273-296`,
-`LOG.d(` at `L284`) emitting one `SL` line, then `teardown_appcontext` runs `Session.remove()`.
+`LOG.d(` at `L284`) emitting one `SL` line, then the registered `teardown_appcontext` callback runs `Session.remove()`
+(Inferred — the callback registration is observed, and Flask fires teardown callbacks by guarantee,
+but the per-request invocation itself is not separately logged).
 
 **Session storage has two backends, both exercised.** With `MEM_STORE_URI` set (`server.py:L163-165`
 → `initialize_redis_services`), a server-side `RedisSessionStore` keeps the data under
@@ -1251,6 +1253,25 @@ psql ... "update users set delete_on=(now() + interval '7 days') where id=5;"  #
 export MEM_STORE_URI=""              # Flask default signed-cookie interface
 /app/venv/bin/python server.py &     # RUN-Q5-COOKIE-N
 # ... web login as above; then decode the 'slapp' cookie with base64url+zlib and NO secret key.
+
+# (G) WEB LOGOUT lifecycle (fresh login on jar cj_logout.txt, then logout + post-logout probe):
+curl -s -D - -o login_body.html -c cj_logout.txt "$BASE/auth/login"                    # anon GET -> CSRF
+CSRF=$(grep -oE 'name="csrf_token"[^>]*value="[^"]+"' login_body.html | head -1 | sed -E 's/.*value="([^"]+)".*/\1/')
+curl -s -o /dev/null -b cj_logout.txt -c cj_logout.txt \
+  --data-urlencode "email=john@wick.com" --data-urlencode "password=password" \
+  --data-urlencode "csrf_token=$CSRF" "$BASE/auth/login"                               # POST -> 302 /dashboard/ (login)
+curl -s -D web_before_logout_dashboard.txt -o /dev/null -b cj_logout.txt "$BASE/dashboard/"  # BEFORE -> 200
+curl -s -D web_logout.txt -o /dev/null -b cj_logout.txt -c cj_logout.txt "$BASE/auth/logout" # -> 302 + Set-Cookie Max-Age=0 (slapp/mfa/dark-mode)
+curl -s -D web_after_logout_dashboard.txt -o /dev/null -b cj_logout.txt "$BASE/dashboard/"   # AFTER -> 302 login
+# (Redis session dump BEFORE vs AFTER logout -> redis_logout.txt; the authenticated key is purged)
+
+# (H) API REVOKED-KEY over HTTP on a concrete endpoint (/api/user_info):
+curl -s -i -H 'Content-Type: application/json' \
+  -d '{"email":"john@wick.com","password":"password","device":"blitzy-q5-revoke"}' \
+  "$BASE/api/auth/login"                                                               # acquire -> api_revoke_acquire.txt (key K)
+curl -s -i -H "Authentication: $K" "$BASE/api/user_info"                               # use     -> 200  api_revoke_use.txt
+psql ... "delete from api_key where code='$K';"                                        # revoke (delete the row)
+curl -s -i -H "Authentication: $K" "$BASE/api/user_info"                               # reuse   -> 401 Wrong api key  api_revoke_after.txt
 ```
 
 
@@ -1695,6 +1716,156 @@ base64-decoded payload (no secret key used => readable => signed, NOT encrypted)
 ```
 
 
+#### (G) Web logout — session destruction & post-logout rejection
+
+The web-session lifecycle is completed by **logout**. `GET /auth/logout` routes to `logout()`
+(`app/auth/views/logout.py:L8-9`), which calls `logout_session()` (`app/session.py:L117-121` —
+Flask-Login's `logout_user()` at `L118`, and, for the Redis backend, `purge_session()` at
+`L119-121`), then returns a `302` to `auth.login` while **deleting** the `slapp`, `mfa`, and
+`dark-mode` cookies (`app/auth/views/logout.py:L13-15`; `SESSION_COOKIE_NAME = "slapp"` at
+`app/config.py:L199`). Captured on one cookie jar (`cj_logout.txt`); the session id / CSRF shown are
+dynamic per run.
+
+**(g-1) BEFORE — authenticated `GET /dashboard/`** (logged in as john@wick.com) —
+`web_before_logout_dashboard.txt` (`200`, the "before" state):
+
+```text
+HTTP/1.0 200 OK
+Content-Type: text/html; charset=utf-8
+Content-Length: 753966
+Set-Cookie: slapp=eb6071a0-37ea-43d7-a806-f5767a8433d4.KJfJfHhbLc_1J1VbqRR7QyxDHlo; Expires=Mon, 20-Jul-2026 23:26:39 GMT; HttpOnly; Path=/; SameSite=Lax
+Server: Werkzeug/1.0.1 Python/3.10.18
+Date: Mon, 13 Jul 2026 23:26:39 GMT
+```
+
+**(g-2) `GET /auth/logout`** — `web_logout.txt`. `302` to `/auth/login`; the response **deletes**
+`slapp`/`mfa`/`dark-mode` (each `Expires=Thu, 01-Jan-1970 00:00:00 GMT; Max-Age=0`) and, in the same
+response, opens a **fresh anonymous** `slapp` session id (Flask starts a new empty session once the
+authenticated one is cleared):
+
+```text
+HTTP/1.0 302 FOUND
+Content-Type: text/html; charset=utf-8
+Content-Length: 229
+Location: http://localhost:7777/auth/login
+Set-Cookie: slapp=; Expires=Thu, 01-Jan-1970 00:00:00 GMT; Max-Age=0; Path=/
+Set-Cookie: mfa=; Expires=Thu, 01-Jan-1970 00:00:00 GMT; Max-Age=0; Path=/
+Set-Cookie: dark-mode=; Expires=Thu, 01-Jan-1970 00:00:00 GMT; Max-Age=0; Path=/
+Set-Cookie: slapp=11e32c66-a9e5-4a0b-9fbc-d992485346de.sNyzhtXjbkZF-OoyTXurQdIcebY; Expires=Mon, 20-Jul-2026 23:26:39 GMT; HttpOnly; Path=/; SameSite=Lax
+Server: Werkzeug/1.0.1 Python/3.10.18
+Date: Mon, 13 Jul 2026 23:26:39 GMT
+```
+
+Server-side session purge (Redis) — `redis_logout.txt`. The authenticated session key existed with
+`ttl=604800` (7 days) **before** logout and is **gone** afterwards (`purge_session()` deleted it):
+
+```text
+--- redis BEFORE logout ---
+session:eb6071a0-37ea-43d7-a806-f5767a8433d4
+604800
+--- redis AFTER logout ---
+keys matching session:eb6071a0-37ea-43d7-a806-f5767a8433d4 => 0
+```
+
+**(g-3) AFTER — post-logout `GET /dashboard/`** on the **same** cookie jar —
+`web_after_logout_dashboard.txt`. `302` to `/auth/login?next=%2Fdashboard%2F%3F`: the jar now carries
+only the fresh anonymous session (no `_user_id`), so the protected page no longer authenticates:
+
+```text
+HTTP/1.0 302 FOUND
+Content-Type: text/html; charset=utf-8
+Content-Length: 277
+Location: http://localhost:7777/auth/login?next=%2Fdashboard%2F%3F
+Set-Cookie: slapp=11e32c66-a9e5-4a0b-9fbc-d992485346de.sNyzhtXjbkZF-OoyTXurQdIcebY; Expires=Mon, 20-Jul-2026 23:26:39 GMT; HttpOnly; Path=/; SameSite=Lax
+Server: Werkzeug/1.0.1 Python/3.10.18
+Date: Mon, 13 Jul 2026 23:26:39 GMT
+```
+
+#### (H) API revoked key over HTTP — a concrete `/api/user_info` request
+
+Revocation is exercised **end-to-end over HTTP** on a concrete endpoint: acquire a key canonically,
+use it, delete its row (revoke), then re-issue the **same** request bearing the now-revoked key.
+On the revoked key, `ApiKey.get_by(code=...)` (`app/api/base.py:L18`) returns `None`, so
+`authorize_request()` takes the no-key branch (`if not api_key:` `L20`); with no web session on the
+request it returns `401 {"error": "Wrong api key"}` (`L27`). The key value below is a disposable
+DEVELOPMENT-only key created solely for this test and deleted at the revoke step; it is dynamic per
+run.
+
+**(h-1) ACQUIRE — `POST /api/auth/login`** (device `blitzy-q5-revoke`) — `api_revoke_acquire.txt`
+(`200`, returns the `api_key`):
+
+```text
+HTTP/1.0 200 OK
+Content-Type: application/json
+Content-Length: 178
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=ec5b849b-9256-4595-a1f8-19317416c382.bj4P_neGd_WNKorqLCTSWocrkIo; Expires=Mon, 20-Jul-2026 23:28:02 GMT; HttpOnly; Path=/; SameSite=Lax
+Server: Werkzeug/1.0.1 Python/3.10.18
+Date: Mon, 13 Jul 2026 23:28:02 GMT
+
+{
+  "api_key": "yfhvaggkgrijkxqlwckljeaedsodnqrlplzczuexlsusenelnnfiwetvjcoq", 
+  "email": "john@wick.com", 
+  "mfa_enabled": false, 
+  "mfa_key": null, 
+  "name": "John Wick"
+}
+```
+
+The acquired key is persisted as an **owned** `api_key` row (`user_id=1` = john) — `revoke_db.txt`
+(top block):
+
+```text
+--- api_key row for acquired key BEFORE revoke (id|name|user_id|times) ---
+8|blitzy-q5-revoke|1|0
+--- rows matching that code AFTER revoke (expect 0) ---
+0
+```
+
+**(h-2) USE — valid key `GET /api/user_info`** — `api_revoke_use.txt` (`200`, john's user JSON):
+
+```text
+HTTP/1.0 200 OK
+Content-Type: application/json
+Content-Length: 279
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=d2e62c8a-cb83-4f55-8386-7712c1d976e7.faB83t0-urDIcKHtohwRb9c8NbE; Expires=Mon, 20-Jul-2026 23:28:02 GMT; HttpOnly; Path=/; SameSite=Lax
+Server: Werkzeug/1.0.1 Python/3.10.18
+Date: Mon, 13 Jul 2026 23:28:02 GMT
+
+{
+  "can_create_reverse_alias": true, 
+  "connected_proton_address": null, 
+  "email": "john@wick.com", 
+  "in_trial": false, 
+  "is_premium": true, 
+  "max_alias_free_plan": 3, 
+  "name": "John Wick", 
+  "profile_picture_url": "http://localhost/static/upload/profile_pic.svg"
+}
+```
+
+**(h-3) REVOKE** — the key row is deleted; the `revoke_db.txt` bottom block above confirms `0` rows
+remain matching that `code`.
+
+**(h-4) REUSE over HTTP — the same, now-revoked key `GET /api/user_info`** — `api_revoke_after.txt`
+(`401`, body `Wrong api key` from `app/api/base.py:L27` — **not** the generic 401 errorhandler that
+would say `"Unauthorized"`):
+
+```text
+HTTP/1.0 401 UNAUTHORIZED
+Content-Type: application/json
+Content-Length: 31
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=64175680-b23c-4ada-abf2-2f69cbd73b67.y6_34wWYteArZcGi9CDIhtDbqKs; Expires=Mon, 20-Jul-2026 23:28:02 GMT; HttpOnly; Path=/; SameSite=Lax
+Server: Werkzeug/1.0.1 Python/3.10.18
+Date: Mon, 13 Jul 2026 23:28:02 GMT
+
+{
+  "error": "Wrong api key"
+}
+```
+
 ### File:line grounding
 
 - **Entry / middleware:** `server.py:L142` `app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_host=1)`
@@ -1727,10 +1898,11 @@ base64-decoded payload (no secret key used => readable => signed, NOT encrypted)
 - **Propagation helper (correction):** `server.py:L332-336` `get_current_user()` returns `g.user`
   else `current_user`; its **only** runtime consumer is the 429 handler `server.py:L367`
   (`LOG.w(..., get_current_user())`). Normal web views use `current_user`; `/api/user_info`
-  (`app/api/user_info.py:L50-51`, `@require_api_auth`) reads `g.user`.
+  (`app/api/views/user_info.py:L50-51`, `@require_api_auth`) reads `g.user`.
 - **Per-request log + teardown:** `server.py:L273` `def after_request(res):`; the `LOG.d(` call opens
-  at `L284` (hence the emitted `"/app/server.py:284"`); skip-list `L276-281`; `teardown_appcontext`
-  runs `Session.remove()` (`server.py:L209-211`).
+  at `L284` (hence the emitted `"/app/server.py:284"`); skip-list `L276-281`; the registered `teardown_appcontext`
+  callback runs `Session.remove()` (`server.py:L209-211`) — **Inferred** (framework-guaranteed: the
+  callback registration is observed, but its per-request invocation is not separately logged).
 - **Session backend selection:** `server.py:L163` `if MEM_STORE_URI:` → `L165`
   `initialize_redis_services(app, MEM_STORE_URI)` (`app/redis_services.py:L9`, which sets
   `app.session_interface = RedisSessionStore(...)`).
@@ -1744,6 +1916,17 @@ base64-decoded payload (no secret key used => readable => signed, NOT encrypted)
   while the web branch returns `redirect(url_for("auth.login", next=request.full_path))` (**`L353`**,
   the exact redirect the review flagged); `server.py:L355-360` `forbidden(e)` — `/api/*` →
   `jsonify(error="Forbidden"), 403` (`L358`), web → `render_template("error/403.html"), 403` (`L360`).
+- **Web logout (subsection G):** `app/auth/views/logout.py:L8` `@auth_bp.route("/logout")`, `L9`
+  `def logout():`; `L10` `logout_session()` (`app/session.py:L117-121` — `logout_user()` `L118`,
+  and for the Redis backend `purge_session()` `L119-121`); `L12`
+  `make_response(redirect(url_for("auth.login")))`; `L13-15` `response.delete_cookie(...)` for
+  `SESSION_COOKIE_NAME` (=`"slapp"`, `app/config.py:L199`), `"mfa"`, and `"dark-mode"`; `L17`
+  `return response`.
+- **API key revocation over HTTP (subsection H):** once the `api_key` row is deleted, the
+  `authorize_request()` lookup `ApiKey.get_by(code=api_code)` (`app/api/base.py:L18`) returns `None`,
+  so the no-key branch `if not api_key:` (`L20`) is taken and — absent a web session — it returns
+  `jsonify(error="Wrong api key"), 401` (`L27`), i.e. the revoked key follows the identical code path
+  as any wrong key.
 
 ### Observed vs Inferred
 
@@ -1756,12 +1939,22 @@ base64-decoded payload (no secret key used => readable => signed, NOT encrypted)
   exist`); both web `load_user` guards (disabled → `302`, inactive → `302`, restore → `200`); the 17
   correlated `SL` request-log lines (PID 5673) with `/health`, `/static`, `/git`, `/favicon.ico`
   excluded; and both session backends (Redis server-side vs signed-cookie, the latter creating no
-  Redis key and decoding — without any secret — to the same `_user_id`).
+  Redis key and decoding — without any secret — to the same `_user_id`); the **web logout**
+  lifecycle (subsection G) — authenticated `/dashboard/` `200` (before) → `GET /auth/logout` `302`
+  with `slapp`/`mfa`/`dark-mode` deleted (`Max-Age=0`) and the server-side Redis session purged
+  (`ttl=604800` → key gone) → post-logout `/dashboard/` `302` to `/auth/login` (after); and the
+  **API-key revocation over HTTP** (subsection H) — canonical acquire (`200`) → use (`200`) → the
+  `api_key` row deleted → the same key reused over HTTP yields `401 {"error": "Wrong api key"}` on
+  the concrete endpoint `/api/user_info`.
 - **Inferred:** the generic 401/403 **errorhandler** bodies `{"error": "Unauthorized"}` /
   `{"error": "Forbidden"}` (`server.py:L350,L358`) were **not** triggered here — the API returns its
   own `authorize_request` JSON directly, so those handler bodies are read from source, not observed.
   The New Relic custom-event recording in `after_request` (`server.py`) is present in source but not
-  independently verified (no New Relic backend in dev).
+  independently verified (no New Relic backend in dev). The `teardown_appcontext` callback's
+  `Session.remove()` (`server.py:L209-211`) is likewise **Inferred at the per-request level**: the
+  callback's registration is observed (`app.teardown_appcontext_funcs` contains
+  `create_app.<locals>.cleanup`) and Flask guarantees teardown callbacks fire, but the callback body
+  emits no log/counter, so its per-request invocation is not separately observed.
 
 
 ## Q6 — Does the webapp auto-start any background jobs or schedulers?
@@ -1775,7 +1968,7 @@ modules (`cron`, `job_runner`, `event_listener`, `email_handler`) are present in
 in its worker (child) process and one in the reloader (parent) process, and **both worker threads
 belong to the Werkzeug dev-server/reloader machinery, not to any application scheduler**:
 
-- **Parent (reloader) process** — `NLWP=1`: blocked in `WerkzeugReloaderLoop.restart_with_reloader()`
+- **Parent (reloader) process** — `NLWP=1`: blocked in `StatReloaderLoop.restart_with_reloader()`
   waiting on the subprocess.
 - **Child (worker) process** — `NLWP=2`: per `werkzeug/_reloader.py:run_with_reloader` (L325), when
   `WERKZEUG_RUN_MAIN == "true"` (L332) the actual WSGI server (`main_func`) is started in a **daemon
@@ -2376,6 +2569,8 @@ body contains observed runtime evidence for it (with the section that carries th
 - [x] Both session backends (Redis server‑side vs signed cookie); before/intermediate/after TTLs — Q5 (B),(F)
 - [x] Signed cookie is signed (readable w/o secret), not encrypted — Q5 (F)
 - [x] 401 edge: web → 302 login redirect; API JSON — Q5 (A),(C) + grounding
+- [x] Web logout: `GET /auth/logout` → `302` + `slapp`/`mfa`/`dark-mode` deleted (`Max-Age=0`) + Redis session purged; post-logout `/dashboard/` → `302` (before `200` / after `302`) — Q5 (G)
+- [x] API key revoked over HTTP on a concrete endpoint: acquire `200` → use `200` → revoke → reuse `401 {"error": "Wrong api key"}` on `/api/user_info` — Q5 (H)
 
 **Q6 — background jobs / schedulers**
 - [x] Webapp starts no scheduler thread (thread counts, `sys.modules` = NONE) — Q6 output
@@ -2423,8 +2618,12 @@ after  delete: ApiKey.get_by(code=rvys...) => None
 remaining john api_keys: [(1, 'Chrome', 'code', 1), (2, 'Firefox', 'codeFF', 0)]
 ```
 
-The seeded `code`/`codeFF` keys remain as standard `flask dummy-data` seed values (`code` still
-shows `times=1` from the intentional stats side-effect demonstrated in Q5 (C)); they are disposable
+The additional disposable key created for the subsection-(H) revocation demonstration
+(`blitzy-q5-revoke`) is deleted at its revoke step — subsection (H)'s `revoke_db.txt` shows `0` rows
+remaining for that `code` — so it too is non-reusable (its reuse over HTTP is the `401 Wrong api key`
+shown in (h-4)). The seeded `code`/`codeFF` keys remain as standard `flask dummy-data` seed values
+(the `code` key's `times` counter increases monotonically with each valid-key authentication used in
+testing — a benign seed side-effect, never reset so as not to fabricate state); they are disposable
 DEVELOPMENT-only credentials in the git-ignored throwaway dev database, never production material.
 
 **Read-only proof — the host repository has exactly one modified path, this document**, on the
