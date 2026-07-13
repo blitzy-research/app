@@ -1063,7 +1063,7 @@ parallel_limiter.lock_redis  = None
 
 Consequences in default config:
 - **Token bucket is a no-op** — `check_bucket_limit` returns immediately at `app/rate_limiter.py:28-29` (`if not lock_redis: return`). OBSERVED: 60 sequential calls with `max_hits=50` raised nothing and returned `None`.
-- **Redlock guard is a pass-through** — `@parallel_limiter.lock`'s inner `decorated` returns the wrapped function directly at `app/parallel_limiter.py:52-53` (`if not lock_redis: return f(*args, **kwargs)`). (This is why the B6 race below is *possible* at all.)
+- **Redlock guard is a pass-through** — `@parallel_limiter.lock`'s inner `decorated` returns the wrapped function directly at `app/parallel_limiter.py:51-52` (`if not lock_redis: return f(*args, **kwargs)`). (This is why the B6 race below is *possible* at all.)
 - **Behavioral confirmation:** across **every** alias created in this whole investigation, the server log contains **0** occurrences of `"Cannot connect to redis"` or `"Rate limit hit for alias_create"` (`grep -c` = 0) — i.e. the bucket never even *attempts* a Redis call canonically.
 
 Thresholds (parsed, runtime-confirmed; used only when the bucket is armed): `ALIAS_CREATE_RATE_LIMIT_FREE = [(10, 900), (50, 3600)]`, `ALIAS_CREATE_RATE_LIMIT_PAID = [(50, 900), (200, 3600)]` (`app/config.py:554-558`); the key is `f"alias_create_{seconds}d:{user.id}"`.
