@@ -601,10 +601,10 @@ Two of the five are **port-binding services** that accept client connections (we
 
 ### Q2 — Service A: the web application (port 7777)
 
-The web app has two real entry points, and **both** are exercised. The **development** entry is `python server.py`, whose `local_main()` (`server.py:571`) calls `app.run(debug=True, port=7777)` (`server.py:588`) — Werkzeug's debug server binds the loopback address `127.0.0.1:7777` and forks a reloader child (hence the boot banner appears twice; the child PID differs from the leader). `/health` returns `("success", 200)` (`server.py:213-215`) and `/` returns a 302 redirect to `/auth/login` (`server.py:249-255`):
+The web app has two real entry points, and **both** are exercised. The **development** entry is `python server.py`, whose `local_main()` (`server.py:572`) calls `app.run(debug=True, port=7777)` (`server.py:588`) — Werkzeug's debug server binds the loopback address `127.0.0.1:7777` and forks a reloader child (hence the boot banner appears twice; the child PID differs from the leader). `/health` returns `("success", 200)` (`server.py:213-215`) and `/` returns a 302 redirect to `/auth/login` (`server.py:249-255`):
 
 ```text
-### Service A (dev entry): python server.py -> local_main() [server.py:571] -> app.run(debug=True, port=7777) [server.py:588]
+### Service A (dev entry): python server.py -> local_main() [server.py:572] -> app.run(debug=True, port=7777) [server.py:588]
   leader PID=8122 (process-group leader via setsid; Werkzeug debug reloader forks a child)
   waited 2s for port bind
 
