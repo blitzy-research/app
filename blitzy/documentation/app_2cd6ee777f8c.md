@@ -199,7 +199,7 @@ Three code-grounded hypotheses were tested at runtime. Each is presented with it
 
 ## (g) Edge-condition results
 
-Every distinct condition the question implies was exercised — the happy path plus the secondary/edge/error paths — through the real entry point (`MailHandler.handle_DATA`), **each scenario at least twice**. Before/after states are reported where state changes.
+Every distinct condition the question implies was exercised — the happy path plus the secondary/edge/error paths — through the real entry point (`MailHandler.handle_DATA`), **each scenario at least twice**. Before/after states are reported where state changes. The exercised set includes the multi-mailbox alias condition called out in the AAP (§0.5.1): `S7` drives a reply from an alias's secondary (non-default) authorized mailbox — and, for completeness, from its default mailbox and from an authorized delegate address.
 
 | Scenario | Condition | Runs | Observed status | Reply `EmailLog` (before → after) | Key citation |
 |----------|-----------|------|-----------------|-----------------------------------|--------------|
@@ -209,10 +209,12 @@ Every distinct condition the question implies was exercised — the happy path p
 | `S4` | Unauthorized sender, spoofing check **ON** | ×2 | `'250 SL E214 Unauthorized for using reverse alias'` (both) | none → **NONE (blocked)**; `total_stored=1`, `sent_alerts_to_owner=1` | `email_handler.py:L1032`/`L1034`, `handle_unknown_mailbox` `email_handler.py:L1390` |
 | `S5` | Unknown sender, `disable_email_spoofing_check=True` | ×2 | `'250 Message accepted for delivery'` (both) | none → created (`user_id=433`/`434`, `mailbox_id==alias.mailbox_id`, `used_default=True`) | `email_handler.py:L1023`/`L1029` |
 | `S6` | `NOREPLIES` address; bounce `mail_from == "<>"` | ×2 | `NOREPLIES → '250 Message accepted for delivery'`; bounce `→ '250 SL E206 Out of office'` | no reply routing performed | `email_handler.py:L2181–L2183`; `email_handler.py:L2166`/`email_handler.py:L2173` |
+| `S7` | Multi-mailbox alias — reply from the **secondary** (non-default) authorized mailbox (plus default mailbox and an authorized delegate address) | ×2 | all `'250 Message accepted for delivery'` (both) | none → created; `EmailLog.mailbox_id` == the **sending** mailbox (secondary→secondary, default→default, delegate→mapped default) | `email_handler.py:L1019`/`L1364`; `app/models.py:L1580–L1590` |
 
 - **(observed) `S4` — unauthorized sender → E214 (spoofing ON):** a sender NOT authorized for the alias's mailbox is rejected with **E214** ("Unauthorized for using reverse alias") at `email_handler.py:L1034` (via `handle_unknown_mailbox` `email_handler.py:L1032`/`email_handler.py:L1390`). NO reply `EmailLog` is created (before → after: reply `EmailLog` = NONE). `total_stored=1` / `sent_alerts_to_owner=1` is the alert email sent to the legitimate user, not a relayed reply. Reproduced on both runs.
 - **(observed) `S5` — default-mailbox fallback (spoofing OFF):** with `disable_email_spoofing_check=True`, an unknown sender is NOT rejected — the code logs "ignore unknown sender to reverse-alias" at `email_handler.py:L1023`, falls back to `mailbox = alias.mailbox` at `email_handler.py:L1029`, and creates the reply `EmailLog` (`used_default=True`). Directly contrasts `S4`'s E214. Reproduced on both runs.
 - **(observed) `S6` — guard paths around the reply logic:** a message to a `NOREPLIES` address short-circuits at `email_handler.py:L2181–L2183` (`send_no_reply_response`) and returns `'250 Message accepted for delivery'` without reply handling. A bounce/auto-reply with `mail_from == "<>"` addressed to a reverse alias is handled as out-of-office → **E206** ("Out of office") at `email_handler.py:L2166`/`email_handler.py:L2173`, before `handle_reply` routing. Reproduced on both runs.
+- **(observed) `S7` — multi-mailbox alias, sender-driven mailbox selection:** an alias with **two** verified mailboxes (a default `mb1` and a secondary `mb2`, plus an authorized delegate address mapped to `mb1`) was replied to from each authorized origin in turn. `get_mailbox_from_mail_from(mail_from, alias)` (`email_handler.py:L1364`) selects the mailbox whose address matches `mail_from` out of `alias.mailboxes` (`app/models.py:L1580–L1590`), and the persisted `EmailLog.mailbox_id` (`email_handler.py:L1047`) equals that **sending** mailbox: default-send → default, secondary-send → **secondary** (`mailbox_id != alias.mailbox_id`), delegate-send → the mapped default (logged as `Found an authorized address` at `email_handler.py:L1376`). All three returned `250` and the selection invariants were identical across both runs — multi-mailbox authorization routes to the correct mailbox, not merely the default. Reproduced on both runs.
 
 ---
 
@@ -275,14 +277,639 @@ redis-server --daemonize yes
 cd /tmp/slrun
 CONFIG=tests/test.env /app/venv/bin/alembic upgrade head        # -> 32f25cbf12f6 (head); 77 tables
 
-# 2) Drive the REAL SMTP callback in-process for all six scenarios (each >=2x) and capture the transcript:
+# 2) Drive the REAL SMTP callback in-process for all seven scenarios (S1-S7) (each >=2x) and capture the transcript:
 cd /tmp/slrun
 CONFIG=tests/test.env GITHUB_ACTIONS_TEST=true PYTEST_ADDOPTS="" \
-  /app/venv/bin/python -m pytest tests/blitzy_reply_trace.py -s -p no:cacheprovider -p no:randomly --no-header -q
-#   -> 6 passed, 18 warnings in 5.00s
+  /app/venv/bin/python -m pytest tests/blitzy_reply_trace.py -s -p no:cacheprovider -p no:randomly -p no:warnings --no-header -q
+#   -> 7 passed in 6.13s
 ```
 
 `tests/blitzy_reply_trace.py` was a temporary observation module that lived **only** inside the run container under `/tmp/slrun/tests/` (a copy of the committed tree exported via `git archive HEAD`); it was never added to the repository and does not exist in the working tree. `/tmp/slrun` is entirely inside the container, so the repository working tree remained git-clean.
+
+Its **complete source is reproduced verbatim below**, so the command above is runnable as-is. The module contains all seven scenarios; the `S1`–`S6` raw transcripts above were captured on the initial six-scenario investigation run, while the `S7` transcript (below) was captured on a subsequent run after the multi-mailbox scenario was added — so the autoincrement `EmailLog`/`Contact`/`Alias`/`Mailbox`/`User` IDs in the `S7` block fall in a higher range than those in the `S1`–`S6` blocks. As `S1` demonstrates, only these autoincrement IDs vary run-to-run; the behaviors, statuses, and invariants are stable.
+
+(The only environment fixes applied inside the container — converting `local_data/dkim.key` to PKCS#1 and shimming `re2`→`re` in `app/spamassassin_utils.py`, both noted in the setup — are confined to the container image and touch neither the reply-pipeline code nor any cited `file:line`.)
+
+### Observation harness source (`tests/blitzy_reply_trace.py`)
+
+```python
+"""
+blitzy_reply_trace.py — temporary, read-only runtime observation harness for the
+SimpleLogin alias reply-handling root-cause analysis.
+
+It drives SimpleLogin's *canonical* inbound-SMTP entry point
+``MailHandler.handle_DATA()`` (email_handler.py:L2289) — which parses the raw
+envelope bytes with ``email.message_from_bytes`` and calls ``_handle()`` (L2335)
+-> ``handle()`` (L1945) — for the reply scenarios S1-S7. Outbound relay is
+captured non-intrusively through the production seam
+``mail_sender.store_emails_instead_of_sending()`` / ``get_stored_emails()``
+(app/mail_sender.py:L102/L108) with ``NOT_SEND_EMAIL=true`` (tests/test.env), so
+no real email leaves the environment.
+
+Nothing here is a mock, monkeypatch, or synthetic bypass: every routing
+decision, ``is_reverse_alias`` classification, ``Contact.get_by`` lookup,
+user/mailbox selection and ``EmailLog`` write is produced by the real handler.
+The module is a pytest module so it inherits the canonical ``flask_client``
+app-context + DB-session fixture from tests/conftest.py.
+
+Run (inside the canonical GHCR image container; the module lives only under the
+container run dir and is never committed):
+
+    cd /tmp/slrun
+    CONFIG=tests/test.env GITHUB_ACTIONS_TEST=true PYTEST_ADDOPTS="" \
+      /app/venv/bin/python -m pytest tests/blitzy_reply_trace.py \
+      -s -p no:cacheprovider -p no:randomly -p no:warnings --no-header -q
+
+Absolute integer IDs (user/alias/contact/mailbox/EmailLog) are assigned by the
+Postgres sequences at run time and therefore differ run-to-run; only the
+behaviors, status strings, and invariants are stable (this is exactly what S1's
+identical-input repetition demonstrates).
+"""
+
+import asyncio
+import logging
+from email.message import EmailMessage
+
+from aiosmtpd.smtp import Envelope
+
+import email_handler
+from email_handler import MailHandler
+from app import config
+from app.config import EMAIL_DOMAIN
+from app.db import Session
+from app.email import headers
+from app.email_utils import is_reverse_alias
+from app.mail_sender import mail_sender
+from app.message_utils import message_to_bytes
+from app.models import (
+    Alias,
+    AliasMailbox,
+    AuthorizedAddress,
+    Contact,
+    EmailLog,
+    Mailbox,
+)
+from app.utils import random_string
+from tests.utils import create_new_user, random_email
+
+
+# --------------------------------------------------------------------------- #
+# Logging capture: record every "SL" logger emission as (funcName, lineno, msg)
+# so we can print the stable compact form  ``LOG> funcName:lineno message``.
+# --------------------------------------------------------------------------- #
+class _LogCapture(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.records = []
+
+    def emit(self, record):
+        self.records.append((record.funcName, record.lineno, record.getMessage()))
+
+    def clear(self):
+        self.records = []
+
+
+_CAP = _LogCapture()
+_SL_LOGGER = logging.getLogger("SL")
+_SL_LOGGER.setLevel(logging.DEBUG)
+_SL_LOGGER.addHandler(_CAP)
+
+# The handler funcNames whose log lines we surface (the routing-relevant ones).
+_LOG_FUNCS_OF_INTEREST = {
+    "_handle",
+    "handle",
+    "apply_dmarc_policy_for_reply_phase",
+    "handle_reply",
+    "handle_unknown_mailbox",
+    "__check",  # nested in get_mailbox_from_mail_from -> "Found an authorized address"
+}
+
+
+def _captured_logs():
+    """Return the compact-form log lines emitted during the last drive()."""
+    out = []
+    for func, lineno, msg in _CAP.records:
+        if func in _LOG_FUNCS_OF_INTEREST:
+            out.append(f"LOG> {func}:{lineno} {msg}")
+    return out
+
+
+def _print_logs(prefix, lines):
+    for ln in lines:
+        print(f"{prefix}{ln}")
+
+
+def _emaillog_dict(el):
+    """Snapshot the EmailLog scalar fields into a plain dict immediately."""
+    if el is None:
+        return None
+    return {
+        "id": el.id,
+        "user_id": el.user_id,
+        "mailbox_id": el.mailbox_id,
+        "alias_id": el.alias_id,
+        "contact_id": el.contact_id,
+        "is_reply": el.is_reply,
+    }
+
+
+def _latest_reply_log_dict(contact_id):
+    el = (
+        EmailLog.filter_by(contact_id=contact_id, is_reply=True)
+        .order_by(EmailLog.id.desc())
+        .first()
+    )
+    return _emaillog_dict(el)
+
+
+def _max_email_log_id():
+    el = EmailLog.filter_by().order_by(EmailLog.id.desc()).first()
+    return el.id if el else 0
+
+
+def drive(mail_from, rcpt_to, msg: EmailMessage) -> str:
+    """Drive the REAL async SMTP DATA callback (the canonical entry point)."""
+    envelope = Envelope()
+    envelope.mail_from = mail_from
+    envelope.rcpt_tos = [rcpt_to]
+    envelope.original_content = msg.as_bytes()
+    _CAP.clear()
+    return asyncio.run(MailHandler().handle_DATA(None, None, envelope))
+
+
+def build_reply_msg(from_addr, reply_email, subject, body) -> EmailMessage:
+    msg = EmailMessage()
+    msg[headers.FROM] = from_addr
+    msg[headers.TO] = reply_email
+    msg[headers.SUBJECT] = subject
+    msg.set_content(body)
+    return msg
+
+
+# =========================================================================== #
+# S1 — Happy path, correctly-owned, SAME UNCHANGED INPUT x2.
+# Grounds the stability + privacy claims (Q1/Q2/Q3/Q4).
+# =========================================================================== #
+def test_s1_happy_path(flask_client):
+    mail_sender.store_emails_instead_of_sending(True)
+    print("==================== S1: HAPPY PATH — SAME UNCHANGED INPUT x2 "
+          "====================")
+    user = create_new_user()
+    alias = Alias.create_new_random(user)
+    Session.flush()
+    contact = Contact.create(
+        user_id=user.id,
+        alias_id=alias.id,
+        website_email=f"ext-s1_{random_string(6)}@external.example",
+        reply_email=f"ra+s1_{random_string(6)}@{EMAIL_DOMAIN}",
+        flush=True,
+    )
+    Session.commit()
+    # snapshot fixture scalars BEFORE any drive (drives can expire/detach ORM objs)
+    user_id = user.id
+    alias_id = alias.id
+    alias_user_id = alias.user_id
+    alias_email = alias.email
+    mailbox_email = alias.mailbox.email
+    contact_id = contact.id
+    contact_user_id = contact.user_id
+    website = contact.website_email
+    reply_email = contact.reply_email
+    print(f"FIX user.id={user_id} alias.id={alias_id} alias.email={alias_email} "
+          f"alias.user_id={alias_user_id} mailbox.email={mailbox_email} "
+          f"contact.id={contact_id} contact.user_id={contact_user_id} "
+          f"website={website} reply_email={reply_email} "
+          f"dual-ref-EQUAL={alias_user_id == contact_user_id}")
+    print(f"is_reverse_alias(reply_email)={is_reverse_alias(reply_email)}")
+
+    distribution = []
+    for run in (1, 2):
+        mail_sender.purge_stored_emails()
+        st = drive(mailbox_email, reply_email,
+                   build_reply_msg(mailbox_email, reply_email,
+                                   "re: same input", "identical body"))
+        logs = _captured_logs()
+        el_d = _latest_reply_log_dict(contact_id)
+        out = mail_sender.get_stored_emails()
+        out_to = out[0].envelope_to if out else None
+        out_from = out[0].envelope_from if out else None
+        msg_from = out[0].msg[headers.FROM] if out else None
+        msg_to = out[0].msg[headers.TO] if out else None
+        full_bytes = message_to_bytes(out[0].msg) if out else b""
+        present = mailbox_email.encode() in full_bytes
+        header_names = out[0].msg.keys() if out else []
+        print(f"[RUN {run}] status={st!r}")
+        print(f"[RUN {run}] EmailLog={el_d}")
+        print(f"[RUN {run}] OUT envelope_from={out_from} envelope_to={out_to} "
+              f"msg.From={msg_from} msg.To={msg_to}")
+        _print_logs(f"[RUN {run}] ", logs)
+        print(f"[RUN {run}] FULL-MSG-BYTES len={len(full_bytes)} "
+              f"real_mailbox({mailbox_email})_present_anywhere={present}")
+        print(f"[RUN {run}] OUT all header names={list(header_names)}")
+        distribution.append((st, el_d["user_id"], out_to, msg_from))
+
+    print(f"[S1] identical-input distribution over 2 runs: {distribution}")
+    print(f"[S1] all runs identical? {distribution[0] == distribution[1]}")
+    mail_sender.store_emails_instead_of_sending(False)
+
+
+# =========================================================================== #
+# S2 — Constructed divergence alias.user_id != contact.user_id (Q5a).
+# The reply is authorized against alias.user but attributed to contact.user_id.
+# =========================================================================== #
+def test_s2_divergence(flask_client):
+    mail_sender.store_emails_instead_of_sending(True)
+    print("==================== S2: DIVERGENCE alias.user_id != contact.user_id "
+          "(Q5a) x2 ====================")
+    for run in (1, 2):
+        owner = create_new_user()          # owns the ALIAS (authorizing user)
+        alias = Alias.create_new_random(owner)
+        Session.flush()
+        other = create_new_user()          # owns the CONTACT (recorded user)
+        contact = Contact.create(
+            user_id=other.id,               # <-- diverges from alias.user_id
+            alias_id=alias.id,
+            website_email=f"ext-div-s2r{run}_{random_string(6)}@external.example",
+            reply_email=f"ra+s2r{run}_{random_string(6)}@{EMAIL_DOMAIN}",
+            flush=True,
+        )
+        Session.commit()
+        alias_id = alias.id
+        alias_user_id = alias.user_id
+        contact_id = contact.id
+        contact_user_id = contact.user_id
+        mailbox_email = alias.mailbox.email  # authorized sender = alias's mailbox
+        reply_email = contact.reply_email
+        print(f"[RUN {run}] BEFORE alias.id={alias_id} alias.user_id={alias_user_id} "
+              f"contact.id={contact_id} contact.user_id={contact_user_id} "
+              f"dual-ref-EQUAL={alias_user_id == contact_user_id}")
+        print(f"[RUN {run}] GATES-INPUT: gate1 contact.user.is_active uses "
+              f"contact.user.id={contact_user_id} ; gate2 user=alias.user."
+              f"can_send_or_receive uses alias.user.id={alias_user_id} ; gate3 "
+              f"apply_dmarc_policy_for_reply_phase(alias,contact) gets "
+              f"alias.user={alias_user_id} AND contact={contact_id} ; gate4 "
+              f"get_mailbox_from_mail_from(mail_from, alias) scoped to "
+              f"alias.user={alias_user_id} mailboxes")
+        mail_sender.purge_stored_emails()
+        st = drive(mailbox_email, reply_email,
+                   build_reply_msg(mailbox_email, reply_email,
+                                   f"re: divergence s2r{run}", "body"))
+        logs = _captured_logs()
+        el_d = _latest_reply_log_dict(contact_id)
+        out = mail_sender.get_stored_emails()
+        out_to = out[0].envelope_to if out else None
+        msg_from = out[0].msg[headers.FROM] if out else None
+        mismatch = el_d["user_id"] != alias_user_id if el_d else None
+        print(f"[RUN {run}] status={st!r}")
+        print(f"[RUN {run}] EmailLog={el_d}")
+        print(f"[RUN {run}] PERSIST: EmailLog.user_id={el_d['user_id']} == "
+              f"contact.user_id={contact_user_id} (recorded owner) ; authorizing "
+              f"alias.user_id={alias_user_id} ; "
+              f"MISMATCH(recorded_vs_authorizing)={mismatch}")
+        print(f"[RUN {run}] OUT envelope_to={out_to} msg.From={msg_from}")
+        _print_logs(f"[RUN {run}] ", logs)
+    mail_sender.store_emails_instead_of_sending(False)
+
+
+# =========================================================================== #
+# S3 — Non-unique reply_email driven through handle_DATA (Q5b), both insertion
+# orders. Two Contact rows (two users, two aliases) share one reply_email.
+# =========================================================================== #
+def _s3_one_order(order_label, first_ext_tag, second_ext_tag):
+    # NOTE: the reverse-alias local part MUST be lower-case — the SMTP handler
+    # lower-cases the envelope recipient before the Contact lookup, and
+    # Contact.reply_email is matched case-sensitively (real SimpleLogin
+    # reverse-aliases are always generated lower-case). ``order_label`` is a
+    # human-readable tag only, so build the address from its lower-cased form.
+    tag = order_label.lower()
+    shared_reply = f"ra+dup_{tag}_{random_string(8)}@{EMAIL_DOMAIN}"
+    # first-inserted contact
+    u1 = create_new_user()
+    a1 = Alias.create_new_random(u1)
+    Session.flush()
+    c1 = Contact.create(
+        user_id=u1.id, alias_id=a1.id,
+        website_email=f"ext-{first_ext_tag.lower()}-dup_{tag}_{random_string(6)}@external.example",
+        reply_email=shared_reply, flush=True,
+    )
+    # second-inserted contact (shares reply_email, different user + alias)
+    u2 = create_new_user()
+    a2 = Alias.create_new_random(u2)
+    Session.flush()
+    c2 = Contact.create(
+        user_id=u2.id, alias_id=a2.id,
+        website_email=f"ext-{second_ext_tag.lower()}-dup_{tag}_{random_string(6)}@external.example",
+        reply_email=shared_reply, flush=True,
+    )
+    Session.commit()
+
+    c1_id, c1_user, c1_alias, c1_web = c1.id, c1.user_id, c1.alias_id, c1.website_email
+    c2_id, c2_user, c2_alias, c2_web = c2.id, c2.user_id, c2.alias_id, c2.website_email
+    a1_mb_email = a1.mailbox.email  # first contact owner's mailbox
+    a2_mb_email = a2.mailbox.email  # second contact owner's mailbox
+
+    print(f"[order={order_label}] two Contact rows share reply_email={shared_reply} "
+          f"(DB accepted both -> reply_email NOT unique):")
+    print(f"   contact.id={c1_id} user_id={c1_user} alias_id={c1_alias} "
+          f"website_email={c1_web}")
+    print(f"   contact.id={c2_id} user_id={c2_user} alias_id={c2_alias} "
+          f"website_email={c2_web}")
+    db_count = Contact.filter_by(reply_email=shared_reply).count()
+    print(f"[order={order_label}] DB row count for that reply_email = {db_count}")
+
+    selected = Contact.get_by(reply_email=shared_reply)
+    sel_id, sel_user, sel_alias, sel_web = (
+        selected.id, selected.user_id, selected.alias_id, selected.website_email
+    )
+    first_inserted_id = min(c1_id, c2_id)
+    print(f"[order={order_label}] Contact.get_by(reply_email).first() SELECTED "
+          f"contact.id={sel_id} user_id={sel_user} alias_id={sel_alias} "
+          f"website_email={sel_web}")
+    print(f"[order={order_label}] selected == first-inserted-contact? "
+          f"{sel_id == first_inserted_id} (selected.id={sel_id} "
+          f"first_inserted.id={first_inserted_id})")
+
+    # the SELECTED owner's mailbox
+    selected_mb = a1_mb_email if sel_id == c1_id else a2_mb_email
+    shadowed_mb = a2_mb_email if sel_id == c1_id else a1_mb_email
+
+    mail_sender.purge_stored_emails()
+    st_sel = drive(selected_mb, shared_reply,
+                   build_reply_msg(selected_mb, shared_reply,
+                                   f"re: dup {order_label} selected", "body"))
+    logs_sel = _captured_logs()
+    el_sel = _latest_reply_log_dict(sel_id)
+    out_sel = mail_sender.get_stored_emails()
+    out_to_sel = out_sel[0].envelope_to if out_sel else None
+    from_sel = out_sel[0].msg[headers.FROM] if out_sel else None
+    print(f"[order={order_label}] reply FROM selected owner mailbox={selected_mb} "
+          f"-> status={st_sel!r}")
+    print(f"[order={order_label}]   EmailLog={el_sel}")
+    print(f"[order={order_label}]   OUT envelope_to={out_to_sel} msg.From={from_sel} "
+          f"(relayed to SELECTED contact website={sel_web}, user_id={sel_user})")
+    _print_logs(f"[order={order_label}]   ", logs_sel)
+
+    baseline = _max_email_log_id()
+    mail_sender.purge_stored_emails()
+    st_shadow = drive(shadowed_mb, shared_reply,
+                      build_reply_msg(shadowed_mb, shared_reply,
+                                      f"re: dup {order_label} shadowed", "body"))
+    logs_shadow = _captured_logs()
+    new_max = _max_email_log_id()
+    print(f"[order={order_label}] reply FROM shadowed owner mailbox={shadowed_mb} "
+          f"-> status={st_shadow!r} (the shadowed owner's identical reply_email "
+          f"resolves to the SELECTED contact.id={sel_id}, so their reply is NOT "
+          f"delivered to their intended contact; new_reply_EmailLog_created="
+          f"{new_max > baseline})")
+    _print_logs(f"[order={order_label}]   ", logs_shadow)
+    return (sel_id == first_inserted_id)
+
+
+def test_s3_non_unique_reply_email(flask_client):
+    mail_sender.store_emails_instead_of_sending(True)
+    print("==================== S3: NON-UNIQUE reply_email -> handle_DATA "
+          "CANONICAL x2 (Q5b) ====================")
+    r1 = _s3_one_order("A_then_B", "A", "B")
+    r2 = _s3_one_order("B_then_A", "B", "A")
+    print(f"[S3] OBSERVED selection==first-inserted in both runs: {r1 and r2} "
+          f"(run1={r1} run2={r2}). NOTE: get_by()=filter_by().first() has NO "
+          f"ORDER BY (models.py:L84); this selection was OBSERVED, not guaranteed.")
+    mail_sender.store_emails_instead_of_sending(False)
+
+
+# =========================================================================== #
+# S4 — Unauthorized sender -> E214 (spoofing check ON) x2.
+# =========================================================================== #
+def test_s4_unauthorized_e214(flask_client):
+    mail_sender.store_emails_instead_of_sending(True)
+    print("==================== S4: UNAUTHORIZED mail_from -> E214 (spoofing ON) "
+          "x2 ====================")
+    for run in (1, 2):
+        user = create_new_user()
+        alias = Alias.create_new_random(user)
+        Session.flush()
+        contact = Contact.create(
+            user_id=user.id, alias_id=alias.id,
+            website_email=f"ext-s4r{run}_{random_string(6)}@external.example",
+            reply_email=f"ra+s4r{run}_{random_string(6)}@{EMAIL_DOMAIN}",
+            flush=True,
+        )
+        Session.commit()
+        spoofing = alias.disable_email_spoofing_check
+        contact_id = contact.id
+        reply_email = contact.reply_email
+        attacker = f"attacker-s4r{run}_{random_string(6)}@evil.example"
+        mail_sender.purge_stored_emails()
+        st = drive(attacker, reply_email,
+                   build_reply_msg(attacker, reply_email, f"re: s4r{run}", "body"))
+        logs = _captured_logs()
+        el_d = _latest_reply_log_dict(contact_id)
+        total_stored = len(mail_sender.get_stored_emails())
+        print(f"[RUN {run}] alias.disable_email_spoofing_check={spoofing} "
+              f"attacker_mail_from={attacker} reply={reply_email}")
+        print(f"[RUN {run}] status={st!r} reply_EmailLog={el_d} "
+              f"total_stored={total_stored} sent_alerts_to_owner={total_stored}")
+        _print_logs(f"[RUN {run}] ", logs)
+    mail_sender.store_emails_instead_of_sending(False)
+
+
+# =========================================================================== #
+# S5 — disable_email_spoofing_check default-mailbox fallback (Q5c) x2.
+# =========================================================================== #
+def test_s5_spoofing_off_fallback(flask_client):
+    mail_sender.store_emails_instead_of_sending(True)
+    print("==================== S5: disable_email_spoofing_check DEFAULT-MAILBOX "
+          "FALLBACK (Q5c) x2 ====================")
+    for run in (1, 2):
+        user = create_new_user()
+        alias = Alias.create_new_random(user)
+        alias.disable_email_spoofing_check = True
+        Session.flush()
+        contact = Contact.create(
+            user_id=user.id, alias_id=alias.id,
+            website_email=f"ext-s5r{run}_{random_string(6)}@external.example",
+            reply_email=f"ra+s5r{run}_{random_string(6)}@{EMAIL_DOMAIN}",
+            flush=True,
+        )
+        Session.commit()
+        alias_mailbox_id = alias.mailbox_id
+        contact_id = contact.id
+        reply_email = contact.reply_email
+        stranger = f"stranger-s5r{run}_{random_string(6)}@nowhere.example"
+        mail_sender.purge_stored_emails()
+        st = drive(stranger, reply_email,
+                   build_reply_msg(stranger, reply_email, f"re: s5r{run}", "body"))
+        logs = _captured_logs()
+        el_d = _latest_reply_log_dict(contact_id)
+        out = mail_sender.get_stored_emails()
+        out_to = out[0].envelope_to if out else None
+        msg_from = out[0].msg[headers.FROM] if out else None
+        used_default = el_d["mailbox_id"] == alias_mailbox_id if el_d else None
+        print(f"[RUN {run}] alias.disable_email_spoofing_check=True "
+              f"alias.mailbox_id={alias_mailbox_id} stranger={stranger}")
+        print(f"[RUN {run}] status={st!r} EmailLog={el_d} "
+              f"used_default(mailbox_id==alias.mailbox_id)={used_default}")
+        print(f"[RUN {run}] OUT envelope_to={out_to} msg.From={msg_from}")
+        _print_logs(f"[RUN {run}] ", logs)
+    mail_sender.store_emails_instead_of_sending(False)
+
+
+# =========================================================================== #
+# S6 — NOREPLIES short-circuit + bounce mail_from == "<>" (edge) x2.
+# =========================================================================== #
+def test_s6_noreplies_and_bounce(flask_client):
+    mail_sender.store_emails_instead_of_sending(True)
+    print("==================== S6: NOREPLIES short-circuit + bounce "
+          "mail_from=='<>' (edge) x2 ====================")
+    print(f"config.NOREPLIES={config.NOREPLIES}")
+    for run in (1, 2):
+        # NOREPLIES short-circuit
+        noreply_rcpt = config.NOREPLIES[0]
+        user = create_new_user()
+        mail_sender.purge_stored_emails()
+        st_nr = drive(user.default_mailbox.email, noreply_rcpt,
+                      build_reply_msg(user.default_mailbox.email, noreply_rcpt,
+                                      f"re: noreply s6r{run}", "body"))
+        print(f"[RUN {run}] NOREPLIES rcpt={noreply_rcpt} -> status={st_nr!r}")
+
+        # bounce mail_from == "<>" to a reverse alias
+        user2 = create_new_user()
+        alias = Alias.create_new_random(user2)
+        Session.flush()
+        contact = Contact.create(
+            user_id=user2.id, alias_id=alias.id,
+            website_email=f"ext-s6r{run}_{random_string(6)}@external.example",
+            reply_email=f"ra+s6r{run}_{random_string(6)}@{EMAIL_DOMAIN}",
+            flush=True,
+        )
+        Session.commit()
+        reply_email = contact.reply_email
+        mail_sender.purge_stored_emails()
+        st_bounce = drive("<>", reply_email,
+                          build_reply_msg("bounce@mta.example", reply_email,
+                                          f"auto-reply s6r{run}", "ooo"))
+        print(f"[RUN {run}] BOUNCE mail_from='<>' rcpt=reverse-alias({reply_email}) "
+              f"-> status={st_bounce!r}")
+    mail_sender.store_emails_instead_of_sending(False)
+
+
+# =========================================================================== #
+# S7 — Multi-mailbox alias: reply from the SECONDARY authorized mailbox (and the
+# default mailbox, and an authorized address). Exercises get_mailbox_from_mail_
+# from() (email_handler.py:L1364) selecting the correct mailbox out of
+# alias.mailboxes (app/models.py:L1580-L1590) and the resulting
+# EmailLog.mailbox_id (email_handler.py:L1047). Run x2.
+# =========================================================================== #
+def test_s7_multi_mailbox(flask_client):
+    mail_sender.store_emails_instead_of_sending(True)
+    print("==================== S7: MULTI-MAILBOX alias -> reply from secondary "
+          "authorized mailbox x2 ====================")
+    distribution = []
+    for run in (1, 2):
+        user = create_new_user()
+        mb1 = user.default_mailbox                 # default mailbox of the alias
+        mb2 = Mailbox.create(
+            user_id=user.id, email=random_email(), verified=True, flush=True
+        )
+        alias = Alias.create_new_random(user)
+        Session.flush()
+        # attach the 2nd verified mailbox -> alias.mailboxes = [mb1, mb2]
+        AliasMailbox.create(alias_id=alias.id, mailbox_id=mb2.id, flush=True)
+        # an authorized address mapped to the DEFAULT mailbox (mb1)
+        authorized = f"authorized-s7r{run}_{random_string(6)}@delegate.example"
+        AuthorizedAddress.create(
+            user_id=user.id, mailbox_id=mb1.id, email=authorized, flush=True
+        )
+        contact = Contact.create(
+            user_id=user.id, alias_id=alias.id,
+            website_email=f"ext-s7r{run}_{random_string(6)}@external.example",
+            reply_email=f"ra+s7r{run}_{random_string(6)}@{EMAIL_DOMAIN}",
+            flush=True,
+        )
+        Session.commit()
+        # snapshot ALL fixture scalars BEFORE any drive
+        alias_id = alias.id
+        alias_default_mb_id = alias.mailbox_id
+        mb1_id, mb1_email = mb1.id, mb1.email
+        mb2_id, mb2_email = mb2.id, mb2.email
+        contact_id = contact.id
+        reply_email = contact.reply_email
+        mb_ids_sorted = [m.id for m in alias.mailboxes]
+        print(f"[RUN {run}] BEFORE alias.id={alias_id} "
+              f"alias.mailbox_id(default)={alias_default_mb_id} "
+              f"mb1(default).id={mb1_id} mb2(secondary).id={mb2_id} "
+              f"alias.mailboxes(verified,sorted)={mb_ids_sorted} "
+              f"authorized_address_on_mb1={authorized}")
+
+        # (a) reply from the DEFAULT mailbox -> selects default (baseline)
+        mail_sender.purge_stored_emails()
+        st_a = drive(mb1_email, reply_email,
+                     build_reply_msg(mb1_email, reply_email,
+                                     f"re: s7r{run} from default", "body-default"))
+        logs_a = _captured_logs()
+        el_a = _latest_reply_log_dict(contact_id)
+        out_a = mail_sender.get_stored_emails()
+        to_a = out_a[0].envelope_to if out_a else None
+        from_a = out_a[0].msg[headers.FROM] if out_a else None
+        print(f"[RUN {run}] (a) DEFAULT mailbox send mail_from={mb1_email} "
+              f"-> status={st_a!r}")
+        print(f"[RUN {run}] (a)   EmailLog={el_a} selected_mailbox_id="
+              f"{el_a['mailbox_id']} == default_mb1.id({mb1_id})? "
+              f"{el_a['mailbox_id'] == mb1_id}")
+        print(f"[RUN {run}] (a)   OUT envelope_to={to_a} msg.From={from_a}")
+        _print_logs(f"[RUN {run}] (a)   ", logs_a)
+
+        # (b) reply from the SECONDARY mailbox -> MUST select the secondary (KEY)
+        mail_sender.purge_stored_emails()
+        st_b = drive(mb2_email, reply_email,
+                     build_reply_msg(mb2_email, reply_email,
+                                     f"re: s7r{run} from secondary",
+                                     "body-secondary"))
+        logs_b = _captured_logs()
+        el_b = _latest_reply_log_dict(contact_id)
+        out_b = mail_sender.get_stored_emails()
+        to_b = out_b[0].envelope_to if out_b else None
+        from_b = out_b[0].msg[headers.FROM] if out_b else None
+        print(f"[RUN {run}] (b) SECONDARY mailbox send mail_from={mb2_email} "
+              f"-> status={st_b!r}")
+        print(f"[RUN {run}] (b)   EmailLog={el_b} selected_mailbox_id="
+              f"{el_b['mailbox_id']} == secondary_mb2.id({mb2_id})? "
+              f"{el_b['mailbox_id'] == mb2_id} (default_mb1.id={mb1_id}, so NOT "
+              f"default? {el_b['mailbox_id'] != mb1_id})")
+        print(f"[RUN {run}] (b)   OUT envelope_to={to_b} msg.From={from_b}")
+        _print_logs(f"[RUN {run}] (b)   ", logs_b)
+
+        # (c) reply from an AUTHORIZED ADDRESS mapped to the default mailbox
+        mail_sender.purge_stored_emails()
+        st_c = drive(authorized, reply_email,
+                     build_reply_msg(authorized, reply_email,
+                                     f"re: s7r{run} from authorized",
+                                     "body-authorized"))
+        logs_c = _captured_logs()
+        el_c = _latest_reply_log_dict(contact_id)
+        out_c = mail_sender.get_stored_emails()
+        to_c = out_c[0].envelope_to if out_c else None
+        from_c = out_c[0].msg[headers.FROM] if out_c else None
+        print(f"[RUN {run}] (c) AUTHORIZED-ADDRESS send mail_from={authorized} "
+              f"-> status={st_c!r}")
+        print(f"[RUN {run}] (c)   EmailLog={el_c} selected_mailbox_id="
+              f"{el_c['mailbox_id']} == default_mb1.id({mb1_id})? "
+              f"{el_c['mailbox_id'] == mb1_id} (authorized address resolves to "
+              f"its mapped mailbox)")
+        print(f"[RUN {run}] (c)   OUT envelope_to={to_c} msg.From={from_c}")
+        _print_logs(f"[RUN {run}] (c)   ", logs_c)
+
+        distribution.append((st_a, el_a["mailbox_id"] == mb1_id,
+                             st_b, el_b["mailbox_id"] == mb2_id,
+                             st_c, el_c["mailbox_id"] == mb1_id))
+
+    print(f"[S7] distribution over 2 runs (a:status,default-selected ; "
+          f"b:status,secondary-selected ; c:status,mapped-to-default): "
+          f"{distribution}")
+    print(f"[S7] all runs identical (selection invariants)? "
+          f"{distribution[0] == distribution[1]}")
+    mail_sender.store_emails_instead_of_sending(False)
+```
 
 ### Raw scenario output
 
@@ -472,6 +1099,62 @@ config.NOREPLIES=['noreply@sl.local']
 
 **(observed)** On both runs, a message to a `NOREPLIES` address short-circuits (`send_no_reply_response`, `email_handler.py:L2181–L2183`) and returns `'250 Message accepted for delivery'` without reply handling; a bounce/auto-reply with `mail_from == "<>"` to a reverse alias is handled as out-of-office → **E206** ("Out of office") at `email_handler.py:L2166`/`email_handler.py:L2173`, before `handle_reply` routing.
 
+#### S7 — Multi-mailbox alias: reply from the secondary authorized mailbox (plus default & authorized-address) ×2
+
+```text
+==================== S7: MULTI-MAILBOX alias -> reply from secondary authorized mailbox x2 ====================
+[RUN 1] BEFORE alias.id=1095 alias.mailbox_id(default)=719 mb1(default).id=719 mb2(secondary).id=720 alias.mailboxes(verified,sorted)=[720, 719] authorized_address_on_mb1=authorized-s7r1_sprxwh@delegate.example
+[RUN 1] (a) DEFAULT mailbox send mail_from=user_xugtj7hjlz@mailbox.test -> status='250 Message accepted for delivery'
+[RUN 1] (a)   EmailLog={'id': 351, 'user_id': 633, 'mailbox_id': 719, 'alias_id': 1095, 'contact_id': 286, 'is_reply': True} selected_mailbox_id=719 == default_mb1.id(719)? True
+[RUN 1] (a)   OUT envelope_to=ext-s7r1_acskth@external.example msg.From=jumble_monies558@sl.local
+[RUN 1] (a)   LOG> _handle:2343 New message, mail from user_xugtj7hjlz@mailbox.test, rctp tos ['ra+s7r1_wyyrre@sl.local']
+[RUN 1] (a)   LOG> handle:2196 Reply phase user_xugtj7hjlz@mailbox.test(user_xugtj7hjlz@mailbox.test) -> ra+s7r1_wyyrre@sl.local
+[RUN 1] (a)   LOG> apply_dmarc_policy_for_reply_phase:159 DMARC check disabled
+[RUN 1] (a)   LOG> handle_reply:1051 Create <EmailLog 351> for <Contact 286 ext-s7r1_acskth@external.example 1095>, <User 633 Test User user_xugtj7hjlz@mailbox.test>, <Mailbox 719 user_xugtj7hjlz@mailbox.test>
+[RUN 1] (b) SECONDARY mailbox send mail_from=knxmxmicsqepvgnsewyd@knxmxmicsqepvgnsewyd.com -> status='250 Message accepted for delivery'
+[RUN 1] (b)   EmailLog={'id': 352, 'user_id': 633, 'mailbox_id': 720, 'alias_id': 1095, 'contact_id': 286, 'is_reply': True} selected_mailbox_id=720 == secondary_mb2.id(720)? True (default_mb1.id=719, so NOT default? True)
+[RUN 1] (b)   OUT envelope_to=ext-s7r1_acskth@external.example msg.From=jumble_monies558@sl.local
+[RUN 1] (b)   LOG> _handle:2343 New message, mail from knxmxmicsqepvgnsewyd@knxmxmicsqepvgnsewyd.com, rctp tos ['ra+s7r1_wyyrre@sl.local']
+[RUN 1] (b)   LOG> handle:2196 Reply phase knxmxmicsqepvgnsewyd@knxmxmicsqepvgnsewyd.com(knxmxmicsqepvgnsewyd@knxmxmicsqepvgnsewyd.com) -> ra+s7r1_wyyrre@sl.local
+[RUN 1] (b)   LOG> apply_dmarc_policy_for_reply_phase:159 DMARC check disabled
+[RUN 1] (b)   LOG> handle_reply:1051 Create <EmailLog 352> for <Contact 286 ext-s7r1_acskth@external.example 1095>, <User 633 Test User user_xugtj7hjlz@mailbox.test>, <Mailbox 720 knxmxmicsqepvgnsewyd@knxmxmicsqepvgnsewyd.com>
+[RUN 1] (c) AUTHORIZED-ADDRESS send mail_from=authorized-s7r1_sprxwh@delegate.example -> status='250 Message accepted for delivery'
+[RUN 1] (c)   EmailLog={'id': 353, 'user_id': 633, 'mailbox_id': 719, 'alias_id': 1095, 'contact_id': 286, 'is_reply': True} selected_mailbox_id=719 == default_mb1.id(719)? True (authorized address resolves to its mapped mailbox)
+[RUN 1] (c)   OUT envelope_to=ext-s7r1_acskth@external.example msg.From=jumble_monies558@sl.local
+[RUN 1] (c)   LOG> _handle:2343 New message, mail from authorized-s7r1_sprxwh@delegate.example, rctp tos ['ra+s7r1_wyyrre@sl.local']
+[RUN 1] (c)   LOG> handle:2196 Reply phase authorized-s7r1_sprxwh@delegate.example(authorized-s7r1_sprxwh@delegate.example) -> ra+s7r1_wyyrre@sl.local
+[RUN 1] (c)   LOG> apply_dmarc_policy_for_reply_phase:159 DMARC check disabled
+[RUN 1] (c)   LOG> __check:1376 Found an authorized address for <Alias 1095 jumble_monies558@sl.local> <Mailbox 719 user_xugtj7hjlz@mailbox.test> <AuthorizedAddress 13 authorized-s7r1_sprxwh@delegate.example 719>
+[RUN 1] (c)   LOG> handle_reply:1051 Create <EmailLog 353> for <Contact 286 ext-s7r1_acskth@external.example 1095>, <User 633 Test User user_xugtj7hjlz@mailbox.test>, <Mailbox 719 user_xugtj7hjlz@mailbox.test>
+[RUN 2] BEFORE alias.id=1097 alias.mailbox_id(default)=721 mb1(default).id=721 mb2(secondary).id=722 alias.mailboxes(verified,sorted)=[721, 722] authorized_address_on_mb1=authorized-s7r2_eyeaur@delegate.example
+[RUN 2] (a) DEFAULT mailbox send mail_from=user_qncr0vh547@mailbox.test -> status='250 Message accepted for delivery'
+[RUN 2] (a)   EmailLog={'id': 354, 'user_id': 634, 'mailbox_id': 721, 'alias_id': 1097, 'contact_id': 287, 'is_reply': True} selected_mailbox_id=721 == default_mb1.id(721)? True
+[RUN 2] (a)   OUT envelope_to=ext-s7r2_mmyevi@external.example msg.From=ropers_cowers603@sl.local
+[RUN 2] (a)   LOG> _handle:2343 New message, mail from user_qncr0vh547@mailbox.test, rctp tos ['ra+s7r2_bmtchn@sl.local']
+[RUN 2] (a)   LOG> handle:2196 Reply phase user_qncr0vh547@mailbox.test(user_qncr0vh547@mailbox.test) -> ra+s7r2_bmtchn@sl.local
+[RUN 2] (a)   LOG> apply_dmarc_policy_for_reply_phase:159 DMARC check disabled
+[RUN 2] (a)   LOG> handle_reply:1051 Create <EmailLog 354> for <Contact 287 ext-s7r2_mmyevi@external.example 1097>, <User 634 Test User user_qncr0vh547@mailbox.test>, <Mailbox 721 user_qncr0vh547@mailbox.test>
+[RUN 2] (b) SECONDARY mailbox send mail_from=wbqahhlnsjuyvzzkwipu@wbqahhlnsjuyvzzkwipu.com -> status='250 Message accepted for delivery'
+[RUN 2] (b)   EmailLog={'id': 355, 'user_id': 634, 'mailbox_id': 722, 'alias_id': 1097, 'contact_id': 287, 'is_reply': True} selected_mailbox_id=722 == secondary_mb2.id(722)? True (default_mb1.id=721, so NOT default? True)
+[RUN 2] (b)   OUT envelope_to=ext-s7r2_mmyevi@external.example msg.From=ropers_cowers603@sl.local
+[RUN 2] (b)   LOG> _handle:2343 New message, mail from wbqahhlnsjuyvzzkwipu@wbqahhlnsjuyvzzkwipu.com, rctp tos ['ra+s7r2_bmtchn@sl.local']
+[RUN 2] (b)   LOG> handle:2196 Reply phase wbqahhlnsjuyvzzkwipu@wbqahhlnsjuyvzzkwipu.com(wbqahhlnsjuyvzzkwipu@wbqahhlnsjuyvzzkwipu.com) -> ra+s7r2_bmtchn@sl.local
+[RUN 2] (b)   LOG> apply_dmarc_policy_for_reply_phase:159 DMARC check disabled
+[RUN 2] (b)   LOG> handle_reply:1051 Create <EmailLog 355> for <Contact 287 ext-s7r2_mmyevi@external.example 1097>, <User 634 Test User user_qncr0vh547@mailbox.test>, <Mailbox 722 wbqahhlnsjuyvzzkwipu@wbqahhlnsjuyvzzkwipu.com>
+[RUN 2] (c) AUTHORIZED-ADDRESS send mail_from=authorized-s7r2_eyeaur@delegate.example -> status='250 Message accepted for delivery'
+[RUN 2] (c)   EmailLog={'id': 356, 'user_id': 634, 'mailbox_id': 721, 'alias_id': 1097, 'contact_id': 287, 'is_reply': True} selected_mailbox_id=721 == default_mb1.id(721)? True (authorized address resolves to its mapped mailbox)
+[RUN 2] (c)   OUT envelope_to=ext-s7r2_mmyevi@external.example msg.From=ropers_cowers603@sl.local
+[RUN 2] (c)   LOG> _handle:2343 New message, mail from authorized-s7r2_eyeaur@delegate.example, rctp tos ['ra+s7r2_bmtchn@sl.local']
+[RUN 2] (c)   LOG> handle:2196 Reply phase authorized-s7r2_eyeaur@delegate.example(authorized-s7r2_eyeaur@delegate.example) -> ra+s7r2_bmtchn@sl.local
+[RUN 2] (c)   LOG> apply_dmarc_policy_for_reply_phase:159 DMARC check disabled
+[RUN 2] (c)   LOG> __check:1376 Found an authorized address for <Alias 1097 ropers_cowers603@sl.local> <Mailbox 721 user_qncr0vh547@mailbox.test> <AuthorizedAddress 14 authorized-s7r2_eyeaur@delegate.example 721>
+[RUN 2] (c)   LOG> handle_reply:1051 Create <EmailLog 356> for <Contact 287 ext-s7r2_mmyevi@external.example 1097>, <User 634 Test User user_qncr0vh547@mailbox.test>, <Mailbox 721 user_qncr0vh547@mailbox.test>
+[S7] distribution over 2 runs (a:status,default-selected ; b:status,secondary-selected ; c:status,mapped-to-default): [('250 Message accepted for delivery', True, '250 Message accepted for delivery', True, '250 Message accepted for delivery', True), ('250 Message accepted for delivery', True, '250 Message accepted for delivery', True, '250 Message accepted for delivery', True)]
+[S7] all runs identical (selection invariants)? True
+```
+
+**(observed)** The alias was given **two** verified mailboxes — a default `mb1` and a secondary `mb2` — plus an authorized delegate address mapped to `mb1`; `alias.mailboxes` therefore lists both, sorted by email (`[720, 719]` in run 1, `[721, 722]` in run 2). Replying from each authorized origin selected the mailbox matching `mail_from`, not merely the default: default-send persisted `EmailLog.mailbox_id == alias.mailbox_id` (the default `mb1`); **secondary-send persisted `EmailLog.mailbox_id` = the secondary `mb2`** (`720`/`722`, `!= alias.mailbox_id`); delegate-send resolved to the mapped default `mb1` and emitted `Found an authorized address ...` (`email_handler.py:L1376`). All three returned `250`, and the selection invariants (default-selected, secondary-selected, mapped-to-default) were identical across both runs (`all runs identical (selection invariants)? True`). **(inferred)** Because the selected mailbox is chosen by matching `mail_from` against `alias.mailboxes` (`get_mailbox_from_mail_from`, `email_handler.py:L1364`; `app/models.py:L1580–L1590`) rather than by the recipient reverse-alias, a multi-mailbox alias routes each reply back through the *sending* mailbox — so multi-mailbox authorization is **not** a source of the reported mis-routing (`EmailLog.mailbox_id` correctly follows the sender). This exercises the AAP §0.5.1 multi-mailbox condition.
+
 ---
 
 ## (i) Observed vs. inferred — key-claim ledger
@@ -497,6 +1180,7 @@ The distinction is annotated inline throughout. The most consequential claims ar
 | 15 | The single most likely mis-routing origin is `Contact.get_by(reply_email=…).first()` (`email_handler.py:L986`) + non-unique schema + `.first()` — Q5b, reproduced in `S3` | **inferred** (from claims 2, 6, 7, 8; no abnormal ownership needed) |
 | 16 | The dual user reference is a pipeline-wide pattern (forward path uses it too: `L557` vs `L600`/`L734`) | **observed** (code) / **inferred** (that it is the same pattern) |
 | 17 | Divergent `alias.user_id`/`contact.user_id` is an abnormal state because `transfer_alias()` updates both together | **observed** (`app/alias_utils.py:L464–L466`, `L506`) / **inferred** (that divergence is therefore abnormal) |
+| 18 | Multi-mailbox alias: a reply from the alias's **secondary** authorized mailbox is routed/attributed to that secondary mailbox (`EmailLog.mailbox_id` == sending mailbox, `!= alias.mailbox_id`); default- and delegate-sends select the default — all `250` | **observed** (`S7`, both runs; `email_handler.py:L1364`/`L1047`, `app/models.py:L1580–L1590`) |
 
 ---
 
@@ -515,5 +1199,6 @@ The distinction is annotated inline throughout. The most consequential claims ar
 - **Q3 — Decided `user_id`:** answered in [§ (d)](#d-q3--the-concrete-integer-user_id-the-system-decides) — happy-path value `422` (stable across two identical-input runs); persisted via `EmailLog.create(user_id=contact.user_id …)` (`L1046`); two independent references (`alias.user` vs `contact.user_id`).
 - **Q4 — Data flow:** answered in [§ (e)](#e-q4--actual-observed-end-to-end-data-flow) — full gate-by-gate narrative + diagram, each node tied to `S1`/`S2` evidence; DMARC shown to be non-blocking.
 - **Q5 — Most likely origin:** answered in [§ (f)](#f-q5--most-likely-point-where-an-incorrect-routing-decision-originates) — three hypotheses reproduced (Q5a in `S2`, Q5b canonically in `S3`, Q5c in `S5`); single most likely origin = `Contact.get_by(reply_email=…).first()` (`email_handler.py:L986`) with the non-unique `reply_email` schema (`app/models.py:L1899`) and `.first()`-without-`ORDER BY` semantics (`app/models.py:L84`).
+- **Edge conditions:** exercised in [§ (g)](#g-edge-condition-results) — `S4` (unauthorized→E214), `S5` (spoofing-off default fallback), `S6` (`NOREPLIES`/bounce), and `S7` (**multi-mailbox alias** — a reply from the secondary authorized mailbox routes to that mailbox; AAP §0.5.1), each reproduced on both runs.
 
 *End of analysis. The only artifact added to the repository is this document; no source file was modified, and all temporary observation scaffolding lived inside the run container and was removed.*
