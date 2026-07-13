@@ -9,7 +9,7 @@
 ---
 ## 1. Lead Answer (Executive Summary)
 
-**How an inbound reply resolves to a contact and a forwarding destination.** When a user replies to a *reverse-alias*, the inbound SMTP recipient (`rcpt_to`) is taken verbatim as the reply address: `reply_email = rcpt_to` (`email_handler.py:972`). It is gated against the service domain — `if not reply_email.endswith(EMAIL_DOMAIN)` (`email_handler.py:977`), falling back to an `SLDomain` lookup (`email_handler.py:978`) and returning `status.E501` if neither matches (`email_handler.py:980-981`). It is then normalized: `reply_email = normalize_reply_email(reply_email)` (`email_handler.py:984`). The normalized value resolves a **single** `Contact`: `contact = Contact.get_by(reply_email=reply_email)` (`email_handler.py:986`). The **forwarding destination is derived entirely from that resolved contact**: `alias = contact.alias` (`email_handler.py:994`), `user = alias.user` (`email_handler.py:1001`), and the sender mailbox is chosen by `mailbox = get_mailbox_from_mail_from(mail_from, alias)` (`email_handler.py:1019`). On the authorized path the resolution is persisted as `EmailLog.create(contact_id=contact.id, alias_id=contact.alias_id, is_reply=True, user_id=contact.user_id, mailbox_id=mailbox.id, ...)` (`email_handler.py:1042-1050`).
+**How an inbound reply resolves to a contact and a forwarding destination.** When a user replies to a *reverse-alias*, the inbound SMTP recipient (`rcpt_to`) is taken verbatim as the reply address: `reply_email = rcpt_to` (`email_handler.py:972`). It is gated against the service domain — `if not reply_email.endswith(EMAIL_DOMAIN)` (`email_handler.py:977`), falling back to an `SLDomain` lookup (`email_handler.py:978`) and returning `status.E501` if neither matches (`email_handler.py:980-981`). It is then normalized: `reply_email = normalize_reply_email(reply_email)` (`email_handler.py:984`). The normalized value resolves a **single** `Contact`: `contact = Contact.get_by(reply_email=reply_email)` (`email_handler.py:986`). The **forwarding destination is derived entirely from that resolved contact**: `alias = contact.alias` (`email_handler.py:994`), `user = alias.user` (`email_handler.py:1004`), and the sender mailbox is chosen by `mailbox = get_mailbox_from_mail_from(mail_from, alias)` (`email_handler.py:1019`). On the authorized path the resolution is persisted as `EmailLog.create(contact_id=contact.id, alias_id=contact.alias_id, is_reply=True, user_id=contact.user_id, mailbox_id=mailbox.id, ...)` (`email_handler.py:1042-1050`).
 
 **Why it *can* forward to the wrong user.** The lookup `Contact.get_by(reply_email=...)` delegates to the shared `ModelMixin.get_by()`, whose entire body is `return Session.query(cls).filter_by(**kw).first()` — a `.first()` with **no `ORDER BY`** (`app/models.py:82-84`). The `reply_email` column carries **no `UNIQUE` constraint**: the only unique constraint on `Contact` is `uq_contact` on `(alias_id, website_email)` (`app/models.py:1875`); `reply_email` is merely `index=True` (`app/models.py:1899`), and the migration that created its index sets `unique=False` (`migrations/versions/2021_071310_78403c7b8089_.py:22`). Generation-time uniqueness is only a best-effort, non-atomic time-of-check-to-time-of-use (TOCTOU) guard, `available_sl_email()` (`app/models.py:1425-1432`), which non-generator write paths (a direct `Contact.create(...)`) bypass entirely. Consequently, **two `Contact` rows owned by different users can share one `reply_email`**, and on such a multi-row match `.first()` returns one row **without any application-specified order**. Because the alias and user are derived from that row, the reply is routed to — and, on the authorized path, logged against — **whichever contact the database returned**, not necessarily the alias owner whose mailbox actually sent the reply.
 
@@ -247,7 +247,7 @@ docker exec sl_app bash -lc 'cd /app; . venv/bin/activate; set -a && . /tmp/sl_e
 ---
 ## 3. Reply-address derivation
 
-The reply address is the inbound SMTP recipient, taken verbatim, then domain-gated and normalized. The exact code (canonical source at commit `2cd6ee777f8c`, re-confirmed at runtime):
+The reply address is the inbound SMTP recipient, taken verbatim, then domain-gated and normalized. An annotated excerpt of the canonical source (commit `2cd6ee777f8c`, re-confirmed at runtime) — intervening unchanged lines are elided and the original line numbers are preserved:
 
 ```
 email_handler.py:966   def handle_reply(envelope, msg: Message, rcpt_to: str) -> (bool, str):
@@ -291,7 +291,7 @@ app/models.py:83      def get_by(cls, **kw):
 app/models.py:84          return Session.query(cls).filter_by(**kw).first()
 ```
 
-**Framework semantics (official, for the pinned SQLAlchemy 1.3.24).** `Query.first()` applies a `LIMIT 1` and returns the first row the database yields ([SQLAlchemy 1.3 Query API — `Query.first()`](https://docs.sqlalchemy.org/en/13/orm/query.html)). When no `ORDER BY` is present and more than one row matches, which row is "first" is **not deterministic**: the SQLAlchemy FAQ states that "*when ORDER BY is not used ... the relational database is free to return matched rows in any arbitrary order*" and that "*any query that limits rows using LIMIT ... will not be deterministic in terms of what result row is returned, assuming there's more than one row that matches*," recommending an `ORDER BY` on a unique column (the primary key) as the remedy ([SQLAlchemy FAQ — "Why is ORDER BY recommended with LIMIT"](https://docs.sqlalchemy.org/en/13/faq/ormconfiguration.html#faq-query-deduplicating)). SimpleLogin's `get_by()` specifies no such order, so on a multi-row `reply_email` match the resolved `Contact` is unordered at the application level (the PostgreSQL-level determinant is analyzed with `EXPLAIN`/`ctid` evidence in §7.4).
+**Framework semantics (official, for the pinned SQLAlchemy 1.3.24).** `Query.first()` applies a `LIMIT 1` and returns the first row the database yields ([SQLAlchemy 1.3 Query API — `Query.first()`](https://docs.sqlalchemy.org/en/13/orm/query.html)). When no `ORDER BY` is present and more than one row matches, which row is "first" is **not deterministic**: the SQLAlchemy 1.3 FAQ states that "*A relational database can return rows in any arbitrary order, when an explicit ordering is not set*" and that "*any query that limits rows using LIMIT or OFFSET should always specify an ORDER BY. Otherwise, it is not deterministic which rows will actually be returned*," recommending an `ORDER BY` on a unique column (the primary key) as the remedy ([SQLAlchemy 1.3 FAQ — "Why is ORDER BY required with LIMIT"](https://docs.sqlalchemy.org/en/13/faq/ormconfiguration.html#why-is-order-by-required-with-limit-especially-with-subqueryload)). SimpleLogin's `get_by()` specifies no such order, so on a multi-row `reply_email` match the resolved `Contact` is unordered at the application level (the PostgreSQL-level determinant is analyzed with `EXPLAIN`/`ctid` evidence in §7.4).
 
 ### 4.2 Observed resolved contact — the canonical happy-path call (complete, unedited output)
 
@@ -423,24 +423,24 @@ DONE
 ---
 ## 5. Forwarding-destination selection
 
-The forwarding destination (alias, owning user, and sender mailbox) is derived **entirely from the resolved contact**. The exact code:
+The forwarding destination (alias, owning user, and sender mailbox) is derived **entirely from the resolved contact**. An annotated excerpt of the canonical source (commit `2cd6ee777f8c`, re-confirmed at runtime) — the E503 sanity branch is compressed and the original line numbers are preserved:
 
 ```
 email_handler.py:994    alias = contact.alias
 email_handler.py:1000       ... (E503 sanity: alias/domain consistency)
-email_handler.py:1001   user = alias.user
+email_handler.py:1004   user = alias.user
 email_handler.py:1007   if not user.can_send_or_receive():        # -> E504 when the user cannot send/receive
 email_handler.py:1019   mailbox = get_mailbox_from_mail_from(mail_from, alias)
-email_handler.py:1023       if alias.disable_email_spoofing_check:  # [non-canonical] fallback path
+email_handler.py:1021       if alias.disable_email_spoofing_check:  # [non-canonical] fallback path
 email_handler.py:1032       else: handle_unknown_mailbox(...)       # default control
 email_handler.py:1034           return False, status.E214
 email_handler.py:1042   email_log = EmailLog.create(
 email_handler.py:1043       contact_id=contact.id, alias_id=contact.alias_id, is_reply=True,
-email_handler.py:1050       user_id=contact.user_id, mailbox_id=mailbox.id, ... )
+email_handler.py:1046       user_id=contact.user_id, mailbox_id=mailbox.id, ... )
 ```
 
 - **Alias** — `alias = contact.alias` (`email_handler.py:994`): the alias is whatever the resolved contact points at, via the `Contact.alias_id` foreign key.
-- **User** — `user = alias.user` (`email_handler.py:1001`): the owning user is derived transitively from that alias. The persisted `EmailLog.user_id` is taken directly from `contact.user_id` (`email_handler.py:1050`), so the log records the **resolved contact's** owner regardless of who actually sent the reply.
+- **User** — `user = alias.user` (`email_handler.py:1004`): the owning user is derived transitively from that alias. The persisted `EmailLog.user_id` is taken directly from `contact.user_id` (`email_handler.py:1046`), so the log records the **resolved contact's** owner regardless of who actually sent the reply.
 - **Mailbox** — `mailbox = get_mailbox_from_mail_from(mail_from, alias)` (`email_handler.py:1019`): the sender mailbox is looked up by matching the SMTP `mail_from` against mailboxes **authorized for that alias**. If the alias belongs to a *different* user than the sender's mailbox, this returns `None`, and the spoof-check branch (`email_handler.py:1019-1034`) decides the outcome:
   - **Default (`disable_email_spoofing_check = False`):** `handle_unknown_mailbox(...)` is called and the handler returns `status.E214` (`email_handler.py:1032-1034`) — the reply is rejected **before** `EmailLog.create` (§7 shows this as the default-control result for the wrong-user data condition).
   - **`[non-canonical]` fallback (`disable_email_spoofing_check = True`):** the check is skipped (log `ignore unknown sender ...` at `email_handler.py:1023`), the mailbox falls back to `alias.mailbox`, and the reply proceeds to `EmailLog.create` and a stored send request — under the resolved (possibly wrong) user.
@@ -623,7 +623,7 @@ app/models.py:1706:            if available_sl_email(email):
 
 ### 6.4 A wrong contact yields a wrong alias, user, mailbox, and persisted log
 
-Because `alias = contact.alias` (`:994`), `user = alias.user` (`:1001`), and `EmailLog.create(..., user_id=contact.user_id, ...)` (`:1042-1050`) all derive from the resolved contact, resolving the *other* same-`reply_email` contact propagates end-to-end: a different alias, a different owning user, a different candidate mailbox, and — on the authorized/fallback path — a log row attributing the reply to the wrong user (`EmailLog.user_id`). §7 shows this propagation directly: flipping only the contacts' insertion order flips the resolved `user_id` from `1` to `2` under the identical input.
+Because `alias = contact.alias` (`:994`), `user = alias.user` (`:1004`), and `EmailLog.create(..., user_id=contact.user_id, ...)` (`:1042-1050`) all derive from the resolved contact, resolving the *other* same-`reply_email` contact propagates end-to-end: a different alias, a different owning user, a different candidate mailbox, and — on the authorized/fallback path — a log row attributing the reply to the wrong user (`EmailLog.user_id`). §7 shows this propagation directly: flipping only the contacts' insertion order flips the resolved `user_id` from `1` to `2` under the identical input.
 
 ### 6.5 The same non-unique lookup gates multiple routing decisions
 
@@ -892,7 +892,7 @@ DRIVE DONE
 Each seed printed the physical `ctid` order and the `EXPLAIN` of the exact lookup `SELECT contact.id FROM contact WHERE contact.reply_email='dist-shared@sl.local' LIMIT 1`:
 
 - **Physical layout.** After a clean-slate truncate + fresh inserts, the two rows occupy the same page in insertion order: the first-inserted row is at `ctid=(0,1)`, the second at `ctid=(0,2)`. In condition `ab` the `(0,1)` row is user_A's; in `ba` it is user_B's.
-- **Plans observed.** The default plan is `Index Scan using ix_contact_reply_email ... Limit rows=1`; with `enable_indexscan/bitmapscan/indexonlyscan` disabled, the same query plans a `Seq Scan on contact ... Limit rows=1`.
+- **Plans observed.** The default plan is `Index Scan using ix_contact_reply_email ... Limit rows=1`; with `enable_indexscan/bitmapscan/indexonlyscan` disabled, the same query plans a `Seq Scan on contact ... Limit rows=1`. (The absolute `cost=` figures printed above are PostgreSQL planner **estimates** that depend on table statistics / `ANALYZE` state and can vary run-to-run and across environments — e.g., on a later re-run of `seed ab off` the default `Index Scan` upper cost was `8.16` rather than the `4.16` captured here, while the forced `Seq Scan` stayed at `0.00..11.00` — whereas the plan **structure** (`Index Scan` vs forced `Seq Scan`, both `Limit rows=1`) and the physical `ctid` ordering were byte-for-byte stable. The interpretation below rests on the plan **structure** and physical order, **not** on the absolute cost estimate.)
 - **What this does and does not prove.** The application specifies **no `ORDER BY`**; PostgreSQL is therefore free to return the matching rows in an unspecified order that, per its documentation, "*depend[s] on the scan and join plan types and the order on disk*" and "*must not be relied on*" (§9). For this **specific** two-row, single-page, append-only layout, both the observed `Index Scan` and the forced `Seq Scan` return the lower-`ctid` (first-inserted) row first, which is why every drive was **stable at 20/20** within a fixed layout. I therefore state only the **observed** fact — *no application ordering is specified, and the database-selected row here tracks the first-inserted/lower-`ctid` row under the active plan* — and treat the **general** claim, that a different plan, index state, page layout, `VACUUM`/update churn, or concurrency could return the *other* row, as explicitly **`[inferred]`** from the absence of an `ORDER BY` plus the official SQLAlchemy/PostgreSQL semantics (§9). The forced `Seq Scan` `EXPLAIN` demonstrates the plan can change; it does **not**, on this tiny layout, demonstrate a changed *result row*, and I do not claim it does.
 
 ### 7.5 Verdict
@@ -958,10 +958,21 @@ This experiment establishes the **precise** normalization semantics and corrects
 docker exec sl_app bash -lc 'cd /app; . venv/bin/activate; set -a; . /tmp/sl_env.sh; set +a; python /tmp/observe_norm.py 2>&1'
 ```
 
-**Output (complete, unedited; run 1 of 2 — run 2 byte-identical modulo per-run-varying fields only: the `RUN 1`/`RUN 2` banner and logger timestamps/PID):**
+**Output (complete, unedited; run 1 of 2 — run 2 is byte-identical except for the per-run-varying fields: logger timestamps, PID, the randomly-generated alias local-part, and the `sl_message_id` tokens):**
 
 ```
-########## observe_norm.py RUN 1 ##########
+load config file /app/tests/test.env
+>>> URL: http://localhost
+Upload files to local dir
+>>> init logging <<<
+2026-07-13 21:38:56,672 - SL - DEBUG - 9160 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+2026-07-13 21:39:01,119 - SL - INFO - 9160 - "/app/init_app.py:44" - add_sl_domains() -  - Add d1.test to SL domain
+2026-07-13 21:39:01,122 - SL - INFO - 9160 - "/app/init_app.py:44" - add_sl_domains() -  - Add d2.test to SL domain
+2026-07-13 21:39:01,124 - SL - INFO - 9160 - "/app/init_app.py:44" - add_sl_domains() -  - Add sl.local to SL domain
+2026-07-13 21:39:01,125 - SL - DEBUG - 9160 - "/app/init_app.py:42" - add_sl_domains() -  - sl.local is already a SL domain
+2026-07-13 21:39:01,409 - SL - INFO - 9160 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
+2026-07-13 21:39:01,427 - SL - DEBUG - 9160 - "/app/app/models.py:1459" - generate_random_alias_email() -  - generate email word_word312@sl.local
+2026-07-13 21:39:01,435 - SL - INFO - 9160 - "/app/app/events/event_dispatcher.py:58" - send_event() -  - Not sending events because webhook is disabled
 === stored Contact.reply_email = 'norm_key@sl.local' (single row) ===
 --- normalize_reply_email() maps each INBOUND spelling onto the stored key ---
   inbound='norm_key@sl.local'              -> normalize_reply_email -> 'norm_key@sl.local'  (==stored? True)
@@ -971,9 +982,42 @@ docker exec sl_app bash -lc 'cd /app; . venv/bin/activate; set -a; . /tmp/sl_env
 --- exact-equality proof: query uses normalized INBOUND vs raw STORED ---
   Contact.get_by(reply_email='norm key@sl.local')            -> None
   Contact.get_by(reply_email=normalize('norm key@sl.local')) -> <Contact 1 ext@nowhere.net 2>
+--- canonical handle_reply() with each inbound spelling resolves the ONE stored contact ---
+2026-07-13 21:39:01,447 - SL - INFO - 9160 - "/app/app/handler/dmarc.py:159" - apply_dmarc_policy_for_reply_phase() -  - DMARC check disabled
+2026-07-13 21:39:01,453 - SL - DEBUG - 9160 - "/app/email_handler.py:1051" - handle_reply() -  - Create <EmailLog 1> for <Contact 1 ext@nowhere.net 2>, <User 1 Test User norm-user@mailbox.test>, <Mailbox 1 norm-user@mailbox.test>
+2026-07-13 21:39:01,459 - SL - DEBUG - 9160 - "/app/email_handler.py:1171" - handle_reply() -  - From header is word_word312@sl.local
+2026-07-13 21:39:01,460 - SL - DEBUG - 9160 - "/app/email_handler.py:380" - replace_header_when_reply() -  - Replace To header, old: norm_key@sl.local, new: Ext <ext@nowhere.net>
+2026-07-13 21:39:01,460 - SL - DEBUG - 9160 - "/app/email_handler.py:383" - replace_header_when_reply() -  - delete the Cc header. Old value None
+2026-07-13 21:39:01,462 - SL - DEBUG - 9160 - "/app/email_handler.py:1314" - replace_original_message_id() -  - create a new sl_message_id <178397874146.9160.6600060960573048428.1@sl.local>
+2026-07-13 21:39:01,469 - SL - DEBUG - 9160 - "/app/email_handler.py:1212" - handle_reply() -  - send email from word_word312@sl.local to ext@nowhere.net, mail_options:[],rcpt_options:[]
+2026-07-13 21:39:01,473 - SL - DEBUG - 9160 - "/app/app/mail_sender.py:131" - send() -  - send email with subject 'norm 0', from 'word_word312@sl.local' to 'Ext <ext@nowhere.net>'
   inbound='norm_key@sl.local'              -> delivered=True code='250 Message accepted for delivery' EmailLog.contact_id=1
+2026-07-13 21:39:01,482 - SL - INFO - 9160 - "/app/app/handler/dmarc.py:159" - apply_dmarc_policy_for_reply_phase() -  - DMARC check disabled
+2026-07-13 21:39:01,484 - SL - DEBUG - 9160 - "/app/email_handler.py:1051" - handle_reply() -  - Create <EmailLog 2> for <Contact 1 ext@nowhere.net 2>, <User 1 Test User norm-user@mailbox.test>, <Mailbox 1 norm-user@mailbox.test>
+2026-07-13 21:39:01,489 - SL - DEBUG - 9160 - "/app/email_handler.py:1171" - handle_reply() -  - From header is word_word312@sl.local
+2026-07-13 21:39:01,490 - SL - DEBUG - 9160 - "/app/email_handler.py:380" - replace_header_when_reply() -  - Replace To header, old: norm_key@sl.local, new: Ext <ext@nowhere.net>
+2026-07-13 21:39:01,490 - SL - DEBUG - 9160 - "/app/email_handler.py:383" - replace_header_when_reply() -  - delete the Cc header. Old value None
+2026-07-13 21:39:01,492 - SL - DEBUG - 9160 - "/app/email_handler.py:1314" - replace_original_message_id() -  - create a new sl_message_id <178397874149.9160.14513197473063157976.2@sl.local>
+2026-07-13 21:39:01,498 - SL - DEBUG - 9160 - "/app/email_handler.py:1212" - handle_reply() -  - send email from word_word312@sl.local to ext@nowhere.net, mail_options:[],rcpt_options:[]
+2026-07-13 21:39:01,500 - SL - DEBUG - 9160 - "/app/app/mail_sender.py:131" - send() -  - send email with subject 'norm 1', from 'word_word312@sl.local' to 'Ext <ext@nowhere.net>'
   inbound='norm key@sl.local'              -> delivered=True code='250 Message accepted for delivery' EmailLog.contact_id=1
+2026-07-13 21:39:01,508 - SL - INFO - 9160 - "/app/app/handler/dmarc.py:159" - apply_dmarc_policy_for_reply_phase() -  - DMARC check disabled
+2026-07-13 21:39:01,511 - SL - DEBUG - 9160 - "/app/email_handler.py:1051" - handle_reply() -  - Create <EmailLog 3> for <Contact 1 ext@nowhere.net 2>, <User 1 Test User norm-user@mailbox.test>, <Mailbox 1 norm-user@mailbox.test>
+2026-07-13 21:39:01,516 - SL - DEBUG - 9160 - "/app/email_handler.py:1171" - handle_reply() -  - From header is word_word312@sl.local
+2026-07-13 21:39:01,517 - SL - DEBUG - 9160 - "/app/email_handler.py:380" - replace_header_when_reply() -  - Replace To header, old: norm_key@sl.local, new: Ext <ext@nowhere.net>
+2026-07-13 21:39:01,517 - SL - DEBUG - 9160 - "/app/email_handler.py:383" - replace_header_when_reply() -  - delete the Cc header. Old value None
+2026-07-13 21:39:01,519 - SL - DEBUG - 9160 - "/app/email_handler.py:1314" - replace_original_message_id() -  - create a new sl_message_id <178397874151.9160.10709628307354080399.3@sl.local>
+2026-07-13 21:39:01,524 - SL - DEBUG - 9160 - "/app/email_handler.py:1212" - handle_reply() -  - send email from word_word312@sl.local to ext@nowhere.net, mail_options:[],rcpt_options:[]
+2026-07-13 21:39:01,527 - SL - DEBUG - 9160 - "/app/app/mail_sender.py:131" - send() -  - send email with subject 'norm 2', from 'word_word312@sl.local' to 'Ext <ext@nowhere.net>'
   inbound='norm#key@sl.local'              -> delivered=True code='250 Message accepted for delivery' EmailLog.contact_id=1
+2026-07-13 21:39:01,535 - SL - INFO - 9160 - "/app/app/handler/dmarc.py:159" - apply_dmarc_policy_for_reply_phase() -  - DMARC check disabled
+2026-07-13 21:39:01,537 - SL - DEBUG - 9160 - "/app/email_handler.py:1051" - handle_reply() -  - Create <EmailLog 4> for <Contact 1 ext@nowhere.net 2>, <User 1 Test User norm-user@mailbox.test>, <Mailbox 1 norm-user@mailbox.test>
+2026-07-13 21:39:01,542 - SL - DEBUG - 9160 - "/app/email_handler.py:1171" - handle_reply() -  - From header is word_word312@sl.local
+2026-07-13 21:39:01,543 - SL - DEBUG - 9160 - "/app/email_handler.py:380" - replace_header_when_reply() -  - Replace To header, old: norm_key@sl.local, new: Ext <ext@nowhere.net>
+2026-07-13 21:39:01,544 - SL - DEBUG - 9160 - "/app/email_handler.py:383" - replace_header_when_reply() -  - delete the Cc header. Old value None
+2026-07-13 21:39:01,545 - SL - DEBUG - 9160 - "/app/email_handler.py:1314" - replace_original_message_id() -  - create a new sl_message_id <178397874154.9160.15015114200142604317.4@sl.local>
+2026-07-13 21:39:01,551 - SL - DEBUG - 9160 - "/app/email_handler.py:1212" - handle_reply() -  - send email from word_word312@sl.local to ext@nowhere.net, mail_options:[],rcpt_options:[]
+2026-07-13 21:39:01,554 - SL - DEBUG - 9160 - "/app/app/mail_sender.py:131" - send() -  - send email with subject 'norm 3', from 'word_word312@sl.local' to 'Ext <ext@nowhere.net>'
   inbound='norm~key@sl.local'              -> delivered=True code='250 Message accepted for delivery' EmailLog.contact_id=1
 --- rows sharing the stored key = 1 (multi-row match needs >1 STORED row with same key) ---
 DONE
@@ -1018,13 +1062,13 @@ DONE
 The official SimpleLogin documentation defines the reverse-alias and its intended uniqueness:
 
 - "*A reverse-alias is unique for each sender and alias*" ([SimpleLogin Docs — Reverse alias](https://simplelogin.io/docs/getting-started/reverse-alias/)). This is the **intended invariant**: one `reply_email` corresponds to exactly one `(alias, contact)` pair.
-- "*When you send an email to a reverse-alias from your personal email, the email will be sent from your alias to the contact*" ([SimpleLogin FAQ](https://simplelogin.io/faq/)), and a reverse-alias "*is created for each alias you want to send email from and each contact you want to send email to*" — i.e., per `(alias, contact)` pair ([SimpleLogin Docs — Send emails from your alias](https://simplelogin.io/docs/getting-started/send-email/)).
+- "*When you send an email to a reverse-alias from your personal email, the email will be sent from your alias to the contact*" ([SimpleLogin FAQ](https://simplelogin.io/faq/)), and — per the documented send-email procedure (choose the alias to send from, then enter the contact's address, which creates a reverse-alias for that contact) — a distinct reverse-alias is created for each alias you send from and each contact you send to, i.e., one per `(alias, contact)` pair (paraphrased) ([SimpleLogin Docs — Send emails from your alias](https://simplelogin.io/docs/getting-started/send-email/)).
 
 The reply path relies on this intended one-to-one mapping when it derives the alias/user/mailbox from the single contact returned by `Contact.get_by(reply_email=...)`. **But the database does not enforce that invariant** (§6.1): with no `UNIQUE` constraint on `reply_email`, two contacts on aliases owned by different users can share one `reply_email`, and the unordered `.first()` then resolves an application-unordered row (§4.1, §6.3). The gap between the documented intent (unique per sender+alias) and the unenforced schema (no `UNIQUE`) is precisely the crux of the wrong-user question.
 
 The framework/database semantics underpinning the ordering analysis are grounded in official sources:
 
-- **SQLAlchemy 1.3** — `Query.first()` emits `LIMIT 1` and returns the first yielded row ([Query API](https://docs.sqlalchemy.org/en/13/orm/query.html)); without `ORDER BY` on more than one match the result "*will not be deterministic*" and an `ORDER BY` on a unique column is recommended ([SQLAlchemy FAQ — ORDER BY with LIMIT](https://docs.sqlalchemy.org/en/13/faq/ormconfiguration.html#faq-query-deduplicating)).
+- **SQLAlchemy 1.3** — `Query.first()` emits `LIMIT 1` and returns the first yielded row ([Query API](https://docs.sqlalchemy.org/en/13/orm/query.html)); without `ORDER BY` on more than one match "*it is not deterministic which rows will actually be returned*" and an `ORDER BY` on a unique column is required ([SQLAlchemy 1.3 FAQ — ORDER BY with LIMIT](https://docs.sqlalchemy.org/en/13/faq/ormconfiguration.html#why-is-order-by-required-with-limit-especially-with-subqueryload)).
 - **PostgreSQL 15** — "*If sorting is not chosen, the rows will be returned in an unspecified order. The actual order in that case will depend on the scan and join plan types and the order on disk, but it must not be relied on*" ([PostgreSQL 15 §7.5 Sorting Rows](https://www.postgresql.org/docs/15/queries-order.html)); a `SELECT` without `ORDER BY`/`LIMIT` has no guaranteed row order ([PostgreSQL 15 SELECT](https://www.postgresql.org/docs/15/sql-select.html)).
 
 ---
@@ -1099,7 +1143,7 @@ DONE
 ```
 
 - **Seed.** `shared_reply='dup-reply-wrong@sl.local'`; insertion B-then-A makes `contact_b.id=1` (user_B) the first row; `[non-canonical] Contact.get_by(...) -> id=1 user_id=2 (user_B)` confirms which row `.first()` resolves.
-- **CASE 1 — default control (`disable_email_spoofing_check=False`) → E214, no forward.** `get_mailbox_from_mail_from()` finds no mailbox of user_A authorized for user_B's alias, so `handle_reply()` invokes `handle_unknown_mailbox()` (`email_handler.py:1393`) and returns `(a) delivered=False code='250 SL E214 Unauthorized for using reverse alias'`. `(b)` **no `EmailLog` and no reply send request** — the path returns E214 before `EmailLog.create`/forward. `(c)` the single stored outbound is the **unknown-mailbox alert** to `userb@mailbox.test` (subject `Attempt to use your alias ... from usera@mailbox.test`), **not** a reply forward. `(d)` a new `SentAlert` row is created (`id=1 user_id=2(user_B) alert_type='reverse_alias_unknown_mailbox'`). `(e)` **no `EmailLog`**. `(f)` no confirmed SMTP (`NOT_SEND_EMAIL=True`); the only outbound is the alert to user_B, and user_A's reply is **not** forwarded anywhere. This is an **access-control boundary**.
+- **CASE 1 — default control (`disable_email_spoofing_check=False`) → E214, no forward.** `get_mailbox_from_mail_from()` finds no mailbox of user_A authorized for user_B's alias, so `handle_reply()` invokes `handle_unknown_mailbox()` (`email_handler.py:1032`; the function's own internal `LOG.w` warning is emitted at `:1393`, shown in the output above) and returns `(a) delivered=False code='250 SL E214 Unauthorized for using reverse alias'`. `(b)` **no `EmailLog` and no reply send request** — the path returns E214 before `EmailLog.create`/forward. `(c)` the single stored outbound is the **unknown-mailbox alert** to `userb@mailbox.test` (subject `Attempt to use your alias ... from usera@mailbox.test`), **not** a reply forward. `(d)` a new `SentAlert` row is created (`id=1 user_id=2(user_B) alert_type='reverse_alias_unknown_mailbox'`). `(e)` **no `EmailLog`**. `(f)` no confirmed SMTP (`NOT_SEND_EMAIL=True`); the only outbound is the alert to user_B, and user_A's reply is **not** forwarded anywhere. This is an **access-control boundary**.
 - **CASE 2 — `[non-canonical]` fallback (`disable_email_spoofing_check=True`) → wrong-user selection, logging, and enqueue.** The spoof check is skipped: `ignore unknown sender ... <Alias 4 ...> -> <Contact 1 b@nowhere.net 4>` (`email_handler.py:1023`), then `Create <EmailLog 1> for <Contact 1 b@nowhere.net 4>, <User 2 ... userb@mailbox.test>, <Mailbox 2 ...>` (`email_handler.py:1051`), header rewrite (`:380`), and send (`:1212`). `(a) delivered=True code='250 Message accepted for delivery'` (E200). `(b)` one stored `SendRequest` with `envelope_to='b@nowhere.net'`. `(c)` external target `b@nowhere.net` = `contact_B.website_email`. `(d)` **no** new `SentAlert`. `(e)` **`EmailLog id=1 contact_id=1 alias_id=4 user_id=2 (user_B — WRONG, not the sending mailbox's owner) mailbox_id=2 is_reply=True`.** `(f)` no confirmed SMTP (`NOT_SEND_EMAIL=True`): the `'250 accepted'` is application acceptance and enqueue only.
 
 **Causal conclusion.** The wrong-user *resolution* is caused by the unordered `.first()` over a non-unique `reply_email` (§4.1, §6.1–§6.3). Whether that mis-resolution becomes a wrong-user **forward** depends on the alias's spoof control: **default** settings convert it into an E214 rejection plus an alert to the resolved (wrong) user (CASE 1); the **`[non-canonical]`** spoof-disabled fallback lets it become an actual forward logged against the wrong user (CASE 2). In neither case is external SMTP delivery confirmed under this harness configuration.
@@ -1117,8 +1161,8 @@ DONE
 | Primary contact lookup | `contact = Contact.get_by(reply_email=reply_email)` — `email_handler.py:986` |
 | E502 no contact / inactive user | `email_handler.py:988-989` / `990-992`; `User.is_active` `app/models.py:766-769` |
 | `.first()` with no `ORDER BY` | `ModelMixin.get_by` — `app/models.py:82-84` |
-| Alias/user/mailbox derived from contact | `alias = contact.alias` `:994`; `user = alias.user` `:1001`; `get_mailbox_from_mail_from` `:1019` |
-| Spoof branch (default E214 vs fallback) | `email_handler.py:1019-1034` (`disable_email_spoofing_check` `:1023`; `handle_unknown_mailbox` `:1032`; `status.E214` `:1034`); `handle_unknown_mailbox` def `:1390`, invoke `:1393` |
+| Alias/user/mailbox derived from contact | `alias = contact.alias` `:994`; `user = alias.user` `:1004`; `get_mailbox_from_mail_from` `:1019` |
+| Spoof branch (default E214 vs fallback) | `email_handler.py:1019-1034` (`disable_email_spoofing_check` `:1021`; `handle_unknown_mailbox` invoke `:1032`; `status.E214` `:1034`); `handle_unknown_mailbox` def `:1390`, internal warning `LOG.w` `:1393` |
 | `EmailLog` fields incl. `user_id=contact.user_id` | `EmailLog.create(...)` — `email_handler.py:1042-1050` |
 | Second lookup site | `replace_header_when_reply` def `email_handler.py:345`; second `Contact.get_by` `:364`; invoked `:1179`(TO)/`:1181`(CC); log `:380/:383` |
 | Routing hub dispatch | `handle` def `email_handler.py:1945`; `==>> Handle` `:1980`; `Reply phase ...` `:2196`; `is_reverse_alias` reuse `:2166`/`:2195` |
@@ -2447,6 +2491,6 @@ No product, source, model, migration, test, configuration, or manifest file was 
 - SimpleLogin Docs — Send emails from your alias: https://simplelogin.io/docs/getting-started/send-email/
 - SimpleLogin FAQ: https://simplelogin.io/faq/
 - SQLAlchemy 1.3 — Query API (`Query.first()`): https://docs.sqlalchemy.org/en/13/orm/query.html
-- SQLAlchemy FAQ — Why is ORDER BY recommended with LIMIT: https://docs.sqlalchemy.org/en/13/faq/ormconfiguration.html#faq-query-deduplicating
+- SQLAlchemy 1.3 FAQ — Why is ORDER BY required with LIMIT: https://docs.sqlalchemy.org/en/13/faq/ormconfiguration.html#why-is-order-by-required-with-limit-especially-with-subqueryload
 - PostgreSQL 15 — §7.5 Sorting Rows (ORDER BY): https://www.postgresql.org/docs/15/queries-order.html
 - PostgreSQL 15 — SELECT: https://www.postgresql.org/docs/15/sql-select.html
