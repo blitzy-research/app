@@ -1715,7 +1715,11 @@ long` and **no** user row is written; on acceptance the waiting-activation page 
 
 ### 4.9 Login / activate edge cases
 
-Each row is a captured HTTP response with its body signal (§4.7 SECTIONS C–G):
+Each row is a captured HTTP response with its body signal — the first five from §4.7 SECTIONS
+C–G, and the three already-authenticated rows from a dedicated live re-verification (complete
+unedited capture below the table). Note that **only** `GET /auth/activate` returns `400` for an
+already-authenticated session; `register` and `login` short-circuit to a `302` redirect to the
+dashboard *before* any form/CSRF processing:
 
 | Case | Entry point | HTTP | Signal | Citation |
 |------|-------------|------|--------|----------|
@@ -1723,7 +1727,40 @@ Each row is a captured HTTP response with its body signal (§4.7 SECTIONS C–G)
 | Login before activation | `POST /auth/login` | 200 | flash "Please check your inbox for the activation email. You can also have this email re-sent"; resend link shown; `LoginEvent.not_activated` | [`login.py:L63-69`] |
 | Invalid code | `GET /auth/activate?code=THIS-CODE-DOES-NOT-EXIST` | **400** | "Activation code cannot be found" | [`activate.py:L28-36`] |
 | Expired code | `GET /auth/activate?code=<code>` (expiry aged via NON-CANONICAL DB write) | **400** | "Activation code was expired"; resend shown | [`activate.py:L38-46`] |
-| Already authenticated | `GET /auth/activate?code=anything` (logged-in session) | **400** | "You are already logged in" | [`activate.py:L18-22`] |
+| Already authenticated — **activate** | `GET /auth/activate?code=anything` (logged-in session) | **400** | "You are already logged in" | [`activate.py:L18-22`] |
+| Already authenticated — **register** | `GET` / `POST /auth/register` (logged-in session) | **302** | redirect to `/dashboard/`; warning flash "You are already logged in" | [`register.py:L33-36`] |
+| Already authenticated — **login** | `GET` / `POST /auth/login` (logged-in session) | **302** | redirect to `/dashboard/` (no flash) | [`login.py:L28-34`] |
+
+The three already-authenticated rows above were re-verified live against the running `:7777` web
+app through the canonical HTTP entry points (seed user `john@wick.com`), confirming that the
+`400 "You are already logged in"` response is emitted **only** by `activate` [`activate.py:L18-22`],
+whereas `register` [`register.py:L33-36`] and `login` [`login.py:L28-34`] return a `302` redirect to
+`/dashboard/` because their `current_user.is_authenticated` guard runs *before* form/CSRF handling.
+Complete unedited capture:
+
+```text
+STEP 2  POST /auth/login  (john@wick.com / password)       -> HTTP 302 ; Location: http://localhost:7777/dashboard/   [session now authenticated]
+STEP 3  GET  /auth/register      (authenticated session)   -> HTTP 302 ; Location: http://localhost:7777/dashboard/
+STEP 4  POST /auth/register      (authenticated session)   -> HTTP 302 ; Location: http://localhost:7777/dashboard/   [redirect precedes form processing]
+STEP 5  GET  /auth/login         (authenticated session)   -> HTTP 302 ; Location: http://localhost:7777/dashboard/
+STEP 6  GET  /auth/activate?code=anything (authenticated)  -> HTTP 400 ; body contains "You are already logged in": YES
+STEP 7  follow register 302 to /dashboard/                 -> warning flash "You are already logged in" present: YES
+```
+
+Read-only proof that the authenticated `POST /auth/register` (STEP 4) created **no** row — the
+guard returns before `RegisterForm` is ever processed, so the demonstration leaves the DB pristine:
+
+```text
+$ psql -U myuser -d simplelogin -c "SELECT COUNT(*) FROM users WHERE email='should-not-be-created@example.com';"
+ count
+-------
+     0
+$ psql -U myuser -d simplelogin -c "SELECT id,email,activated FROM users ORDER BY id;"
+ id |          email          | activated
+----+-------------------------+-----------
+  1 | john@wick.com           | t
+  2 | winston@continental.com | t
+```
 
 **Inferred vs observed.** Every row in §4.5, §4.8, and §4.9 is **Observed** — a captured HTTP status
 plus a body/flash string, a DB row-state read, and (where applicable) a `sl-web` log line. The only
@@ -2457,7 +2494,7 @@ of the application behaving on its own).
 | 8 | `activation_code` row present → deleted → replay `400 Activation code cannot be found` | §4.4 | 2 |
 | 9 | `POST /auth/login` → `302` → `/dashboard/` → authenticated dashboard `200` | §4.2 | 2 |
 | 10 | Activation-success flash `Your account has been activated` rendered on the dashboard | §4.5 | 2 |
-| 11 | Edge paths: wrong password, login-before-activation, invalid code `400`, expired code `400`, already-authenticated `400` | §4.9 | 2 |
+| 11 | Edge paths: wrong password, login-before-activation, invalid code `400`, expired code `400`, already-authenticated activate `400` (register / login redirect `302`) | §4.9 | 2 |
 | 12 | Resend `GET` `200` + `POST` `200` flash `An activation email has been sent to you` + code regenerated | §4.8 | 2 |
 | 13 | Password boundaries: `7` rejected, `8` accepted, `100` accepted, `101` rejected | §4.8 | 2 |
 | 14 | GDPR export `Job.state` `ready` → `taken` → `done` + observed pickup latencies (~4.25 s, ~8.81 s) | §5.1, §5.2 | 3 |
@@ -2525,7 +2562,8 @@ own.
 | Edge: login-before-activation [`login.py:L63-69`] | §4.9 | Observed | Flash `Please check your inbox for the activation email` |
 | Edge: invalid activation code [`activate.py:L28-36`] | §4.9 | Observed | HTTP `400 Activation code cannot be found` |
 | Edge: expired activation code [`activate.py:L38-46`] | §4.9 | Observed + Non-canonical | HTTP `400 Activation code was expired` (expiry aged via **Non-canonical** DB write) |
-| Edge: already-authenticated register/login | §4.9 | Observed | HTTP `400` `You are already logged in` |
+| Edge: already-authenticated activate [`activate.py:L18-22`] | §4.9 | Observed | HTTP `400` `You are already logged in` |
+| Edge: already-authenticated register / login [`register.py:L33-36`, `login.py:L28-34`] | §4.9 | Observed | HTTP `302` → `/dashboard/` (register adds warning flash `You are already logged in`; login has no flash) |
 | Resend activation `GET` + `POST` [`resend_activation.py`] | §4.8 | Observed | `GET` 200 `Resend activation email`; `POST` 200 flash `An activation email has been sent to you`; code regenerated |
 | Password boundaries `Length(min=8,max=100)` [`register.py:L27`] | §4.8 | Observed | `7` rejected, `8` accepted, `100` accepted, `101` rejected |
 
