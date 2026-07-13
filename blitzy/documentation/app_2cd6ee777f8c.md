@@ -1286,7 +1286,7 @@ Seeder `obs_q2_seed_fail.py`:
 process_job. JOB_BATCH_IMPORT dispatches to handle_batch_import(batch_import)
 [job_runner.py:222-225]; with a non-existent batch_import_id, BatchImport.get
 returns None and handle_batch_import(None) raises AttributeError on
-`batch_import.user` [app/import_utils.py:24]. The main loop has NO try/except, so
+`batch_import.user` [app/import_utils.py:23]. The main loop has NO try/except, so
 the exception propagates and the runner PROCESS exits; state=done is never set."""
 from server import create_app
 app = create_app()
@@ -1652,13 +1652,21 @@ echo "PYTEST EXIT CODE = ${PIPESTATUS[0]}"'
 ```
 tests/jobs/test_job_runner.py::test_get_jobs_to_run PASSED               [ 50%]
 tests/tasks/test_cleanup_old_jobs.py::test_cleanup_old_jobs PASSED       [100%]
+venv/lib/python3.10/site-packages/flask_limiter/errors.py:10
+venv/lib/python3.10/site-packages/flask_limiter/errors.py:10
 ======================== 2 passed, 18 warnings in 0.04s ========================
 PYTEST EXIT CODE = 0
 ```
 
 **[OBSERVED]** both canonical harness tests pass; **exit code 0**. (The 18
 warnings are pre-existing third-party `DeprecationWarning`s from `pkg_resources`,
-`flask_limiter`, and `gnupg`, unrelated to Q2.)
+`flask_limiter`, and `gnupg`, unrelated to Q2. The two
+`venv/lib/python3.10/site-packages/flask_limiter/errors.py:10` lines are
+warning-source locations printed by pytest's warning summary; they survive the
+`grep -E "^tests/|passed|failed|error"` / `grep -v Warning` filter because the
+path substring `errors.py` matches `error` and the bare path line itself
+contains no `Warning` token. They are deterministic across runs and carry no
+load-bearing value.)
 
 ### Q2 file:line reference table
 
@@ -3468,7 +3476,7 @@ section name (stable), and every item carries its evidence label.
   appears only in `cleanup_old_jobs` and tests). *(Q2 Evidence B before/after
   rows; grep evidence; OBSERVED + SOURCE-VERIFIED.)*
 - [x] **Retry-eligibility branches** — immediate `ready`, stale `taken` past the
-  30-minute window, and exhausted `attempts >= 5` (ineligible). *(Q2 Evidence A
+  30-minute window, and exhausted `attempts >= 5` (ineligible). *(Q2 Evidence C
   eligibility scenarios; OBSERVED.)*
 - [x] **End-of-life cleanup** — `cleanup_old_jobs` deletes old jobs in `done(2)`
   or `error(3)`, and old `taken(1)` jobs with `attempts >= JOB_MAX_ATTEMPTS`,
@@ -3506,20 +3514,21 @@ section name (stable), and every item carries its evidence label.
   `get_verp_info_from_email(rcpt_tos[0])` (HMAC-verified) to recover the
   `EmailLog` id, then loads that `EmailLog`. *(Q3 Evidence B; OBSERVED +
   SOURCE-VERIFIED.)*
-- [x] **State changes recorded** — a `Bounce` row is created, a `RefusedEmail`
-  is stored, and `email_log.bounced = True` with `bounced_mailbox_id` set; the
-  reply phase additionally sets `refused_email_id` and creates a user
-  `Notification`. *(Q3 Evidence B before/after rows for both directions;
-  OBSERVED.)*
+- [x] **State changes recorded** — in **both** phases a `Bounce` row is created,
+  a `RefusedEmail` is stored, and `email_log.bounced = True`, `refused_email_id`,
+  and `bounced_mailbox_id` are set, and a user `Notification` is created. The
+  phases differ in the `Bounce` key (`mailbox.email` vs `contact.website_email`)
+  and the SMTP status (`E211` vs `E212`). *(Q3 Evidence B before/after rows for
+  both directions; OBSERVED.)*
 - [x] **How handling differs by DIRECTION — forward vs reply** — direction is
   taken from `EmailLog.is_reply` in `handle_bounce`. **Forward phase**
   (`handle_bounce_forward_phase`): `Bounce` keyed on the **mailbox** email,
   may auto-disable the alias after repeated bounces, returns SMTP **`E211`**.
   **Reply phase** (`handle_bounce_reply_phase`): `Bounce` keyed on the
-  **contact's website email**, creates a user `Notification`, returns SMTP
-  **`E212`**. *(Q3 Evidence B, real `email_handler.handle()` driven for both
-  directions with the captured status lines, two runs; OBSERVED +
-  SOURCE-VERIFIED.)*
+  **contact's website email**, returns SMTP **`E212`**. Both phases create a
+  user `Notification` (differing only in wording). *(Q3 Evidence B, real
+  `email_handler.handle()` driven for both directions with the captured status
+  lines, two runs; OBSERVED + SOURCE-VERIFIED.)*
 - [x] **Forward-phase auto-disable modifier** — after enough accumulated
   forward bounces, the next forward bounce flips `alias.enabled` from `True` to
   `False` and creates a `Notification`. *(Q3 Evidence D, seeded to the
