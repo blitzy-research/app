@@ -33,7 +33,7 @@ it is explicitly labeled **inferred**.
 
 | # | Question | Direct answer (observed) |
 |---|----------|--------------------------|
-| Q1 | What TCP port does the app bind to on startup? | `0.0.0.0:7777` (Gunicorn `-b 0.0.0.0:7777`; dev server `port=7777`) |
+| Q1 | What TCP port does the app bind to on startup? | Port **`7777`** on both paths, on different interfaces: the canonical Gunicorn server binds `0.0.0.0:7777` (`-b 0.0.0.0:7777`); the development server binds `127.0.0.1:7777` (`app.run(..., port=7777)`, Werkzeug default `host`) |
 | Q2 | What do the startup / initialization logs look like? | Gunicorn arbiter `[INFO]` lines on **stderr** + the app's import-time **stdout** printed **once per worker**, incl. the banner `>>> init logging <<<`. The `werkzeug` logger is disabled. |
 | Q3 | What does the health-check endpoint return? | Body `success`, HTTP `200 OK`, `Content-Type: text/html; charset=utf-8`, `Content-Length: 7` |
 | Q4 | Alias creation via REST API — JSON response + DB persistence? | HTTP `201`, a 17-key JSON object; a row is inserted into the `alias` table (API `id` == DB `id`) |
@@ -612,8 +612,11 @@ This is exactly the Docker image's production command
 
 ## Q1 — What TCP port does the application bind to on startup?
 
-**Direct answer (observed):** the application binds to **`0.0.0.0:7777`** (all interfaces,
-TCP port 7777), for both the canonical Gunicorn server and the development server.
+**Direct answer (observed):** the application binds to **TCP port 7777** on both paths, but on
+different interfaces. The canonical Gunicorn server (the production path) binds
+**`0.0.0.0:7777`** (all interfaces, via `-b 0.0.0.0:7777` [Dockerfile:47]); the development
+server binds **`127.0.0.1:7777`** (localhost only) because `app.run(debug=True, port=7777)`
+[server.py:588] omits the `host` argument, leaving Werkzeug's default `host="127.0.0.1"`.
 
 **(a) Command used**
 
@@ -673,8 +676,8 @@ $ curl -s -i http://127.0.0.1:7777/health | head -1
 HTTP/1.0 200 OK
 ```
 
-The dev server answers on `7777` (note `HTTP/1.0`, the Werkzeug dev server, versus Gunicorn's
-`HTTP/1.1`). Two things are worth noting in that transcript, both **observed**: (1) the app's
+The dev server answers on `127.0.0.1:7777` (localhost only; note `HTTP/1.0`, the Werkzeug dev
+server, versus Gunicorn's `HTTP/1.1`). Two things are worth noting in that transcript, both **observed**: (1) the app's
 import-time block appears **twice** — once for the reloader parent (PID `354`) and once for the
 reloader child (PID `370`) — because `debug=True` enables the auto-reloader; and (2) the
 Flask/Werkzeug banner shows `* Serving Flask app "server"`, `* Environment: production`, the
@@ -683,7 +686,8 @@ Flask/Werkzeug banner shows `* Serving Flask app "server"`, `* Environment: prod
 stat` line appears. That omission is explained in Q2: those specific lines are emitted through
 the `werkzeug` logger, which the app disables [app/log.py:70-71].
 
-**(c) Concrete observed value:** `0.0.0.0:7777`. The arbiter line `Listening at:
+**(c) Concrete observed value:** `0.0.0.0:7777` for the canonical Gunicorn (production) server;
+`127.0.0.1:7777` for the development server. The arbiter line `Listening at:
 http://0.0.0.0:7777 (268)` is emitted by the master process (PID `268` on boot #1). Confirmed
 **stable across two starts**: boot #2 (shown in full in Q2) produced `Listening at:
 http://0.0.0.0:7777 (291)` — identical bind address; only the PID changed (`268` → `291`).
@@ -1112,11 +1116,13 @@ mailbox), `name` NULL, `enabled=t`, `flags=0`, `pinned=f`, and `automatic_creati
 **Persistence semantics (corrected).** The endpoint calls `Alias.create_new_random(...)`
 [app/api/views/new_random_alias.py:106], which builds the row via
 `Alias.create(user_id=…, email=…, mailbox_id=…, note=…)` [app/models.py:1750-1755] — passing
-**neither** `commit` **nor** `flush`. Inside `ModelMixin.create` [app/models.py:116] **both**
-arguments default to `False`: `commit = kw.pop("commit", False)` [app/models.py:118] and
-`flush = kw.pop("flush", False)` [app/models.py:119]. The method therefore only runs
-`Session.add(r)` [app/models.py:122] and returns the instance [app/models.py:130] in the SQLAlchemy
-**pending** state — no `INSERT` has been emitted yet. The row is not sent to PostgreSQL until the
+**neither** `commit` **nor** `flush`. That call resolves to the **`Alias.create` override**
+[app/models.py:1628-1692] — which shadows the base `ModelMixin.create` [app/models.py:116] for
+the alias path — where **both** arguments default to `False`: `commit = kw.pop("commit", False)`
+[app/models.py:1629] and `flush = kw.pop("flush", False)` [app/models.py:1630]. The override adds
+the row with `Session.add(new_alias)` [app/models.py:1660], then commits or flushes only if those
+flags are set; since both are `False` it does neither and returns the instance
+[app/models.py:1692] in the SQLAlchemy **pending** state — no `INSERT` has been emitted yet. The row is not sent to PostgreSQL until the
 endpoint issues an explicit `Session.commit()` [app/api/views/new_random_alias.py:107], which
 flushes the pending `INSERT` and commits the transaction. (This corrects the earlier claim that
 `create(commit=False)` had "already flushed" the alias: it had not, because `flush` is `False` by
