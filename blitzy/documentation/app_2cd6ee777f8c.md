@@ -79,7 +79,11 @@ git HEAD: 2cd6ee777f8c2d3531559588bcfb18627ffb5d2c
 
 The runtime is Python 3.10.18 (matching `pyproject.toml:61` `python = "^3.10"`), and the source is exactly the reviewed commit.
 
-### 2.3 Required one-time fix: `pyre2` replaces `google-re2`
+### 2.3 Required one-time environment fixes: `pyre2` and `swaks`
+
+Two one-time corrections are applied to the pristine image before the reproduction can run: the `pyre2`/`google-re2` swap below, and installation of the `swaks` SMTP injection client (used from Section 3 onward), which is **absent** from the image.
+
+#### 2.3.1 `pyre2` replaces `google-re2`
 
 The image venv ships `google-re2` (`google-re2==1.1.20250805`), whose `re2` module lacks `DOTALL`/`IGNORECASE` (`getattr(re2, "DOTALL", "MISSING")` → `MISSING` **[OBSERVED]**). On a **canonical** checkout — where `app/spamassassin_utils.py:8` is `import re2 as re` — importing the handler therefore fails at import time, because the module-level `re.compile(rb"...", re.DOTALL)` at `app/spamassassin_utils.py:13` dereferences that missing attribute. The failing import chain is `email_handler.py:92` (`from app.email.spam import get_spam_score`) → `app/email/spam.py:11` (`from app.spamassassin_utils import SpamAssassin`) → `app/spamassassin_utils.py:13`. Captured traceback **[OBSERVED]** (canonical source with `google-re2` installed, run before applying the fix below):
 
@@ -142,9 +146,64 @@ Upload files to local dir
 import email_handler OK
 ```
 
+#### 2.3.2 Install `swaks` (SMTP injection client)
+
+The pristine image has **no** `swaks` (`command -v swaks` → absent; `dpkg -l | grep -iw swaks` → no package), yet `swaks` is the sole canonical injector used from Section 3 onward. Install it once:
+
+```bash
+docker exec "$CID" bash -lc 'apt-get update && apt-get install -y swaks'
+```
+
+Verification command and output **[OBSERVED]**:
+
+```bash
+docker exec "$CID" bash -lc 'command -v swaks && swaks --version | head -1'
+```
+
+```
+/usr/bin/swaks
+swaks version 20201014.0
+```
+
+`swaks` is a pure client (it makes no product change) and, like the `pyre2` swap, is a **setup** correction to the environment — no product file is modified.
+
 ### 2.4 Services: Postgres, Redis, SMTP sink
 
-- **Postgres 15.13** on port `15432` (the cluster's `postgresql.conf` `port` set to `15432`; started with `pg_ctlcluster 15 main start`), role `myuser` (SUPERUSER, password `mypassword`), database `simplelogin` owned by `myuser`. The `pg_trgm` extension is **not** pre-created — it is created by the migration on a clean database (pre-creating it makes migration `2021_082012_424808e1fe49` roll back on `DUPLICATE_OBJECT`).
+**Pristine state [OBSERVED].** The image ships a Postgres 15 cluster (`main`) that is **down** and configured for port `5432`, with only the roles `postgres`/`test` and databases `postgres`/`template0`/`template1`/`test`; the app role `myuser` and the database `simplelogin` do **not** exist yet:
+
+```bash
+docker exec "$CID" bash -lc 'pg_lsclusters'
+```
+
+```
+Ver Cluster Port Status Owner    Data directory              Log file
+15  main    5432 down   postgres /var/lib/postgresql/15/main /var/log/postgresql/postgresql-15-main.log
+```
+
+Because `DB_URI` targets `myuser:mypassword@localhost:15432/simplelogin` (Section 2.6), the cluster is moved to `15432`, started, and provisioned with the app role and database; Redis is started; and the SMTP sink (Section 2.5) is launched. Provisioning and startup commands **[OBSERVED]**:
+
+```bash
+# Postgres: move cluster 'main' from its default 5432 to 15432, start it,
+# then create the app role and database (the pristine image has neither).
+docker exec "$CID" bash -lc 'pg_conftool 15 main set port 15432 && pg_ctlcluster 15 main start'
+docker exec "$CID" bash -lc "su postgres -c 'psql -p 15432 -v ON_ERROR_STOP=1' <<'SQL'
+CREATE ROLE myuser SUPERUSER LOGIN PASSWORD 'mypassword';
+CREATE DATABASE simplelogin OWNER myuser;
+SQL"
+# Redis
+docker exec "$CID" bash -lc 'redis-server --daemonize yes --port 6379'
+```
+
+Output of the Postgres role/database provisioning **[OBSERVED]**:
+
+```
+CREATE ROLE
+CREATE DATABASE
+```
+
+Resulting service state:
+
+- **Postgres 15.13** now on port `15432`, role `myuser` (SUPERUSER, password `mypassword`), database `simplelogin` owned by `myuser`. The `pg_trgm` extension is **not** pre-created — it is created by the migration on a clean database (pre-creating it makes migration `2021_082012_424808e1fe49` roll back on `DUPLICATE_OBJECT`).
 - **Redis 7.x** on `6379` (`redis-server --daemonize yes --port 6379`).
 - **SMTP sink** on `127.0.0.1:1025` (Section 2.5).
 
@@ -247,7 +306,17 @@ Messages `#1–#3` are the three byte-identical `hey@google.com → e1@sl.local`
 
 ### 2.6 Configuration: `.env` deltas and resolution
 
-`.env` is derived from `example.env` with exactly four deltas so a real forward is emitted to the local sink. Command and output **[OBSERVED]**:
+`.env` is derived from `example.env` with exactly four deltas so a real forward is emitted to the local sink. Create it with `cp` plus four `sed` edits:
+
+```bash
+docker exec "$CID" bash -lc 'cd /app && cp example.env .env && \
+  sed -i "s|^NOT_SEND_EMAIL=true|# NOT_SEND_EMAIL=true  # commented out: presence-based; real forward required|" .env && \
+  sed -i "s|^# POSTFIX_SERVER=my-postfix.com|POSTFIX_SERVER=localhost|" .env && \
+  sed -i "s|^DB_URI=postgresql://myuser:mypassword@localhost:5432/simplelogin|DB_URI=postgresql://myuser:mypassword@localhost:15432/simplelogin|" .env && \
+  sed -i "s|^# POSTFIX_PORT=1025|POSTFIX_PORT=1025|" .env'
+```
+
+The result is exactly four deltas, confirmed with `diff` **[OBSERVED]**:
 
 ```bash
 docker exec "$CID" bash -lc 'cd /app && diff example.env .env'
@@ -411,10 +480,10 @@ c1dd2e00b7fc4009815f7b4a13b61151c367744ec480c5cfa2e599daf1f84471  /tmp/payload.e
 bytes: 314
 ```
 
-The payload is `314` bytes, CRLF-terminated, with exactly one `Message-ID: <blitzy-fixed-probe-2cd6ee777f8c@test.local>`. All three success runs inject this **same file** via:
+The payload is `314` bytes, CRLF-terminated, with exactly one `Message-ID: <blitzy-fixed-probe-2cd6ee777f8c@test.local>`. All three success runs inject this **same file** (inside the container, per Section 2.1) via:
 
 ```bash
-swaks --to e1@sl.local --from hey@google.com --server 127.0.0.1:20381 --data - < /tmp/payload.eml
+docker exec "$CID" bash -lc 'swaks --to e1@sl.local --from hey@google.com --server 127.0.0.1:20381 --data - < /tmp/payload.eml'
 ```
 
 **Byte-identity of what the handler actually received [OBSERVED].** The handler logs the parsed inbound envelope on one line (`==>> Handle ...`, `email_handler.py:1980`). Hashing that exact line for each of the three runs yields the identical digest, proving the handler processed identical input every time:
@@ -440,10 +509,10 @@ Identical digest across all three runs ⇒ **byte-identical input**, satisfying 
 
 ### 4.1 Success — complete handler stdout (run #1, first send)
 
-Command (host) that injected run #1:
+Command (inside container) that injected run #1:
 
 ```bash
-swaks --to e1@sl.local --from hey@google.com --server 127.0.0.1:20381 --data - < /tmp/payload.eml
+docker exec "$CID" bash -lc 'swaks --to e1@sl.local --from hey@google.com --server 127.0.0.1:20381 --data - < /tmp/payload.eml'
 ```
 
 Complete SMTP transcript returned to the client **[OBSERVED]** — terminal status is `250 Message accepted for delivery`:
@@ -528,10 +597,10 @@ docker exec "$CID" bash -lc 'export PGPASSWORD=mypassword; psql -h localhost -p 
 0
 ```
 
-Command (host) — same fixed payload, only the RCPT changes to a non-existent alias:
+Command (inside container) — same fixed payload, only the RCPT changes to a non-existent alias:
 
 ```bash
-swaks --to doesnotexist@sl.local --from hey@google.com --server 127.0.0.1:20381 --data - < /tmp/payload.eml
+docker exec "$CID" bash -lc 'swaks --to doesnotexist@sl.local --from hey@google.com --server 127.0.0.1:20381 --data - < /tmp/payload.eml'
 ```
 
 Complete SMTP transcript **[OBSERVED]** — terminal status is `550 SL E515 Email not exist` (note `<**`, an SMTP error reply):
