@@ -104,7 +104,7 @@ $ pg_isready -h localhost            # -> /var/run/postgresql:5432 - accepting c
 $ redis-server --daemonize yes --dir /tmp ; redis-cli ping   # -> PONG
 ```
 
-**Step 1 — schema (`alembic upgrade head`):** run as `cd /app && /app/venv/bin/python -m alembic upgrade head` in the image venv. On startup the command prints the app banner (`>>> URL: http://localhost:7777`, then `MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value`) and then applies the project's **full Alembic migration chain** up to head `32f25cbf12f6`. The **contiguous tail** of that run — its final three `Running upgrade` lines and the captured exit code — is shown below (OBSERVED; `alembic upgrade` emits no further output after the last migration, so these are the genuine last lines):
+**Step 1 — schema (`alembic upgrade head`):** run as `cd /app && /app/venv/bin/alembic upgrade head` in the image venv. On startup the command prints the app banner (`>>> URL: http://localhost:7777`, then `MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value`) and then applies the project's **full Alembic migration chain** up to head `32f25cbf12f6`. The **contiguous tail** of that run — its final three `Running upgrade` lines and the captured exit code — is shown below (OBSERVED; `alembic upgrade` emits no further output after the last migration, so these are the genuine last lines):
 
 ```
 INFO  [alembic.runtime.migration] Running upgrade 62afa3a10010 -> 91ed7f46dc81, alias_audit_log
