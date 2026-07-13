@@ -469,7 +469,7 @@ AttributeError: 'NoneType' object has no attribute 'sudo_mode_at'
   exception at `L390` (`LOG.e(e)`) and returns `jsonify(error="Internal error"), 500` at `L392`
   for `/api/` paths.
 - Endpoint `delete_user()` (`DELETE /api/user`, `@require_api_sudo`): route at
-  `app/api/views/user.py:L11`, function `delete_user()` at `L14`; the deletion is *scheduled* via
+  `app/api/views/user.py:L12`, function `delete_user()` at `L14`; the deletion is *scheduled* via
   `Job.create(name=config.JOB_DELETE_ACCOUNT, …)` where `JOB_DELETE_ACCOUNT = "delete-account"`
   (`app/config.py:L306`).
 
@@ -1283,7 +1283,7 @@ Set-Cookie: slapp=e673e274-d0f2-48f7-8679-b069523619d2.<REDACTED-HMAC-sig>; Expi
 - **New Relic event — INFERRED (source-derived), not observable in logs:** the failed branch calls
   `LoginEvent(LoginEvent.ActionType.failed).send()` (`login.py:L50`), and `send()` performs
   `newrelic.agent.record_custom_event("LoginEvent", {"action": "failed", "source": "web"})`
-  (`app/events/auth_event.py:L22-L24`). This dispatches to the New Relic agent, **not** to
+  (`app/events/auth_event.py:L23-L25`). This dispatches to the New Relic agent, **not** to
   stdout/stderr, so — as OBSERVED above — it produces **no** line in `gunicorn.log`. Its emission
   is therefore inferred from source, while its absence from the logs is observed.
 
@@ -1310,7 +1310,7 @@ Set-Cookie: slapp=e673e274-d0f2-48f7-8679-b069523619d2.<REDACTED-HMAC-sig>; Expi
   `remote_addr method path args status_code`, i.e. `request.args` (not the form body), defined at
   `server.py:L273-L290`.
 - New Relic custom event (INFERRED / source-derived): `app/auth/views/login.py:L50` —
-  `LoginEvent(LoginEvent.ActionType.failed).send()`; `app/events/auth_event.py:L22-L24` —
+  `LoginEvent(LoginEvent.ActionType.failed).send()`; `app/events/auth_event.py:L23-L25` —
   `newrelic.agent.record_custom_event("LoginEvent", {...})`.
 - Rate limit: `app/auth/views/login.py:L22-L23` — `@limiter.limit("10/minute",
   deduct_when=lambda r: hasattr(g, "deduct_limit") and g.deduct_limit)`.
