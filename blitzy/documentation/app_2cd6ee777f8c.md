@@ -155,7 +155,7 @@ EMAIL_DOMAIN=sl.local                                        # [example.env:22],
 SUPPORT_EMAIL=support@sl.local                               # [example.env:40], [app/config.py:93]
 WORDS_FILE_PATH=local_data/test_words.txt                    # [example.env:97]
 DB_URI=postgresql://***:***@localhost:5432/slobs   (redacted) # [example.env:75]
-FLASK_SECRET=***                                   (redacted) # [example.env:77], [app/config.py:194]
+FLASK_SECRET=***                                   (redacted) # [example.env:77], [app/config.py:196]
 ```
 
 > Reproducibility & safety conventions used throughout: every observation script runs under
@@ -510,6 +510,23 @@ Indexes:
     "ix_alias_mailbox_id" btree (mailbox_id)
     "ix_alias_user_id" btree (user_id)
     "ix_video___ts_vector__" gin (ts_vector)
+    "note_pg_trgm_index" gin (note gin_trgm_ops)
+Foreign-key constraints:
+    "alias_batch_import_id_fkey" FOREIGN KEY (batch_import_id) REFERENCES batch_import(id) ON DELETE SET NULL
+    "alias_original_owner_id_fkey" FOREIGN KEY (original_owner_id) REFERENCES users(id) ON DELETE SET NULL
+    "gen_email_custom_domain_id_fkey" FOREIGN KEY (custom_domain_id) REFERENCES custom_domain(id) ON DELETE CASCADE
+    "gen_email_directory_id_fkey" FOREIGN KEY (directory_id) REFERENCES directory(id) ON DELETE CASCADE
+    "gen_email_mailbox_id_fkey" FOREIGN KEY (mailbox_id) REFERENCES mailbox(id) ON DELETE CASCADE
+    "gen_email_user_id_fkey" FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+Referenced by:
+    TABLE "alias_hibp" CONSTRAINT "alias_hibp_alias_id_fkey" FOREIGN KEY (alias_id) REFERENCES alias(id) ON DELETE CASCADE
+    TABLE "alias_mailbox" CONSTRAINT "alias_mailbox_alias_id_fkey" FOREIGN KEY (alias_id) REFERENCES alias(id) ON DELETE CASCADE
+    TABLE "alias_used_on" CONSTRAINT "alias_used_on_alias_id_fkey" FOREIGN KEY (alias_id) REFERENCES alias(id) ON DELETE CASCADE
+    TABLE "client_user" CONSTRAINT "client_user_alias_id_fkey" FOREIGN KEY (alias_id) REFERENCES alias(id) ON DELETE CASCADE
+    TABLE "contact" CONSTRAINT "contact_alias_id_fkey" FOREIGN KEY (alias_id) REFERENCES alias(id) ON DELETE CASCADE
+    TABLE "email_log" CONSTRAINT "email_log_alias_id_fkey" FOREIGN KEY (alias_id) REFERENCES alias(id) ON DELETE CASCADE
+    TABLE "hibp_notified_alias" CONSTRAINT "hibp_notified_alias_alias_id_fkey" FOREIGN KEY (alias_id) REFERENCES alias(id) ON DELETE CASCADE
+    TABLE "users" CONSTRAINT "users_newsletter_alias_id_fkey" FOREIGN KEY (newsletter_alias_id) REFERENCES alias(id) ON DELETE SET NULL
 ```
 
 ```
@@ -1044,8 +1061,9 @@ the output — that is why `alias` appears first and `support_pgp` last. In both
 The two responses are **not byte-identical**: they describe different aliases (`"id"` 2 vs 3, a
 different random `email`, different `creation_date`/`creation_timestamp`, and a different `note`),
 and each carries a freshly re-signed `slapp` session cookie. What they share is the **same parsed
-JSON content and structure** — the same 17 keys in the same (alphabetized) order — which has merely
-been reformatted (pretty-printed) here for readability. (This corrects an earlier characterization
+JSON content and structure** — the same 17 keys in the same (alphabetized) order. Both payloads are
+shown above **verbatim**, exactly as Flask's `jsonify` emits them (compact single-line, not
+pretty-printed). (This corrects an earlier characterization
 of the two payloads as "the same bytes"; only the shape is identical, not the bytes.)
 
 ### Q4.2 — What is persisted (the `alias` table) and the persistence semantics
