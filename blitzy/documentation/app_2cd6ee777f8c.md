@@ -33,7 +33,7 @@ A short orientation to the log format the reader will see everywhere is in [§3]
 
 ## 2. How to run it locally (Environment)
 
-Everything below was run against the **default, canonical configuration** in the user-provided Docker image, using two co-operating containers on a private Docker network. A newcomer can reproduce the whole environment by following §2.1 → §2.5 in order.
+Everything below was run against the **default, canonical configuration** in the user-provided Docker image, using two co-operating containers on a private Docker network. A newcomer can reproduce the whole environment by following §2.1 → §2.5 in order: §2.1 brings up both containers, creates the `.env`, and starts Redis; §2.5 migrates the database to head and loads the seed data.
 
 ### 2.1 Images and containers
 
@@ -44,6 +44,8 @@ $ docker images --format '{{.Repository}}:{{.Tag}}  {{.ID}}  {{.Size}}' | grep -
 ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_simple-login_app_1.0  ea242796bbce  2.14GB
 postgres:13  264e9dea325c  438MB
 ```
+
+> **Image reference.** The user-provided Special Instructions name this image by its Docker Hub alias `andrewparkscaleai/coding-agent:simple-login__app__2cd6ee7…`; this document uses the equivalent, directly-pullable GHCR reference shown above — the same image (identical image ID `ea242796bbce`) — which is the reference available in this environment.
 
 Two containers run on a user-defined bridge network `sl-net`. `sl-app` (the GHCR image) publishes the web port `7777` and the SMTP port `20381` to the host; `sl-postgres` publishes `15432→5432`:
 
@@ -58,7 +60,7 @@ sl-app 172.18.0.3/16
 sl-postgres 172.18.0.2/16
 ```
 
-The equivalent bring-up (already performed for this environment) is:
+The complete bring-up (already performed for this environment; run it verbatim on a fresh host to reproduce the exact state §2.2–§2.4 observe and §2.5 migrates and seeds) is:
 
 ```bash
 docker network create sl-net
@@ -68,8 +70,20 @@ docker run -d --name sl-postgres --network sl-net \
 docker run -d --name sl-app --network sl-net \
   -p 7777:7777 -p 20381:20381 \
   ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_simple-login_app_1.0 \
-  bash -lc 'sleep infinity'
+  -lc 'sleep infinity'
+
+# Prepare configuration inside sl-app: the pristine image ships example.env but no
+# .env, so create it and repoint DB_URI from the shipped @localhost (example.env:L75)
+# to the sl-postgres container, which is where Postgres is reachable on sl-net:
+docker exec sl-app bash -lc 'cd /app && cp example.env .env'
+docker exec sl-app bash -lc "cd /app && sed -i 's#@localhost:5432/simplelogin#@sl-postgres:5432/simplelogin#' .env"
+
+# Start Redis inside sl-app (used for sessions and rate-limiting); the pristine
+# image does not auto-start it:
+docker exec sl-app redis-server --daemonize yes --save "" --appendonly no
 ```
+
+> **Why the app container's command is `-lc 'sleep infinity'` (not `bash -lc …`).** The image's entrypoint is `/bin/bash` (`docker image inspect ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_simple-login_app_1.0 --format '{{json .Config.Entrypoint}}'` → `["/bin/bash"]`), so the trailing tokens after the image name are passed as *arguments* to that entrypoint. Supplying `-lc 'sleep infinity'` yields exactly `Path=/bin/bash Args=["-lc","sleep infinity"]` — the form the running `sl-app` uses. Supplying `bash -lc 'sleep infinity'` instead would run `/bin/bash bash -lc 'sleep infinity'`, and the container exits immediately: `docker inspect` shows `State.ExitCode=126` and the log reads `/usr/bin/bash: /usr/bin/bash: cannot execute binary file`.
 
 ### 2.2 Runtime versions
 
@@ -86,9 +100,9 @@ $ docker exec sl-app redis-cli ping
 PONG
 ```
 
-> **Newcomer note — use the venv, not the system Python.** Flask and the app's dependencies live only in `/app/venv`. `python3 server.py` fails with `ModuleNotFoundError: No module named 'flask'`; every invocation below uses `./venv/bin/python …` (or the pre-built `./venv/bin/gunicorn`, `./venv/bin/alembic`, `./venv/bin/flask`).
+> **Newcomer note — use the venv, not the system Python.** The app's third-party dependencies (Flask, `arrow`, and the rest) live only in `/app/venv`. Run against the system Python, `python3 server.py` fails at its first third-party import — `ModuleNotFoundError: No module named 'arrow'` (`server.py:L5` imports `arrow`, before the Flask imports at `server.py:L12`); every invocation below uses `./venv/bin/python …` (or the pre-built `./venv/bin/gunicorn`, `./venv/bin/alembic`, `./venv/bin/flask`).
 
-Redis is started inside `sl-app` as a daemon; it is the same process the app uses for sessions and rate-limiting:
+Redis is started inside `sl-app` as a daemon by the last command in §2.1 (the pristine image does not auto-start it); it is the same process the app uses for sessions and rate-limiting:
 
 ```
 $ docker exec sl-app ps -o pid,args -C redis-server
@@ -111,7 +125,7 @@ The image ships eight already-modified tracked files (key material, a rebuilt `s
 
 ### 2.4 Configuration (`.env`)
 
-Configuration is environment-variable driven via `/app/.env` (copied from `example.env`) and `app/config.py`. The file is **git-ignored** (`git check-ignore .env` → `.env`), so editing it is not a source-tree change. The keys that matter for this investigation, with their line numbers in the file:
+Configuration is environment-variable driven via `/app/.env` and `app/config.py`. The pristine image ships `example.env` but no `.env`, so §2.1 creates it (`cp example.env .env`) and rewrites `DB_URI` from the shipped `@localhost` to `@sl-postgres`. The file is **git-ignored** (`git check-ignore .env` → `.env`), so creating and editing it is not a source-tree change. The keys that matter for this investigation, with their line numbers in the file:
 
 ```
 $ docker exec sl-app bash -lc "cd /app && grep -nvE '^\s*#|^\s*$' .env | grep -iE 'URL|DB_URI|EMAIL_DOMAIN|SUPPORT_EMAIL|FLASK_SECRET|NOT_SEND_EMAIL|DISABLE'"
