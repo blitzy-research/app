@@ -81,7 +81,23 @@ The runtime is Python 3.10.18 (matching `pyproject.toml:61` `python = "^3.10"`),
 
 ### 2.3 Required one-time fix: `pyre2` replaces `google-re2`
 
-The image venv ships `google-re2`, whose `re2` module lacks `DOTALL`/`IGNORECASE`; `import email_handler` therefore fails with `AttributeError: module 're2' has no attribute 'DOTALL'` until the lock-consistent `pyre2` is installed. This is a **setup** correction to the environment, not a change to any product file.
+The image venv ships `google-re2` (`google-re2==1.1.20250805`), whose `re2` module lacks `DOTALL`/`IGNORECASE` (`getattr(re2, "DOTALL", "MISSING")` → `MISSING` **[OBSERVED]**). On a **canonical** checkout — where `app/spamassassin_utils.py:8` is `import re2 as re` — importing the handler therefore fails at import time, because the module-level `re.compile(rb"...", re.DOTALL)` at `app/spamassassin_utils.py:13` dereferences that missing attribute. The failing import chain is `email_handler.py:92` (`from app.email.spam import get_spam_score`) → `app/email/spam.py:11` (`from app.spamassassin_utils import SpamAssassin`) → `app/spamassassin_utils.py:13`. Captured traceback **[OBSERVED]** (canonical source with `google-re2` installed, run before applying the fix below):
+
+```
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/app/email_handler.py", line 92, in <module>
+    from app.email.spam import get_spam_score
+  File "/app/app/email/spam.py", line 11, in <module>
+    from app.spamassassin_utils import SpamAssassin
+  File "/app/app/spamassassin_utils.py", line 13, in <module>
+    divider_pattern = re.compile(rb"^(.*?)\r?\n(.*?)\r?\n\r?\n", re.DOTALL)
+AttributeError: module 're2' has no attribute 'DOTALL'
+```
+
+Installing the lock-consistent `pyre2` resolves it. This is a **setup** correction to the environment, not a change to any product file.
+
+> **Image-baseline caveat [OBSERVED]:** the image's in-container `/app/app/spamassassin_utils.py` carries a baseline patch that changes line 8 to the stdlib `import re` (which *does* expose `DOTALL`), so the import failure is masked inside this particular image even before the `pyre2` fix. The canonical source — and the host deliverable checkout at this commit — use `import re2 as re`, so a canonical checkout fails exactly as shown above; the traceback above was captured after restoring line 8 to the canonical `import re2 as re` in the disposable container. `pyre2` is the correct `poetry.lock`-consistent remedy regardless (`pyproject.toml` requires `pyre2 = "^0.3.6"`).
 
 Fix command:
 
@@ -876,11 +892,11 @@ The **same 314-byte payload** (`sha256=c1dd2e00b7fc4009815f7b4a13b61151c367744ec
 | `X-SimpleLogin-EmailLog-ID` header | `2` | `3` | `4` | **VARIABLE** [OBSERVED] |
 | Full delivered `.eml` sha256 | `caaac0e1aac3b9085de975a458197a50a24a43fce4bfabe1951da3102e1e5dd8` | `62330b65e531b0b8b8260d40b49fc056838e8d9b3ba0cfd78ae0d1d24e64f6db` | `ca5690f49f1a4f795b3ac79591f733aa83eb3261dde7ca15ff67b9628d2f3a58` | **VARIABLE** [OBSERVED] |
 
-**Nuance worth highlighting [OBSERVED]:** even with byte-identical *input*, the full delivered `.eml` bytes differ every run, because the message embeds the fresh `EmailLog.id` (`X-SimpleLogin-EmailLog-ID`) and is DKIM-signed. So "the forwarded email is not byte-identical run to run" is **true and expected** — while the two fields a recipient usually notices (`Message-ID`, `From` format) are stable.
+**Nuance worth highlighting [OBSERVED]:** even with byte-identical *input*, the full delivered `.eml` bytes differ every run, because the message embeds the fresh `EmailLog.id` in the `X-SimpleLogin-EmailLog-ID` header (`2` → `3` → `4` above). A `diff` of two consecutive delivered `.eml` files confirms that header is the **only** line that changes (`X-SimpleLogin-EmailLog-ID: 2` vs `3`). So "the forwarded email is not byte-identical run to run" is **true and expected** — while the two fields a recipient usually notices (`Message-ID`, `From` format) are stable. The message is **not** DKIM-signed under this default configuration: `DKIM_PRIVATE_KEY_PATH` is commented out (`example.env:72`), so `config.DKIM_PRIVATE_KEY` is `None` (`app/config.py:184`) and the unconditional `add_dkim_signature(msg, EMAIL_DOMAIN)` call (`email_handler.py:891`) is a no-op via the `if config.DKIM_PRIVATE_KEY:` guard (`app/email_utils.py:490`) — consistent with the Section 5.2 delivered header set, which contains no `DKIM-Signature`.
 
 **Bounded conclusion / hypothesis (finding-aware):**
 
-- **[OBSERVED]** On the **forward** path, with identical input, behavior is *format-stable* (templates, status codes, preserved `Message-ID`, `From`/reverse-alias format) and *value-variable* (`EmailLog.id`, timestamps, log-tracing uuid, VERP envelope-from, whole-message bytes/DKIM).
+- **[OBSERVED]** On the **forward** path, with identical input, behavior is *format-stable* (templates, status codes, preserved `Message-ID`, `From`/reverse-alias format) and *value-variable* (`EmailLog.id`, timestamps, log-tracing uuid, VERP envelope-from, whole-message bytes — solely due to the `X-SimpleLogin-EmailLog-ID` increment; the message is not DKIM-signed by default).
 - **[HYPOTHESIS]** A user perceiving "inconsistent behavior" is most plausibly seeing (i) these intentionally per-message-variable fields and/or (ii) **phase-dependent** `Message-ID` handling (preserved on forward vs. replaced on reply, Section 5).
 - This report deliberately does **not** claim the reported production issue is "not a defect" or globally deterministic: the **reply** and **bounce** paths were not exercised here, so any statement about them would be unsupported. The scope of these conclusions is exactly the **forward transactions observed above**.
 
