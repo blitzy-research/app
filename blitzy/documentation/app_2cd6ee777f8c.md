@@ -336,7 +336,7 @@ Every application log line below is emitted by a single centralized logger. Unde
   ```
   %(asctime)s - %(name)s - %(levelname)s - %(process)d - "%(pathname)s:%(lineno)d" - %(funcName)s() - %(message_id)s - %(message)s
   ```
-  Timestamps are UTC — the formatter sets `converter = time.gmtime` (`app/log.py:L44`).
+  Timestamps are UTC — the formatter sets `converter = time.gmtime` (`app/log.py:L43`).
 - **Logger name** is `"SL"` (`app/log.py:L79`, `LOG = _get_logger("SL")`).
 - **Level shortcuts** (`app/log.py:L74-L77`): `LOG.d` → `debug`, `LOG.i` → `info`, `LOG.w` → `warning`, and **`LOG.e` → `logging.Logger.exception`** — so `LOG.e` lines are emitted at **ERROR** level and append a traceback tail (even a bare `NoneType: None` when called outside an `except` block, as in the unknown-job case in [§6.4](#64-edge-an-unknown-job-name)).
 - **Import-time banner** `>>> init logging <<<` is printed once per process (`app/log.py:L67`).
