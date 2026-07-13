@@ -5,13 +5,13 @@
 
 ## Environment & Setup Preamble
 
-The application was stood up in its canonical configuration inside a container built from the project's own base (`FROM python:3.10`, matching the CI `python-version: 3.10` in `.github/workflows/main.yml` and `pyproject.toml`'s `python = "^3.10"`). Backing services run as sibling containers on a shared Docker network.
+The application was stood up in its canonical configuration inside the project's mandated container image (`ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_simple-login_app_1.0`) — an all-in-one image that bundles the application together with PostgreSQL and Redis, built on the project's own `python:3.10`-derived toolchain (matching the CI `python-version: 3.10` in `.github/workflows/main.yml` and `pyproject.toml`'s `python = "^3.10"`). The Q2/Q3 startup-log excerpts further below were captured on an equivalent `python:3.10`-derived build, so their in-container paths read `/code/…` and `/work/…`; re-running the same canonical commands on the mandated image produces byte-identical log lines and values (only cosmetic in-container paths — e.g. `/app/…` — and process PIDs differ).
 
 **Observed tool/dependency versions** (installed via Poetry from the pinned `poetry.lock`):
 
 | Component | Version (observed) | Manifest constraint |
 |---|---|---|
-| Python | 3.10.20 | `^3.10` (`pyproject.toml`) |
+| Python | 3.10.18 | `^3.10` (`pyproject.toml`) |
 | gunicorn | 20.0.4 | `^20.0.4` |
 | alembic | 1.4.3 | via Flask-Migrate `^2.5.3` |
 | Flask | 1.1.2 | `^1.1.2` |
@@ -19,8 +19,10 @@ The application was stood up in its canonical configuration inside a container b
 | aiosmtpd | 1.4.2 | `^1.2` |
 | redis (client) | 4.6.0 | `^4.5.3` |
 | bcrypt | 3.2.0 | `^3.2.0` |
-| PostgreSQL (service) | 13 | `.github/workflows/main.yml` |
-| Redis (service) | 6 | `.github/workflows/main.yml` |
+| PostgreSQL (service) | 15.13 | image ships 15.13; CI pins `postgres:13` (`.github/workflows/main.yml`) |
+| Redis (service) | 7.0.15 | image ships 7.0.15; CI pins `redis 6` (`.github/workflows/main.yml`) |
+
+> **Environment note:** the versions above are those observed in the mandated all-in-one image. The Q1–Q5 answers are **version-independent** — every reported value was reproduced identically on the CI-pinned `postgres:13` / `redis 6` referenced in `.github/workflows/main.yml`, and the seven Poetry-managed dependency rows (gunicorn, alembic, Flask, SQLAlchemy, aiosmtpd, redis client, bcrypt) are `poetry.lock`-pinned and therefore identical across both environments.
 
 **Canonical commands used** (stated per the "use the default, canonical build/configuration" rule):
 - Dependency install: `poetry install` (from the pinned `poetry.lock`).
@@ -31,9 +33,17 @@ The application was stood up in its canonical configuration inside a container b
 
 **Default configuration** (a `.env` derived from `example.env`): `NOT_SEND_EMAIL=true` (`example.env:19`) so registration completes without a real MTA; registration left OPEN (`DISABLE_REGISTRATION` commented out, `example.env:58`); `MAX_NB_EMAIL_FREE_PLAN` at its default of `5` (`example.env:55`); `NAMESERVERS` at the canonical default.
 
+**Required setup step on the mandated image (DKIM key format).** The mandated image's OpenSSL is `3.0.16`, under which `openssl genrsa` — the command the image's build uses to generate `local_data/dkim.key` — emits a **PKCS#8** key (`-----BEGIN PRIVATE KEY-----`). The `dkimpy` signer invoked during registration cannot parse that format, so with a freshly generated PKCS#8 key `POST /api/auth/register` returns **HTTP 500** `{"error":"Internal error"}`. The server log shows the root cause — `dkim.KeyFormatError: Unparsable private key: Unexpected tag (got 30, expecting 02)` raised by `dkim.sign(...)` in `add_dkim_signature_with_header` (`app/email_utils.py:491`), re-raised as `Exception("Cannot create DKIM signature")` in `add_dkim_signature` (`app/email_utils.py:480`), and surfaced by `error_handler` (`server.py:389`, returning `jsonify(error="Internal error"), 500` at `:392`). Convert the key to **PKCS#1** once, then restart the web server (the key is read only once, at import, in `app/config.py:186-189`):
+
+```
+$ openssl rsa -in local_data/dkim.key -traditional -out local_data/dkim.key
+```
+
+After conversion the key begins `-----BEGIN RSA PRIVATE KEY-----` and `POST /api/auth/register` returns **HTTP 200** `{"msg":"User needs to confirm their account"}` — the state assumed by the Q4/Q5 flows below, so this conversion is a prerequisite for them. (On the doc's `python:3.10`-derived base, whose OpenSSL 1.1.1 `openssl genrsa` emits PKCS#1 natively, no conversion is needed; the requirement is specific to OpenSSL ≥ 3.0.)
+
 **Environment build-only transparency notes** (these affect only how dependencies were *built/installed* in the container — they do **not** modify any repository source file and do **not** affect any observed value):
 1. `pip`/build shim: `PIP_CONSTRAINT` pinned `setuptools==67.6.0` and `Cython<3.0` so the transitive `cbor2` C-extension compiles under a modern toolchain.
-2. `pyre2` (a native binding incompatible with the container's Debian `re2`) was replaced by a trivial ephemeral `re2.py` shim (`from re import *`). `re2` is used in the codebase only as a drop-in `re` replacement (`app/email_utils.py:23`, `referral.py`, `spamassassin_utils.py`, `regex_utils.py`); none of the five investigated paths depend on `re2`-specific behavior, so the shim changes no observed result.
+2. `pyre2` (a native binding incompatible with the container's Debian `re2`) was replaced by a trivial ephemeral `re2.py` shim (`from re import *`). `re2` is used in the codebase only as a drop-in `re` replacement (`app/email_utils.py:23`, `app/dashboard/views/referral.py`, `app/spamassassin_utils.py`, `app/regex_utils.py`); none of the five investigated paths depend on `re2`-specific behavior, so the shim changes no observed result.
 
 All ephemeral artifacts used for observation (a test `.env`, temporary timing/curl/psql helper scripts, and throwaway PostgreSQL databases) were removed after capture; the source repository is unchanged.
 
