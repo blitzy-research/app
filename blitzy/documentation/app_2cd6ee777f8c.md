@@ -10,9 +10,13 @@ question is answered in the mandated five-stage order: **(1) direct answer → (
 > **Evidence discipline.** Every fenced output block below is the *verbatim* stdout/stderr of the
 > command shown immediately above it, copied byte-for-byte from a capture file. Nothing inside an
 > output block is truncated, re-ordered, or annotated; all interpretation lives *outside* the
-> blocks. The one normalization applied is line endings: `curl -i` HTTP responses are
-> **CRLF-terminated on the wire** (RFC 7230) and are shown here **LF-normalized** — the status line,
-> headers and body are otherwise verbatim. Where a value can vary run-to-run (PIDs, timestamps, the session id, the elapsed
+> blocks. **Two byte-level normalizations** are applied, and only these two. **(1) Line endings:**
+> `curl -i` HTTP responses are **CRLF-terminated on the wire** (RFC 7230) and are shown here
+> **LF-normalized** — the status line, headers and body are otherwise verbatim. **(2) Secret
+> masking:** the random secret *bytes* of security-sensitive fields (session-cookie HMAC signatures,
+> the signed-cookie payload blob, acquired API-key values, and CSRF tokens) are replaced in place
+> with a labelled `<REDACTED:…>` marker while every surrounding structural and non-secret decoded
+> field is preserved verbatim — see the **Secret-handling convention** note below. Where a value can vary run-to-run (PIDs, timestamps, the session id, the elapsed
 > `takes`, the Debugger PIN), the same unchanged path was exercised **at least twice** and the
 > distribution is reported honestly (stable vs variable). Runs are labelled with **Run IDs**
 > (RUN‑A, RUN‑B, RUN‑Q5‑REDIS, RUN‑Q5‑COOKIE‑1/2, RUN‑Q6, RUN‑Q7) so HTTP responses, Redis keys,
@@ -24,6 +28,35 @@ question is answered in the mandated five-stage order: **(1) direct answer → (
 > `debug=True`, and `OAUTHLIB_INSECURE_TRANSPORT=1` — is **disposable, DEVELOPMENT-only**, created
 > by `flask dummy-data` in a throwaway local container. **None of it is production guidance.** Each
 > sensitive value is re-flagged as DEV-only beside its use below.
+
+> **Secret-handling convention (mask-before-emission).** Although every value shown here is a
+> disposable DEV-only throwaway (each captured session was flushed and each acquired API key was
+> revoked at cleanup — proven in *Cleanup and read-only guarantee*), this document does **not**
+> persist raw secret key material. In every evidence block the random secret *bytes* are masked in
+> place with a labelled marker, while all structure and every non-secret field is shown verbatim so
+> that no evidentiary value is lost:
+>
+> - **Session-cookie HMAC signature** — the `slapp` cookie value `session-id.signature` keeps the
+>   real session-id (needed to prove the id is retained across a login and to correlate with the
+>   Redis `session:<id>` key) and masks the signature as `<REDACTED:slapp-hmac-signature>`.
+> - **Signed-cookie payload** — the fallback-backend cookie `.payload.timestamp.signature` keeps the
+>   leading `.eJw` zlib marker and the real timestamp segment, and masks the compressed payload
+>   (`<REDACTED:zlib+base64url-session-payload>`) and signature (`<REDACTED:slapp-hmac-signature>`);
+>   the *decoded* JSON is shown below each blob with only its `csrf_token` masked, which still proves
+>   the payload decodes **without any secret key** (⇒ signed-not-encrypted) and still shows the
+>   `_user_id`/`_id`/`_fresh`/`_permanent`/`sudo_time` fields.
+> - **Acquired API key** — the 60-character value returned by `POST /api/auth/login` is masked as
+>   `<REDACTED:api_key-value>` (these keys are revoked at cleanup and never re-used in a later
+>   request; the calls below bind the key via a shell variable or use the seeded `code` key).
+> - **CSRF token** — the 40-hex `csrf_token` value is masked as `<REDACTED:csrf_token-value>`.
+>
+> **Retained verbatim** (not secrets, required as evidence): the session-id UUID, `_user_id`
+> (= the user's `alternative_id`), `_id` (a SHA-512 of `remote_addr|user_agent`, not secret-derived),
+> `_fresh`, `_permanent`, `sudo_time`, the signed-cookie timestamp, all cookie flags
+> (`HttpOnly`/`Path`/`SameSite`/`Expires`/`Max-Age`), all HTTP statuses/headers/bodies, all `SL` log
+> lines, and the public seed values (`FLASK_SECRET=secret`, seed keys `code`/`codeFF`). This
+> reconciles the run-first *complete-evidence* rule with mask-before-emission: only opaque random
+> bytes — which carry no evidentiary meaning — are hidden.
 
 ## Investigation environment
 
@@ -662,7 +695,7 @@ Out-of-band readiness confirmation while the server was up (RUN‑A):
 HTTP/1.0 200 OK
 Content-Type: text/html; charset=utf-8
 Content-Length: 7
-Set-Cookie: slapp=c44ff3a2-7a92-4b69-8a61-c1b58ab5332d.fMfM_lS9OERlPc0EletbOR-aA7E; Expires=Mon, 20-Jul-2026 18:23:25 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=c44ff3a2-7a92-4b69-8a61-c1b58ab5332d.<REDACTED:slapp-hmac-signature>; Expires=Mon, 20-Jul-2026 18:23:25 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
 Date: Mon, 13 Jul 2026 18:23:25 GMT
 
@@ -805,7 +838,7 @@ parent/child PIDs recorded):
 HTTP/1.0 200 OK
 Content-Type: text/html; charset=utf-8
 Content-Length: 7
-Set-Cookie: slapp=71782d44-deb0-4725-afa3-52c158f17fe7.PZ5Rfs8U77E0ygSYInhf00QOtQU; Expires=Mon, 20-Jul-2026 18:42:37 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=71782d44-deb0-4725-afa3-52c158f17fe7.<REDACTED:slapp-hmac-signature>; Expires=Mon, 20-Jul-2026 18:42:37 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
 Date: Mon, 13 Jul 2026 18:42:37 GMT
 
@@ -1305,7 +1338,7 @@ honored:
 HTTP/1.0 200 OK
 Content-Type: text/html; charset=utf-8
 Content-Length: 342103
-Set-Cookie: slapp=24878969-dfd3-4f8a-9717-2a376213144a.IFTONUorOuOdsv-DLoys6_F6hK8; Expires=Mon, 20-Jul-2026 18:54:40 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=24878969-dfd3-4f8a-9717-2a376213144a.<REDACTED:slapp-hmac-signature>; Expires=Mon, 20-Jul-2026 18:54:40 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
 Date: Mon, 13 Jul 2026 18:54:40 GMT
 ```
@@ -1320,7 +1353,7 @@ HTTP/1.0 302 FOUND
 Content-Type: text/html; charset=utf-8
 Content-Length: 277
 Location: http://proxied.example.test/auth/login?next=%2Fdashboard%2F%3F
-Set-Cookie: slapp=08dc93ff-1093-4b51-a64d-e088e1e9527c.5c2Xzjv5S8NkC5DR7Z-F2vxt9i4; Expires=Mon, 20-Jul-2026 18:56:48 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=08dc93ff-1093-4b51-a64d-e088e1e9527c.<REDACTED:slapp-hmac-signature>; Expires=Mon, 20-Jul-2026 18:56:48 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
 Date: Mon, 13 Jul 2026 18:56:48 GMT
 ```
@@ -1334,7 +1367,7 @@ Date: Mon, 13 Jul 2026 18:56:48 GMT
 HTTP/1.0 200 OK
 Content-Type: text/html; charset=utf-8
 Content-Length: 215139
-Set-Cookie: slapp=83213b1a-73bf-4dc8-85d5-47896a8f8307.blSCI-SXCkkHo8GQdXAH_lEq4uw; Expires=Mon, 20-Jul-2026 18:54:40 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=83213b1a-73bf-4dc8-85d5-47896a8f8307.<REDACTED:slapp-hmac-signature>; Expires=Mon, 20-Jul-2026 18:54:40 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
 Date: Mon, 13 Jul 2026 18:54:40 GMT
 ```
@@ -1344,9 +1377,9 @@ Redis session state **BEFORE** login — `redis_anon.txt` (both anonymous sessio
 
 ```text
 session:24878969-dfd3-4f8a-9717-2a376213144a  ttl=300
-    decoded: {'_permanent': True, '_fresh': False, 'csrf_token': '5e907ac917b9cbc5c90b7536661a308e7ac8ffdb'}
+    decoded: {'_permanent': True, '_fresh': False, 'csrf_token': '<REDACTED:csrf_token-value>'}
 session:83213b1a-73bf-4dc8-85d5-47896a8f8307  ttl=300
-    decoded: {'_permanent': True, '_fresh': False, 'csrf_token': 'e6ce673f3d27b03633e32a4fbdf00651255cbbf1'}
+    decoded: {'_permanent': True, '_fresh': False, 'csrf_token': '<REDACTED:csrf_token-value>'}
 ```
 
 **(b-2) `POST /auth/login`** (john@wick.com / password) — `web_post_login_headers.txt`. `302` to
@@ -1357,7 +1390,7 @@ HTTP/1.0 302 FOUND
 Content-Type: text/html; charset=utf-8
 Content-Length: 229
 Location: http://localhost:7777/dashboard/
-Set-Cookie: slapp=83213b1a-73bf-4dc8-85d5-47896a8f8307.blSCI-SXCkkHo8GQdXAH_lEq4uw; Expires=Mon, 20-Jul-2026 18:54:40 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=83213b1a-73bf-4dc8-85d5-47896a8f8307.<REDACTED:slapp-hmac-signature>; Expires=Mon, 20-Jul-2026 18:54:40 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
 Date: Mon, 13 Jul 2026 18:54:40 GMT
 ```
@@ -1368,9 +1401,9 @@ transitioned `ttl=300 → ttl=604800` (7 days) and gained `_user_id`, `_fresh: T
 
 ```text
 session:24878969-dfd3-4f8a-9717-2a376213144a  ttl=299
-    decoded: {'_permanent': True, '_fresh': False, 'csrf_token': '5e907ac917b9cbc5c90b7536661a308e7ac8ffdb'}
+    decoded: {'_permanent': True, '_fresh': False, 'csrf_token': '<REDACTED:csrf_token-value>'}
 session:83213b1a-73bf-4dc8-85d5-47896a8f8307  ttl=604800
-    decoded: {'_permanent': True, '_fresh': True, 'csrf_token': 'e6ce673f3d27b03633e32a4fbdf00651255cbbf1', '_user_id': 'bfb8024e-6c00-4c33-ac2c-e60bf3b7003d', '_id': 'b03643a8a515eae10966eb5799d0b928b1fae8daeb0b0a33ba33f35b5fd7e09d574a2b38cd3af3ce53bdb464d28d2c515533674c8b087cba7d49abfa2cc9de57', 'sudo_time': 1783968880}
+    decoded: {'_permanent': True, '_fresh': True, 'csrf_token': '<REDACTED:csrf_token-value>', '_user_id': 'bfb8024e-6c00-4c33-ac2c-e60bf3b7003d', '_id': 'b03643a8a515eae10966eb5799d0b928b1fae8daeb0b0a33ba33f35b5fd7e09d574a2b38cd3af3ce53bdb464d28d2c515533674c8b087cba7d49abfa2cc9de57', 'sudo_time': 1783968880}
 ```
 
 **Identity proof** — `db_john_identity.txt` (`select id, alternative_id …`). The session's
@@ -1388,7 +1421,7 @@ john, resolved via `load_user`):
 HTTP/1.0 200 OK
 Content-Type: text/html; charset=utf-8
 Content-Length: 762858
-Set-Cookie: slapp=83213b1a-73bf-4dc8-85d5-47896a8f8307.blSCI-SXCkkHo8GQdXAH_lEq4uw; Expires=Mon, 20-Jul-2026 18:54:41 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=83213b1a-73bf-4dc8-85d5-47896a8f8307.<REDACTED:slapp-hmac-signature>; Expires=Mon, 20-Jul-2026 18:54:41 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
 Date: Mon, 13 Jul 2026 18:54:41 GMT
 ```
@@ -1404,12 +1437,12 @@ HTTP/1.0 200 OK
 Content-Type: application/json
 Content-Length: 178
 Access-Control-Allow-Origin: *
-Set-Cookie: slapp=491f6af4-c9cd-4dae-a8de-93227c898d21.ZdU-skYix6XVhpWZIS0k06jCMoo; Expires=Mon, 20-Jul-2026 18:54:41 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=491f6af4-c9cd-4dae-a8de-93227c898d21.<REDACTED:slapp-hmac-signature>; Expires=Mon, 20-Jul-2026 18:54:41 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
 Date: Mon, 13 Jul 2026 18:54:41 GMT
 
 {
-  "api_key": "rvysrxelwpmbbwjzinneattbqhtuoamnticocsddssvljnzjteegfptwfnef", 
+  "api_key": "<REDACTED:api_key-value>", 
   "email": "john@wick.com", 
   "mfa_enabled": false, 
   "mfa_key": null, 
@@ -1430,7 +1463,7 @@ HTTP/1.0 200 OK
 Content-Type: application/json
 Content-Length: 279
 Access-Control-Allow-Origin: *
-Set-Cookie: slapp=0b692651-8010-4892-8a4c-7aedb594c26d.yWCvP90LM6xsvUBICyltxU9G40c; Expires=Mon, 20-Jul-2026 18:54:41 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=0b692651-8010-4892-8a4c-7aedb594c26d.<REDACTED:slapp-hmac-signature>; Expires=Mon, 20-Jul-2026 18:54:41 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
 Date: Mon, 13 Jul 2026 18:54:41 GMT
 
@@ -1457,7 +1490,7 @@ HTTP/1.0 401 UNAUTHORIZED
 Content-Type: application/json
 Content-Length: 31
 Access-Control-Allow-Origin: *
-Set-Cookie: slapp=5bc49879-7749-4ef1-95a1-0f1e0b2bb86d.xbxR-3JJfdAqYzPfdfItCGYY7J4; Expires=Mon, 20-Jul-2026 18:54:41 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=5bc49879-7749-4ef1-95a1-0f1e0b2bb86d.<REDACTED:slapp-hmac-signature>; Expires=Mon, 20-Jul-2026 18:54:41 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
 Date: Mon, 13 Jul 2026 18:54:41 GMT
 
@@ -1473,7 +1506,7 @@ HTTP/1.0 401 UNAUTHORIZED
 Content-Type: application/json
 Content-Length: 31
 Access-Control-Allow-Origin: *
-Set-Cookie: slapp=cdf09b42-9f22-4741-bd30-b5a7357533b7.l7-xtgKkXIQC74xJt3yMvltgn7A; Expires=Mon, 20-Jul-2026 18:54:41 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=cdf09b42-9f22-4741-bd30-b5a7357533b7.<REDACTED:slapp-hmac-signature>; Expires=Mon, 20-Jul-2026 18:54:41 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
 Date: Mon, 13 Jul 2026 18:54:41 GMT
 
@@ -1491,7 +1524,7 @@ HTTP/1.0 200 OK
 Content-Type: application/json
 Content-Length: 279
 Access-Control-Allow-Origin: *
-Set-Cookie: slapp=83213b1a-73bf-4dc8-85d5-47896a8f8307.blSCI-SXCkkHo8GQdXAH_lEq4uw; Expires=Mon, 20-Jul-2026 18:54:41 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=83213b1a-73bf-4dc8-85d5-47896a8f8307.<REDACTED:slapp-hmac-signature>; Expires=Mon, 20-Jul-2026 18:54:41 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
 Date: Mon, 13 Jul 2026 18:54:41 GMT
 
@@ -1517,7 +1550,7 @@ HTTP/1.0 403 FORBIDDEN
 Content-Type: application/json
 Content-Length: 34
 Access-Control-Allow-Origin: *
-Set-Cookie: slapp=3860bfb9-8a64-415d-882b-b7b93152bfbc.XzaNgT6QWqiE09YYuxl51i0kApg; Expires=Mon, 20-Jul-2026 18:54:41 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=3860bfb9-8a64-415d-882b-b7b93152bfbc.<REDACTED:slapp-hmac-signature>; Expires=Mon, 20-Jul-2026 18:54:41 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
 Date: Mon, 13 Jul 2026 18:54:41 GMT
 
@@ -1534,7 +1567,7 @@ HTTP/1.0 401 UNAUTHORIZED
 Content-Type: application/json
 Content-Length: 40
 Access-Control-Allow-Origin: *
-Set-Cookie: slapp=af52c895-f954-448a-890f-578d96f893b3.sEyqqYKrDVilToTh2jkrbeA_BJc; Expires=Mon, 20-Jul-2026 18:54:41 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=af52c895-f954-448a-890f-578d96f893b3.<REDACTED:slapp-hmac-signature>; Expires=Mon, 20-Jul-2026 18:54:41 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
 Date: Mon, 13 Jul 2026 18:54:41 GMT
 
@@ -1559,7 +1592,7 @@ HTTP/1.0 302 FOUND
 Content-Type: text/html; charset=utf-8
 Content-Length: 229
 Location: http://localhost:7777/dashboard/
-Set-Cookie: slapp=b8c1f1f6-d45a-48cc-b900-105a22c08b5b.AXBxN7c87oXpd3fxhsNXwoYvO1Q; Expires=Mon, 20-Jul-2026 18:54:41 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=b8c1f1f6-d45a-48cc-b900-105a22c08b5b.<REDACTED:slapp-hmac-signature>; Expires=Mon, 20-Jul-2026 18:54:41 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
 Date: Mon, 13 Jul 2026 18:54:41 GMT
 ```
@@ -1570,7 +1603,7 @@ Baseline — row active → `load_user` returns the user → `200 OK` (`d3_befor
 HTTP/1.0 200 OK
 Content-Type: text/html; charset=utf-8
 Content-Length: 683139
-Set-Cookie: slapp=b8c1f1f6-d45a-48cc-b900-105a22c08b5b.AXBxN7c87oXpd3fxhsNXwoYvO1Q; Expires=Mon, 20-Jul-2026 18:54:42 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=b8c1f1f6-d45a-48cc-b900-105a22c08b5b.<REDACTED:slapp-hmac-signature>; Expires=Mon, 20-Jul-2026 18:54:42 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
 Date: Mon, 13 Jul 2026 18:54:42 GMT
 ```
@@ -1583,7 +1616,7 @@ HTTP/1.0 302 FOUND
 Content-Type: text/html; charset=utf-8
 Content-Length: 277
 Location: http://localhost:7777/auth/login?next=%2Fdashboard%2F%3F
-Set-Cookie: slapp=b8c1f1f6-d45a-48cc-b900-105a22c08b5b.AXBxN7c87oXpd3fxhsNXwoYvO1Q; Expires=Mon, 20-Jul-2026 18:54:42 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=b8c1f1f6-d45a-48cc-b900-105a22c08b5b.<REDACTED:slapp-hmac-signature>; Expires=Mon, 20-Jul-2026 18:54:42 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
 Date: Mon, 13 Jul 2026 18:54:42 GMT
 ```
@@ -1594,7 +1627,7 @@ Date: Mon, 13 Jul 2026 18:54:42 GMT
 HTTP/1.0 200 OK
 Content-Type: text/html; charset=utf-8
 Content-Length: 559418
-Set-Cookie: slapp=b8c1f1f6-d45a-48cc-b900-105a22c08b5b.AXBxN7c87oXpd3fxhsNXwoYvO1Q; Expires=Mon, 20-Jul-2026 18:54:42 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=b8c1f1f6-d45a-48cc-b900-105a22c08b5b.<REDACTED:slapp-hmac-signature>; Expires=Mon, 20-Jul-2026 18:54:42 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
 Date: Mon, 13 Jul 2026 18:54:42 GMT
 ```
@@ -1607,7 +1640,7 @@ HTTP/1.0 302 FOUND
 Content-Type: text/html; charset=utf-8
 Content-Length: 277
 Location: http://localhost:7777/auth/login?next=%2Fdashboard%2F%3F
-Set-Cookie: slapp=b8c1f1f6-d45a-48cc-b900-105a22c08b5b.AXBxN7c87oXpd3fxhsNXwoYvO1Q; Expires=Mon, 20-Jul-2026 18:54:42 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=b8c1f1f6-d45a-48cc-b900-105a22c08b5b.<REDACTED:slapp-hmac-signature>; Expires=Mon, 20-Jul-2026 18:54:42 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
 Date: Mon, 13 Jul 2026 18:54:42 GMT
 ```
@@ -1659,7 +1692,7 @@ session id** — the data is in Redis (shown in (b)). `cj_john.txt` (curl cookie
 # https://curl.se/docs/http-cookies.html
 # This file was generated by libcurl! Edit at your own risk.
 
-#HttpOnly_localhost	FALSE	/	FALSE	1784573680	slapp	83213b1a-73bf-4dc8-85d5-47896a8f8307.blSCI-SXCkkHo8GQdXAH_lEq4uw
+#HttpOnly_localhost	FALSE	/	FALSE	1784573680	slapp	83213b1a-73bf-4dc8-85d5-47896a8f8307.<REDACTED:slapp-hmac-signature>
 ```
 
 **Signed-cookie backend** (`MEM_STORE_URI=""`, RUN-Q5-COOKIE, twice): login still succeeds
@@ -1685,7 +1718,7 @@ Content-Type: text/html; charset=utf-8
 Content-Length: 229
 Location: http://localhost:7777/dashboard/
 Vary: Cookie
-Set-Cookie: slapp=.eJw9jzluxDAQBP_C2AKGnOGlzwhzEV4YqzV0RAv_3QwMBx1WofodtnH4-RnW67j9I2wPC2sQwELIjXPMzh6hl-KSa-8G0lOTONibsQsIMKLMDcySh1WHbrkSJ8GmhjxQPaOYUCFLzZJOaUYslbQJtKrC1aizDE6q3TzXMEO-_Xjy7vv1n3affvz1DWmQyJeiAAsp4sKadPECMlAqANp06HmM7Xp9-T6ZDCTkCZIBj9Jb6nE0YY7eS22kMB9nEp_cedtrux5PD2usDXvpUPLPL4VZVvM.alU1KQ.kolOaZOiI2fuSUOl3doQxI2M7Q8; Expires=Mon, 20-Jul-2026 18:57:45 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=.eJw<REDACTED:zlib+base64url-session-payload>.alU1KQ.<REDACTED:slapp-hmac-signature>; Expires=Mon, 20-Jul-2026 18:57:45 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
 Date: Mon, 13 Jul 2026 18:57:45 GMT
 ```
@@ -1694,7 +1727,7 @@ Now the cookie carries the **whole session payload**. `cookie_1_jar.txt` (the le
 zlib-compressed payload; the three dot-separated parts are `payload.timestamp.signature`):
 
 ```text
-#HttpOnly_localhost	FALSE	/	FALSE	1784573865	slapp	.eJw9jzluxDAQBP_C2AKGnOGlzwhzEV4YqzV0RAv_3QwMBx1WofodtnH4-RnW67j9I2wPC2sQwELIjXPMzh6hl-KSa-8G0lOTONibsQsIMKLMDcySh1WHbrkSJ8GmhjxQPaOYUCFLzZJOaUYslbQJtKrC1aizDE6q3TzXMEO-_Xjy7vv1n3affvz1DWmQyJeiAAsp4sKadPECMlAqANp06HmM7Xp9-T6ZDCTkCZIBj9Jb6nE0YY7eS22kMB9nEp_cedtrux5PD2usDXvpUPLPL4VZVvM.alU1KQ.kolOaZOiI2fuSUOl3doQxI2M7Q8
+#HttpOnly_localhost	FALSE	/	FALSE	1784573865	slapp	.eJw<REDACTED:zlib+base64url-session-payload>.alU1KQ.<REDACTED:slapp-hmac-signature>
 ```
 
 Decoding the payload with **base64url + zlib and no secret key** yields readable JSON — proving the
@@ -1703,16 +1736,16 @@ cookie is **signed (tamper-evident), not encrypted**. Both runs decode to the sa
 `cookie_1_decoded.txt` and `cookie_2_decoded.txt`:
 
 ```text
-raw cookie value: .eJw9jzluxDAQBP_C2AKGnOGlzwhzEV4YqzV0RAv_3QwMBx1WofodtnH4-RnW67j9I2wPC2sQwELIjXPMzh6hl-KSa-8G0lOTONibsQsIMKLMDcySh1WHbrkSJ8GmhjxQPaOYUCFLzZJOaUYslbQJtKrC1aizDE6q3TzXMEO-_Xjy7vv1n3affvz1DWmQyJeiAAsp4sKadPECMlAqANp06HmM7Xp9-T6ZDCTkCZIBj9Jb6nE0YY7eS22kMB9nEp_cedtrux5PD2usDXvpUPLPL4VZVvM.alU1KQ.kolOaZOiI2fuSUOl3doQxI2M7Q8
+raw cookie value: .eJw<REDACTED:zlib+base64url-session-payload>.alU1KQ.<REDACTED:slapp-hmac-signature>
 zlib_compressed: True
 base64-decoded payload (no secret key used => readable => signed, NOT encrypted):
-{"_fresh":true,"_id":"b03643a8a515eae10966eb5799d0b928b1fae8daeb0b0a33ba33f35b5fd7e09d574a2b38cd3af3ce53bdb464d28d2c515533674c8b087cba7d49abfa2cc9de57","_permanent":true,"_user_id":"bfb8024e-6c00-4c33-ac2c-e60bf3b7003d","csrf_token":"504b4e202d0af698291f8baa1e96784c064354be","sudo_time":1783969065}
+{"_fresh":true,"_id":"b03643a8a515eae10966eb5799d0b928b1fae8daeb0b0a33ba33f35b5fd7e09d574a2b38cd3af3ce53bdb464d28d2c515533674c8b087cba7d49abfa2cc9de57","_permanent":true,"_user_id":"bfb8024e-6c00-4c33-ac2c-e60bf3b7003d","csrf_token":"<REDACTED:csrf_token-value>","sudo_time":1783969065}
 ```
 ```text
-raw cookie value: .eJw9jklqAzEQAP-icwZaanVL8meG3kRMsB1mOYX8PRMIOdSxivpK69xif0-3YzvjLa13T7ekgFxRulCmkMgwmEOpjeGgo3TNU6K7hIKCIOrFRFKa3gKGU6tSFLs5ykQLQnWtXL10L3ZFCZFbta7Qm6k0r0N0SjEbHtTSNfIZ20Oe8Tz-1849tr-_qR1KjYUNYKmGuIgVW4JBJ2oDQL8atm9zPV4f8fx1hKflwsGVRGbJ1Bwy8hzUueTWehFTp8vbT3-tx_0R6ZZbx8EDGn7_AJRYVyI.alU1MQ.IXkvOuSUoAdQU5RGkhwKp8Oa9ac
+raw cookie value: .eJw<REDACTED:zlib+base64url-session-payload>.alU1MQ.<REDACTED:slapp-hmac-signature>
 zlib_compressed: True
 base64-decoded payload (no secret key used => readable => signed, NOT encrypted):
-{"_fresh":true,"_id":"b03643a8a515eae10966eb5799d0b928b1fae8daeb0b0a33ba33f35b5fd7e09d574a2b38cd3af3ce53bdb464d28d2c515533674c8b087cba7d49abfa2cc9de57","_permanent":true,"_user_id":"bfb8024e-6c00-4c33-ac2c-e60bf3b7003d","csrf_token":"ba6fc126e645aaf2157d0136f9586217782acbd5","sudo_time":1783969073}
+{"_fresh":true,"_id":"b03643a8a515eae10966eb5799d0b928b1fae8daeb0b0a33ba33f35b5fd7e09d574a2b38cd3af3ce53bdb464d28d2c515533674c8b087cba7d49abfa2cc9de57","_permanent":true,"_user_id":"bfb8024e-6c00-4c33-ac2c-e60bf3b7003d","csrf_token":"<REDACTED:csrf_token-value>","sudo_time":1783969073}
 ```
 
 
@@ -1733,7 +1766,7 @@ dynamic per run.
 HTTP/1.0 200 OK
 Content-Type: text/html; charset=utf-8
 Content-Length: 753966
-Set-Cookie: slapp=eb6071a0-37ea-43d7-a806-f5767a8433d4.KJfJfHhbLc_1J1VbqRR7QyxDHlo; Expires=Mon, 20-Jul-2026 23:26:39 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=eb6071a0-37ea-43d7-a806-f5767a8433d4.<REDACTED:slapp-hmac-signature>; Expires=Mon, 20-Jul-2026 23:26:39 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
 Date: Mon, 13 Jul 2026 23:26:39 GMT
 ```
@@ -1751,7 +1784,7 @@ Location: http://localhost:7777/auth/login
 Set-Cookie: slapp=; Expires=Thu, 01-Jan-1970 00:00:00 GMT; Max-Age=0; Path=/
 Set-Cookie: mfa=; Expires=Thu, 01-Jan-1970 00:00:00 GMT; Max-Age=0; Path=/
 Set-Cookie: dark-mode=; Expires=Thu, 01-Jan-1970 00:00:00 GMT; Max-Age=0; Path=/
-Set-Cookie: slapp=11e32c66-a9e5-4a0b-9fbc-d992485346de.sNyzhtXjbkZF-OoyTXurQdIcebY; Expires=Mon, 20-Jul-2026 23:26:39 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=11e32c66-a9e5-4a0b-9fbc-d992485346de.<REDACTED:slapp-hmac-signature>; Expires=Mon, 20-Jul-2026 23:26:39 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
 Date: Mon, 13 Jul 2026 23:26:39 GMT
 ```
@@ -1776,7 +1809,7 @@ HTTP/1.0 302 FOUND
 Content-Type: text/html; charset=utf-8
 Content-Length: 277
 Location: http://localhost:7777/auth/login?next=%2Fdashboard%2F%3F
-Set-Cookie: slapp=11e32c66-a9e5-4a0b-9fbc-d992485346de.sNyzhtXjbkZF-OoyTXurQdIcebY; Expires=Mon, 20-Jul-2026 23:26:39 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=11e32c66-a9e5-4a0b-9fbc-d992485346de.<REDACTED:slapp-hmac-signature>; Expires=Mon, 20-Jul-2026 23:26:39 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
 Date: Mon, 13 Jul 2026 23:26:39 GMT
 ```
@@ -1799,12 +1832,12 @@ HTTP/1.0 200 OK
 Content-Type: application/json
 Content-Length: 178
 Access-Control-Allow-Origin: *
-Set-Cookie: slapp=ec5b849b-9256-4595-a1f8-19317416c382.bj4P_neGd_WNKorqLCTSWocrkIo; Expires=Mon, 20-Jul-2026 23:28:02 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=ec5b849b-9256-4595-a1f8-19317416c382.<REDACTED:slapp-hmac-signature>; Expires=Mon, 20-Jul-2026 23:28:02 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
 Date: Mon, 13 Jul 2026 23:28:02 GMT
 
 {
-  "api_key": "yfhvaggkgrijkxqlwckljeaedsodnqrlplzczuexlsusenelnnfiwetvjcoq", 
+  "api_key": "<REDACTED:api_key-value>", 
   "email": "john@wick.com", 
   "mfa_enabled": false, 
   "mfa_key": null, 
@@ -1829,7 +1862,7 @@ HTTP/1.0 200 OK
 Content-Type: application/json
 Content-Length: 279
 Access-Control-Allow-Origin: *
-Set-Cookie: slapp=d2e62c8a-cb83-4f55-8386-7712c1d976e7.faB83t0-urDIcKHtohwRb9c8NbE; Expires=Mon, 20-Jul-2026 23:28:02 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=d2e62c8a-cb83-4f55-8386-7712c1d976e7.<REDACTED:slapp-hmac-signature>; Expires=Mon, 20-Jul-2026 23:28:02 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
 Date: Mon, 13 Jul 2026 23:28:02 GMT
 
@@ -1857,7 +1890,7 @@ HTTP/1.0 401 UNAUTHORIZED
 Content-Type: application/json
 Content-Length: 31
 Access-Control-Allow-Origin: *
-Set-Cookie: slapp=64175680-b23c-4ada-abf2-2f69cbd73b67.y6_34wWYteArZcGi9CDIhtDbqKs; Expires=Mon, 20-Jul-2026 23:28:02 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=64175680-b23c-4ada-abf2-2f69cbd73b67.<REDACTED:slapp-hmac-signature>; Expires=Mon, 20-Jul-2026 23:28:02 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
 Date: Mon, 13 Jul 2026 23:28:02 GMT
 
@@ -2606,11 +2639,12 @@ redis_session_keys=0
 
 **Bearer-material invalidation.** The flushed Redis sessions (`redis_session_keys=0` above) make
 every captured `slapp` **session-id** cookie and its paired CSRF token dead. The one API key
-acquired canonically during Q5 (`blitzy-q5-device` — the `rvysrxel…` value shown in
-`api_auth_login.txt`) was deleted at completion; re-running the exact lookup `authorize_request`
-performs — `ApiKey.get_by(code="rvysrxel…")` (`app/api/base.py:L18`) — now returns `None`, so any
-request bearing that key takes the `Wrong api key` `401` path (`app/api/base.py:L27`) and the key is
-non-reusable:
+acquired canonically during Q5 (`blitzy-q5-device` — the value captured in `api_auth_login.txt`,
+shown there as `<REDACTED:api_key-value>` per the secret-handling convention above) was deleted at
+completion; re-running the exact lookup `authorize_request` performs — `ApiKey.get_by(code=…)`
+(`app/api/base.py:L18`), keyed on that same acquired value (printed truncated as `rvys...` in the
+capture below) — now returns `None`, so any request bearing that key takes the `Wrong api key` `401`
+path (`app/api/base.py:L27`) and the key is non-reusable:
 
 ```text
 before delete: ApiKey.get_by(code=rvys...) => FOUND id=5 name=blitzy-q5-device
