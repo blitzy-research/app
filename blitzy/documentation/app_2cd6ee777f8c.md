@@ -72,14 +72,27 @@ These are the **exact, literal** commands used. `<CID>` is the container id of t
 
 ```bash
 # --- start the canonical GHCR container (no host bind-mount; state is container-internal) ---
-docker run -d --name slinv_probe \
-  ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_simple-login_app_1.0 sleep infinity
+# The image's ENTRYPOINT is ["/bin/bash"] (see [P2] above), so a trailing `sleep infinity` would be
+# parsed as a bash *script* argument and the container would exit immediately (observed: "Exited (126)",
+# "/usr/bin/sleep: cannot execute binary file"). Override the entrypoint to `sleep` so the container
+# stays alive to `docker exec` into.
+docker run -d --name slinv_probe --entrypoint sleep \
+  ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_simple-login_app_1.0 infinity
 CID=$(docker inspect -f '{{.Id}}' slinv_probe)
 
 # --- bring up the backing services INSIDE the container ---
-docker exec "$CID" bash -lc 'pg_ctlcluster 15 main start'          # PostgreSQL 15 on localhost:15432
+# The image ships the PostgreSQL 15 cluster on its default port 5432 (initial state: "15 main 5432 down",
+# postgresql.conf `port = 5432`), but tests/test.env pins DB_URI=postgresql://test:test@localhost:15432/test,
+# so the cluster port must be moved to 15432 BEFORE the cluster is started — otherwise the app (and psql on
+# 15432) get "connection refused". This one-line reconfiguration is what yields the "15 main 15432 online"
+# state captured in [P4]/[P6] above.
+docker exec "$CID" bash -lc "sed -i 's/^port = 5432/port = 15432/' /etc/postgresql/15/main/postgresql.conf"
+docker exec "$CID" bash -lc 'pg_ctlcluster 15 main start'          # PostgreSQL 15 now on localhost:15432
 docker exec "$CID" bash -lc 'redis-server --daemonize yes'         # Redis on 127.0.0.1:6379
-docker exec "$CID" bash -lc 'cd /app && CONFIG=tests/test.env alembic upgrade head'  # 77 tables (once)
+# alembic lives in the project venv (it is NOT on the container's default PATH — bare `alembic` gives
+# "command not found"); the image already ships the DB at the Alembic head, so this is an idempotent
+# no-op that also confirms the app-level DB connection on 15432.
+docker exec "$CID" bash -lc 'cd /app && CONFIG=tests/test.env /app/venv/bin/alembic upgrade head'  # 77 tables
 
 # --- copy the observation harness into the container (OUTSIDE the /app repo tree) ---
 docker cp /tmp/obs_harness.py "$CID":/tmp/obs_harness.py
