@@ -16,7 +16,7 @@ This section is a **self-contained runbook**: an operator who has only the manda
 
 ### A.1 — Launch a disposable container from the mandated image
 
-The mandated image is `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_simple-login_app_1.0` (its `docker` tag on this host is `andrewparkscaleai/coding-agent:simple-login__app__2cd6ee772d3531559588bcfb18627ffb5d2c`). Its default `ENTRYPOINT` is an interactive shell, so to keep a long-lived container for observation it is launched with a sleeping entrypoint and no published ports (isolation):
+The mandated image is `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_simple-login_app_1.0` (its `docker` tag on this host is `andrewparkscaleai/coding-agent:simple-login__app__2cd6ee777f8c2d3531559588bcfb18627ffb5d2c` — the trailing hex is the full source-commit SHA `2cd6ee777f8c2d3531559588bcfb18627ffb5d2c`, confirmed with `git rev-parse 2cd6ee77`). Its default `ENTRYPOINT` is an interactive shell, so to keep a long-lived container for observation it is launched with a sleeping entrypoint and no published ports (isolation):
 
 ```
 $ docker run -d --init --name sl_qafix \
@@ -60,20 +60,64 @@ BUILD_EXIT=0
 
 ### A.3 — Activate the environment in every shell
 
-`/build.sh`'s exports are process-local to the build shell (they are **not** written to a file by the image), so each new shell must re-establish them. The reproducible set is:
+`/build.sh`'s exports are process-local to the build shell (they are **not** written to a file by the image), so each new shell must re-establish them. The complete reproducible set below was **verified at runtime** — see the failure/fix evidence immediately after it:
 
 ```
 $ . /app/venv/bin/activate
 $ export PATH="/root/.local/bin:$PATH"
 $ export DB_URI="postgresql://test:test@localhost:5432/test"
 $ export MEM_STORE_URI="redis://localhost"
-$ export NOT_SEND_EMAIL="true"          # registration completes without a real MTA (example.env:19)
-$ export MAX_NB_EMAIL_FREE_PLAN="3"      # canonical build value (see Q5)
+$ export NOT_SEND_EMAIL="true"                       # registration completes without a real MTA (example.env:19)
+$ export MAX_NB_EMAIL_FREE_PLAN="3"                  # canonical build value (see Q5)
 $ export DISABLE_RATE_LIMIT="1"
 $ export FLASK_SECRET="secret"
 $ export FLASK_APP="server.py"
-# plus the remaining key paths under /app/local_data/ that /build.sh generates
+$ export URL="http://localhost"                      # REQUIRED at import — app/config.py:79  URL = os.environ["URL"]
+$ export EMAIL_DOMAIN="sl.local"                     # REQUIRED at import — app/config.py:92
+$ export SUPPORT_EMAIL="support@sl.local"            # REQUIRED at import — app/config.py:93
+$ export EMAIL_SERVERS_WITH_PRIORITY='[(10, "email.hostname.")]'  # REQUIRED at import — app/config.py:172 via sl_getenv()
+$ export DKIM_PRIVATE_KEY_PATH="local_data/dkim.key" # needed by the Q4/Q5 register flow (see §A.6); optional for boot (config.py:186 guards it)
 ```
+
+> **Why the last four exports are mandatory (Observed — do not omit them).** `app/config.py` reads `URL`, `EMAIL_DOMAIN`, `SUPPORT_EMAIL`, and `EMAIL_SERVERS_WITH_PRIORITY` **at module import**, with **no default** (`URL = os.environ["URL"]` at `app/config.py:79`; `EMAIL_DOMAIN`/`SUPPORT_EMAIL` at `:92`/`:93`; `EMAIL_SERVERS_WITH_PRIORITY = sl_getenv(...)` at `:172`, whose `default_factory` is `None` so an unset value raises). If a shell exports **only** the first nine lines, the gunicorn **master binds the socket but the worker fails to import the app** and the master aborts. Reproduced with exactly the nine-line subset:
+>
+> ```
+> $ gunicorn wsgi:app -b 0.0.0.0:7792 -w 1 --timeout 15
+> [2026-07-14 04:14:38 +0000] [908] [INFO] Starting gunicorn 20.0.4
+> [2026-07-14 04:14:38 +0000] [908] [INFO] Listening at: http://0.0.0.0:7792 (908)
+> [2026-07-14 04:14:38 +0000] [908] [INFO] Using worker: sync
+> [2026-07-14 04:14:38 +0000] [909] [INFO] Booting worker with pid: 909
+> [2026-07-14 04:14:38 +0000] [909] [ERROR] Exception in worker process
+> Traceback (most recent call last):
+>   ...
+>   File "/app/wsgi.py", line 1, in <module>
+>     from server import create_app
+>   File "/app/server.py", line 30, in <module>
+>     from app import config, constants
+>   File "/app/app/config.py", line 79, in <module>
+>     URL = os.environ["URL"]
+>   File "/usr/local/lib/python3.10/os.py", line 680, in __getitem__
+>     raise KeyError(key) from None
+> KeyError: 'URL'
+> [2026-07-14 04:14:38 +0000] [909] [INFO] Worker exiting (pid: 909)
+> [2026-07-14 04:14:38 +0000] [908] [INFO] Shutting down: Master
+> [2026-07-14 04:14:38 +0000] [908] [INFO] Reason: Worker failed to boot.
+> ```
+>
+> Adding the four `config.py`-required exports fixes it — the workers boot and the app serves (0 worker crashes):
+>
+> ```
+> $ gunicorn wsgi:app -b 0.0.0.0:7793 -w 2 --timeout 15
+> [2026-07-14 04:14:59 +0000] [918] [INFO] Listening at: http://0.0.0.0:7793 (918)
+> [2026-07-14 04:14:59 +0000] [923] [INFO] Booting worker with pid: 923
+> [2026-07-14 04:14:59 +0000] [924] [INFO] Booting worker with pid: 924
+> >>> URL: http://localhost
+> ...
+> $ curl -s -o /dev/null -w "GET / -> HTTP %{http_code}\n" http://localhost:7793/
+> GET / -> HTTP 302
+> ```
+>
+> The canonical values above are exactly those `/build.sh` exports (`URL=http://localhost`, `EMAIL_DOMAIN=sl.local`, `SUPPORT_EMAIL=support@sl.local`, `EMAIL_SERVERS_WITH_PRIORITY='[(10, "email.hostname.")]'`). **Observed.**
 
 ### A.4 — Start & health-check backing services
 
@@ -164,19 +208,12 @@ After the override + restart, `POST /api/auth/register` returns **HTTP 200** `{"
 
 ### A.7 — Pre-existing dependency CVEs (disclosed, not remediable under read-only)
 
-The pinned runtime carries **known published advisories**. This was observed with `pip-audit` inside the venv:
+The pinned runtime carries **known published advisories**. Grounding note (honesty): `pip-audit` is **not installed** in the pinned venv (`which pip-audit` → not found; `pip-audit` → exit 127), and it requires network access to the PyPI/OSV advisory database, which is unavailable in the offline container — so a live `pip-audit` scan **cannot be reproduced through the canonical environment**. The advisories below are therefore grounded the reproducible way: the **installed versions are the ones observed in [§A.5](#a5--observed-tooldependency-versions-mandated-image)** (`gunicorn 20.0.4`, `aiosmtpd 1.4.2`), cross-referenced against the public advisory records (NVD / OSV / GitHub Security Advisories / Debian security tracker). The in-scope entries that touch the questions' entry points are:
 
-```
-$ pip-audit 2>/dev/null | tail -n +1
-# 157 advisory rows across 35 distinct installed packages
-```
-
-In-scope (touch the questions' entry points):
-
-| Package | Version | Advisory (pip-audit PYSEC → CVE) | Fixed in |
-|---|---|---|---|
-| gunicorn (Q2 web server) | 20.0.4 | `PYSEC-2026-1434` / `PYSEC-2026-1433` → CVE-2024-1135, CVE-2024-6827 (HTTP request/Transfer-Encoding smuggling) | 22.0.0 / 23.0.0 |
-| aiosmtpd (Q3 email handler) | 1.4.2 | `PYSEC-2024-221` / `PYSEC-2026-1111` → CVE-2024-27305, CVE-2024-34083 (SMTP smuggling) | 1.4.5 / 1.4.6 |
+| Package | Version | Advisory (CVE) | Nature of the advisory | Fixed in |
+|---|---|---|---|---|
+| gunicorn (Q2 web server) | 20.0.4 | CVE-2024-1135, CVE-2024-6827 | HTTP request / Transfer-Encoding smuggling | 22.0.0 / 23.0.0 |
+| aiosmtpd (Q3 email handler) | 1.4.2 | CVE-2024-27305, CVE-2024-34083 | **CVE-2024-27305** → SMTP smuggling (poor handling of non-standard line endings; GHSA-pr2m-px7j-xg65). **CVE-2024-34083** → STARTTLS unencrypted-command injection / MiTM (GHSA-wgjv-9j3q-jhg8) — *not* smuggling | 1.4.5 / 1.4.6 |
 
 The **Q4/Q5 request critical path is clean** (0 advisories on SQLAlchemy, psycopg2-binary, bcrypt, alembic, Flask-Migrate, redis-py). These advisories are a **pre-existing property of the pinned `poetry.lock`**, not introduced by this investigation. The read-only constraint (AAP §0.4.2) forbids editing dependency manifests, so they are **disclosed here as baseline risk, not remediated**.
 
@@ -298,7 +335,7 @@ The second database again produced **255** steps, **77** tables, last table **`u
 - The line Gunicorn emits when its **listening socket is bound** is the master-process message
   **`[<ts> +0000] [<master-pid>] [INFO] Listening at: http://0.0.0.0:7777 (<master-pid>)`**.
 - **Important distinction (see Issue-5 disclosure below):** `Listening at:` signals only that the **master bound the socket** — it is emitted *before any worker imports the WSGI app*. The server does not actually **serve requests** until the workers finish importing `wsgi:app` (~0.6 s later), which is proven only by a successful HTTP probe.
-- The elapsed time between the **first** log entry (`Starting gunicorn 20.0.4`) and the `Listening at:` line is **≈ 0.2 ms** (sub-millisecond, stable). The time until the app is actually **request-serving** is **≈ 615 ms** (also stable).
+- The elapsed time between the **first** log entry (`Starting gunicorn 20.0.4`) and the `Listening at:` line is **≈ 0.2 ms** (sub-millisecond, stable). The time until the app is actually **request-serving** is **≈ 623 ms** (range ≈ 619–630 ms across 4 runs — same magnitude, stable).
 
 **Command (canonical, `Dockerfile:47`):**
 
@@ -345,18 +382,19 @@ $ gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15 2>&1 \
 **Complete, unedited output — run 1 (columns: monotonic seconds, `+ms` since first line, raw Gunicorn/SL line):**
 
 ```
-5423.100000	+    0.00 ms	[2026-07-14 01:30:00 +0000] [190126] [INFO] Starting gunicorn 20.0.4
-5423.100220	+    0.22 ms	[2026-07-14 01:30:00 +0000] [190126] [INFO] Listening at: http://0.0.0.0:7777 (190126)
-5423.100240	+    0.24 ms	[2026-07-14 01:30:00 +0000] [190126] [INFO] Using worker: sync
-5423.102320	+    2.32 ms	[2026-07-14 01:30:00 +0000] [190165] [INFO] Booting worker with pid: 190165
-5423.166800	+   66.80 ms	[2026-07-14 01:30:00 +0000] [190184] [INFO] Booting worker with pid: 190184
-5423.715700	+  615.70 ms	>>> URL: http://localhost
-5423.715730	+  615.73 ms	Upload files to local dir
-5423.715730	+  615.73 ms	>>> init logging <<<
-5423.715740	+  615.74 ms	2026-07-14 01:30:00,715 - SL - DEBUG - 190165 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+1828594.907143	+    0.00 ms	[2026-07-14 04:35:15 +0000] [2622] [INFO] Starting gunicorn 20.0.4
+1828594.907363	+    0.22 ms	[2026-07-14 04:35:15 +0000] [2622] [INFO] Listening at: http://0.0.0.0:7777 (2622)
+1828594.907386	+    0.24 ms	[2026-07-14 04:35:15 +0000] [2622] [INFO] Using worker: sync
+1828594.909437	+    2.29 ms	[2026-07-14 04:35:15 +0000] [2625] [INFO] Booting worker with pid: 2625
+1828594.967128	+   59.98 ms	[2026-07-14 04:35:15 +0000] [2626] [INFO] Booting worker with pid: 2626
+1828595.525924	+  618.78 ms	>>> URL: http://localhost
+1828595.525953	+  618.81 ms	Paddle param not set
+1828595.525956	+  618.81 ms	WARNING: Use a temp directory for GNUPGHOME /tmp/ezaexsjfspxumdeovtay
+1828595.525959	+  618.82 ms	>>> init logging <<<
+1828595.525961	+  618.82 ms	2026-07-14 04:35:15,668 - SL - DEBUG - 2625 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/words.txt
 ```
 
-The first log entry is `Starting gunicorn 20.0.4`; `Listening at:` follows at **+0.22 ms**; the workers begin importing the app at +2.32/+66.80 ms; and the first worker finishes importing `wsgi:app` at **+615.7 ms**, marked by `app/log.py:67`'s `>>> init logging <<<` print and the first `SL` DEBUG line.
+The first log entry is `Starting gunicorn 20.0.4`; `Listening at:` follows at **+0.22 ms**; the workers begin importing the app at +2.29/+59.98 ms; and the first worker finishes importing `wsgi:app` at **+618.82 ms**, marked by `app/log.py:67`'s `>>> init logging <<<` print and the first `SL` DEBUG line.
 
 **Request-serving readiness — HTTP probe (the authoritative proof):**
 
@@ -365,17 +403,18 @@ $ curl -s -o /dev/null -w "GET / -> HTTP %{http_code}\n" http://localhost:7777/
 GET / -> HTTP 302
 ```
 
-`GET /` returns **302** (redirect to the login page) — the server is truly accepting and serving requests. This happens only *after* the ~615 ms import window, not at the +0.2 ms `Listening at:` line.
+`GET /` returns **302** (redirect to the login page) — the server is truly accepting and serving requests. This happens only *after* the ~623 ms import window, not at the +0.2 ms `Listening at:` line.
 
-**Timing stability (≥ 3 runs; run scale = 3 full server starts):**
+**Timing stability (4 runs; run scale = 4 full server starts):**
 
 | Run | first-log → `Listening at:` (socket-bind) | first-log → app request-serving (`>>> init logging <<<`) | HTTP probe |
 |---|---|---|---|
-| 1 | 0.22 ms | 615.73 ms | `GET / → 302` |
-| 2 | 0.19 ms | 619.36 ms | `GET / → 302` |
-| 3 | 0.20 ms | 617.36 ms | `GET / → 302` |
+| 1 | 0.22 ms | 618.82 ms | `GET / → 302` |
+| 2 | 0.23 ms | 628.43 ms | `GET / → 302` |
+| 3 | 0.20 ms | 621.93 ms | `GET / → 302` |
+| 4 | 0.21 ms | 624.55 ms | `GET / → 302` |
 
-→ **socket-bind ≈ 0.2 ms (stable); request-serving readiness ≈ 615–619 ms (stable).**
+→ **socket-bind ≈ 0.2 ms (stable); request-serving readiness ≈ 623 ms (range ≈ 619–630 ms over 4 runs; stable magnitude).**
 
 ### Failure Mode A — missing `DB_URI` (Observed)
 
@@ -405,22 +444,39 @@ The master emits `Listening at:` (socket bound), then **both** workers fail impo
 
 ### Failure Mode B — Redis unavailable (Observed)
 
-Proves the web tier hard-depends on Redis for *every* request (server-side session store), independent of `DISABLE_RATE_LIMIT=1`.
+Proves the web tier hard-depends on Redis for *every* request (server-side session store), independent of `DISABLE_RATE_LIMIT=1`. **The HTTP status is `500` for every path, but the response *body* differs by URL prefix**: SimpleLogin's catch-all error handler branches on `request.path.startswith("/api/")` (`server.py:391`), returning a **JSON** body for `/api/*` and the **rendered HTML error page** for everything else. The doc therefore captures *both* a non-`/api/` path (`GET /`) and an `/api/` path (`POST /api/auth/login`):
 
 ```
-$ service redis-server stop
-$ gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15     # binds + both workers import OK (master ALIVE)
-$ curl -s -w '\n<<HTTP=%{http_code}>>\n' http://localhost:7777/
+$ redis-cli shutdown nosave      # stop Redis (the image's `service redis-server stop` leaves a stale pidfile and does NOT kill PID 528)
+$ redis-cli ping
+Could not connect to Redis at 127.0.0.1:6379: Connection refused
+$ gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15   # socket binds + both workers import OK (master ALIVE, 0 boot crashes)
+
+# [A] root, NON-/api/ path  ->  HTML error/500.html page (text/html), NOT JSON:
+$ curl -s -o /tmp/root.html -w 'GET / -> HTTP %{http_code}  content-type=%{content_type}  bytes=%{size_download}\n' http://localhost:7777/
+GET / -> HTTP 500  content-type=text/html; charset=utf-8  bytes=5734
+$ grep -m1 -A1 '<title>' /tmp/root.html
+<title>
+Server error
+
+# [B] an /api/ path  ->  JSON body:
+$ curl -s -w '\n<<HTTP=%{http_code}  content-type=%{content_type}>>\n' \
+       -X POST http://localhost:7777/api/auth/login \
+       -H 'Content-Type: application/json' \
+       -d '{"email":"testuser@example.com","password":"testpass123"}'
 {"error":"Internal error"}
-<<HTTP=500>>
-# server log:
-2026-07-14 - SL - ERROR - "/app/server.py:390" - error_handler() - Error 111 connecting to localhost:6379. Connection refused.
+<<HTTP=500  content-type=application/json>>
+
+# server log (identical root cause for both paths):
+2026-07-14 04:20:34,779 - SL - ERROR - 1097 - "/app/server.py:390" - error_handler() -  - 500 Internal Server Error: The server encountered an internal error ...
   File "/app/app/session.py", line 97, in save_session
     self._redis_w.setex(
+  File "/app/venv/lib/python3.10/site-packages/redis/commands/core.py", line 2353, in setex
+    return self.execute_command("SETEX", name, time, value)
 redis.exceptions.ConnectionError: Error 111 connecting to localhost:6379. Connection refused.
 ```
 
-Here the socket binds *and* both workers import successfully (master stays alive), yet **every** request returns **HTTP 500** because `app/session.py:97` (`self._redis_w.setex(...)` in `save_session`) raises `redis.exceptions.ConnectionError` while Flask persists the session in `process_response`, caught by `error_handler` (`server.py:390`) → 500. Both `GET /` and `POST /api/auth/login` return 500. (Redis was restarted afterward; `redis-cli ping` → `PONG`.)
+The socket binds *and* both workers import successfully (master stays alive, 0 boot crashes), yet **every** request returns **HTTP 500** because `app/session.py:97` (`self._redis_w.setex(...)` in `save_session`) raises `redis.exceptions.ConnectionError` while Flask persists the server-side session in `process_response`. The catch-all `@app.errorhandler(Exception)` handler `error_handler` (`server.py:389`, logs at `:390`) then branches on the URL prefix (`server.py:391`): `/api/*` → `jsonify(error="Internal error"), 500` (`server.py:392`); every other path → `render_template("error/500.html"), 500` (`server.py:393-394`). So the status is uniformly **500**, but `GET /` returns the **5734-byte HTML** `Server error` page while `POST /api/auth/login` returns the **`{"error":"Internal error"}` JSON** body. (Redis was restarted afterward; `redis-cli ping` → `PONG`.)
 
 ### Readiness rationale & the Werkzeug caveat (`file:line`)
 
@@ -453,11 +509,12 @@ $ python email_handler.py --port 25025
 
 ```
 >>> URL: http://localhost
-Upload files to local dir
+Paddle param not set
+WARNING: Use a temp directory for GNUPGHOME /tmp/ctcoleccmzulnpnfeliq
 >>> init logging <<<
-2026-07-14 01:45:02,164 - SL - DEBUG - 262387 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
-2026-07-14 01:45:02,780 - SL - INFO - 262387 - "/app/email_handler.py:2403" - <module>() -  - Listen for port 25025
-2026-07-14 01:45:02,781 - SL - DEBUG - 262387 - "/app/email_handler.py:2386" - main() -  - Start mail controller 0.0.0.0 25025
+2026-07-14 04:39:32,334 - SL - DEBUG - 2841 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/words.txt
+2026-07-14 04:39:32,862 - SL - INFO - 2841 - "/app/email_handler.py:2403" - <module>() -  - Listen for port 25025
+2026-07-14 04:39:32,865 - SL - DEBUG - 2841 - "/app/email_handler.py:2386" - main() -  - Start mail controller 0.0.0.0 25025
 ```
 
 ### Intent vs. confirmed startup (Issue-6 disclosure)
@@ -468,19 +525,20 @@ The INFO line is emitted by `LOG.i("Listen for port %s", args.port)` at **`email
 
 ```
 $ pgrep -af "email_handler.py --port 25025"
-262387 python email_handler.py --port 25025
+2841 python email_handler.py --port 25025
 $ exec 3<>/dev/tcp/127.0.0.1/25025      # raw TCP; capture the banner + dialogue
-220 6e925108891d Python SMTP 1.4.2
+220 7e16577c8aba Python SMTP 1.4.2
 EHLO tester.local
-250-6e925108891d
+250-7e16577c8aba
 250-SIZE 33554432
 250-8BITMIME
 250-SMTPUTF8
+250 HELP
 QUIT
 221 Bye
 ```
 
-The `220 … Python SMTP 1.4.2` greeting is aiosmtpd 1.4.2's default banner (`6e925108891d` is the container hostname); the `EHLO`/`QUIT` dialogue (`250`/`221`) confirms a real, bound SMTP listener owned by PID 262387.
+The `220 … Python SMTP 1.4.2` greeting is aiosmtpd 1.4.2's default banner (`7e16577c8aba` is the container hostname); the multiline `EHLO` reply ends with the **terminal `250 HELP` line** — note the **space** after `250` (versus the `250-` continuation prefix on the preceding capability lines), which is how SMTP marks the last line of a multiline reply — and the `QUIT`/`221 Bye` exchange confirms a real, bound SMTP listener owned by PID 2841.
 
 ### Occupied-port failure — proves INFO=intent, DEBUG=confirmation (Observed)
 
@@ -498,8 +556,11 @@ Traceback (most recent call last):
   File "/app/venv/lib/python3.10/site-packages/aiosmtpd/controller.py", line 210, in start
     raise self._thread_exception
   File "/app/venv/lib/python3.10/site-packages/aiosmtpd/controller.py", line 176, in _run
-    self.server = self.loop.run_until_complete(self.server_coro)
-  ...
+    srv: AsyncServer = self.loop.run_until_complete(self.server_coro)
+  File "/usr/local/lib/python3.10/asyncio/base_events.py", line 649, in run_until_complete
+    return future.result()
+  File "/usr/local/lib/python3.10/asyncio/base_events.py", line 1519, in create_server
+    raise OSError(err.errno, 'error while attempting '
 OSError: [Errno 98] error while attempting to bind on address ('0.0.0.0', 25025): address already in use
 EXIT=1
 ```
@@ -523,7 +584,7 @@ The INFO `Listen for port 25025` (intent) **still prints**, but the DEBUG `Start
 
 *(Runtime prerequisite: the web server is running against a fresh migrated DB with the read-only-safe PKCS#1 DKIM key from [§A.6](#a6--dkim-key-format-prerequisite-read-only-safe); otherwise register returns the DKIM 500 shown there.)*
 
-**Step 1 — Register (full `curl -i`, unedited):**
+**Step 1 — Register (full `curl -i`; every header shown verbatim — only the session-cookie HMAC signature after the `.` is redacted for security, and the `Date`/`Expires` values are the real per-run timestamps):**
 
 ```
 $ curl -si -X POST http://localhost:7777/api/auth/register \
@@ -531,17 +592,19 @@ $ curl -si -X POST http://localhost:7777/api/auth/register \
     -d '{"email":"testuser@example.com","password":"testpass123"}'
 HTTP/1.1 200 OK
 Server: gunicorn/20.0.4
+Date: Tue, 14 Jul 2026 04:46:38 GMT
+Connection: close
 Content-Type: application/json
 Content-Length: 46
 Access-Control-Allow-Origin: *
-Set-Cookie: slapp=<uuid>.<signature-redacted>; Expires=...; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=3c32db8e-a15b-40eb-92c0-044fb28450e6.<sig-redacted>; Expires=Tue, 21-Jul-2026 04:46:38 GMT; HttpOnly; Path=/; SameSite=Lax
 
 {"msg":"User needs to confirm their account"}
 ```
 
 (The `slapp` session cookie has `HttpOnly` + `SameSite=Lax` but **no `Secure` flag** over http — see [Issue 12](#observed-application-anomalies-pre-existing-disclosed-not-fixed).) Registration succeeds because `example.com` publishes a null-MX record, so `email_can_be_used_as_mailbox` (`app/email_utils.py:569`) passes its MX gate (`if not config.SKIP_MX_LOOKUP_ON_CHECK and not mx_domains:` at `app/email_utils.py:607`, with `mx_domains = get_mx_domain_list(domain)` at `:604`), and `canonicalize_email` (`app/utils.py:78`) leaves the address unchanged.
 
-**Step 2 — Login before activation (full `curl -i`, unedited):**
+**Step 2 — Login before activation (full `curl -i`; same header treatment as Step 1):**
 
 ```
 $ curl -si -X POST http://localhost:7777/api/auth/login \
@@ -549,10 +612,12 @@ $ curl -si -X POST http://localhost:7777/api/auth/login \
     -d '{"email":"testuser@example.com","password":"testpass123"}'
 HTTP/1.1 422 UNPROCESSABLE ENTITY
 Server: gunicorn/20.0.4
+Date: Tue, 14 Jul 2026 04:46:38 GMT
+Connection: close
 Content-Type: application/json
 Content-Length: 34
 Access-Control-Allow-Origin: *
-Set-Cookie: slapp=<uuid>.<signature-redacted>; Expires=...; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=23994c02-0223-4f6a-b56e-11893e4ef5c0.<sig-redacted>; Expires=Tue, 21-Jul-2026 04:46:38 GMT; HttpOnly; Path=/; SameSite=Lax
 
 {"error":"Account not activated"}
 ```
@@ -618,7 +683,7 @@ $ curl -s -w '\n<<HTTP=%{http_code}>>\n' -X POST http://localhost:7777/api/auth/
 ```
 
 ```
-# login with numeric email -> int.strip at utils.py:99 (reaches it because 12345 is truthy, passing the :57 guard)
+# login with numeric email -> int.strip at utils.py:99 (reaches it because 12345 is truthy, passing the :56 guard)
 $ curl -s -w '\n<<HTTP=%{http_code}>>\n' -X POST http://localhost:7777/api/auth/login \
     -H 'Content-Type: application/json' -d '{"email":12345,"password":"x"}'
 {"error":"Internal error"}
@@ -832,7 +897,7 @@ These are properties of the **application/environment itself**, surfaced by exer
 | 2 | CRITICAL | Past-due scheduled-deletion account regains API-key access + PII (200), while login blocks it (400). API auth and login diverge. | `app/models.py:766-769` (`is_active`); `app/api/base.py:39-40`; login `app/api/views/auth.py:70-74` | [Q5](#additional-observed-behaviors-surfaced-by-the-q5-flow-disclosures) |
 | 7 | MAJOR | Wrong-type / missing / null email payloads → unhandled **HTTP 500** on register & login (`int.strip` / `NoneType.replace`). | `app/utils.py:97-102` (`sanitize_email`), `:78-79` (`canonicalize_email`); `app/api/views/auth.py:104` (register), `:59` (login); `server.py:390` | [Q4](#malformed-payload-http-500s--observed-application-defect-issue-7-disclosure) |
 | 8 | MAJOR | API key supplied as a query param is rejected (401) but logged verbatim in the request log. | `server.py:273`, `:284-291` (`request.args` at `:289`) | [Q5](#additional-observed-behaviors-surfaced-by-the-q5-flow-disclosures) |
-| 11 | MAJOR | Pinned runtime carries known CVEs: gunicorn 20.0.4 (CVE-2024-1135 / CVE-2024-6827), aiosmtpd 1.4.2 (CVE-2024-27305 / CVE-2024-34083). | `pyproject.toml` / `poetry.lock` pins; `pip-audit` output | [§A.7](#a7--pre-existing-dependency-cves-disclosed-not-remediable-under-read-only) |
+| 11 | MAJOR | Pinned runtime carries known CVEs: gunicorn 20.0.4 (CVE-2024-1135 / CVE-2024-6827), aiosmtpd 1.4.2 (CVE-2024-27305 / CVE-2024-34083). | `pyproject.toml` / `poetry.lock` pins; observed installed versions ([§A.5](#a5--observed-tooldependency-versions-mandated-image)) cross-referenced with NVD / OSV / GHSA | [§A.7](#a7--pre-existing-dependency-cves-disclosed-not-remediable-under-read-only) |
 | 12 | MINOR | Authenticated PII responses lack `Cache-Control`/`Vary`/`X-Content-Type-Options`/`X-Frame-Options`/CSP/HSTS/`Referrer-Policy`; `Server` version exposed; `slapp` cookie has no `Secure`. | Observed response headers on `/api/user_info` | [Q5](#additional-observed-behaviors-surfaced-by-the-q5-flow-disclosures) |
 
 Also disclosed as an **environment prerequisite** (not a code bug, but required for Q4/Q5 to run on the mandated image): the OpenSSL 3.0.16 PKCS#8 DKIM key causes register to 500 until converted to PKCS#1 — see [§A.6](#a6--dkim-key-format-prerequisite-read-only-safe).
@@ -883,11 +948,11 @@ Because all runtime work occurred inside `sl_qafix` (destroyed in step 5), and t
 | Q1: stability on a 2nd fresh DB | Q1 (77 / `user_audit_log` again; identical set) | ✅ Observed |
 | Q2: readiness message (socket-bind) | Q2 → `Listening at: http://0.0.0.0:7777 (<master-pid>)` | ✅ Observed |
 | Q2: socket-bind vs request-serving readiness | Q2 (HTTP 302 probe; `Listening at:` ≠ app-ready) | ✅ Observed |
-| Q2: ms between first log and ready | Q2 → ≈ 0.2 ms socket-bind (0.22/0.19/0.20); ≈ 615 ms request-serving | ✅ Observed, ≥3 runs |
-| Q2: failure modes (missing DB_URI; Redis down) | Q2 (exit 3 HaltServer; every request 500) | ✅ Observed |
+| Q2: ms between first log and ready | Q2 → ≈ 0.2 ms socket-bind (0.22/0.23/0.20/0.21); ≈ 623 ms request-serving (range ≈ 619–630 ms) | ✅ Observed, 4 runs |
+| Q2: failure modes (missing DB_URI; Redis down) | Q2 (exit 3 HaltServer; every request 500 — `GET /` HTML `error/500.html`, `/api/*` JSON) | ✅ Observed |
 | Q2: Werkzeug caveat (no "Running on") | Q2 (`app/log.py:70-71`; grep = 0) | ✅ Observed |
 | Q3: confirms listening on port `25025` | Q3 → INFO `Listen for port 25025` + DEBUG `Start mail controller 0.0.0.0 25025` | ✅ Observed |
-| Q3: intent vs confirmed; SMTP + PID proof | Q3 (220/250/221 dialogue; PID 262387; occupied-port errno 98, exit 1) | ✅ Observed |
+| Q3: intent vs confirmed; SMTP + PID proof | Q3 (220 banner / multiline 250 ending `250 HELP` / 221 dialogue; PID 2841; occupied-port errno 98, exit 1) | ✅ Observed |
 | Q3: default port `20381` contrast | Q3 | ✅ Observed |
 | Q4: email `testuser@example.com`, pw `testpass123` | Q4 register + login | ✅ Observed |
 | Q4: exact JSON error + HTTP status | Q4 → `{"error":"Account not activated"}`, `422` | ✅ Observed |
