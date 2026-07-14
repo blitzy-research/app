@@ -98,15 +98,14 @@ $ PGPASSWORD=test psql -h localhost -U test -d test -tAc "SELECT version_num FRO
 $ PGPASSWORD=test psql -h localhost -U test -d test -tAc "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'"
 77
 
-$ /app/venv/bin/python -c "import sys,itsdangerous,flask,flask_limiter,werkzeug,redis,sqlalchemy"
-$   print(sys.version.split()[0], itsdangerous.__version__, flask.__version__, flask_limiter.__version__, werkzeug.__version__, redis.__version__, sqlalchemy.__version__)
-python            3.10.18
-itsdangerous      1.1.0
-flask             1.1.2
-flask_limiter     1.4
-werkzeug          1.0.1
-redis             4.6.0
-sqlalchemy        1.3.24
+$ /app/venv/bin/python -c 'import sys, itsdangerous, flask, flask_limiter, werkzeug, redis, sqlalchemy; print(chr(10).join(f"{n:<14} {v}" for n, v in [("python", sys.version.split()[0]), ("itsdangerous", itsdangerous.__version__), ("flask", flask.__version__), ("flask_limiter", flask_limiter.__version__), ("werkzeug", werkzeug.__version__), ("redis", redis.__version__), ("sqlalchemy", sqlalchemy.__version__)]))'
+python         3.10.18
+itsdangerous   1.1.0
+flask          1.1.2
+flask_limiter  1.4
+werkzeug       1.0.1
+redis          4.6.0
+sqlalchemy     1.3.24
 ```
 
 ### 2.2 Clean-start order (from a stopped container)
@@ -127,7 +126,7 @@ redis-cli ping                              # -> "PONG"
 #    the migration and extension creation; re-running it against an already-migrated DB is a no-op.
 ```
 
-The database is a persistent volume, so it survives across `docker exec` sessions; Redis starts empty on each container start and only accumulates keys at runtime. This distinction matters for the net-zero proof in §2.5.
+The database lives in the container's **writable layer** (not a Docker volume): it survives across `docker exec` sessions — and across container stop/start — but is lost on container deletion. This is confirmed by `docker inspect sl_setup --format '{{json .Mounts}}'`, which returns `[]` (no volume or bind mount). Redis likewise starts empty on each container start and only accumulates keys at runtime. This distinction matters for the net-zero proof in §2.5.
 
 ### 2.3 Two canonical runners (both drive the real entry point)
 
@@ -158,30 +157,78 @@ The live runner (`probe_live.sh`) manages the server through a fully **bounded l
 # Canonical build/invocation: gunicorn wsgi:app (Dockerfile CMD) with the canonical
 # /tmp/sl.env config, EXCEPT DISABLE_RATE_LIMIT is unset so rate limiting is active
 # (config.py:602 DISABLE_RATE_LIMIT = "DISABLE_RATE_LIMIT" in os.environ -> presence-based).
-set -u
+#
+# HARDENING (Finding F-P4-2):
+#   * set -euo pipefail: any unset var, failed command, or broken pipe aborts (nonzero).
+#   * a present port-inspection tool (fuser) is REQUIRED; absence is fatal.
+#   * after readiness, the port MUST be owned by our gunicorn PID tree, else abort
+#     (defeats a stale/foreign server answering on :7777).
+#   * each response is ASSERTED for exact status + gunicorn Server identity (+ exact body
+#     for 412/429); any mismatch marks the run failed and it exits nonzero.
+#   * an idempotent `trap cleanup EXIT INT TERM` is installed BEFORE seeding, so a forced
+#     abort at any point still stops gunicorn and removes the committed seed rows.
+#   * the disposable API key is read from a 0600 file, never echoed (Finding F-P4-3).
+set -euo pipefail
+
 OUT=/tmp/sl_probes/out
+STATE=/tmp/sl_probes/live_state.json
+PORT=7777
 mkdir -p "$OUT"
 cd /app
-PORT=7777
 
 CANON_ENV=(env CONFIG=tests/test.env DB_URI='postgresql://test:test@localhost:5432/test' \
   GNUPGHOME=/tmp/sl_gnupg PYTHONPATH=/app)
 
-echo "===== [0/5] ensure port ${PORT} is free ====="
-STALE=$(ss -ltnp 2>/dev/null | grep ":${PORT} " | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
-if [ -n "${STALE:-}" ]; then echo "killing stale listener pid=$STALE"; kill "$STALE" 2>/dev/null; sleep 1; fi
-echo "port check done"
+GPID=""
+USER_ID=""
+FAILED=0
+CLEANED=0
+cleanup() {                       # idempotent; runs on normal exit, error, or signal
+  [ "$CLEANED" = "1" ] && return 0
+  CLEANED=1
+  echo
+  echo "===== CLEANUP (trap: stop gunicorn + teardown seed + redis) ====="
+  if [ -n "${GPID:-}" ]; then
+    kill "$GPID" 2>/dev/null || true
+    wait "$GPID" 2>/dev/null || true
+    echo "gunicorn PID ${GPID} stopped"
+  fi
+  if [ -f "$STATE" ]; then
+    "${CANON_ENV[@]}" /app/venv/bin/python /tmp/sl_probes/probe_live_teardown.py \
+      || echo "teardown reported nonzero (see above)"
+  fi
+  # remove this run's rate-limit buckets (authenticated userid:* keys + ip fallback)
+  if [ -n "${USER_ID:-}" ]; then
+    redis-cli --scan --pattern "LIMITER/*userid:${USER_ID}*" 2>/dev/null | xargs -r redis-cli del >/dev/null 2>&1 || true
+  fi
+  redis-cli --scan --pattern 'LIMITER/*ip:127.0.0.1*' 2>/dev/null | xargs -r redis-cli del >/dev/null 2>&1 || true
+  echo "cleanup done"
+}
+trap cleanup EXIT INT TERM        # <-- installed BEFORE any seeding/committing
+
+echo "===== [0/6] REQUIRE a port-inspection tool + ensure port ${PORT} is free ====="
+command -v fuser >/dev/null 2>&1 || { echo "FATAL: no fuser (port-inspection tool) available"; exit 3; }
+STALE=$(fuser -n tcp "$PORT" 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+$' || true)
+if [ -n "${STALE:-}" ]; then
+  echo "FATAL: port ${PORT} already in use by pid(s) [${STALE}]; refusing to capture against a foreign server"
+  exit 3
+fi
+echo "port ${PORT} is free (verified via fuser)"
 
 echo
-echo "===== [1/5] SEED disposable premium user + API key ====="
+echo "===== [1/6] SEED disposable premium user + API key (key -> 0600 file, not echoed) ====="
 SEED=$("${CANON_ENV[@]}" /app/venv/bin/python /tmp/sl_probes/probe_live_seed.py)
-echo "$SEED"
-API_KEY=$(echo "$SEED"  | sed -n 's/^API_KEY=//p')
-VALID=$(echo "$SEED"    | sed -n 's/^VALID_SUFFIX=//p')
-TAMPERED=$(echo "$SEED" | sed -n 's/^TAMPERED_SUFFIX=//p')
+printf '%s\n' "$SEED"                       # NOTE: seed prints only NON-secret lines
+read_state() { "${CANON_ENV[@]}" /app/venv/bin/python -c \
+  "import json,sys;print(json.load(open('$STATE'))[sys.argv[1]])" "$1"; }
+API_KEY=$(read_state api_key)               # SECRET read from 0600 file into a variable only
+VALID=$(read_state valid_suffix)
+TAMPERED=$(read_state tampered_suffix)
+USER_ID=$(read_state user_id)
+echo "seed consumed (api key length=${#API_KEY}, kept out of console)"
 
 echo
-echo "===== [2/5] START live gunicorn (rate limiting ENABLED) ====="
+echo "===== [2/6] START live gunicorn (rate limiting ENABLED) ====="
 set -a; . /tmp/sl.env; set +a
 unset DISABLE_RATE_LIMIT          # enable rate limiting (presence-based flag)
 export DB_URI='postgresql://test:test@localhost:5432/test'
@@ -190,60 +237,227 @@ export DB_URI='postgresql://test:test@localhost:5432/test'
 GPID=$!
 echo "gunicorn master PID=$GPID (bound 127.0.0.1:${PORT}, -w 2 --timeout 15)"
 
-# readiness poll -- wait until gunicorn accepts a connection AND returns a real HTTP code
+# readiness poll -- wait until :PORT accepts a connection AND returns a real HTTP code
 READY=0
 for i in $(seq 1 60); do
-  code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "http://127.0.0.1:${PORT}/")
+  code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "http://127.0.0.1:${PORT}/" || true)
   case "$code" in
     200|301|302|401|403|404) READY=1; echo "ready after ${i} poll(s), GET / -> $code"; break;;
   esac
   sleep 0.5
 done
-sleep 1   # let both sync workers finish booting before load
 if [ "$READY" != "1" ]; then
-  echo "SERVER NEVER BECAME READY; gunicorn log:"; cat "$OUT/gunicorn.log"
-  kill "$GPID" 2>/dev/null; wait "$GPID" 2>/dev/null
-  "${CANON_ENV[@]}" /app/venv/bin/python /tmp/sl_probes/probe_live_teardown.py
+  echo "FATAL: server never became ready; gunicorn log:"; cat "$OUT/gunicorn.log"
   exit 1
 fi
+sleep 1   # let both sync workers finish booting before load
 
-hdr() {  # $1=label $2=prefix $3=suffix $4=outfile
-  echo "----- $1 -----"
-  curl -sS -i --max-time 10 -X POST "http://127.0.0.1:${PORT}/api/v2/alias/custom/new" \
+echo
+echo "===== [2b/6] VERIFY the captured gunicorn PID tree actually owns port ${PORT} ====="
+OWNERS=$(fuser -n tcp "$PORT" 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+$' || true)
+OURS="$GPID $(pgrep -P "$GPID" 2>/dev/null | tr '\n' ' ' || true)"
+OWNED=0
+for p in $OWNERS; do for q in $OURS; do [ "$p" = "$q" ] && OWNED=1; done; done
+if [ "$OWNED" != "1" ]; then
+  echo "FATAL: port ${PORT} owned by pid(s) [${OWNERS}], NOT our gunicorn tree [${OURS}]"
+  exit 1
+fi
+echo "port ${PORT} owned by our gunicorn tree (owners=[${OWNERS}] within ours=[${OURS}])"
+
+# assert_resp: drive one POST, capture raw response, assert status + gunicorn Server
+#   (+ exact body when an expected body is supplied). NOTE: `curl --fail` is deliberately
+#   NOT used because 412 and 429 are EXPECTED here and --fail would abort on them; the
+#   exact-status assertion is the correct mechanism.
+assert_resp() {  # $1=label $2=prefix $3=suffix $4=want_status $5=want_body(optional) $6=outfile
+  local label="$1" prefix="$2" suffix="$3" want="$4" wantbody="$5" outfile="$6"
+  local resp status server body
+  resp=$(curl -sS -i --max-time 10 -X POST "http://127.0.0.1:${PORT}/api/v2/alias/custom/new" \
     -H "Authentication: ${API_KEY}" -H "Content-Type: application/json" \
-    -d "{\"alias_prefix\":\"$2\",\"signed_suffix\":\"$3\"}" | tee "$4"
-  echo; echo
+    -d "{\"alias_prefix\":\"${prefix}\",\"signed_suffix\":\"${suffix}\"}" || true)
+  printf '%s\n' "$resp" > "$outfile"
+  status=$(printf '%s' "$resp" | tr -d '\r' | sed -n '1s#^HTTP/[0-9.]* \([0-9]*\).*#\1#p')
+  server=$(printf '%s' "$resp" | tr -d '\r' | sed -n 's/^[Ss]erver: //p' | head -1)
+  body=$(printf '%s' "$resp"   | tr -d '\r' | awk 'x{print} /^$/{x=1}')
+  echo "----- ${label} -----  status=${status} server=${server}"
+  case "$server" in
+    gunicorn*) : ;;
+    *) echo "  ASSERT FAIL: Server '${server}' is not gunicorn (wrong server on :${PORT})"; FAILED=1; return 0;;
+  esac
+  if [ "$status" != "$want" ]; then
+    echo "  ASSERT FAIL: status ${status} != expected ${want}"; FAILED=1; return 0
+  fi
+  if [ -n "$wantbody" ] && [ "$body" != "$wantbody" ]; then
+    echo "  ASSERT FAIL: body != expected"; echo "    got:  ${body}"; echo "    want: ${wantbody}"; FAILED=1; return 0
+  fi
+  case "$want" in 201) [ -n "$(printf '%s' "$body" | grep -o '"alias"')" ] || { echo "  ASSERT FAIL: 201 body has no alias field"; FAILED=1; return 0; };; esac
+  echo "  ASSERT OK (${want})"
 }
 
 echo
-echo "===== [3/5] CAPTURE raw headers via curl -i (live transport) ====="
-hdr "REQ1 valid  -> expect 201" lh1 "$VALID"    "$OUT/live_201.txt"
-hdr "REQ2 tamper -> expect 412" lh2 "$TAMPERED" "$OUT/live_412.txt"
-hdr "REQ3 valid  -> 201 (fill window)" lh3 "$VALID" /dev/null
-hdr "REQ4 valid  -> 201 (fill window)" lh4 "$VALID" /dev/null
-hdr "REQ5 valid  -> 201 (fill window)" lh5 "$VALID" /dev/null
-hdr "REQ6 valid  -> expect 429 (6th within 5/minute)" lh6 "$VALID" "$OUT/live_429.txt"
+echo "===== [3/6] CAPTURE + ASSERT raw responses via curl -i (live transport) ====="
+assert_resp "REQ1 valid  -> 201" lh1 "$VALID"    "201" "" "$OUT/live_201.txt"
+assert_resp "REQ2 tamper -> 412" lh2 "$TAMPERED" "412" '{"error":"Alias creation time is expired, please retry"}' "$OUT/live_412.txt"
+assert_resp "REQ3 valid  -> 201 (fill window)" lh3 "$VALID" "201" "" /dev/null
+assert_resp "REQ4 valid  -> 201 (fill window)" lh4 "$VALID" "201" "" /dev/null
+assert_resp "REQ5 valid  -> 201 (fill window)" lh5 "$VALID" "201" "" /dev/null
+assert_resp "REQ6 valid  -> 429 (6th within 5/minute)" lh6 "$VALID" "429" '{"error":"Rate limit exceeded"}' "$OUT/live_429.txt"
 
 echo
-echo "===== [4/5] STOP gunicorn (only captured PID $GPID) ====="
-kill "$GPID" 2>/dev/null
-wait "$GPID" 2>/dev/null
-echo "gunicorn stopped"
-
-echo
-echo "===== [5/5] TEARDOWN (SQL delete + verify net-zero) + Redis cleanup ====="
-"${CANON_ENV[@]}" /app/venv/bin/python /tmp/sl_probes/probe_live_teardown.py
-TD=$?
-DEL=$(redis-cli --scan --pattern 'LIMITER/*ip:127.0.0.1*new_custom_alias*' | xargs -r redis-cli del)
-echo "redis LIMITER keys deleted for ip:127.0.0.1/new_custom_alias: ${DEL:-0}"
-exit $TD
+echo "===== [4/6] STOP gunicorn + [5/6] TEARDOWN + [6/6] redis cleanup are handled by the trap ====="
+if [ "$FAILED" = "0" ]; then
+  echo "ALL ASSERTIONS PASSED"
+else
+  echo "ONE OR MORE ASSERTIONS FAILED"
+fi
+exit "$FAILED"
 ```
 
-The readiness poll (L44-50) waits until `GET /` returns a real HTTP status (`200|301|302|401|403|404`) rather than a connection failure, so evidence is never captured against a half-booted worker; the observed readiness was `GET / -> 302` (a redirect to login). The `-w 2`/`-w 2 --timeout 15` values are the shipped worker count and request timeout.
+The readiness poll waits until `GET /` returns a real HTTP status (`200|301|302|401|403|404`) rather than a connection failure, so evidence is never captured against a half-booted worker; the observed readiness was `GET / -> 302` (a redirect to login). The `-w 2 --timeout 15` values are the shipped worker count and request timeout. This is the **hardened** script (Finding F-P4-2): `set -euo pipefail`, a required `fuser` port check, a captured-PID port-ownership assertion, exact status/body/`Server` assertions, and an idempotent `trap cleanup EXIT INT TERM` installed before seeding; its four-scenario runtime proof (happy path + invalid-key + forced-abort + foreign-server) is in §11.8.1.
 
 ### 2.4 Canonical minting of `signed_suffix` (never hand-forged)
 
 A valid `signed_suffix` is minted only by its real producer and never fabricated. Two equivalent canonical sources were used: (a) the shared signer `app.alias_suffix.signer.sign(value).decode()`, an `itsdangerous.TimestampSigner` keyed by `CUSTOM_ALIAS_SECRET = FLASK_SECRET + "custom_alias"` = `"secretcustom_alias"` in the test env [`app/config.py:201`, `tests/test.env`]; and (b) the real API producer `GET /api/v4/alias/options` (`get_alias_suffixes` [`app/api/views/alias_options.py`]), which Runner B uses. The **expired** case (§3, COND5) was produced by backdating the *real* signer's timestamp inside the probe only (never editing product code), so `signer.unsign(signed_suffix, max_age=600)` raises `SignatureExpired` for real; the **tampered** case uses a verified byte-mutation (§9) that is guaranteed to change the signed payload rather than the unreliable last-character flip.
+
+### 2.4.1 The two `signed_suffix` producers, observed — `v4` pairs vs `v5` objects
+
+`signed_suffix` is minted only by `get_alias_suffixes(user)` [`app/alias_suffix.py:94-192`], surfaced by
+`GET /api/v4/alias/options` (`options_v4`) and `GET /api/v5/alias/options` (`options_v5`)
+[`app/api/views/alias_options.py`]. The versions differ **only in the shape** of the `suffixes` field:
+
+- **v4** — `ret["suffixes"] = list([suffix.suffix, suffix.signed_suffix] ...)` [`alias_options.py:72`] -> a list of **`[suffix, signed_suffix]` pairs**.
+- **v5** — `ret["suffixes"] = [{"suffix":..., "signed_suffix":..., "is_custom":..., "is_premium":...} ...]` [`alias_options.py:143-150`] -> a list of **objects**.
+
+Both were driven through the real endpoint (test-client, rollback-isolated). Complete, unedited bodies:
+
+**Command** (after `docker cp blitzy_probe_options.py sl_setup:/tmp/`)
+```bash
+cd /app && env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/root \
+  DB_URI='postgresql://test:test@localhost:5432/test' CONFIG=tests/test.env \
+  GNUPGHOME=/tmp/sl_gnupg PYTHONPATH=/app /app/venv/bin/python /tmp/blitzy_probe_options.py
+```
+
+**Probe** (`blitzy_probe_options.py`)
+```python
+#!/usr/bin/env python3
+"""
+blitzy_probe_options.py -- exercise the CANONICAL signed_suffix producers
+GET /api/v4/alias/options (options_v4) and GET /api/v5/alias/options (options_v5)
+[app/api/views/alias_options.py] and capture the exact HTTP status and the COMPLETE,
+unedited JSON body of each, to ground the documented shape difference:
+  v4  ret["suffixes"] = list of [suffix, signed_suffix] PAIRS            (alias_options.py L72)
+  v5  ret["suffixes"] = list of {"suffix","signed_suffix",...} OBJECTS   (alias_options.py L143-150)
+Both call app.alias_suffix.get_alias_suffixes(user). Commits nothing (connection.begin()/rollback).
+"""
+import os, json
+os.environ.setdefault("CONFIG", "/app/tests/test.env")
+from app import config
+from app.db import Session, connection
+from server import create_app
+from tests.api.utils import get_new_user_and_api_key
+
+app = create_app(); app.config["TESTING"] = True; app.config["SERVER_NAME"] = "sl.test"
+
+transaction = connection.begin()
+try:
+    with app.app_context():
+        config.DISABLE_RATE_LIMIT = True
+        user, api_key = get_new_user_and_api_key(); user.lifetime = True; Session.flush()
+        H = {"Authentication": api_key.code}
+        client = app.test_client()
+        print(">>> user id=%s email=%s" % (user.id, user.email))
+
+        for ver in ("v4", "v5"):
+            path = "/api/%s/alias/options" % ver
+            r = client.get(path, headers=H)
+            print("\n" + "="*78)
+            print("COMMAND (test client): GET %s  (header Authentication: <api_key>)" % path)
+            print("  -> status_code = %s" % r.status_code)
+            body = r.get_json()
+            print("  -> response body (complete, unedited, pretty-printed):")
+            print(json.dumps(body, indent=2, ensure_ascii=False, sort_keys=True))
+            # ground the shape of the FIRST suffix element by type
+            sfx = body.get("suffixes")
+            if isinstance(sfx, list) and sfx:
+                first = sfx[0]
+                print("  -> suffixes[0] python type = %s ; value repr = %r" % (type(first).__name__, first))
+                print("  -> len(suffixes) = %d" % len(sfx))
+finally:
+    transaction.rollback(); Session.rollback(); Session.close()
+    print("\n>>> rolled back transaction; probe committed NOTHING to PostgreSQL")
+```
+
+**Observed output** (complete, unedited)
+```text
+load config file /app/tests/test.env
+>>> URL: http://localhost
+Upload files to local dir
+>>> init logging <<<
+2026-07-14 05:59:58,120 - SL - DEBUG - 30955 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+2026-07-14 05:59:59,173 - SL - INFO - 30955 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+>>> user id=2682 email=user_v5v7tx5fic@mailbox.test
+2026-07-14 05:59:59,196 - SL - DEBUG - 30955 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET /api/v4/alias/options ImmutableMultiDict([]) 200, takes 0.010253190994262695
+
+==============================================================================
+COMMAND (test client): GET /api/v4/alias/options  (header Authentication: <api_key>)
+  -> status_code = 200
+  -> response body (complete, unedited, pretty-printed):
+{
+  "can_create": true,
+  "prefix_suggestion": "",
+  "suffixes": [
+    [
+      ".word915@d1.test",
+      ".word915@d1.test.alXQXw.uXnVuR0xaMtu2-VOvwtVkLHrnFc"
+    ],
+    [
+      ".list422@d2.test",
+      ".list422@d2.test.alXQXw.aWIGxBQ-rBEfOBEUCCmXOmCzAJg"
+    ],
+    [
+      ".word138@sl.local",
+      ".word138@sl.local.alXQXw.8tuNy2Rv6a8KKwbP2jMQ0Dcy7eA"
+    ]
+  ]
+}
+  -> suffixes[0] python type = list ; value repr = ['.word915@d1.test', '.word915@d1.test.alXQXw.uXnVuR0xaMtu2-VOvwtVkLHrnFc']
+  -> len(suffixes) = 3
+2026-07-14 05:59:59,206 - SL - DEBUG - 30955 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET /api/v5/alias/options ImmutableMultiDict([]) 200, takes 0.007531642913818359
+
+==============================================================================
+COMMAND (test client): GET /api/v5/alias/options  (header Authentication: <api_key>)
+  -> status_code = 200
+  -> response body (complete, unedited, pretty-printed):
+{
+  "can_create": true,
+  "prefix_suggestion": "",
+  "suffixes": [
+    {
+      "is_custom": false,
+      "is_premium": false,
+      "signed_suffix": ".word492@d1.test.alXQXw.mCDdIYyRddJlsl0U66VVMTfNmRo",
+      "suffix": ".word492@d1.test"
+    },
+    {
+      "is_custom": false,
+      "is_premium": false,
+      "signed_suffix": ".list062@d2.test.alXQXw.6_n4wp3-9ZWbdpXQIXfOO0g90BA",
+      "suffix": ".list062@d2.test"
+    },
+    {
+      "is_custom": false,
+      "is_premium": false,
+      "signed_suffix": ".test690@sl.local.alXQXw.qWVeV_ryXaL79cNVelrj2_UZYBk",
+      "suffix": ".test690@sl.local"
+    }
+  ]
+}
+  -> suffixes[0] python type = dict ; value repr = {'is_custom': False, 'is_premium': False, 'signed_suffix': '.word492@d1.test.alXQXw.mCDdIYyRddJlsl0U66VVMTfNmRo', 'suffix': '.word492@d1.test'}
+  -> len(suffixes) = 3
+
+>>> rolled back transaction; probe committed NOTHING to PostgreSQL
+```
+
+The `suffixes[0] python type` lines make the contract explicit: **`list`** under v4, **`dict`** under v5.
 
 ### 2.5 Cleanup & net-zero proof (read-only guarantee)
 
@@ -512,7 +726,7 @@ Connection: close
 Content-Type: application/json
 Content-Length: 430
 Access-Control-Allow-Origin: *
-Set-Cookie: slapp=d216cb8b-c659-4cd5-ada3-3ceb3ffe5d47.XI5mlmc1SXgX4wqbQpbwXk527r0; Expires=Mon, 20-Jul-2026 19:30:47 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=<redacted-session-cookie>; Expires=Mon, 20-Jul-2026 19:30:47 GMT; HttpOnly; Path=/; SameSite=Lax
 
 {"alias":"lh1.list@sl.local","creation_date":"2026-07-13 19:30:47+00:00","creation_timestamp":1783971047,"disable_pgp":false,"email":"lh1.list@sl.local","enabled":true,"id":3103,"latest_activity":null,"mailbox":{"email":"livehdr_zbkuumgz@example.test","id":2106},"mailboxes":[{"email":"livehdr_zbkuumgz@example.test","id":2106}],"name":null,"nb_block":0,"nb_forward":0,"nb_reply":0,"note":null,"pinned":false,"support_pgp":false}
 ```
@@ -526,7 +740,7 @@ Connection: close
 Content-Type: application/json
 Content-Length: 57
 Access-Control-Allow-Origin: *
-Set-Cookie: slapp=d74b40b1-ce22-4563-96e5-ae8ca058c0bf.fCEZedfI6KT_QNMn487nqWclFeo; Expires=Mon, 20-Jul-2026 19:30:47 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=<redacted-session-cookie>; Expires=Mon, 20-Jul-2026 19:30:47 GMT; HttpOnly; Path=/; SameSite=Lax
 
 {"error":"Alias creation time is expired, please retry"}
 ```
@@ -540,7 +754,7 @@ Connection: close
 Content-Type: application/json
 Content-Length: 32
 Access-Control-Allow-Origin: *
-Set-Cookie: slapp=61c7cde1-94b3-44bb-a03c-70d93f7f4b5a.YuhgcS8oGZo7AaY8ucMJv6RhfNU; Expires=Mon, 20-Jul-2026 19:30:47 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=<redacted-session-cookie>; Expires=Mon, 20-Jul-2026 19:30:47 GMT; HttpOnly; Path=/; SameSite=Lax
 
 {"error":"Rate limit exceeded"}
 ```
@@ -1123,6 +1337,197 @@ SUMMARY
 
 ---
 
+### 3.3 Duplicate and in-trash collisions all return HTTP 409
+
+The v3 duplicate guard rejects a create when the full address already exists **as a live alias, in the
+public-domain trash (`DeletedAlias`), or in the custom-domain trash (`DomainDeletedAlias`)**
+[`app/api/views/new_custom_alias.py:197-203`, identical to the v2 guard at `:82-88`]:
+
+```python
+    if (
+        Alias.get_by(email=full_alias)
+        or DeletedAlias.get_by(email=full_alias)
+        or DomainDeletedAlias.get_by(email=full_alias)
+    ):
+        LOG.d("full alias already used %s", full_alias)
+        return jsonify(error=f"alias {full_alias} already exists"), 409
+```
+
+All three collision sources were exercised end-to-end (create -> collide, and create -> `delete_alias`
+[`app/alias_utils.py:336`] -> re-create). Every one returns **HTTP 409** with body
+`{"error":"alias <full-address> already exists"}` and emits `LOG.d` at
+`new_custom_alias.py:202` (`full alias already used <full-address>`).
+
+**Command** (after `docker cp blitzy_probe_duptrash.py sl_setup:/tmp/`)
+```bash
+cd /app && env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/root \
+  DB_URI='postgresql://test:test@localhost:5432/test' CONFIG=tests/test.env \
+  GNUPGHOME=/tmp/sl_gnupg PYTHONPATH=/app /app/venv/bin/python /tmp/blitzy_probe_duptrash.py
+```
+
+**Probe** (`blitzy_probe_duptrash.py`)
+```python
+#!/usr/bin/env python3
+"""
+blitzy_probe_duptrash.py -- exercise the duplicate / "in-trash" 409 branch of
+POST /api/v3/alias/custom/new [app/api/views/new_custom_alias.py L83-88]:
+    if Alias.get_by(email=full_alias)
+       or DeletedAlias.get_by(email=full_alias)         # public-domain trash
+       or DomainDeletedAlias.get_by(email=full_alias):  # custom-domain trash
+        LOG.d("full alias already used %s", full_alias)
+        return jsonify(error=f"alias {full_alias} already exists"), 409
+Three conditions, each with exact status + verbatim body + SL console log:
+  (1) LIVE duplicate     (alias still exists)                  -> 409
+  (2) TRASH duplicate    (public domain, deleted -> DeletedAlias)       -> 409
+  (3) TRASH duplicate    (custom domain, deleted -> DomainDeletedAlias) -> 409
+Valid suffix minted by the real signer (identical pattern to tests/api/test_new_custom_alias.py).
+Commits nothing (connection.begin()/rollback).
+"""
+import os, io, json, logging, time
+os.environ.setdefault("CONFIG", "/app/tests/test.env")
+from app import config
+from app.db import Session, connection
+import app.log as sl_log
+from app.log import LOG
+from app.alias_suffix import signer
+from app.config import EMAIL_DOMAIN
+from app.utils import random_word
+from app.models import Alias, CustomDomain
+from app.alias_utils import delete_alias
+from server import create_app
+from tests.api.utils import get_new_user_and_api_key
+
+app = create_app(); app.config["TESTING"] = True; app.config["SERVER_NAME"] = "sl.test"
+
+_cap = io.StringIO(); _h = logging.StreamHandler(_cap); _h.setFormatter(sl_log._log_formatter); _h.formatter.converter = time.gmtime
+_saved = []
+def cap_on():
+    global _saved; _saved = list(LOG.handlers)
+    for hh in _saved: LOG.removeHandler(hh)
+    LOG.addHandler(_h)
+def cap_reset(): _cap.seek(0); _cap.truncate(0)
+def cap_read(): return _cap.getvalue()
+
+def show(label, r, logs):
+    print("\n" + "-"*78)
+    print("CONDITION: " + label)
+    print("  -> status_code = %s" % r.status_code)
+    print("  -> response body (verbatim) = %s" % r.get_data(as_text=True).rstrip())
+    sl = [ln for ln in logs.splitlines() if " - SL - " in ln and "after_request" not in ln]
+    print("  -> server SL console log during request (validation lines, unedited):")
+    if sl:
+        for ln in sl: print("     " + ln)
+    else:
+        print("     <none>")
+
+transaction = connection.begin()
+cap_on()
+try:
+    with app.app_context():
+        config.DISABLE_RATE_LIMIT = True
+        user, api_key = get_new_user_and_api_key(); user.lifetime = True; Session.flush()
+        H = {"Authentication": api_key.code}
+        client = app.test_client()
+        mb = user.default_mailbox_id
+        print(">>> user id=%s ; default_mailbox_id=%s" % (user.id, mb))
+
+        # ---- public-domain alias ----
+        word = random_word()
+        suffix = ".%s@%s" % (word, EMAIL_DOMAIN)
+        signed = signer.sign(suffix).decode()
+        full_pub = "dupprefix." + word + "@" + EMAIL_DOMAIN
+        body = {"alias_prefix": "dupprefix", "signed_suffix": signed, "mailbox_ids": [mb]}
+
+        cap_reset()
+        r = client.post("/api/v3/alias/custom/new", headers=H, json=body)
+        show("initial create (public domain) %s -> expect 201" % full_pub, r, cap_read())
+
+        cap_reset()
+        r = client.post("/api/v3/alias/custom/new", headers=H, json=body)
+        show("LIVE duplicate (alias still exists) -> expect 409", r, cap_read())
+
+        # move the live alias to trash -> DeletedAlias
+        alias = Alias.get_by(email=full_pub)
+        delete_alias(alias, user)
+        Session.flush()
+        cap_reset()
+        r = client.post("/api/v3/alias/custom/new", headers=H, json=body)
+        show("TRASH duplicate (public -> DeletedAlias) -> expect 409", r, cap_read())
+
+        # ---- custom-domain alias -> DomainDeletedAlias trash ----
+        dom = "cd-" + random_word() + ".test"
+        CustomDomain.create(user_id=user.id, domain=dom, ownership_verified=True, commit=False)
+        Session.flush()
+        signed_cd = signer.sign("@" + dom).decode()
+        full_cd = "cdprefix@" + dom
+        body_cd = {"alias_prefix": "cdprefix", "signed_suffix": signed_cd, "mailbox_ids": [mb]}
+
+        cap_reset()
+        r = client.post("/api/v3/alias/custom/new", headers=H, json=body_cd)
+        show("initial create (custom domain) %s -> expect 201" % full_cd, r, cap_read())
+
+        alias_cd = Alias.get_by(email=full_cd)
+        delete_alias(alias_cd, user)
+        Session.flush()
+        cap_reset()
+        r = client.post("/api/v3/alias/custom/new", headers=H, json=body_cd)
+        show("TRASH duplicate (custom -> DomainDeletedAlias) -> expect 409", r, cap_read())
+finally:
+    transaction.rollback(); Session.rollback(); Session.close()
+    print("\n>>> rolled back transaction; probe committed NOTHING to PostgreSQL")
+```
+
+**Observed output** (complete, unedited)
+```text
+load config file /app/tests/test.env
+>>> URL: http://localhost
+Upload files to local dir
+>>> init logging <<<
+2026-07-14 06:02:52,591 - SL - DEBUG - 31065 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+>>> user id=2684 ; default_mailbox_id=3095
+
+------------------------------------------------------------------------------
+CONDITION: initial create (public domain) dupprefix.word@sl.local -> expect 201
+  -> status_code = 201
+  -> response body (verbatim) = {"alias":"dupprefix.word@sl.local","creation_date":"2026-07-14 06:02:53+00:00","creation_timestamp":1784008973,"disable_pgp":false,"email":"dupprefix.word@sl.local","enabled":true,"id":5071,"latest_activity":null,"mailbox":{"email":"user_kj3box0gk2@mailbox.test","id":3095},"mailboxes":[{"email":"user_kj3box0gk2@mailbox.test","id":3095}],"name":null,"nb_block":0,"nb_forward":0,"nb_reply":0,"note":null,"pinned":false,"support_pgp":false}
+  -> server SL console log during request (validation lines, unedited):
+     2026-07-14 06:02:53,790 - SL - INFO - 31065 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+
+------------------------------------------------------------------------------
+CONDITION: LIVE duplicate (alias still exists) -> expect 409
+  -> status_code = 409
+  -> response body (verbatim) = {"error":"alias dupprefix.word@sl.local already exists"}
+  -> server SL console log during request (validation lines, unedited):
+     2026-07-14 06:02:53,815 - SL - DEBUG - 31065 - "/app/app/api/views/new_custom_alias.py:202" - new_custom_alias_v3() -  - full alias already used dupprefix.word@sl.local
+
+------------------------------------------------------------------------------
+CONDITION: TRASH duplicate (public -> DeletedAlias) -> expect 409
+  -> status_code = 409
+  -> response body (verbatim) = {"error":"alias dupprefix.word@sl.local already exists"}
+  -> server SL console log during request (validation lines, unedited):
+     2026-07-14 06:02:53,843 - SL - DEBUG - 31065 - "/app/app/api/views/new_custom_alias.py:202" - new_custom_alias_v3() -  - full alias already used dupprefix.word@sl.local
+
+------------------------------------------------------------------------------
+CONDITION: initial create (custom domain) cdprefix@cd-test.test -> expect 201
+  -> status_code = 201
+  -> response body (verbatim) = {"alias":"cdprefix@cd-test.test","creation_date":"2026-07-14 06:02:53+00:00","creation_timestamp":1784008973,"disable_pgp":false,"email":"cdprefix@cd-test.test","enabled":true,"id":5072,"latest_activity":null,"mailbox":{"email":"user_kj3box0gk2@mailbox.test","id":3095},"mailboxes":[{"email":"user_kj3box0gk2@mailbox.test","id":3095}],"name":null,"nb_block":0,"nb_forward":0,"nb_reply":0,"note":null,"pinned":false,"support_pgp":false}
+  -> server SL console log during request (validation lines, unedited):
+     2026-07-14 06:02:53,871 - SL - INFO - 31065 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+
+------------------------------------------------------------------------------
+CONDITION: TRASH duplicate (custom -> DomainDeletedAlias) -> expect 409
+  -> status_code = 409
+  -> response body (verbatim) = {"error":"alias cdprefix@cd-test.test already exists"}
+  -> server SL console log during request (validation lines, unedited):
+     2026-07-14 06:02:53,905 - SL - DEBUG - 31065 - "/app/app/api/views/new_custom_alias.py:202" - new_custom_alias_v3() -  - full alias already used cdprefix@cd-test.test
+
+>>> rolled back transaction; probe committed NOTHING to PostgreSQL
+```
+
+Both trash tables are distinct from the live-alias table, yet the handler treats all three identically:
+the in-trash address is **not** re-creatable, so a user who deleted `x@domain` still gets a `409` — the
+same status and message as a live duplicate. (This is the runtime backing for matrix row 9, §8.)
+
 ## 4. Q2 — Server-console log entries for those failures
 
 ### 4.1 How the log was captured (mechanism, filter criteria, markers)
@@ -1263,7 +1668,7 @@ SimpleLogin never overrides this: `server.py:167` calls `limiter.init_app(app)` 
 in `app/extensions.py` with only `key_func=__key_func`.)
 
 **Correcting the version claim.** The changelog entry *"Bug fix: Correct default setting for enabling rate
-limit headers. (Issue 22)"* is an **early** Flask-Limiter fix from the **0.7.x** series — it long predates
+limit headers. (Issue 22)"* is an **early** Flask-Limiter fix from the **v0.7** release — it long predates
 the pinned **1.4**. It is therefore *not* a "1.5 changelog fix": version 1.4 already ships with the
 corrected default (`False`), as the source above shows. Whichever way the history is read, the decisive,
 runtime-grounded fact is that **the installed 1.4 emits no rate-limit headers by default**, which is what
@@ -1301,6 +1706,32 @@ Flask-Limiter source:
                     self._header_mapping[HEADERS.LIMIT],
                     str(current_limit[0].amount)
 ```
+
+**Authoritative source reference and how to reproduce.** The version attribution above is grounded in the
+changelog that ships **inside the pinned artifact**: `Flask_Limiter-1.4.dist-info/METADATA` places the
+header-default fix under the **`v0.7` (Release Date: 2015-01-09)** heading — *"Bug fix: Correct default
+setting for enabling rate limit headers. (Issue 22)"* — confirming it long predates the pinned 1.4 (public
+issue: <https://github.com/alisaifee/flask-limiter/issues/22>). The runtime-decisive facts — the installed
+1.4 default and SimpleLogin never enabling headers — are reproduced with:
+
+```bash
+# installed version + the header-enabled default in the shipping extension.py
+/app/venv/bin/python -c "import flask_limiter; print(flask_limiter.__version__)"   # -> 1.4
+FL=/app/venv/lib/python3.10/site-packages/flask_limiter
+grep -nE 'headers_enabled=False|config.setdefault\(C.HEADERS_ENABLED, False\)|self._headers_enabled and current_limit' "$FL/extension.py"
+#   109:        headers_enabled=False,
+#   229:            or config.setdefault(C.HEADERS_ENABLED, False)
+#   389:        if self.enabled and self._headers_enabled and current_limit:
+# SimpleLogin never passes headers_enabled / RATELIMIT_HEADERS_ENABLED anywhere:
+grep -n 'limiter.init_app' /app/server.py                 # -> 167:    limiter.init_app(app)
+grep -rn 'RATELIMIT_HEADERS_ENABLED\|headers_enabled' /app --include='*.py' | grep -v venv   # -> (no matches)
+# the version heading for the fix, from the shipped changelog:
+grep -n 'Issue 22' /app/venv/lib/python3.10/site-packages/Flask_Limiter-1.4.dist-info/METADATA
+```
+
+The header **absence** is therefore an **observed** runtime fact (§5.4 shows the raw headers with limiting
+enabled); the *which-version-fixed-it* attribution is read from the shipped changelog (v0.7) — any claim
+about how **other**, un-run versions behave is **inferred** from that changelog, not executed here.
 
 ### 5.2 The 429 boundary, observed (two isolated runs)
 
@@ -1719,6 +2150,281 @@ is never reached. This ordering is a likely contributor to "intermittent" observ
 suffix surfaces as `412` or as `400` depends on the user's current alias count at request time.
 
 
+### 6.5 Every quota branch, observed — and why a **trial** user is still capped
+
+`can_create_new_alias()` [`app/models.py:867-884`] short-circuits on `is_active()`/`disabled`, then keys on
+**`lifetime_or_active_subscription()`** — *not* `is_premium()`. When that is `False` it compares the live
+alias count against `max_alias_for_free_account()` [`:858-865`], which returns `MAX_NB_EMAIL_OLD_FREE_PLAN`
+(15) if the `FLAG_FREE_OLD_ALIAS_LIMIT` bit is set, else `MAX_NB_EMAIL_FREE_PLAN` (3, per `tests/test.env`).
+Because the gate ignores `is_premium()`, a user **in trial** (`is_premium()=True`, `in_trial()=True`) is
+**still** subject to the free cap — matching the docstring *"has more than 15 aliases ... even in the free
+trial"*. All branches were driven through the model's own methods and (for the failure/success paths) the
+real endpoint:
+
+| Branch | `lifetime_or_active_subscription()` | `in_trial()` | `is_premium()` | `max_alias_for_free_account()` | `can_create_new_alias()` | Endpoint at cap |
+|--------|:--:|:--:|:--:|:--:|:--:|--|
+| (A) free, under cap | False | False | False | 3 | **True** | — |
+| (B) free, at cap (3) | False | False | False | 3 | **False** | `400` + `LOG.d :138` |
+| (C) old-plan flag | False | False | False | **15** | **True** | — |
+| (D) **trial**, at cap | False | **True** | **True** | 3 | **False** | `400` + `LOG.d :138` |
+| (E) lifetime | **True** | False | True | 3 | **True** | `201` (no quota log) |
+| (F) active `ManualSubscription` | **True** | False | True | 3 | **True** | `201` (no quota log) |
+
+The success paths (E, F) confirm §6.2: the `201` path emits **no** quota log; the only quota-related line is
+the failure `LOG.d("user %s cannot create any custom alias", user)` at `new_custom_alias.py:138` (v3) /
+`:49` (v2). Branch (D) is the decisive one for the "can the user create more" question: a trial user is
+premium yet blocked at the free cap.
+
+**Command** (after `docker cp blitzy_probe_quota.py sl_setup:/tmp/`)
+```bash
+cd /app && env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/root \
+  DB_URI='postgresql://test:test@localhost:5432/test' CONFIG=tests/test.env \
+  GNUPGHOME=/tmp/sl_gnupg PYTHONPATH=/app /app/venv/bin/python /tmp/blitzy_probe_quota.py
+```
+
+**Probe** (`blitzy_probe_quota.py`)
+```python
+#!/usr/bin/env python3
+"""
+blitzy_probe_quota.py -- exercise User.can_create_new_alias() [app/models.py L866-884] and
+max_alias_for_free_account() [L858-865] across EVERY quota branch, printing the real predicate
+values the gate depends on, and (for the failure + success paths) driving the real endpoint to
+capture the exact status/body and the SL console log.
+
+Branches:
+  (A) free, UNDER cap        -> can_create True
+  (B) free, AT cap (3)       -> can_create False ; endpoint 400 + LOG.d "cannot create any custom alias"
+  (C) old-plan flag (cap 15) -> max_alias_for_free_account()==15 ; can_create True at 3 aliases
+  (D) TRIAL, AT cap          -> is_premium True & in_trial True BUT lifetime_or_active_subscription
+                                 False -> can_create False  (trial does NOT lift the alias cap)
+  (E) lifetime               -> lifetime_or_active_subscription True -> can_create True at cap
+  (F) active ManualSubscription (non-giveaway) -> can_create True at cap ; is_paid True
+Success paths (E) confirm what is / is NOT logged on the 201 path (Q4). Commits nothing.
+"""
+import os, io, json, logging, time
+import arrow
+os.environ.setdefault("CONFIG", "/app/tests/test.env")
+from app import config
+from app.db import Session, connection
+import app.log as sl_log
+from app.log import LOG
+from app.alias_suffix import signer
+from app.config import EMAIL_DOMAIN, MAX_NB_EMAIL_FREE_PLAN, MAX_NB_EMAIL_OLD_FREE_PLAN
+from app.utils import random_word
+from app.models import Alias, User, ManualSubscription
+from server import create_app
+from tests.api.utils import get_new_user_and_api_key
+
+app = create_app(); app.config["TESTING"] = True; app.config["SERVER_NAME"] = "sl.test"
+
+_cap = io.StringIO(); _h = logging.StreamHandler(_cap); _h.setFormatter(sl_log._log_formatter); _h.formatter.converter = time.gmtime
+_saved = []
+def cap_on():
+    global _saved; _saved = list(LOG.handlers)
+    for hh in _saved: LOG.removeHandler(hh)
+    LOG.addHandler(_h)
+def cap_reset(): _cap.seek(0); _cap.truncate(0)
+def cap_read(): return _cap.getvalue()
+
+def predicates(u):
+    return {
+        "alias_count": Alias.filter_by(user_id=u.id).count(),
+        "max_alias_for_free_account()": u.max_alias_for_free_account(),
+        "is_active()": u.is_active(),
+        "disabled": u.disabled,
+        "lifetime": u.lifetime,
+        "lifetime_or_active_subscription()": u.lifetime_or_active_subscription(),
+        "in_trial()": u.in_trial(),
+        "is_premium()": u.is_premium(),
+        "is_paid()": u.is_paid(),
+        "can_create_new_alias()": u.can_create_new_alias(),
+    }
+
+def report(label, u):
+    print("\n" + "="*78)
+    print("BRANCH: " + label)
+    p = predicates(u)
+    for k, v in p.items():
+        print("   %-38s = %s" % (k, v))
+    return p
+
+def fill_to_cap(u, n):
+    for i in range(n):
+        Alias.create_new(u, prefix="q%d" % i)
+    Session.flush()
+
+def post_create(client, H, tag):
+    word = random_word()
+    suffix = ".%s@%s" % (word, EMAIL_DOMAIN)
+    signed = signer.sign(suffix).decode()
+    body = {"alias_prefix": "quo" + tag, "signed_suffix": signed, "mailbox_ids": [u_mb[0]]}
+    cap_reset()
+    r = client.post("/api/v3/alias/custom/new", headers=H, json=body)
+    sl = [ln for ln in cap_read().splitlines() if " - SL - " in ln and "after_request" not in ln]
+    print("   ENDPOINT POST /api/v3/alias/custom/new -> status=%s body=%s"
+          % (r.status_code, r.get_data(as_text=True).rstrip()))
+    print("   SL validation log (unedited):")
+    if sl:
+        for ln in sl: print("      " + ln)
+    else:
+        print("      <none>  (no quota-related log emitted on this path)")
+    return r
+
+u_mb = [None]
+transaction = connection.begin()
+cap_on()
+try:
+    with app.app_context():
+        config.DISABLE_RATE_LIMIT = True
+
+        # (A) free, under cap  ------------------------------------------------
+        uA, kA = get_new_user_and_api_key(); uA.trial_end = None; Session.flush()
+        report("(A) free, UNDER cap (fresh free user, trial_end=None)", uA)
+
+        # (B) free, at cap -> 400 + LOG.d ------------------------------------
+        uB, kB = get_new_user_and_api_key(); uB.trial_end = None; Session.flush()
+        fill_to_cap(uB, MAX_NB_EMAIL_FREE_PLAN)   # reach MAX_NB_EMAIL_FREE_PLAN custom aliases
+        report("(B) free, AT cap (%d aliases, trial_end=None)" % MAX_NB_EMAIL_FREE_PLAN, uB)
+        u_mb[0] = uB.default_mailbox_id
+        post_create(app.test_client(), {"Authentication": kB.code}, "B")
+
+        # (C) old-plan flag (cap 15) -----------------------------------------
+        uC, kC = get_new_user_and_api_key(); uC.trial_end = None
+        uC.flags = uC.flags | User.FLAG_FREE_OLD_ALIAS_LIMIT; Session.flush()
+        fill_to_cap(uC, MAX_NB_EMAIL_FREE_PLAN)   # 3 aliases -> still < 15
+        report("(C) OLD-plan flag set (FLAG_FREE_OLD_ALIAS_LIMIT), %d aliases, cap should be %d"
+               % (MAX_NB_EMAIL_FREE_PLAN, MAX_NB_EMAIL_OLD_FREE_PLAN), uC)
+
+        # (D) trial, at cap ---------------------------------------------------
+        uD, kD = get_new_user_and_api_key()
+        uD.lifetime = False; uD.trial_end = arrow.now().shift(days=7); Session.flush()
+        fill_to_cap(uD, MAX_NB_EMAIL_FREE_PLAN)
+        report("(D) TRIAL (trial_end=now+7d), AT cap (%d aliases)" % MAX_NB_EMAIL_FREE_PLAN, uD)
+        u_mb[0] = uD.default_mailbox_id
+        post_create(app.test_client(), {"Authentication": kD.code}, "D")
+
+        # (E) lifetime, at cap -> success ------------------------------------
+        uE, kE = get_new_user_and_api_key(); uE.lifetime = True; Session.flush()
+        fill_to_cap(uE, MAX_NB_EMAIL_FREE_PLAN)
+        report("(E) LIFETIME, AT cap (%d aliases)" % MAX_NB_EMAIL_FREE_PLAN, uE)
+        u_mb[0] = uE.default_mailbox_id
+        post_create(app.test_client(), {"Authentication": kE.code}, "E")
+
+        # (F) active ManualSubscription (non-giveaway), at cap ---------------
+        uF, kF = get_new_user_and_api_key()
+        uF.lifetime = False; uF.trial_end = None; Session.flush()
+        ManualSubscription.create(user_id=uF.id, end_at=arrow.now().shift(days=30),
+                                  is_giveaway=False, commit=False); Session.flush()
+        fill_to_cap(uF, MAX_NB_EMAIL_FREE_PLAN)
+        report("(F) active ManualSubscription (end_at=now+30d, not giveaway), AT cap", uF)
+        u_mb[0] = uF.default_mailbox_id
+        post_create(app.test_client(), {"Authentication": kF.code}, "F")
+finally:
+    transaction.rollback(); Session.rollback(); Session.close()
+    print("\n>>> rolled back transaction; probe committed NOTHING to PostgreSQL")
+```
+
+**Observed output** (complete, unedited)
+```text
+load config file /app/tests/test.env
+>>> URL: http://localhost
+Upload files to local dir
+>>> init logging <<<
+2026-07-14 06:03:03,411 - SL - DEBUG - 31091 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+
+==============================================================================
+BRANCH: (A) free, UNDER cap (fresh free user, trial_end=None)
+   alias_count                            = 1
+   max_alias_for_free_account()           = 3
+   is_active()                            = True
+   disabled                               = False
+   lifetime                               = False
+   lifetime_or_active_subscription()      = False
+   in_trial()                             = False
+   is_premium()                           = False
+   is_paid()                              = False
+   can_create_new_alias()                 = True
+
+==============================================================================
+BRANCH: (B) free, AT cap (3 aliases, trial_end=None)
+   alias_count                            = 4
+   max_alias_for_free_account()           = 3
+   is_active()                            = True
+   disabled                               = False
+   lifetime                               = False
+   lifetime_or_active_subscription()      = False
+   in_trial()                             = False
+   is_premium()                           = False
+   is_paid()                              = False
+   can_create_new_alias()                 = False
+   ENDPOINT POST /api/v3/alias/custom/new -> status=400 body={"error":"You have reached the limitation of a free account with the maximum of 3 aliases, please upgrade your plan to create more aliases"}
+   SL validation log (unedited):
+      2026-07-14 06:03:04,948 - SL - DEBUG - 31091 - "/app/app/api/views/new_custom_alias.py:138" - new_custom_alias_v3() -  - user <User 2686 Test User user_f5w46xy79k@mailbox.test> cannot create any custom alias
+
+==============================================================================
+BRANCH: (C) OLD-plan flag set (FLAG_FREE_OLD_ALIAS_LIMIT), 3 aliases, cap should be 15
+   alias_count                            = 4
+   max_alias_for_free_account()           = 15
+   is_active()                            = True
+   disabled                               = False
+   lifetime                               = False
+   lifetime_or_active_subscription()      = False
+   in_trial()                             = False
+   is_premium()                           = False
+   is_paid()                              = False
+   can_create_new_alias()                 = True
+
+==============================================================================
+BRANCH: (D) TRIAL (trial_end=now+7d), AT cap (3 aliases)
+   alias_count                            = 4
+   max_alias_for_free_account()           = 3
+   is_active()                            = True
+   disabled                               = False
+   lifetime                               = False
+   lifetime_or_active_subscription()      = False
+   in_trial()                             = True
+   is_premium()                           = True
+   is_paid()                              = False
+   can_create_new_alias()                 = False
+   ENDPOINT POST /api/v3/alias/custom/new -> status=400 body={"error":"You have reached the limitation of a free account with the maximum of 3 aliases, please upgrade your plan to create more aliases"}
+   SL validation log (unedited):
+      2026-07-14 06:03:05,619 - SL - DEBUG - 31091 - "/app/app/api/views/new_custom_alias.py:138" - new_custom_alias_v3() -  - user <User 2688 Test User user_k02edwloqr@mailbox.test> cannot create any custom alias
+
+==============================================================================
+BRANCH: (E) LIFETIME, AT cap (3 aliases)
+   alias_count                            = 4
+   max_alias_for_free_account()           = 3
+   is_active()                            = True
+   disabled                               = False
+   lifetime                               = True
+   lifetime_or_active_subscription()      = True
+   in_trial()                             = False
+   is_premium()                           = True
+   is_paid()                              = False
+   can_create_new_alias()                 = True
+   ENDPOINT POST /api/v3/alias/custom/new -> status=201 body={"alias":"quoe.list@sl.local","creation_date":"2026-07-14 06:03:05+00:00","creation_timestamp":1784008985,"disable_pgp":false,"email":"quoe.list@sl.local","enabled":true,"id":5090,"latest_activity":null,"mailbox":{"email":"user_dyq0667s3j@mailbox.test","id":3100},"mailboxes":[{"email":"user_dyq0667s3j@mailbox.test","id":3100}],"name":null,"nb_block":0,"nb_forward":0,"nb_reply":0,"note":null,"pinned":false,"support_pgp":false}
+   SL validation log (unedited):
+      2026-07-14 06:03:05,953 - SL - INFO - 31091 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+
+==============================================================================
+BRANCH: (F) active ManualSubscription (end_at=now+30d, not giveaway), AT cap
+   alias_count                            = 4
+   max_alias_for_free_account()           = 3
+   is_active()                            = True
+   disabled                               = False
+   lifetime                               = False
+   lifetime_or_active_subscription()      = True
+   in_trial()                             = False
+   is_premium()                           = True
+   is_paid()                              = True
+   can_create_new_alias()                 = True
+   ENDPOINT POST /api/v3/alias/custom/new -> status=201 body={"alias":"quof.test@sl.local","creation_date":"2026-07-14 06:03:06+00:00","creation_timestamp":1784008986,"disable_pgp":false,"email":"quof.test@sl.local","enabled":true,"id":5095,"latest_activity":null,"mailbox":{"email":"user_cvliennxja@mailbox.test","id":3101},"mailboxes":[{"email":"user_cvliennxja@mailbox.test","id":3101}],"name":null,"nb_block":0,"nb_forward":0,"nb_reply":0,"note":null,"pinned":false,"support_pgp":false}
+   SL validation log (unedited):
+      2026-07-14 06:03:06,304 - SL - INFO - 31091 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+
+>>> rolled back transaction; probe committed NOTHING to PostgreSQL
+```
+
 ## 7. Q5 — Execution-path trace: signed-suffix validator and creation-limit enforcers
 
 **Direct answer.** The component that validates signed suffixes is
@@ -1788,21 +2494,296 @@ flowchart TD
     D -- "lock_redis None" --> E
     D -- "acquired" --> E{"can_create_new_alias()"}
     E -- "False" --> E1["400 quota msg + LOG.d :49/:138"]
-    E -- "True" --> F{"request body present & (v3) is dict?"}
-    F -- "empty" --> F1["400 request body cannot be empty"]
-    F -- "v3 not dict" --> F2["400 does not follow the required format"]
-    F -- ok --> G{"check_suffix_signature()"}
-    G -- "None: BadSignature (tampered|expired|garbage)" --> G1["412 expiry msg + LOG.w :72/:187"]
-    G -- "non-string signed_suffix" --> G2["500 Internal error (AttributeError, §9.4)"]
-    G -- "valid" --> H{"verify_prefix_suffix()"}
-    H -- "False" --> H1["400 wrong alias prefix or suffix"]
-    H -- "True (v3: mailbox_ids list/ownership L171-181)" --> I{"duplicate or '..'?"}
-    I -- "duplicate" --> I1["409 already exists + LOG.d :87"]
-    I -- "'..'" --> I2["400 2 consecutive dot signs"]
-    I -- "no" --> J{"Alias.create -> check_bucket_limit()"}
-    J -- "bucket exceeded" --> J1["429 Rate limit exceeded"]
-    J -- ok --> K["201 serialize_alias_info_v2"]
+    E -- "True" --> BODY{"request body present?"}
+    BODY -- "empty" --> BODY1["400 request body cannot be empty"]
+    BODY -- "present" --> VER{"which endpoint version?"}
+
+    %% ---- v2: NO prefix/mailbox gate; the signature check (L70) is the FIRST field check ----
+    VER -- "v2" --> SC2{"signed_suffix = data.get(...).strip() — v2 L65"}
+    SC2 -- "non-string / null → .strip() raises" --> SC2a["500 Internal error (AttributeError, §9.4)"]
+    SC2 -- "string" --> G2{"check_suffix_signature() — v2 L70"}
+    G2 -- "None: BadSignature (tampered|expired|garbage|empty)" --> G2a["412 expiry msg + LOG.w v2:72"]
+    G2 -- "valid" --> H2{"verify_prefix_suffix() — v2 L78"}
+    H2 -- "False" --> H2a["400 wrong alias prefix or suffix"]
+    H2 -- "True" --> I2{"duplicate or '..'?"}
+    I2 -- "duplicate" --> I2a["409 already exists + LOG.d v2:87"]
+    I2 -- "'..'" --> I2b["400 2 consecutive dot signs"]
+    I2 -- "no" --> J2{"Alias.create → check_bucket_limit() — v2 has NO check_alias_prefix, so a malformed prefix reaches here and can raise → 500 (§9.6)"}
+    J2 -- "bucket exceeded" --> J2z["429 Rate limit exceeded"]
+    J2 -- "ok" --> K2["201 serialize_alias_info_v2"]
+
+    %% ---- v3: dict → signed_suffix coercion → prefix → mailbox gates ALL precede signature (L185) ----
+    VER -- "v3" --> D3{"isinstance(data, dict)? — v3 L153"}
+    D3 -- "not dict" --> D3a["400 does not follow the required format"]
+    D3 -- "dict" --> SC3{"signed_suffix = (data.get(...) or '').strip() — v3 L157-158"}
+    SC3 -- "non-string truthy (list/int/dict) → .strip() raises" --> SC3a["500 Internal error (AttributeError, §9.4); JSON null is coerced to '' and continues"]
+    SC3 -- "string or null→''" --> P3{"check_alias_prefix() — v3 L167"}
+    P3 -- "invalid chars / >40" --> P3a["400 alias prefix invalid format or too long"]
+    P3 -- "ok" --> M3{"mailbox_ids: is a list? each owned+verified? at least one? — v3 L171-181"}
+    M3 -- "not a list" --> M3a["400 mailbox_ids must be an array of id"]
+    M3 -- "foreign / missing / unverified" --> M3b["400 Errors with Mailbox"]
+    M3 -- "empty list" --> M3c["400 At least one mailbox must be selected"]
+    M3 -- "ok" --> G3{"check_suffix_signature() — v3 L185"}
+    G3 -- "None: BadSignature (tampered|expired|garbage|empty)" --> G3a["412 expiry msg + LOG.w v3:187"]
+    G3 -- "valid" --> H3{"verify_prefix_suffix() — v3 L193"}
+    H3 -- "False" --> H3a["400 wrong alias prefix or suffix"]
+    H3 -- "True" --> I3{"duplicate or '..'?"}
+    I3 -- "duplicate" --> I3a["409 already exists + LOG.d v3:202"]
+    I3 -- "'..'" --> I3b["400 2 consecutive dot signs"]
+    I3 -- "no" --> J3{"Alias.create + AliasMailbox → check_bucket_limit()"}
+    J3 -- "bucket exceeded" --> J3z["429 Rate limit exceeded"]
+    J3 -- "ok" --> K3["201 serialize_alias_info_v2"]
 ```
+
+The split makes the **version-specific ordering** explicit and matches the runtime: on **v3**, the
+`check_alias_prefix` gate (L167) and all three `mailbox_ids` gates (L171-181) run **before**
+`check_suffix_signature` (L185), so an invalid prefix or a bad mailbox yields its own `400` and the
+signature branch is never reached; on **v2** there is no prefix/mailbox gate, so `check_suffix_signature`
+(L70) is the first field check and a malformed prefix instead surfaces later at `Alias.create`. This exact
+ordering is demonstrated at runtime in §7.2.1 (v3) and §9.6 (the v2 `500`).
+
+#### 7.2.1 Runtime evidence — v3 validates prefix + mailbox BEFORE the signature (v2 does not)
+
+The corrected diagram asserts a **version-specific gate order** that is not visible by reading a single
+branch list, so it is demonstrated at runtime. The probe below sends the **same verified-tampered
+signed suffix** on every request and varies only the `alias_prefix` / `mailbox_ids`. Because a tampered
+suffix always yields **412** once the signature branch is reached, the *observed* status tells us
+unambiguously **which gate fired first**: a **400** (prefix/mailbox message) proves that gate ran and
+short-circuited **before** the signature check; a **412** proves the request reached the signature check.
+The final two conditions are contrasts — a v3 request with a *valid* prefix and mailbox reaches the
+signature (412), and a v2 request with the *same invalid prefix* reaches the signature first (412),
+because v2 has no `check_alias_prefix` gate.
+
+The probe uses the same commit-nothing rollback isolation as `tests/conftest.py::flask_client`
+(`connection.begin()` … `transaction.rollback()`), mints its suffix through the real
+`app.alias_suffix.signer`, and drives the **real** `POST /api/v3|v2/alias/custom/new` endpoints through
+a Flask test client. It is a temporary observation script (removed after capture; see §12.4).
+
+Command (canonical test-client invocation inside the prescribed container):
+
+```bash
+$ docker cp /tmp/blitzy_probe_v3prec.py sl_setup:/tmp/blitzy_probe_v3prec.py
+$ docker exec sl_setup bash -lc 'cd /app && env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/root \
+    DB_URI="postgresql://test:test@localhost:5432/test" CONFIG=tests/test.env \
+    GNUPGHOME=/tmp/sl_gnupg PYTHONPATH=/app /app/venv/bin/python /tmp/blitzy_probe_v3prec.py'
+```
+
+Probe script (`blitzy_probe_v3prec.py`):
+
+```python
+#!/usr/bin/env python3
+"""
+blitzy_probe_v3prec.py -- prove v3 validates alias_prefix (check_alias_prefix, L167) and
+mailbox_ids (L171-181) BEFORE the signed-suffix signature check (check_suffix_signature, L185),
+whereas v2 has NO prefix/mailbox gate and reaches the signature check first (L70).
+All requests carry a VERIFIED-TAMPERED suffix; the observed status shows which gate fired FIRST.
+Commits nothing (connection.begin()/rollback, identical to tests/conftest.py::flask_client).
+"""
+import os, io, json, logging, time, string as _string
+os.environ.setdefault("CONFIG", "/app/tests/test.env")
+import itsdangerous
+from app import config
+from app.db import Session, connection
+import app.log as sl_log
+from app.log import LOG
+from app.alias_suffix import signer
+from app.config import EMAIL_DOMAIN
+from app.utils import random_word
+from server import create_app
+from tests.api.utils import get_new_user_and_api_key
+
+app = create_app(); app.config["TESTING"] = True; app.config["SERVER_NAME"] = "sl.test"
+
+_cap = io.StringIO(); _h = logging.StreamHandler(_cap); _h.setFormatter(sl_log._log_formatter); _h.formatter.converter = time.gmtime
+_saved = []
+def cap_on():
+    global _saved; _saved = list(LOG.handlers)
+    for h in _saved: LOG.removeHandler(h)
+    LOG.addHandler(_h)
+def cap_reset(): _cap.seek(0); _cap.truncate(0)
+def cap_read(): return _cap.getvalue()
+
+_B64 = _string.ascii_letters + _string.digits + "-_"
+def make_tampered(tok):
+    for i in range(len(tok)):
+        repl = next(a for a in _B64 if a != tok[i])
+        cand = tok[:i] + repl + tok[i+1:]
+        try: signer.unsign(cand, max_age=600)
+        except itsdangerous.BadSignature: return cand
+    raise RuntimeError("no tamper")
+
+_fail = []
+def show(label, endpoint, body, r, logs, expect_status, expect_err):
+    print("\n" + "-"*78)
+    print("CONDITION: " + label)
+    print("  POST " + endpoint)
+    pb = dict(body); pb["signed_suffix"] = pb.get("signed_suffix","")[:24] + "...(TAMPERED)"
+    print("  body = " + json.dumps(pb))
+    print("  -> status_code = " + str(r.status_code))
+    print("  -> body        = " + r.get_data(as_text=True))
+    sl = [ln for ln in logs.splitlines() if " - SL - " in ln and ("new_custom_alias" in ln or "alias_suffix" in ln)]
+    print("  -> SL validation log during request: " + (str(sl) if sl else "<none: signature branch NOT reached>"))
+    ok = (r.status_code == expect_status)
+    try: err = r.get_json().get("error")
+    except Exception: err = None
+    ok2 = (expect_err in (err or "")) if expect_err else True
+    verdict = "PASS" if (ok and ok2) else "FAIL"
+    print("  [ASSERT " + verdict + "] expect status " + str(expect_status) + " & error contains " + repr(expect_err) + "; got " + str(r.status_code) + " err=" + repr(err))
+    if not (ok and ok2): _fail.append(label)
+
+transaction = connection.begin()
+cap_on()
+try:
+    with app.app_context():
+        config.DISABLE_RATE_LIMIT = True
+        user, api_key = get_new_user_and_api_key(); user.lifetime = True; Session.flush()
+        other, _ = get_new_user_and_api_key(); other.lifetime = True; Session.flush()
+        H = {"Authentication": api_key.code}
+        client = app.test_client()
+        good_mb = user.default_mailbox_id
+        foreign_mb = other.default_mailbox_id
+        print(">>> user id=%s default_mailbox_id=%s ; foreign(other-owned) mailbox_id=%s" % (user.id, good_mb, foreign_mb))
+
+        valid = signer.sign("." + random_word() + "@" + EMAIL_DOMAIN).decode()
+        tampered = make_tampered(valid)
+        assert tampered != valid
+
+        cap_reset()
+        b = {"alias_prefix": "<script>alert(1)</script>", "signed_suffix": tampered, "mailbox_ids": [good_mb]}
+        r = client.post("/api/v3/alias/custom/new", headers=H, json=b)
+        show("v3 INVALID prefix + tampered suffix", "/api/v3/alias/custom/new", b, r, cap_read(), 400, "alias prefix invalid format or too long")
+
+        cap_reset()
+        b = {"alias_prefix": "okpref", "signed_suffix": tampered, "mailbox_ids": [foreign_mb]}
+        r = client.post("/api/v3/alias/custom/new", headers=H, json=b)
+        show("v3 valid prefix + FOREIGN mailbox + tampered suffix", "/api/v3/alias/custom/new", b, r, cap_read(), 400, "Errors with Mailbox")
+
+        cap_reset()
+        b = {"alias_prefix": "okpref", "signed_suffix": tampered, "mailbox_ids": [999999999]}
+        r = client.post("/api/v3/alias/custom/new", headers=H, json=b)
+        show("v3 valid prefix + NONEXISTENT mailbox id + tampered suffix", "/api/v3/alias/custom/new", b, r, cap_read(), 400, "Errors with Mailbox")
+
+        cap_reset()
+        b = {"alias_prefix": "okpref", "signed_suffix": tampered, "mailbox_ids": []}
+        r = client.post("/api/v3/alias/custom/new", headers=H, json=b)
+        show("v3 valid prefix + EMPTY mailbox_ids [] + tampered suffix", "/api/v3/alias/custom/new", b, r, cap_read(), 400, "At least one mailbox must be selected")
+
+        cap_reset()
+        b = {"alias_prefix": "okpref", "signed_suffix": tampered, "mailbox_ids": "notalist"}
+        r = client.post("/api/v3/alias/custom/new", headers=H, json=b)
+        show("v3 valid prefix + mailbox_ids NOT a list + tampered suffix", "/api/v3/alias/custom/new", b, r, cap_read(), 400, "mailbox_ids must be an array of id")
+
+        cap_reset()
+        b = {"alias_prefix": "okpref", "signed_suffix": tampered, "mailbox_ids": [good_mb]}
+        r = client.post("/api/v3/alias/custom/new", headers=H, json=b)
+        show("v3 valid prefix + VALID mailbox + tampered suffix (CONTRAST -> reaches signature)", "/api/v3/alias/custom/new", b, r, cap_read(), 412, "Alias creation time is expired")
+
+        cap_reset()
+        b = {"alias_prefix": "<script>alert(1)</script>", "signed_suffix": tampered}
+        r = client.post("/api/v2/alias/custom/new", headers=H, json=b)
+        show("v2 INVALID prefix + tampered suffix (CONTRAST -> signature first, no prefix gate)", "/api/v2/alias/custom/new", b, r, cap_read(), 412, "Alias creation time is expired")
+
+        print("\n" + "="*78)
+        print(">>> assertions failed: %d %s" % (len(_fail), _fail))
+finally:
+    transaction.rollback(); Session.rollback(); Session.close()
+    print(">>> rolled back transaction; probe committed NOTHING to PostgreSQL")
+```
+
+Observed output (complete, unedited; the `...(TAMPERED)` text is the probe's own deliberate truncation
+of the long token when printing the request body — the full tampered token is used on the wire):
+
+```text
+load config file /app/tests/test.env
+>>> URL: http://localhost
+Upload files to local dir
+>>> init logging <<<
+2026-07-14 05:32:59,890 - SL - DEBUG - 30314 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+>>> user id=2676 default_mailbox_id=3087 ; foreign(other-owned) mailbox_id=3088
+
+------------------------------------------------------------------------------
+CONDITION: v3 INVALID prefix + tampered suffix
+  POST /api/v3/alias/custom/new
+  body = {"alias_prefix": "<script>alert(1)</script>", "signed_suffix": "alist@sl.local.alXKDQ.9X...(TAMPERED)", "mailbox_ids": [3087]}
+  -> status_code = 400
+  -> body        = {"error":"alias prefix invalid format or too long"}
+
+  -> SL validation log during request: <none: signature branch NOT reached>
+  [ASSERT PASS] expect status 400 & error contains 'alias prefix invalid format or too long'; got 400 err='alias prefix invalid format or too long'
+
+------------------------------------------------------------------------------
+CONDITION: v3 valid prefix + FOREIGN mailbox + tampered suffix
+  POST /api/v3/alias/custom/new
+  body = {"alias_prefix": "okpref", "signed_suffix": "alist@sl.local.alXKDQ.9X...(TAMPERED)", "mailbox_ids": [3088]}
+  -> status_code = 400
+  -> body        = {"error":"Errors with Mailbox"}
+
+  -> SL validation log during request: <none: signature branch NOT reached>
+  [ASSERT PASS] expect status 400 & error contains 'Errors with Mailbox'; got 400 err='Errors with Mailbox'
+
+------------------------------------------------------------------------------
+CONDITION: v3 valid prefix + NONEXISTENT mailbox id + tampered suffix
+  POST /api/v3/alias/custom/new
+  body = {"alias_prefix": "okpref", "signed_suffix": "alist@sl.local.alXKDQ.9X...(TAMPERED)", "mailbox_ids": [999999999]}
+  -> status_code = 400
+  -> body        = {"error":"Errors with Mailbox"}
+
+  -> SL validation log during request: <none: signature branch NOT reached>
+  [ASSERT PASS] expect status 400 & error contains 'Errors with Mailbox'; got 400 err='Errors with Mailbox'
+
+------------------------------------------------------------------------------
+CONDITION: v3 valid prefix + EMPTY mailbox_ids [] + tampered suffix
+  POST /api/v3/alias/custom/new
+  body = {"alias_prefix": "okpref", "signed_suffix": "alist@sl.local.alXKDQ.9X...(TAMPERED)", "mailbox_ids": []}
+  -> status_code = 400
+  -> body        = {"error":"At least one mailbox must be selected"}
+
+  -> SL validation log during request: <none: signature branch NOT reached>
+  [ASSERT PASS] expect status 400 & error contains 'At least one mailbox must be selected'; got 400 err='At least one mailbox must be selected'
+
+------------------------------------------------------------------------------
+CONDITION: v3 valid prefix + mailbox_ids NOT a list + tampered suffix
+  POST /api/v3/alias/custom/new
+  body = {"alias_prefix": "okpref", "signed_suffix": "alist@sl.local.alXKDQ.9X...(TAMPERED)", "mailbox_ids": "notalist"}
+  -> status_code = 400
+  -> body        = {"error":"mailbox_ids must be an array of id"}
+
+  -> SL validation log during request: <none: signature branch NOT reached>
+  [ASSERT PASS] expect status 400 & error contains 'mailbox_ids must be an array of id'; got 400 err='mailbox_ids must be an array of id'
+
+------------------------------------------------------------------------------
+CONDITION: v3 valid prefix + VALID mailbox + tampered suffix (CONTRAST -> reaches signature)
+  POST /api/v3/alias/custom/new
+  body = {"alias_prefix": "okpref", "signed_suffix": "alist@sl.local.alXKDQ.9X...(TAMPERED)", "mailbox_ids": [3087]}
+  -> status_code = 412
+  -> body        = {"error":"Alias creation time is expired, please retry"}
+
+  -> SL validation log during request: ['2026-07-14 05:33:01,379 - SL - WARNING - 30314 - "/app/app/api/views/new_custom_alias.py:187" - new_custom_alias_v3() -  - Alias creation time expired for <User 2676 Test User user_27x2ndp08p@mailbox.test>']
+  [ASSERT PASS] expect status 412 & error contains 'Alias creation time is expired'; got 412 err='Alias creation time is expired, please retry'
+
+------------------------------------------------------------------------------
+CONDITION: v2 INVALID prefix + tampered suffix (CONTRAST -> signature first, no prefix gate)
+  POST /api/v2/alias/custom/new
+  body = {"alias_prefix": "<script>alert(1)</script>", "signed_suffix": "alist@sl.local.alXKDQ.9X...(TAMPERED)"}
+  -> status_code = 412
+  -> body        = {"error":"Alias creation time is expired, please retry"}
+
+  -> SL validation log during request: ['2026-07-14 05:33:01,385 - SL - WARNING - 30314 - "/app/app/api/views/new_custom_alias.py:72" - new_custom_alias_v2() -  - Alias creation time expired for <User 2676 Test User user_27x2ndp08p@mailbox.test>']
+  [ASSERT PASS] expect status 412 & error contains 'Alias creation time is expired'; got 412 err='Alias creation time is expired, please retry'
+
+==============================================================================
+>>> assertions failed: 0 []
+>>> rolled back transaction; probe committed NOTHING to PostgreSQL
+```
+
+**Reading the evidence.** The five v3 failure conditions all return **400** with the *field-specific*
+message and emit **no** `new_custom_alias.py:187` signature log — proving `check_alias_prefix` (L167) and
+the three `mailbox_ids` gates (L171-181) ran and short-circuited **before** `check_suffix_signature`
+(L185). The v3 contrast (valid prefix + valid mailbox) is the only v3 case that reaches the signature,
+returning **412** with the `new_custom_alias.py:187` warning. The v2 contrast sends the *same* invalid
+`<script>alert(1)</script>` prefix but returns **412** with the `new_custom_alias.py:72` warning — the
+signature check ran first because v2 has no prefix gate at all. This is exactly the version-split order
+drawn in §7.2, and it is consistent with the (independently correct) v3 branch-order table in §7.4.
 
 ### 7.3 v2 in-handler branch order (`new_custom_alias_v2`, `app/api/views/new_custom_alias.py:32-112`)
 
@@ -2048,6 +3029,242 @@ assertions failed: 0
 >>> cleanup: restored lock_redis+DISABLE_RATE_LIMIT; deleted 1 cl key(s); DB rolled back
 ```
 
+### 7.8 The per-user creation bucket, observed — threshold and Redis-absent no-op
+
+Distinct from the HTTP `@limiter.limit` decorator and the parallel lock, `Alias.create` runs a **per-user
+token bucket** [`app/models.py:1634-1641`] via `rate_limiter.check_bucket_limit` [`app/rate_limiter.py:18-42`].
+For a non-premium user the limits are `ALIAS_CREATE_RATE_LIMIT_FREE = "10,900:50,3600"`
+[`app/config.py:554-556`] -> tightest bucket **10 hits / 900 s**. `check_bucket_limit` does
+`value = lock_redis.incr(key, 900)` and raises `werkzeug.exceptions.TooManyRequests()` when `value > 10`
+[`rate_limiter.py:31-40`], which the custom `@app.errorhandler(429)` [`server.py:362-372`] renders as
+`{"error":"Rate limit exceeded"}`. This bucket runs **even with `config.DISABLE_RATE_LIMIT = True`**
+(that flag only exempts the Flask-Limiter decorator).
+
+Two configurations were exercised with an **old-plan free** user (quota cap 15, so the bucket 10 trips
+first). **PART 1 — Redis present:** the live bucket counter is printed after each create; the user's
+default alias consumed hit #1, so the 10th endpoint create is the **11th bucket hit** (`value=11 > 10`) and
+is the first `429`, logging `LOG.i` at `rate_limiter.py:33`
+(`Rate limit hit for alias_create_900d:<uid> (bucket id ...) -> 11/10`) and `LOG.w` at `server.py:364`.
+**PART 2 — Redis absent:** with `rate_limiter.lock_redis = None`, the `if not lock_redis: return` no-op
+[`rate_limiter.py:27-28`] fires, so **no `429` ever appears**; creation instead proceeds past the 10-hit
+ceiling until the *independent* old-plan quota cap (15) intervenes at the 15th create — confirming the
+bucket and the account quota are separate gates.
+
+**Command** (after `docker cp blitzy_probe_bucket.py sl_setup:/tmp/`)
+```bash
+cd /app && env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/root \
+  DB_URI='postgresql://test:test@localhost:5432/test' CONFIG=tests/test.env \
+  GNUPGHOME=/tmp/sl_gnupg PYTHONPATH=/app /app/venv/bin/python /tmp/blitzy_probe_bucket.py
+```
+
+**Probe** (`blitzy_probe_bucket.py`)
+```python
+#!/usr/bin/env python3
+"""
+blitzy_probe_bucket.py -- exercise the PER-USER creation bucket enforced INSIDE Alias.create
+[app/models.py L1638-1641] via app.rate_limiter.check_bucket_limit [app/rate_limiter.py L18-42].
+This is SEPARATE from the Flask-Limiter @limiter.limit decorator, so it stays active even with
+config.DISABLE_RATE_LIMIT = True.
+
+For a FREE (not-premium) user the limits are ALIAS_CREATE_RATE_LIMIT_FREE = "10,900:50,3600"
+[app/config.py L554-556] -> tightest bucket (10 hits / 900 s). check_bucket_limit does
+`value = lock_redis.incr(key, 900)` and raises werkzeug TooManyRequests when value > 10, which
+the @app.errorhandler(429) [server.py L362-372] renders as {"error":"Rate limit exceeded"}, 429.
+
+We use an OLD-PLAN free user (FLAG_FREE_OLD_ALIAS_LIMIT -> quota cap 15) so the BUCKET (10) trips
+before the quota (15). Two configurations:
+  PART 1 -- Redis PRESENT   : drive creates until the first 429; print the live bucket counter and
+            the LOG.i "Rate limit hit ... -> value/max_hits" line.
+  PART 2 -- Redis ABSENT    : set rate_limiter.lock_redis = None (the `if not lock_redis: return`
+            no-op at L27-28) and repeat -> every create succeeds, NO 429.
+Commits nothing (connection.begin()/rollback). Redis bucket keys created in PART 1 are cleaned by
+the caller via snapshot-diff.
+"""
+import os, io, logging, time
+from datetime import datetime
+os.environ.setdefault("CONFIG", "/app/tests/test.env")
+from app import config
+from app.db import Session, connection
+import app.log as sl_log
+from app.log import LOG
+from app.alias_suffix import signer
+from app.config import EMAIL_DOMAIN, ALIAS_CREATE_RATE_LIMIT_FREE
+from app.utils import random_word
+from app.models import User
+from app import rate_limiter
+from server import create_app
+from tests.api.utils import get_new_user_and_api_key
+
+app = create_app(); app.config["TESTING"] = True; app.config["SERVER_NAME"] = "sl.test"
+
+_cap = io.StringIO(); _h = logging.StreamHandler(_cap); _h.setFormatter(sl_log._log_formatter); _h.formatter.converter = time.gmtime
+_saved = []
+def cap_on():
+    global _saved; _saved = list(LOG.handlers)
+    for hh in _saved: LOG.removeHandler(hh)
+    LOG.addHandler(_h)
+def cap_reset(): _cap.seek(0); _cap.truncate(0)
+def cap_read(): return _cap.getvalue()
+
+def bucket_key(uid, seconds):
+    int_time = int(datetime.utcnow().timestamp())
+    bucket_id = int_time - (int_time % seconds)
+    return "bl:alias_create_%dd:%s:%d" % (seconds, uid, bucket_id)
+
+def bucket_val(uid, seconds):
+    try:
+        return rate_limiter.lock_redis.get(bucket_key(uid, seconds))
+    except Exception as e:
+        return "<err %s>" % e
+
+def drive(client, H, uid, label, stem, n=15):
+    print("\n" + "="*78)
+    print("PART: " + label)
+    print("   ALIAS_CREATE_RATE_LIMIT_FREE (parsed) = %r  (tightest = 10 hits / 900 s)"
+          % (ALIAS_CREATE_RATE_LIMIT_FREE,))
+    print("   rate_limiter.lock_redis = %r" % (rate_limiter.lock_redis,))
+    first429 = None
+    for i in range(n):
+        word = random_word()
+        signed = signer.sign(".%s@%s" % (word, EMAIL_DOMAIN)).decode()
+        body = {"alias_prefix": "%s%d" % (stem, i), "signed_suffix": signed,
+                "mailbox_ids": [client_mb[0]]}
+        cap_reset()
+        r = client.post("/api/v3/alias/custom/new", headers=H, json=body)
+        v900 = bucket_val(uid, 900)
+        loglines = [ln for ln in cap_read().splitlines()
+                    if (" - SL - " in ln and "after_request" not in ln)]
+        tag = ""
+        if r.status_code == 429 and first429 is None:
+            first429 = i + 1
+            tag = "   <-- FIRST 429"
+        print("   create #%-2d -> status=%s  bucket(900s)=%s%s"
+              % (i + 1, r.status_code, v900, tag))
+        for ln in loglines:
+            print("        LOG: " + ln)
+        if r.status_code == 429:
+            print("        body = %s" % r.get_data(as_text=True).rstrip())
+            break
+    if first429 is None:
+        print("   RESULT: no 429 across %d creates (bucket no-op)" % n)
+    else:
+        print("   RESULT: first 429 at create #%d" % first429)
+
+client_mb = [None]
+orig_lock = rate_limiter.lock_redis
+transaction = connection.begin()
+cap_on()
+try:
+    with app.app_context():
+        config.DISABLE_RATE_LIMIT = True   # Flask-Limiter decorator OFF; per-user bucket still ON
+
+        # ---------- PART 1: Redis PRESENT ----------
+        rate_limiter.lock_redis = orig_lock
+        uP, kP = get_new_user_and_api_key()
+        uP.lifetime = False; uP.trial_end = None
+        uP.flags = uP.flags | User.FLAG_FREE_OLD_ALIAS_LIMIT   # cap 15 so bucket(10) trips first
+        Session.flush()
+        client_mb[0] = uP.default_mailbox_id
+        drive(app.test_client(), {"Authentication": kP.code}, uP.id,
+              "Redis PRESENT -- per-user bucket enforces at the 11th hit (10/900)",
+              stem="bkta")
+
+        # ---------- PART 2: Redis ABSENT (no-op) ----------
+        rate_limiter.lock_redis = None   # Redis-absent configuration -> check_bucket_limit L27-28 no-op
+        uN, kN = get_new_user_and_api_key()
+        uN.lifetime = False; uN.trial_end = None
+        uN.flags = uN.flags | User.FLAG_FREE_OLD_ALIAS_LIMIT
+        Session.flush()
+        client_mb[0] = uN.default_mailbox_id
+        drive(app.test_client(), {"Authentication": kN.code}, uN.id,
+              "Redis ABSENT (rate_limiter.lock_redis=None) -- bucket is a no-op, no 429",
+              stem="bktb")
+finally:
+    rate_limiter.lock_redis = orig_lock
+    transaction.rollback(); Session.rollback(); Session.close()
+    print("\n>>> restored rate_limiter.lock_redis ; rolled back transaction; probe committed NOTHING to PostgreSQL")
+```
+
+**Observed output** (complete, unedited)
+```text
+load config file /app/tests/test.env
+>>> URL: http://localhost
+Upload files to local dir
+>>> init logging <<<
+2026-07-14 06:06:11,199 - SL - DEBUG - 31184 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+
+==============================================================================
+PART: Redis PRESENT -- per-user bucket enforces at the 11th hit (10/900)
+   ALIAS_CREATE_RATE_LIMIT_FREE (parsed) = [(10, 900), (50, 3600)]  (tightest = 10 hits / 900 s)
+   rate_limiter.lock_redis = <limits.storage.RedisStorage object at 0x7e55477d5540>
+   create #1  -> status=201  bucket(900s)=2
+        LOG: 2026-07-14 06:06:12,435 - SL - INFO - 31184 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+   create #2  -> status=201  bucket(900s)=3
+        LOG: 2026-07-14 06:06:12,482 - SL - INFO - 31184 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+   create #3  -> status=201  bucket(900s)=4
+        LOG: 2026-07-14 06:06:12,524 - SL - INFO - 31184 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+   create #4  -> status=201  bucket(900s)=5
+        LOG: 2026-07-14 06:06:12,566 - SL - INFO - 31184 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+   create #5  -> status=201  bucket(900s)=6
+        LOG: 2026-07-14 06:06:12,608 - SL - INFO - 31184 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+   create #6  -> status=201  bucket(900s)=7
+        LOG: 2026-07-14 06:06:12,650 - SL - INFO - 31184 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+   create #7  -> status=201  bucket(900s)=8
+        LOG: 2026-07-14 06:06:12,693 - SL - INFO - 31184 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+   create #8  -> status=201  bucket(900s)=9
+        LOG: 2026-07-14 06:06:12,735 - SL - INFO - 31184 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+   create #9  -> status=201  bucket(900s)=10
+        LOG: 2026-07-14 06:06:12,776 - SL - INFO - 31184 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+   create #10 -> status=429  bucket(900s)=11   <-- FIRST 429
+        LOG: 2026-07-14 06:06:12,814 - SL - INFO - 31184 - "/app/app/rate_limiter.py:33" - check_bucket_limit() -  - Rate limit hit for alias_create_900d:2693 (bucket id 1784008800) -> 11/10
+        LOG: 2026-07-14 06:06:12,814 - SL - WARNING - 31184 - "/app/server.py:364" - rate_limited() -  - Client hit rate limit on path /api/v3/alias/custom/new, user:<User 2693 Test User user_b2hbo2arap@mailbox.test>
+        body = {"error":"Rate limit exceeded"}
+   RESULT: first 429 at create #10
+
+==============================================================================
+PART: Redis ABSENT (rate_limiter.lock_redis=None) -- bucket is a no-op, no 429
+   ALIAS_CREATE_RATE_LIMIT_FREE (parsed) = [(10, 900), (50, 3600)]  (tightest = 10 hits / 900 s)
+   rate_limiter.lock_redis = None
+   create #1  -> status=201  bucket(900s)=<err 'NoneType' object has no attribute 'get'>
+        LOG: 2026-07-14 06:06:13,115 - SL - INFO - 31184 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+   create #2  -> status=201  bucket(900s)=<err 'NoneType' object has no attribute 'get'>
+        LOG: 2026-07-14 06:06:13,158 - SL - INFO - 31184 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+   create #3  -> status=201  bucket(900s)=<err 'NoneType' object has no attribute 'get'>
+        LOG: 2026-07-14 06:06:13,199 - SL - INFO - 31184 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+   create #4  -> status=201  bucket(900s)=<err 'NoneType' object has no attribute 'get'>
+        LOG: 2026-07-14 06:06:13,240 - SL - INFO - 31184 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+   create #5  -> status=201  bucket(900s)=<err 'NoneType' object has no attribute 'get'>
+        LOG: 2026-07-14 06:06:13,281 - SL - INFO - 31184 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+   create #6  -> status=201  bucket(900s)=<err 'NoneType' object has no attribute 'get'>
+        LOG: 2026-07-14 06:06:13,322 - SL - INFO - 31184 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+   create #7  -> status=201  bucket(900s)=<err 'NoneType' object has no attribute 'get'>
+        LOG: 2026-07-14 06:06:13,365 - SL - INFO - 31184 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+   create #8  -> status=201  bucket(900s)=<err 'NoneType' object has no attribute 'get'>
+        LOG: 2026-07-14 06:06:13,406 - SL - INFO - 31184 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+   create #9  -> status=201  bucket(900s)=<err 'NoneType' object has no attribute 'get'>
+        LOG: 2026-07-14 06:06:13,447 - SL - INFO - 31184 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+   create #10 -> status=201  bucket(900s)=<err 'NoneType' object has no attribute 'get'>
+        LOG: 2026-07-14 06:06:13,487 - SL - INFO - 31184 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+   create #11 -> status=201  bucket(900s)=<err 'NoneType' object has no attribute 'get'>
+        LOG: 2026-07-14 06:06:13,528 - SL - INFO - 31184 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+   create #12 -> status=201  bucket(900s)=<err 'NoneType' object has no attribute 'get'>
+        LOG: 2026-07-14 06:06:13,571 - SL - INFO - 31184 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+   create #13 -> status=201  bucket(900s)=<err 'NoneType' object has no attribute 'get'>
+        LOG: 2026-07-14 06:06:13,612 - SL - INFO - 31184 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+   create #14 -> status=201  bucket(900s)=<err 'NoneType' object has no attribute 'get'>
+        LOG: 2026-07-14 06:06:13,653 - SL - INFO - 31184 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+   create #15 -> status=400  bucket(900s)=<err 'NoneType' object has no attribute 'get'>
+        LOG: 2026-07-14 06:06:13,669 - SL - DEBUG - 31184 - "/app/app/api/views/new_custom_alias.py:138" - new_custom_alias_v3() -  - user <User 2694 Test User user_rnfeqoksq4@mailbox.test> cannot create any custom alias
+   RESULT: no 429 across 15 creates (bucket no-op)
+
+>>> restored rate_limiter.lock_redis ; rolled back transaction; probe committed NOTHING to PostgreSQL
+```
+
+(`rate_limiter.lock_redis` is wired by `initialize_redis_services` [`app/redis_services.py`] from
+`MEM_STORE_URI`; PART 2 sets it to `None` to reproduce the **Redis-absent configuration** — a real config
+state, not a mock — then restores it. Redis bucket keys created in PART 1 are cleaned by snapshot-diff,
+§2.5.)
+
 ## 8. Complete condition matrix
 
 Every distinct condition exercised through the real endpoints, with the observed status, the exact body,
@@ -2082,11 +3299,21 @@ test-client conditions is in §3.2; rate-limit/lock/500 conditions are evidenced
 | 18 | HTTP rate limit exceeded (`5/minute`) | v2/v3 | `429` | `{"error":"Rate limit exceeded"}` | `@limiter.limit(ALIAS_LIMIT)` → `server.py:364` | `WARNING server.py:364` |
 | 19 | Parallel-creation lock contended | v2/v3 | `429` | `{"error":"Rate limit exceeded"}` | `@parallel_limiter.lock` → `TooManyRequests` → `server.py:364` | `WARNING server.py:364` |
 | 20 | Per-user alias-create bucket exceeded | v2/v3 | `429` | `{"error":"Rate limit exceeded"}` | `check_bucket_limit` `app/models.py:1634-1641` → `TooManyRequests` | `WARNING server.py:364` |
+| 21 | **Malformed string `alias_prefix`** (`<script>…`, `;cat /etc/passwd`, embedded newline, over-length, SQLi-with-quotes) | v2 | `500` | `{"error":"Internal error"}` | **no** `check_alias_prefix` gate on v2 → `Alias.create` → `get_custom_domain` → `validate_email` raises `EmailNotValidError` (`app/models.py:1617`) | `ERROR server.py:390` (+ email-validator msg) |
+| 21′ | Same malformed string `alias_prefix` | v3 | `400` | `{"error":"alias prefix invalid format or too long"}` | `check_alias_prefix()` `new_custom_alias.py:167` → `False` | `DEBUG server.py:284` only |
+| 22 | **Non-string `alias_prefix`** (JSON `null`, integer, object) | v2 | `500` | `{"error":"Internal error"}` | `data.get("alias_prefix","").strip()` `new_custom_alias.py:64` → `AttributeError` (before suffix read) | `ERROR server.py:390` (`'…' object has no attribute 'strip'`) |
+| 23 | `alias_prefix` that is a valid local part but SQL-keyword-like (`drop_table_users`) | v2 | `201` | serialized alias, `email":"drop_table_users.list@sl.local"` | stored **literally** via SQLAlchemy-parameterized insert (no SQL executed; `alias` table intact) | `INFO event_dispatcher.py:62` + `DEBUG server.py:284` |
+| 24 | Unicode `alias_prefix` (`Café_Münster`) | v2 | `201` | serialized alias, `email":"cafe_munster.list@sl.local"` | `convert_to_id`/`unidecode` transliterates to ASCII `app/utils.py:50-56` | `INFO event_dispatcher.py:62` + `DEBUG server.py:284` |
 
 **Reading the matrix for Q1:** rows 3, 4 and 5 are the crux — invalid, garbage and expired suffixes are
 indistinguishable at the HTTP layer (all `412`, identical body). Rows 15 and 17 show the only way to get a
 non-412 out of the signature area (an unhandled `500`), and only via a non-string value a canonical client
-never sends.
+never sends. Rows 21-24 record the **`alias_prefix`** outcomes: because **v2 has no `check_alias_prefix`
+gate** (unlike v3, row 21′), a malformed prefix is not rejected with a clean `4xx` but surfaces as an
+unhandled **`500 {"error":"Internal error"}`** (string prefixes via `validate_email`, non-string prefixes
+via `.strip()` at `:64`) — fully evidenced with runtime output in §9.6. In every `500` the client body is
+the generic `{"error":"Internal error"}` with no leaked detail; SQL-keyword-like but valid prefixes are
+stored verbatim (row 23, no injection) and Unicode is transliterated (row 24).
 
 ---
 
@@ -2479,7 +3706,7 @@ COMMAND: POST /api/v3/alias/custom/new json={alias_prefix:'cdok',signed_suffix:<
     Access-Control-Allow-Origin: *
     Content-Length: 436
     Content-Type: application/json
-    Set-Cookie: slapp=e6859c85-0cc0-4f00-99b6-ea2364550a22.MKnD6l8Vp0kjQLFncUquiLavblg; Domain=.sl.test; Expires=Mon, 20-Jul-2026 20:45:43 GMT; HttpOnly; Path=/; SameSite=Lax
+    Set-Cookie: slapp=<redacted-session-cookie>; Domain=.sl.test; Expires=Mon, 20-Jul-2026 20:45:43 GMT; HttpOnly; Path=/; SameSite=Lax
   X-RateLimit-*/Retry-After headers present: NONE
   SL log:
     2026-07-13 20:45:43,393 - SL - INFO - 9565 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
@@ -2519,6 +3746,463 @@ bucket-limit keys its 201 path created (`NET-ZERO on Redis: True`), so both stor
 exactly as found.
 
 ---
+
+### 9.6 v2 `alias_prefix` has NO validation gate — malformed prefixes surface as HTTP 500 (Finding F-P4-1)
+
+Unlike **v3**, which validates the prefix with `check_alias_prefix()` at `new_custom_alias.py:167`
+(§7.2.1, §7.4), the **v2** handler has **no** prefix-format gate. It only normalizes the prefix
+(`data.get("alias_prefix", "").strip().lower().replace(" ", "")` at `new_custom_alias.py:64`, then
+`convert_to_id()` at `:67`) and then relies on `verify_prefix_suffix()` — which validates **only the
+suffix/domain**, never the prefix format (`app/alias_suffix.py:45-91`). A malformed prefix therefore
+slips through and fails later, producing an **unhandled 500** rather than a clean `4xx`. This condition
+was not part of the happy-path matrix in earlier drafts; it is documented here in full with its real
+runtime output. Two mechanisms produce the 500:
+
+- **Non-string prefix** (JSON `null`, integer, object): the very first operation
+  `data.get("alias_prefix", "").strip()` (L64) raises `AttributeError` (`'NoneType'/'int'/'dict' object
+  has no attribute 'strip'`) — **before** the signed-suffix is even read (L65).
+- **Malformed string prefix** (control/again-forbidden characters, over-length): normalization succeeds,
+  `check_suffix_signature` and `verify_prefix_suffix` pass (the suffix is valid), and the value reaches
+  `Alias.create(...)` (L96) → `Alias.get_custom_domain(email)` → `validate_email(...)` (the
+  `email_validator` library, `app/models.py:1617`), which raises `EmailNotValidError`.
+
+Both exceptions bubble to the catch-all `@app.errorhandler(Exception)` at `server.py:388-392`, which logs
+`LOG.e(e)` (**`ERROR server.py:390`** + the exception message) and returns **`500 {"error":"Internal
+error"}`** for any `/api/` path. Crucially, **the client-visible body is always the generic
+`{"error":"Internal error"}`** — the exception text, stack, and file paths appear **only** in the
+server-side SL console log, never in the HTTP response.
+
+Command (canonical test-client invocation inside the prescribed container):
+
+```bash
+$ docker cp /tmp/blitzy_probe_v2prefix.py sl_setup:/tmp/blitzy_probe_v2prefix.py
+$ docker exec sl_setup bash -lc 'cd /app && env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/root \
+    DB_URI="postgresql://test:test@localhost:5432/test" CONFIG=tests/test.env \
+    GNUPGHOME=/tmp/sl_gnupg PYTHONPATH=/app /app/venv/bin/python /tmp/blitzy_probe_v2prefix.py'
+```
+
+Probe script (`blitzy_probe_v2prefix.py`):
+
+```python
+#!/usr/bin/env python3
+"""
+blitzy_probe_v2prefix.py -- exercise POST /api/v2/alias/custom/new with a VALID signed suffix
+(minted through the real app.alias_suffix.signer) and a battery of malformed / adversarial
+alias_prefix values, to observe the REAL status code, the REAL client-visible body, and the
+REAL server-console SL log for each. v2 has NO check_alias_prefix gate (unlike v3 L167), so:
+  * a non-string prefix raises AttributeError at data.get("alias_prefix","").strip() (L64), and
+  * a malformed STRING prefix passes verify_prefix_suffix and reaches Alias.create ->
+    get_custom_domain -> validate_email (email_validator) which raises,
+both surfacing through @app.errorhandler(Exception) (server.py:388-392) as 500 {"error":"Internal error"}.
+Two benign-but-suspicious inputs (SQLi-safe token, Unicode) are included to show what is stored/normalized.
+Commits nothing to the DB (connection.begin()/rollback, identical to tests/conftest.py::flask_client).
+"""
+import os, io, json, logging, time
+os.environ.setdefault("CONFIG", "/app/tests/test.env")
+from app import config
+from app.db import Session, connection
+import app.log as sl_log
+from app.log import LOG
+from app.alias_suffix import signer
+from app.config import EMAIL_DOMAIN
+from app.utils import random_word
+from server import create_app
+from tests.api.utils import get_new_user_and_api_key
+
+app = create_app(); app.config["TESTING"] = True; app.config["SERVER_NAME"] = "sl.test"
+
+_cap = io.StringIO(); _h = logging.StreamHandler(_cap); _h.setFormatter(sl_log._log_formatter); _h.formatter.converter = time.gmtime
+_saved = []
+def cap_on():
+    global _saved; _saved = list(LOG.handlers)
+    for hh in _saved: LOG.removeHandler(hh)
+    LOG.addHandler(_h)
+def cap_reset(): _cap.seek(0); _cap.truncate(0)
+def cap_read(): return _cap.getvalue()
+
+def show(label, body_obj, r, logs):
+    print("\n" + "-"*78)
+    print("CONDITION: " + label)
+    print("  POST /api/v2/alias/custom/new")
+    # print the alias_prefix repr faithfully (type-visible), suffix truncated for readability only
+    pb = dict(body_obj)
+    if "signed_suffix" in pb and isinstance(pb["signed_suffix"], str):
+        pb["signed_suffix"] = pb["signed_suffix"][:22] + "...(VALID)"
+    print("  body sent (repr) = " + repr(pb))
+    print("  -> status_code = " + str(r.status_code))
+    print("  -> response body (verbatim, client-visible) = " + r.get_data(as_text=True))
+    sl = [ln for ln in logs.splitlines() if " - SL - " in ln]
+    # complete, unedited SL console output captured during THIS request:
+    print("  -> server SL console log during request (complete, unedited):")
+    if sl:
+        for ln in sl: print("     " + ln)
+    else:
+        print("     <none>")
+
+def alias_count():
+    return Session.execute("select count(*) from alias").scalar()
+
+transaction = connection.begin()
+cap_on()
+try:
+    with app.app_context():
+        config.DISABLE_RATE_LIMIT = True
+        user, api_key = get_new_user_and_api_key(); user.lifetime = True; Session.flush()
+        H = {"Authentication": api_key.code}
+        client = app.test_client()
+        print(">>> user id=%s ; alias_count(before)=%s" % (user.id, alias_count()))
+
+        # canonical VALID suffix minted by the real signer
+        valid = signer.sign("." + random_word() + "@" + EMAIL_DOMAIN).decode()
+
+        cases = [
+            ("string: XSS <script>alert(1)</script>", "<script>alert(1)</script>"),
+            ("string: shell-meta ;cat /etc/passwd",    ";cat /etc/passwd"),
+            ("string: embedded newline 'ab\\ncd'",      "ab\ncd"),
+            ("string: overlong (130 x 'a')",            "a"*130),
+            ("non-string: JSON null (None)",            None),
+            ("non-string: integer 12345",               12345),
+            ("non-string: dict {}",                     {}),
+            ("string: SQLi (email-INVALID) x'); DROP TABLE alias;--", "x'); DROP TABLE alias;--"),
+            ("string: SQLi-safe token (email-VALID) drop_table_users", "drop_table_users"),
+            ("string: Unicode 'Cafe\u0301_Mu\u0308nster'", "Caf\u00e9_M\u00fcnster"),
+        ]
+        for label, prefix in cases:
+            cap_reset()
+            b = {"alias_prefix": prefix, "signed_suffix": valid}
+            r = client.post("/api/v2/alias/custom/new", headers=H, json=b)
+            show(label, b, r, cap_read())
+
+        print("\n" + "="*78)
+        print(">>> alias_count(after, pre-rollback)=%s" % alias_count())
+finally:
+    transaction.rollback(); Session.rollback(); Session.close()
+    print(">>> rolled back transaction; probe committed NOTHING to PostgreSQL")
+```
+
+Observed output (complete, unedited; identical status distribution across two runs — 8×`500`, 2×`201`;
+the `...(VALID)` text is the probe's own deliberate truncation of the long *valid* suffix when printing
+the request body — the full valid suffix is used on the wire):
+
+```text
+load config file /app/tests/test.env
+>>> URL: http://localhost
+Upload files to local dir
+>>> init logging <<<
+2026-07-14 05:45:35,905 - SL - DEBUG - 30602 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+>>> user id=2680 ; alias_count(before)=1071
+
+------------------------------------------------------------------------------
+CONDITION: string: XSS <script>alert(1)</script>
+  POST /api/v2/alias/custom/new
+  body sent (repr) = {'alias_prefix': '<script>alert(1)</script>', 'signed_suffix': '.list@sl.local.alXNAQ....(VALID)'}
+  -> status_code = 500
+  -> response body (verbatim, client-visible) = {"error":"Internal error"}
+
+  -> server SL console log during request (complete, unedited):
+     2026-07-14 05:45:37,105 - SL - ERROR - 30602 - "/app/server.py:390" - error_handler() -  - The email address contains invalid characters before the @-sign: (, ), ., <, >.
+     2026-07-14 05:45:37,106 - SL - DEBUG - 30602 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 500, takes 0.02727365493774414
+
+------------------------------------------------------------------------------
+CONDITION: string: shell-meta ;cat /etc/passwd
+  POST /api/v2/alias/custom/new
+  body sent (repr) = {'alias_prefix': ';cat /etc/passwd', 'signed_suffix': '.list@sl.local.alXNAQ....(VALID)'}
+  -> status_code = 500
+  -> response body (verbatim, client-visible) = {"error":"Internal error"}
+
+  -> server SL console log during request (complete, unedited):
+     2026-07-14 05:45:37,126 - SL - ERROR - 30602 - "/app/server.py:390" - error_handler() -  - The email address contains invalid characters before the @-sign: ., ;.
+     2026-07-14 05:45:37,127 - SL - DEBUG - 30602 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 500, takes 0.018575429916381836
+
+------------------------------------------------------------------------------
+CONDITION: string: embedded newline 'ab\ncd'
+  POST /api/v2/alias/custom/new
+  body sent (repr) = {'alias_prefix': 'ab\ncd', 'signed_suffix': '.list@sl.local.alXNAQ....(VALID)'}
+  -> status_code = 500
+  -> response body (verbatim, client-visible) = {"error":"Internal error"}
+
+  -> server SL console log during request (complete, unedited):
+     2026-07-14 05:45:37,145 - SL - ERROR - 30602 - "/app/server.py:390" - error_handler() -  - The email address contains invalid characters before the @-sign:  , ..
+     2026-07-14 05:45:37,146 - SL - DEBUG - 30602 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 500, takes 0.01782965660095215
+
+------------------------------------------------------------------------------
+CONDITION: string: overlong (130 x 'a')
+  POST /api/v2/alias/custom/new
+  body sent (repr) = {'alias_prefix': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'signed_suffix': '.list@sl.local.alXNAQ....(VALID)'}
+  -> status_code = 500
+  -> response body (verbatim, client-visible) = {"error":"Internal error"}
+
+  -> server SL console log during request (complete, unedited):
+     2026-07-14 05:45:37,165 - SL - ERROR - 30602 - "/app/server.py:390" - error_handler() -  - The email address is too long before the @-sign (71 characters too many).
+     2026-07-14 05:45:37,166 - SL - DEBUG - 30602 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 500, takes 0.018682003021240234
+
+------------------------------------------------------------------------------
+CONDITION: non-string: JSON null (None)
+  POST /api/v2/alias/custom/new
+  body sent (repr) = {'alias_prefix': None, 'signed_suffix': '.list@sl.local.alXNAQ....(VALID)'}
+  -> status_code = 500
+  -> response body (verbatim, client-visible) = {"error":"Internal error"}
+
+  -> server SL console log during request (complete, unedited):
+     2026-07-14 05:45:37,171 - SL - ERROR - 30602 - "/app/server.py:390" - error_handler() -  - 'NoneType' object has no attribute 'strip'
+     2026-07-14 05:45:37,171 - SL - DEBUG - 30602 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 500, takes 0.004153728485107422
+
+------------------------------------------------------------------------------
+CONDITION: non-string: integer 12345
+  POST /api/v2/alias/custom/new
+  body sent (repr) = {'alias_prefix': 12345, 'signed_suffix': '.list@sl.local.alXNAQ....(VALID)'}
+  -> status_code = 500
+  -> response body (verbatim, client-visible) = {"error":"Internal error"}
+
+  -> server SL console log during request (complete, unedited):
+     2026-07-14 05:45:37,176 - SL - ERROR - 30602 - "/app/server.py:390" - error_handler() -  - 'int' object has no attribute 'strip'
+     2026-07-14 05:45:37,176 - SL - DEBUG - 30602 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 500, takes 0.0040111541748046875
+
+------------------------------------------------------------------------------
+CONDITION: non-string: dict {}
+  POST /api/v2/alias/custom/new
+  body sent (repr) = {'alias_prefix': {}, 'signed_suffix': '.list@sl.local.alXNAQ....(VALID)'}
+  -> status_code = 500
+  -> response body (verbatim, client-visible) = {"error":"Internal error"}
+
+  -> server SL console log during request (complete, unedited):
+     2026-07-14 05:45:37,181 - SL - ERROR - 30602 - "/app/server.py:390" - error_handler() -  - 'dict' object has no attribute 'strip'
+     2026-07-14 05:45:37,181 - SL - DEBUG - 30602 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 500, takes 0.004146099090576172
+
+------------------------------------------------------------------------------
+CONDITION: string: SQLi (email-INVALID) x'); DROP TABLE alias;--
+  POST /api/v2/alias/custom/new
+  body sent (repr) = {'alias_prefix': "x'); DROP TABLE alias;--", 'signed_suffix': '.list@sl.local.alXNAQ....(VALID)'}
+  -> status_code = 500
+  -> response body (verbatim, client-visible) = {"error":"Internal error"}
+
+  -> server SL console log during request (complete, unedited):
+     2026-07-14 05:45:37,200 - SL - ERROR - 30602 - "/app/server.py:390" - error_handler() -  - The email address contains invalid characters before the @-sign: ), ., ;.
+     2026-07-14 05:45:37,200 - SL - DEBUG - 30602 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 500, takes 0.018124818801879883
+
+------------------------------------------------------------------------------
+CONDITION: string: SQLi-safe token (email-VALID) drop_table_users
+  POST /api/v2/alias/custom/new
+  body sent (repr) = {'alias_prefix': 'drop_table_users', 'signed_suffix': '.list@sl.local.alXNAQ....(VALID)'}
+  -> status_code = 201
+  -> response body (verbatim, client-visible) = {"alias":"drop_table_users.list@sl.local","creation_date":"2026-07-14 05:45:37+00:00","creation_timestamp":1784007937,"disable_pgp":false,"email":"drop_table_users.list@sl.local","enabled":true,"id":5063,"latest_activity":null,"mailbox":{"email":"user_sgchenldnk@mailbox.test","id":3091},"mailboxes":[{"email":"user_sgchenldnk@mailbox.test","id":3091}],"name":null,"nb_block":0,"nb_forward":0,"nb_reply":0,"note":null,"pinned":false,"support_pgp":false}
+
+  -> server SL console log during request (complete, unedited):
+     2026-07-14 05:45:37,222 - SL - INFO - 30602 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+     2026-07-14 05:45:37,230 - SL - DEBUG - 30602 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.028764963150024414
+
+------------------------------------------------------------------------------
+CONDITION: string: Unicode 'Café_Münster'
+  POST /api/v2/alias/custom/new
+  body sent (repr) = {'alias_prefix': 'Café_Münster', 'signed_suffix': '.list@sl.local.alXNAQ....(VALID)'}
+  -> status_code = 201
+  -> response body (verbatim, client-visible) = {"alias":"cafe_munster.list@sl.local","creation_date":"2026-07-14 05:45:37+00:00","creation_timestamp":1784007937,"disable_pgp":false,"email":"cafe_munster.list@sl.local","enabled":true,"id":5064,"latest_activity":null,"mailbox":{"email":"user_sgchenldnk@mailbox.test","id":3091},"mailboxes":[{"email":"user_sgchenldnk@mailbox.test","id":3091}],"name":null,"nb_block":0,"nb_forward":0,"nb_reply":0,"note":null,"pinned":false,"support_pgp":false}
+
+  -> server SL console log during request (complete, unedited):
+     2026-07-14 05:45:37,251 - SL - INFO - 30602 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+     2026-07-14 05:45:37,256 - SL - DEBUG - 30602 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v2/alias/custom/new ImmutableMultiDict([]) 201, takes 0.02479100227355957
+
+==============================================================================
+>>> alias_count(after, pre-rollback)=1073
+>>> rolled back transaction; probe committed NOTHING to PostgreSQL
+```
+
+**Reading the evidence.**
+
+| # | `alias_prefix` sent | Type | Status | Client body | Server log (`ERROR server.py:390`) — mechanism |
+|---|---------------------|------|--------|-------------|-------------------------------------------------|
+| 1 | `<script>alert(1)</script>` | str | `500` | `{"error":"Internal error"}` | `…invalid characters before the @-sign: (, ), ., <, >.` → `validate_email` in `Alias.create` |
+| 2 | `;cat /etc/passwd` | str | `500` | `{"error":"Internal error"}` | `…invalid characters before the @-sign: ., ;.` → `validate_email` |
+| 3 | `ab\ncd` (embedded newline) | str | `500` | `{"error":"Internal error"}` | `…invalid characters before the @-sign:  , ..` → `validate_email` |
+| 4 | 130 × `a` (over-length) | str | `500` | `{"error":"Internal error"}` | `…too long before the @-sign (71 characters too many).` → `validate_email` |
+| 5 | JSON `null` | None | `500` | `{"error":"Internal error"}` | `'NoneType' object has no attribute 'strip'` → **L64** `.strip()` (before suffix read) |
+| 6 | `12345` | int | `500` | `{"error":"Internal error"}` | `'int' object has no attribute 'strip'` → **L64** `.strip()` |
+| 7 | `{}` | dict | `500` | `{"error":"Internal error"}` | `'dict' object has no attribute 'strip'` → **L64** `.strip()` |
+| 8 | `x'); DROP TABLE alias;--` | str | `500` | `{"error":"Internal error"}` | `…invalid characters before the @-sign: ), ., ;.` → `validate_email` (payload **rejected**, never executed) |
+| 9 | `drop_table_users` | str | `201` | serialized alias (`email":"drop_table_users.list@sl.local"`) | stored **literally** — parameterized write, no SQL executed |
+| 10 | `Café_Münster` | str | `201` | serialized alias (`email":"cafe_munster.list@sl.local"`) | `convert_to_id`/`unidecode` **transliterated** to ASCII before storage |
+
+Four observations follow directly from the output:
+
+1. **The 500 is real and reproducible** (8 of 10 inputs, identical across two runs), and it is the exact
+   behavior the user's "intermittent validation failures that don't match the expected behavior" would
+   surface for a client that constructs the prefix client-side — v2 offers no `4xx` for a malformed prefix.
+2. **No information leaks to the client.** Every 500 body is the generic `{"error":"Internal error"}`;
+   the descriptive email-validator text, exception class, and file paths live only in the server console
+   log (`ERROR server.py:390`). This is a security-positive property of the catch-all handler.
+3. **SQL injection is not possible here.** The quote/semicolon payload (#8) is *rejected* by email
+   validation (500) and never reaches a query; the SQL-keyword token that *is* a valid local part (#9) is
+   stored **verbatim** as `drop_table_users.list@sl.local` via SQLAlchemy-parameterized inserts — the
+   `alias` table was verified intact after the run (`select to_regclass('public.alias') is not null` → `t`).
+4. **Unicode is normalized, not rejected** (#10): `convert_to_id` applies `unidecode`, folding
+   `Café_Münster` → `cafe_munster` before the alias is created.
+
+**Net-zero.** `alias_count(before)=1071` (baseline `1070` + the probe user's default alias created
+in-transaction) and `alias_count(after, pre-rollback)=1073` (the two `201` inserts); after
+`transaction.rollback()` the real database returns to **1070** (verified over a separate `psql`
+connection), and the six `bl:alias_create_*`/`session:*` Redis keys the two `201` paths created were
+reaped by snapshot-diff, returning Redis to its **253**-key baseline.
+
+**Scope.** Per the read-only mandate (AAP §0.5.2, §0.8; §12.4), this 500 behavior — and the absent v2
+prefix gate that causes it — is **reported, not remediated**: no product code is changed. A fix would
+belong in `new_custom_alias_v2` (add a `check_alias_prefix` gate mirroring v3 `:167`) or in
+`Alias.create` (catch `EmailNotValidError` and return `400`), but that is outside this documentation task.
+
+---
+
+### 9.7 The 412 collapse is 100% deterministic — 40 identical requests, zero variance
+
+The reported *"intermittent validation failures"* are not random: the same unchanged input yields the
+**same** `412` every time. Two fixed inputs — a **tampered** and a genuinely **expired** `signed_suffix`,
+both minted by the real `app.alias_suffix.signer` — were each POSTed **40 times** (identical bytes) to
+`/api/v3/alias/custom/new`. The status distribution is `{412: 40}` for **both**, with a byte-identical
+body on request #1 and #40. Before any request, each token is classified against the pinned
+`itsdangerous 1.1.0`: the tampered token raises `BadTimeSignature`, the expired token raises
+`SignatureExpired` — both subclasses of `BadSignature`, which is why `check_suffix_signature` returns
+`None` for each (§9.1-9.2) and the handler collapses them to one `412`.
+
+**Command** (after `docker cp blitzy_probe_stable40.py sl_setup:/tmp/`)
+```bash
+cd /app && env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/root \
+  DB_URI='postgresql://test:test@localhost:5432/test' CONFIG=tests/test.env \
+  GNUPGHOME=/tmp/sl_gnupg PYTHONPATH=/app /app/venv/bin/python /tmp/blitzy_probe_stable40.py
+```
+
+**Probe** (`blitzy_probe_stable40.py`)
+```python
+#!/usr/bin/env python3
+"""
+blitzy_probe_stable40.py -- Rule "reproduce reported inconsistency directly": run the SAME
+unchanged input MANY times and report the observed status distribution, to demonstrate the
+"intermittent validation failures" are in fact 100% DETERMINISTIC 412s (the BadSignature
+super-class collapse), NOT random.
+
+Two fixed inputs, each POSTed 40x (identical bytes every time) to POST /api/v3/alias/custom/new:
+  (a) a TAMPERED signed_suffix  (valid suffix minted by real signer, last char flipped)
+  (b) an EXPIRED signed_suffix  (real signer.sign(...) of a timestamp backdated > max_age=600s)
+Both are minted through the real app.alias_suffix.signer (no hand-forged tokens).
+Commits nothing (connection.begin()/rollback).
+"""
+import os, json, time
+from collections import Counter
+os.environ.setdefault("CONFIG", "/app/tests/test.env")
+from app import config
+from app.db import Session, connection
+from app.alias_suffix import signer
+from app.config import EMAIL_DOMAIN
+from app.utils import random_word
+from server import create_app
+from tests.api.utils import get_new_user_and_api_key
+import itsdangerous
+
+app = create_app(); app.config["TESTING"] = True; app.config["SERVER_NAME"] = "sl.test"
+N = 40
+
+def flip_last(s):
+    # flip the final base64 char so the HMAC no longer verifies -> BadTimeSignature (tampered)
+    last = s[-1]
+    repl = "A" if last != "A" else "B"
+    return s[:-1] + repl
+
+transaction = connection.begin()
+try:
+    with app.app_context():
+        config.DISABLE_RATE_LIMIT = True
+        user, api_key = get_new_user_and_api_key(); user.lifetime = True; Session.flush()
+        H = {"Authentication": api_key.code}
+        client = app.test_client()
+        mb = user.default_mailbox_id
+        print(">>> user id=%s ; default_mailbox_id=%s ; N=%d identical POSTs per input" % (user.id, mb, N))
+
+        suffix_plain = "." + random_word() + "@" + EMAIL_DOMAIN
+        valid = signer.sign(suffix_plain).decode()
+        tampered = flip_last(valid)
+        # EXPIRED: sign with the signer's timestamp forced into the past (> 600s ago).
+        # itsdangerous TimestampSigner.sign() stamps "now"; to backdate we sign then patch the
+        # embedded timestamp is non-trivial, so we use the documented approach: temporarily make
+        # get_timestamp() return a past value via the signer's own API is not exposed -> instead
+        # sign normally and verify expiry by checking unsign(max_age=0) which forces SignatureExpired
+        # for ANY nonzero-age token. To keep the CANONICAL request path unchanged we instead craft a
+        # genuinely-old token by signing with a patched time source:
+        _real = itsdangerous.TimestampSigner.get_timestamp
+        try:
+            itsdangerous.TimestampSigner.get_timestamp = lambda self: _real(self) - 1000
+            expired = signer.sign("." + random_word() + "@" + EMAIL_DOMAIN).decode()
+        finally:
+            itsdangerous.TimestampSigner.get_timestamp = _real
+
+        def run(label, signed_suffix):
+            dist = Counter(); first_body = None; last_body = None
+            for i in range(N):
+                b = {"alias_prefix": "sig" + str(i), "signed_suffix": signed_suffix,
+                     "mailbox_ids": [mb]}
+                r = client.post("/api/v3/alias/custom/new", headers=H, json=b)
+                dist[r.status_code] += 1
+                if i == 0: first_body = r.get_data(as_text=True)
+                last_body = r.get_data(as_text=True)
+            print("\n" + "="*78)
+            print("INPUT: " + label)
+            print("  signed_suffix (repr, minted by real signer) = %r" % signed_suffix)
+            print("  -> status distribution over %d identical POSTs = %s" % (N, dict(dist)))
+            print("  -> body on request #1  (verbatim) = %s" % first_body)
+            print("  -> body on request #%d (verbatim) = %s" % (N, last_body))
+
+        # confirm classification of each token against the pinned itsdangerous, no request yet
+        for lbl, tok in (("tampered", tampered), ("expired", expired)):
+            try:
+                signer.unsign(tok, max_age=600)
+                print(">>> classify %-8s -> unsign OK (unexpected)" % lbl)
+            except Exception as e:
+                print(">>> classify %-8s -> %s: %s" % (lbl, type(e).__name__, e))
+
+        run("TAMPERED signed_suffix (last char flipped)", tampered)
+        run("EXPIRED signed_suffix (timestamp backdated 1000s > max_age=600s)", expired)
+finally:
+    transaction.rollback(); Session.rollback(); Session.close()
+    print("\n>>> rolled back transaction; probe committed NOTHING to PostgreSQL")
+```
+
+**Observed output** — the two `INPUT` result blocks are the complete tally; the interleaved per-request
+log pair is uniform and shown as a 3-pair sample (full transcript is the probe's stdout):
+```text
+load config file /app/tests/test.env
+>>> URL: http://localhost
+Upload files to local dir
+>>> init logging <<<
+2026-07-14 06:00:09,855 - SL - DEBUG - 30981 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+2026-07-14 06:00:11,039 - SL - INFO - 30981 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+>>> user id=2683 ; default_mailbox_id=3094 ; N=40 identical POSTs per input
+>>> classify tampered -> BadTimeSignature: Signature b'0JoXBY9yyDRJuqWiBgH0fLQMnMA' does not match
+>>> classify expired  -> SignatureExpired: Signature age 1000 > 600 seconds
+2026-07-14 06:00:11,058 - SL - WARNING - 30981 - "/app/app/api/views/new_custom_alias.py:187" - new_custom_alias_v3() -  - Alias creation time expired for <User 2683 Test User user_a673xl28rg@mailbox.test>
+2026-07-14 06:00:11,059 - SL - DEBUG - 30981 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 412, takes 0.006056070327758789
+2026-07-14 06:00:11,065 - SL - WARNING - 30981 - "/app/app/api/views/new_custom_alias.py:187" - new_custom_alias_v3() -  - Alias creation time expired for <User 2683 Test User user_a673xl28rg@mailbox.test>
+2026-07-14 06:00:11,066 - SL - DEBUG - 30981 - "/app/server.py:284" - after_request() -  - 127.0.0.1 POST /api/v3/alias/custom/new ImmutableMultiDict([]) 412, takes 0.00511622428894043
+2026-07-14 06:00:11,071 - SL - WARNING - 30981 - "/app/app/api/views/new_custom_alias.py:187" - new_custom_alias_v3() -  - Alias creation time expired for <User 2683 Test User user_a673xl28rg@mailbox.test>
+        ... (the identical `WARNING new_custom_alias.py:187` + `DEBUG server.py:284 412` pair
+        repeats once per request; the {412: 40} tally below is the complete result for all 40 of
+        each input, and the expired input emits the same pair 40x) ...
+
+
+==============================================================================
+INPUT: TAMPERED signed_suffix (last char flipped)
+  signed_suffix (repr, minted by real signer) = '.test@sl.local.alXQaw.0JoXBY9yyDRJuqWiBgH0fLQMnMA'
+  -> status distribution over 40 identical POSTs = {412: 40}
+  -> body on request #1  (verbatim) = {"error":"Alias creation time is expired, please retry"}
+
+  -> body on request #40 (verbatim) = {"error":"Alias creation time is expired, please retry"}
+
+INPUT: EXPIRED signed_suffix (timestamp backdated 1000s > max_age=600s)
+  signed_suffix (repr, minted by real signer) = '.list@sl.local.alXMgw.wKK0nZwbM5D4GI-j9g6pUUyqWuA'
+  -> status distribution over 40 identical POSTs = {412: 40}
+  -> body on request #1  (verbatim) = {"error":"Alias creation time is expired, please retry"}
+
+  -> body on request #40 (verbatim) = {"error":"Alias creation time is expired, please retry"}
+```
+
+`{412: 40}` twice, identical bodies, zero non-412 outcomes: the collapse is deterministic, not flaky. The
+user-perceived "intermittence" is the *indistinguishability* of tampered vs expired vs empty suffixes at
+the HTTP layer (all `412`, §9), not run-to-run randomness.
 
 ## 10. Secondary paths and honest caveats
 
@@ -2647,7 +4331,7 @@ reading the console.
 
 Every probe below is a **temporary** observation script that lived in the container at
 `/tmp/sl_probes/` for the duration of the investigation and is **removed afterwards** (the source
-repository is never touched; see §2.5 for the cleanup proof and §0 for the read-only constraint).
+repository is never touched; see §2.5 for the cleanup proof and §12.4 for the read-only constraint).
 They are reproduced here **in full, unabridged**, so that every status code, log line, header, and
 count reported in §3–§10 is independently reproducible with the exact commands in §2.3.
 
@@ -2655,7 +4339,7 @@ count reported in §3–§10 is independently reproducible with the exact comman
 test-only, and time-limited** (`max_age=600` seconds); the signing key `CUSTOM_ALIAS_SECRET`
 (`"secretcustom_alias"`) is the **public, test-only** value from `tests/test.env`
 (`FLASK_SECRET` + `"custom_alias"`) and must never be treated as a credential. Real API keys and
-session cookies are **REDACTED** in the probes (the API-key `code` is never printed), while the
+session cookies are **redacted** in every embedded transcript and the disposable API-key `code` is never printed to the console (the test-client probes redact via the `redact()` helper; the live harness writes the key to a `0600` file and asserts responses without echoing it — Findings F-P4-2/F-P4-3), while the
 disposable users/mailboxes/domains they mint are created inside a rolled-back transaction and
 never persist.
 
@@ -3849,7 +5533,7 @@ _sys.exit(1 if fails or alias_before != alias_after else 0)
 
 ### 11.8 `probe_live.sh`
 
-Live-server harness (§3.1, §5). Starts a bounded `gunicorn` (`--timeout 15`, the Dockerfile value) with a captured PID and readiness poll, drives `curl -i` for the 201/412/429 raw-header captures, then terminates the exact PID and tears down its seed user. Never uses `pkill`.
+Live-server harness (§3.1, §5), **hardened per Finding F-P4-2**. It runs under `set -euo pipefail`; **requires** a present port-inspection tool (`fuser`) and refuses to run if `:7777` is already occupied; starts a bounded `gunicorn` (`--timeout 15`, the Dockerfile value) with a captured PID and readiness poll; **verifies the captured gunicorn PID tree actually owns `:7777`** before sending load; **asserts the exact status + `gunicorn` `Server` identity (and exact body for 412/429)** on every response, exiting non-zero on any mismatch; and installs an **idempotent `trap cleanup EXIT INT TERM` before seeding**, so a forced abort still stops the exact PID (never `pkill`) and tears down the committed seed user to net-zero. The disposable API key is read from a `0600` file and never echoed (Finding F-P4-3). The runtime proof of all four behaviours (happy path + three failure variants) is in §11.8.1.
 ```bash
 #!/bin/bash
 # probe_live.sh -- capture COMPLETE raw HTTP response headers (incl. gunicorn transport
@@ -3860,30 +5544,78 @@ Live-server harness (§3.1, §5). Starts a bounded `gunicorn` (`--timeout 15`, t
 # Canonical build/invocation: gunicorn wsgi:app (Dockerfile CMD) with the canonical
 # /tmp/sl.env config, EXCEPT DISABLE_RATE_LIMIT is unset so rate limiting is active
 # (config.py:602 DISABLE_RATE_LIMIT = "DISABLE_RATE_LIMIT" in os.environ -> presence-based).
-set -u
+#
+# HARDENING (Finding F-P4-2):
+#   * set -euo pipefail: any unset var, failed command, or broken pipe aborts (nonzero).
+#   * a present port-inspection tool (fuser) is REQUIRED; absence is fatal.
+#   * after readiness, the port MUST be owned by our gunicorn PID tree, else abort
+#     (defeats a stale/foreign server answering on :7777).
+#   * each response is ASSERTED for exact status + gunicorn Server identity (+ exact body
+#     for 412/429); any mismatch marks the run failed and it exits nonzero.
+#   * an idempotent `trap cleanup EXIT INT TERM` is installed BEFORE seeding, so a forced
+#     abort at any point still stops gunicorn and removes the committed seed rows.
+#   * the disposable API key is read from a 0600 file, never echoed (Finding F-P4-3).
+set -euo pipefail
+
 OUT=/tmp/sl_probes/out
+STATE=/tmp/sl_probes/live_state.json
+PORT=7777
 mkdir -p "$OUT"
 cd /app
-PORT=7777
 
 CANON_ENV=(env CONFIG=tests/test.env DB_URI='postgresql://test:test@localhost:5432/test' \
   GNUPGHOME=/tmp/sl_gnupg PYTHONPATH=/app)
 
-echo "===== [0/5] ensure port ${PORT} is free ====="
-STALE=$(ss -ltnp 2>/dev/null | grep ":${PORT} " | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
-if [ -n "${STALE:-}" ]; then echo "killing stale listener pid=$STALE"; kill "$STALE" 2>/dev/null; sleep 1; fi
-echo "port check done"
+GPID=""
+USER_ID=""
+FAILED=0
+CLEANED=0
+cleanup() {                       # idempotent; runs on normal exit, error, or signal
+  [ "$CLEANED" = "1" ] && return 0
+  CLEANED=1
+  echo
+  echo "===== CLEANUP (trap: stop gunicorn + teardown seed + redis) ====="
+  if [ -n "${GPID:-}" ]; then
+    kill "$GPID" 2>/dev/null || true
+    wait "$GPID" 2>/dev/null || true
+    echo "gunicorn PID ${GPID} stopped"
+  fi
+  if [ -f "$STATE" ]; then
+    "${CANON_ENV[@]}" /app/venv/bin/python /tmp/sl_probes/probe_live_teardown.py \
+      || echo "teardown reported nonzero (see above)"
+  fi
+  # remove this run's rate-limit buckets (authenticated userid:* keys + ip fallback)
+  if [ -n "${USER_ID:-}" ]; then
+    redis-cli --scan --pattern "LIMITER/*userid:${USER_ID}*" 2>/dev/null | xargs -r redis-cli del >/dev/null 2>&1 || true
+  fi
+  redis-cli --scan --pattern 'LIMITER/*ip:127.0.0.1*' 2>/dev/null | xargs -r redis-cli del >/dev/null 2>&1 || true
+  echo "cleanup done"
+}
+trap cleanup EXIT INT TERM        # <-- installed BEFORE any seeding/committing
+
+echo "===== [0/6] REQUIRE a port-inspection tool + ensure port ${PORT} is free ====="
+command -v fuser >/dev/null 2>&1 || { echo "FATAL: no fuser (port-inspection tool) available"; exit 3; }
+STALE=$(fuser -n tcp "$PORT" 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+$' || true)
+if [ -n "${STALE:-}" ]; then
+  echo "FATAL: port ${PORT} already in use by pid(s) [${STALE}]; refusing to capture against a foreign server"
+  exit 3
+fi
+echo "port ${PORT} is free (verified via fuser)"
 
 echo
-echo "===== [1/5] SEED disposable premium user + API key ====="
+echo "===== [1/6] SEED disposable premium user + API key (key -> 0600 file, not echoed) ====="
 SEED=$("${CANON_ENV[@]}" /app/venv/bin/python /tmp/sl_probes/probe_live_seed.py)
-echo "$SEED"
-API_KEY=$(echo "$SEED"  | sed -n 's/^API_KEY=//p')
-VALID=$(echo "$SEED"    | sed -n 's/^VALID_SUFFIX=//p')
-TAMPERED=$(echo "$SEED" | sed -n 's/^TAMPERED_SUFFIX=//p')
+printf '%s\n' "$SEED"                       # NOTE: seed prints only NON-secret lines
+read_state() { "${CANON_ENV[@]}" /app/venv/bin/python -c \
+  "import json,sys;print(json.load(open('$STATE'))[sys.argv[1]])" "$1"; }
+API_KEY=$(read_state api_key)               # SECRET read from 0600 file into a variable only
+VALID=$(read_state valid_suffix)
+TAMPERED=$(read_state tampered_suffix)
+USER_ID=$(read_state user_id)
+echo "seed consumed (api key length=${#API_KEY}, kept out of console)"
 
 echo
-echo "===== [2/5] START live gunicorn (rate limiting ENABLED) ====="
+echo "===== [2/6] START live gunicorn (rate limiting ENABLED) ====="
 set -a; . /tmp/sl.env; set +a
 unset DISABLE_RATE_LIMIT          # enable rate limiting (presence-based flag)
 export DB_URI='postgresql://test:test@localhost:5432/test'
@@ -3892,58 +5624,310 @@ export DB_URI='postgresql://test:test@localhost:5432/test'
 GPID=$!
 echo "gunicorn master PID=$GPID (bound 127.0.0.1:${PORT}, -w 2 --timeout 15)"
 
-# readiness poll -- wait until gunicorn accepts a connection AND returns a real HTTP code
+# readiness poll -- wait until :PORT accepts a connection AND returns a real HTTP code
 READY=0
 for i in $(seq 1 60); do
-  code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "http://127.0.0.1:${PORT}/")
+  code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "http://127.0.0.1:${PORT}/" || true)
   case "$code" in
     200|301|302|401|403|404) READY=1; echo "ready after ${i} poll(s), GET / -> $code"; break;;
   esac
   sleep 0.5
 done
-sleep 1   # let both sync workers finish booting before load
 if [ "$READY" != "1" ]; then
-  echo "SERVER NEVER BECAME READY; gunicorn log:"; cat "$OUT/gunicorn.log"
-  kill "$GPID" 2>/dev/null; wait "$GPID" 2>/dev/null
-  "${CANON_ENV[@]}" /app/venv/bin/python /tmp/sl_probes/probe_live_teardown.py
+  echo "FATAL: server never became ready; gunicorn log:"; cat "$OUT/gunicorn.log"
   exit 1
 fi
+sleep 1   # let both sync workers finish booting before load
 
-hdr() {  # $1=label $2=prefix $3=suffix $4=outfile
-  echo "----- $1 -----"
-  curl -sS -i --max-time 10 -X POST "http://127.0.0.1:${PORT}/api/v2/alias/custom/new" \
+echo
+echo "===== [2b/6] VERIFY the captured gunicorn PID tree actually owns port ${PORT} ====="
+OWNERS=$(fuser -n tcp "$PORT" 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+$' || true)
+OURS="$GPID $(pgrep -P "$GPID" 2>/dev/null | tr '\n' ' ' || true)"
+OWNED=0
+for p in $OWNERS; do for q in $OURS; do [ "$p" = "$q" ] && OWNED=1; done; done
+if [ "$OWNED" != "1" ]; then
+  echo "FATAL: port ${PORT} owned by pid(s) [${OWNERS}], NOT our gunicorn tree [${OURS}]"
+  exit 1
+fi
+echo "port ${PORT} owned by our gunicorn tree (owners=[${OWNERS}] within ours=[${OURS}])"
+
+# assert_resp: drive one POST, capture raw response, assert status + gunicorn Server
+#   (+ exact body when an expected body is supplied). NOTE: `curl --fail` is deliberately
+#   NOT used because 412 and 429 are EXPECTED here and --fail would abort on them; the
+#   exact-status assertion is the correct mechanism.
+assert_resp() {  # $1=label $2=prefix $3=suffix $4=want_status $5=want_body(optional) $6=outfile
+  local label="$1" prefix="$2" suffix="$3" want="$4" wantbody="$5" outfile="$6"
+  local resp status server body
+  resp=$(curl -sS -i --max-time 10 -X POST "http://127.0.0.1:${PORT}/api/v2/alias/custom/new" \
     -H "Authentication: ${API_KEY}" -H "Content-Type: application/json" \
-    -d "{\"alias_prefix\":\"$2\",\"signed_suffix\":\"$3\"}" | tee "$4"
-  echo; echo
+    -d "{\"alias_prefix\":\"${prefix}\",\"signed_suffix\":\"${suffix}\"}" || true)
+  printf '%s\n' "$resp" > "$outfile"
+  status=$(printf '%s' "$resp" | tr -d '\r' | sed -n '1s#^HTTP/[0-9.]* \([0-9]*\).*#\1#p')
+  server=$(printf '%s' "$resp" | tr -d '\r' | sed -n 's/^[Ss]erver: //p' | head -1)
+  body=$(printf '%s' "$resp"   | tr -d '\r' | awk 'x{print} /^$/{x=1}')
+  echo "----- ${label} -----  status=${status} server=${server}"
+  case "$server" in
+    gunicorn*) : ;;
+    *) echo "  ASSERT FAIL: Server '${server}' is not gunicorn (wrong server on :${PORT})"; FAILED=1; return 0;;
+  esac
+  if [ "$status" != "$want" ]; then
+    echo "  ASSERT FAIL: status ${status} != expected ${want}"; FAILED=1; return 0
+  fi
+  if [ -n "$wantbody" ] && [ "$body" != "$wantbody" ]; then
+    echo "  ASSERT FAIL: body != expected"; echo "    got:  ${body}"; echo "    want: ${wantbody}"; FAILED=1; return 0
+  fi
+  case "$want" in 201) [ -n "$(printf '%s' "$body" | grep -o '"alias"')" ] || { echo "  ASSERT FAIL: 201 body has no alias field"; FAILED=1; return 0; };; esac
+  echo "  ASSERT OK (${want})"
 }
 
 echo
-echo "===== [3/5] CAPTURE raw headers via curl -i (live transport) ====="
-hdr "REQ1 valid  -> expect 201" lh1 "$VALID"    "$OUT/live_201.txt"
-hdr "REQ2 tamper -> expect 412" lh2 "$TAMPERED" "$OUT/live_412.txt"
-hdr "REQ3 valid  -> 201 (fill window)" lh3 "$VALID" /dev/null
-hdr "REQ4 valid  -> 201 (fill window)" lh4 "$VALID" /dev/null
-hdr "REQ5 valid  -> 201 (fill window)" lh5 "$VALID" /dev/null
-hdr "REQ6 valid  -> expect 429 (6th within 5/minute)" lh6 "$VALID" "$OUT/live_429.txt"
+echo "===== [3/6] CAPTURE + ASSERT raw responses via curl -i (live transport) ====="
+assert_resp "REQ1 valid  -> 201" lh1 "$VALID"    "201" "" "$OUT/live_201.txt"
+assert_resp "REQ2 tamper -> 412" lh2 "$TAMPERED" "412" '{"error":"Alias creation time is expired, please retry"}' "$OUT/live_412.txt"
+assert_resp "REQ3 valid  -> 201 (fill window)" lh3 "$VALID" "201" "" /dev/null
+assert_resp "REQ4 valid  -> 201 (fill window)" lh4 "$VALID" "201" "" /dev/null
+assert_resp "REQ5 valid  -> 201 (fill window)" lh5 "$VALID" "201" "" /dev/null
+assert_resp "REQ6 valid  -> 429 (6th within 5/minute)" lh6 "$VALID" "429" '{"error":"Rate limit exceeded"}' "$OUT/live_429.txt"
 
 echo
-echo "===== [4/5] STOP gunicorn (only captured PID $GPID) ====="
-kill "$GPID" 2>/dev/null
-wait "$GPID" 2>/dev/null
-echo "gunicorn stopped"
-
-echo
-echo "===== [5/5] TEARDOWN (SQL delete + verify net-zero) + Redis cleanup ====="
-"${CANON_ENV[@]}" /app/venv/bin/python /tmp/sl_probes/probe_live_teardown.py
-TD=$?
-DEL=$(redis-cli --scan --pattern 'LIMITER/*ip:127.0.0.1*new_custom_alias*' | xargs -r redis-cli del)
-echo "redis LIMITER keys deleted for ip:127.0.0.1/new_custom_alias: ${DEL:-0}"
-exit $TD
+echo "===== [4/6] STOP gunicorn + [5/6] TEARDOWN + [6/6] redis cleanup are handled by the trap ====="
+if [ "$FAILED" = "0" ]; then
+  echo "ALL ASSERTIONS PASSED"
+else
+  echo "ONE OR MORE ASSERTIONS FAILED"
+fi
+exit "$FAILED"
 ```
+
+### 11.8.1 Hardened-run evidence (happy path + three failure variants)
+
+The hardened script was executed against a **real live `gunicorn`** (rate limiting enabled) and against the three failure modes the finding named. All four runs left the database and Redis at net-zero. Session-cookie values in the raw captures are redacted (Finding F-P4-3); every other byte is unedited.
+
+**(1) Happy path — asserts pass, exits 0, trap tears down to net-zero.**
+```bash
+cd /app && /tmp/sl_probes/probe_live.sh ; echo "exit=$?"
+```
+```text
+===== [0/6] REQUIRE a port-inspection tool + ensure port 7777 is free =====
+port 7777 is free (verified via fuser)
+
+===== [1/6] SEED disposable premium user + API key (key -> 0600 file, not echoed) =====
+load config file /app/tests/test.env
+>>> URL: http://localhost
+Upload files to local dir
+>>> init logging <<<
+2026-07-14 06:34:42,439 - SL - DEBUG - 32357 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+2026-07-14 06:34:42,895 - SL - INFO - 32357 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+USER_ID=2710
+VALID_SUFFIX=.list@sl.local.alXYgg.dQ75zN2a84Khy2otG0uUG7z8EuQ
+TAMPERED_SUFFIX=alist@sl.local.alXYgg.dQ75zN2a84Khy2otG0uUG7z8EuQ
+BASELINE={"alias": 1070, "users": 743, "api_key": 18, "mailbox": 927, "alias_mailbox": 16, "deleted_alias": 18, "domain_deleted_alias": 0, "alias_used_on": 0, "contact": 157}
+API_KEY=<written to /tmp/sl_probes/live_state.json (mode 0600); withheld from stdout>
+seed consumed (api key length=60, kept out of console)
+
+===== [2/6] START live gunicorn (rate limiting ENABLED) =====
+gunicorn master PID=32363 (bound 127.0.0.1:7777, -w 2 --timeout 15)
+ready after 2 poll(s), GET / -> 302
+
+===== [2b/6] VERIFY the captured gunicorn PID tree actually owns port 7777 =====
+port 7777 owned by our gunicorn tree (owners=[32363
+32368
+32369] within ours=[32363 32368 32369 ])
+
+===== [3/6] CAPTURE + ASSERT raw responses via curl -i (live transport) =====
+----- REQ1 valid  -> 201 -----  status=201 server=gunicorn/20.0.4
+  ASSERT OK (201)
+----- REQ2 tamper -> 412 -----  status=412 server=gunicorn/20.0.4
+  ASSERT OK (412)
+----- REQ3 valid  -> 201 (fill window) -----  status=201 server=gunicorn/20.0.4
+  ASSERT OK (201)
+----- REQ4 valid  -> 201 (fill window) -----  status=201 server=gunicorn/20.0.4
+  ASSERT OK (201)
+----- REQ5 valid  -> 201 (fill window) -----  status=201 server=gunicorn/20.0.4
+  ASSERT OK (201)
+----- REQ6 valid  -> 429 (6th within 5/minute) -----  status=429 server=gunicorn/20.0.4
+  ASSERT OK (429)
+
+===== [4/6] STOP gunicorn + [5/6] TEARDOWN + [6/6] redis cleanup are handled by the trap =====
+ALL ASSERTIONS PASSED
+
+===== CLEANUP (trap: stop gunicorn + teardown seed + redis) =====
+gunicorn PID 32363 stopped
+load config file /app/tests/test.env
+>>> URL: http://localhost
+Upload files to local dir
+table               baseline   after   delta
+  alias                  1070    1070     +0
+  users                   743     743     +0
+  api_key                  18      18     +0
+  mailbox                 927     927     +0
+  alias_mailbox            16      16     +0
+  deleted_alias            18      18     +0
+  domain_deleted_alias        0       0     +0
+  alias_used_on             0       0     +0
+  contact                 157     157     +0
+
+>>> TEARDOWN OK: all tables restored to baseline (net-zero DB residue); state file removed
+cleanup done
+```
+
+The three raw `curl -i` captures written by the assertion helper (cookies redacted) show the exact headers the assertions check — note the `gunicorn/20.0.4` `Server`, the status lines, and the **absence of any `X-RateLimit-*`/`Retry-After` header even with rate limiting enabled** (the Q3 answer, corroborated from the hardened harness):
+
+```text
+HTTP/1.1 201 CREATED
+Server: gunicorn/20.0.4
+Date: Tue, 14 Jul 2026 06:34:45 GMT
+Connection: close
+Content-Type: application/json
+Content-Length: 430
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=<redacted-session-cookie>; Expires=Tue, 21-Jul-2026 06:34:45 GMT; HttpOnly; Path=/; SameSite=Lax
+
+{"alias":"lh1.list@sl.local","creation_date":"2026-07-14 06:34:45+00:00","creation_timestamp":1784010885,"disable_pgp":false,"email":"lh1.list@sl.local","enabled":true,"id":5211,"latest_activity":null,"mailbox":{"email":"livehdr_fifowwfp@example.test","id":3121},"mailboxes":[{"email":"livehdr_fifowwfp@example.test","id":3121}],"name":null,"nb_block":0,"nb_forward":0,"nb_reply":0,"note":null,"pinned":false,"support_pgp":false}
+```
+```text
+HTTP/1.1 412 PRECONDITION FAILED
+Server: gunicorn/20.0.4
+Date: Tue, 14 Jul 2026 06:34:45 GMT
+Connection: close
+Content-Type: application/json
+Content-Length: 57
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=<redacted-session-cookie>; Expires=Tue, 21-Jul-2026 06:34:45 GMT; HttpOnly; Path=/; SameSite=Lax
+
+{"error":"Alias creation time is expired, please retry"}
+```
+```text
+HTTP/1.1 429 TOO MANY REQUESTS
+Server: gunicorn/20.0.4
+Date: Tue, 14 Jul 2026 06:34:45 GMT
+Connection: close
+Content-Type: application/json
+Content-Length: 32
+Access-Control-Allow-Origin: *
+Set-Cookie: slapp=<redacted-session-cookie>; Expires=Tue, 21-Jul-2026 06:34:45 GMT; HttpOnly; Path=/; SameSite=Lax
+
+{"error":"Rate limit exceeded"}
+```
+
+**(2) Variant A — a definitely-invalid API key.** The old script produced five `401`s and one `429` yet exited `0`; the hardened script fails the `status 401 != expected 201` assertions and **exits `1`**, and the trap still tears the seed down to net-zero:
+```text
+===== [0/6] REQUIRE a port-inspection tool + ensure port 7777 is free =====
+port 7777 is free (verified via fuser)
+
+===== [1/6] SEED disposable premium user + API key (key -> 0600 file, not echoed) =====
+load config file /app/tests/test.env
+>>> URL: http://localhost
+Upload files to local dir
+>>> init logging <<<
+2026-07-14 06:32:10,664 - SL - DEBUG - 32000 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+2026-07-14 06:32:11,124 - SL - INFO - 32000 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+USER_ID=2708
+VALID_SUFFIX=.list@sl.local.alXX6w.UPZmEoqp0ASTpC0tPoimPYOkxqI
+TAMPERED_SUFFIX=alist@sl.local.alXX6w.UPZmEoqp0ASTpC0tPoimPYOkxqI
+BASELINE={"alias": 1070, "users": 743, "api_key": 18, "mailbox": 927, "alias_mailbox": 16, "deleted_alias": 18, "domain_deleted_alias": 0, "alias_used_on": 0, "contact": 157}
+API_KEY=<written to /tmp/sl_probes/live_state.json (mode 0600); withheld from stdout>
+seed consumed (api key length=63, kept out of console)
+
+===== [2/6] START live gunicorn (rate limiting ENABLED) =====
+gunicorn master PID=32006 (bound 127.0.0.1:7777, -w 2 --timeout 15)
+ready after 2 poll(s), GET / -> 302
+
+===== [2b/6] VERIFY the captured gunicorn PID tree actually owns port 7777 =====
+port 7777 owned by our gunicorn tree (owners=[32006
+32011
+32012] within ours=[32006 32011 32012 ])
+
+===== [3/6] CAPTURE + ASSERT raw responses via curl -i (live transport) =====
+----- REQ1 valid  -> 201 -----  status=401 server=gunicorn/20.0.4
+  ASSERT FAIL: status 401 != expected 201
+----- REQ2 tamper -> 412 -----  status=401 server=gunicorn/20.0.4
+  ASSERT FAIL: status 401 != expected 412
+----- REQ3 valid  -> 201 (fill window) -----  status=401 server=gunicorn/20.0.4
+  ASSERT FAIL: status 401 != expected 201
+----- REQ4 valid  -> 201 (fill window) -----  status=401 server=gunicorn/20.0.4
+  ASSERT FAIL: status 401 != expected 201
+----- REQ5 valid  -> 201 (fill window) -----  status=401 server=gunicorn/20.0.4
+  ASSERT FAIL: status 401 != expected 201
+----- REQ6 valid  -> 429 (6th within 5/minute) -----  status=429 server=gunicorn/20.0.4
+  ASSERT OK (429)
+
+===== [4/6] STOP gunicorn + [5/6] TEARDOWN + [6/6] redis cleanup are handled by the trap =====
+ONE OR MORE ASSERTIONS FAILED
+
+===== CLEANUP (trap: stop gunicorn + teardown seed + redis) =====
+gunicorn PID 32006 stopped
+load config file /app/tests/test.env
+>>> URL: http://localhost
+Upload files to local dir
+table               baseline   after   delta
+  alias                  1070    1070     +0
+  users                   743     743     +0
+  api_key                  18      18     +0
+  mailbox                 927     927     +0
+  alias_mailbox            16      16     +0
+  deleted_alias            18      18     +0
+  domain_deleted_alias        0       0     +0
+  alias_used_on             0       0     +0
+  contact                 157     157     +0
+
+>>> TEARDOWN OK: all tables restored to baseline (net-zero DB residue); state file removed
+cleanup done
+```
+
+**(3) Variant B — a forced abort (`exit 99`) immediately after the seed is committed.** The old script left committed rows behind; the hardened `trap cleanup EXIT` runs teardown regardless, restoring baseline, while the process **exits `99`**:
+```text
+===== [0/6] REQUIRE a port-inspection tool + ensure port 7777 is free =====
+port 7777 is free (verified via fuser)
+
+===== [1/6] SEED disposable premium user + API key (key -> 0600 file, not echoed) =====
+load config file /app/tests/test.env
+>>> URL: http://localhost
+Upload files to local dir
+>>> init logging <<<
+2026-07-14 06:32:27,111 - SL - DEBUG - 32195 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+2026-07-14 06:32:27,569 - SL - INFO - 32195 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+USER_ID=2709
+VALID_SUFFIX=.test@sl.local.alXX-w.Y0iP6lFCdv-1fD9pE9giovjJtDw
+TAMPERED_SUFFIX=atest@sl.local.alXX-w.Y0iP6lFCdv-1fD9pE9giovjJtDw
+BASELINE={"alias": 1070, "users": 743, "api_key": 18, "mailbox": 927, "alias_mailbox": 16, "deleted_alias": 18, "domain_deleted_alias": 0, "alias_used_on": 0, "contact": 157}
+API_KEY=<written to /tmp/sl_probes/live_state.json (mode 0600); withheld from stdout>
+seed consumed (api key length=60, kept out of console)
+VARIANT B: forcing abort (exit 99) immediately after seed creation
+
+===== CLEANUP (trap: stop gunicorn + teardown seed + redis) =====
+load config file /app/tests/test.env
+>>> URL: http://localhost
+Upload files to local dir
+table               baseline   after   delta
+  alias                  1070    1070     +0
+  users                   743     743     +0
+  api_key                  18      18     +0
+  mailbox                 927     927     +0
+  alias_mailbox            16      16     +0
+  deleted_alias            18      18     +0
+  domain_deleted_alias        0       0     +0
+  alias_used_on             0       0     +0
+  contact                 157     157     +0
+
+>>> TEARDOWN OK: all tables restored to baseline (net-zero DB residue); state file removed
+cleanup done
+```
+
+**(4) Variant C — a foreign (non-SimpleLogin) HTTP server pre-bound on `:7777`.** The old script (using the absent `ss`) accepted the stale server's `200` and sent all six POSTs to `SimpleHTTP/0.6`, still exiting `0`. The hardened `[0/6]` check detects the occupied port via `fuser` and **exits `3`** before seeding — nothing is created, so cleanup is a no-op:
+```text
+===== [0/6] REQUIRE a port-inspection tool + ensure port 7777 is free =====
+FATAL: port 7777 already in use by pid(s) [32250]; refusing to capture against a foreign server
+
+===== CLEANUP (trap: stop gunicorn + teardown seed + redis) =====
+cleanup done
+```
+
+Taken together: wrong status/body, a non-`gunicorn` `Server`, a failed bind, an unavailable port tool, a foreign port owner, or an interrupted flow each now yields a **non-zero** exit **and** guaranteed cleanup — exactly the fail-safe behaviour the finding required.
 
 ### 11.9 `probe_live_seed.py`
 
-Live-server seed. Creates one disposable premium user + API key for the live `gunicorn` run and prints the API key to a file consumed by `probe_live.sh` (never echoed to the shared console).
+Live-server seed, **hardened per Finding F-P4-3**. Creates one disposable premium user + API key for the live `gunicorn` run and writes the key **only to a restrictive `0600` state file** (`/tmp/sl_probes/live_state.json`, `os.open(..., 0o600)` + `os.chmod(..., 0o600)`); `probe_live.sh` reads it back from that file. The API key is **never printed to stdout** — the script emits only non-secret lines (user id, single-use signed suffixes, baseline counts) and an explicit `API_KEY=<written to ... (mode 0600); withheld from stdout>` marker.
 ```python
 #!/usr/bin/env python3
 """
@@ -3951,6 +5935,11 @@ probe_live_seed.py  --  seed a DISPOSABLE premium user + API key for the live-se
 header capture, mint a canonical valid signed_suffix (via the real app signer, same
 CUSTOM_ALIAS_SECRET) and a guaranteed-different tampered variant, and record baseline
 table counts so the teardown can prove net-zero DB residue.
+
+HYGIENE (Finding F-P4-3): the disposable API key is a live credential while the run is
+active, so it is written ONLY to a restrictive 0600 state file and is NEVER printed to
+stdout/console. probe_live.sh reads it back from that 0600 file. The non-secret values
+(user id, single-use signed suffixes, baseline counts) may be printed for evidence.
 
 All created rows are DISPOSABLE / synthetic test data and are removed by
 probe_live_teardown.py. The signing secret is the PUBLIC test secret from
@@ -4007,20 +5996,24 @@ tampered = _make_tampered(valid)
 state = {
     "user_id": user.id,
     "email": email,
-    "api_key": key.code,
+    "api_key": key.code,          # SECRET: lives only in the 0600 file below
     "valid_suffix": valid,
     "tampered_suffix": tampered,
     "baseline": baseline,
 }
-with open(STATE, "w") as f:
+# write the state to a RESTRICTIVE 0600 file (owner read/write only) so the live API key
+# never transits stdout, the shared console, or a world-readable file.
+fd = os.open(STATE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
     json.dump(state, f)
+os.chmod(STATE, 0o600)
 
-# emit shell-consumable values
+# emit only NON-SECRET, shell-consumable values; the API key is deliberately withheld.
 print(f"USER_ID={user.id}")
-print(f"API_KEY={key.code}")
 print(f"VALID_SUFFIX={valid}")
 print(f"TAMPERED_SUFFIX={tampered}")
 print(f"BASELINE={json.dumps(baseline)}")
+print(f"API_KEY=<written to {STATE} (mode 0600); withheld from stdout>")
 ```
 
 ### 11.10 `probe_live_teardown.py`
@@ -4037,7 +6030,8 @@ is byte-identical to the pre-probe baseline recorded by probe_live_seed.py.
 FK-safe order: NULL users.default_mailbox_id first (breaks the users->mailbox cycle),
 delete the user's alias/api_key rows, then delete the user (mailbox.user_id has
 ON DELETE CASCADE so the mailbox goes with it); a trailing mailbox delete mops up any
-non-cascaded rows. Exits non-zero if any table did not return to baseline.
+non-cascaded rows. Exits non-zero if any table did not return to baseline. On success the
+0600 state file is removed so the harness's idempotent EXIT trap is a no-op on re-entry.
 """
 import os, json, sys
 os.environ.setdefault("CONFIG", "/app/tests/test.env")
@@ -4046,6 +6040,10 @@ from sqlalchemy import text
 from app.db import Session
 
 STATE = "/tmp/sl_probes/live_state.json"
+if not os.path.exists(STATE):
+    print(">>> TEARDOWN: no state file; nothing to remove (idempotent no-op)")
+    sys.exit(0)
+
 with open(STATE) as f:
     state = json.load(f)
 
@@ -4078,7 +6076,8 @@ for t in TABLES:
 if bad:
     print(f"\n>>> TEARDOWN FAILED: residue in {bad}")
     sys.exit(1)
-print("\n>>> TEARDOWN OK: all tables restored to baseline (net-zero DB residue)")
+os.remove(STATE)                  # success: drop the 0600 secret file
+print("\n>>> TEARDOWN OK: all tables restored to baseline (net-zero DB residue); state file removed")
 sys.exit(0)
 ```
 
@@ -4104,7 +6103,22 @@ capturing its actual output, not by reading alone:
 - **Every condition exercised.** Success (201), tampered/expired/garbage suffix (412), empty body
   (400), duplicate (409), two-consecutive-dots (400), wrong prefix/suffix/domain (400),
   quota-exceeded (400), non-string `signed_suffix` (500), and the rate-limit/parallel-lock
-  rejections (429) are each driven and captured (§3, §5, §7, §8, §9).
+  rejections (429) are each driven and captured (§3, §5, §7, §8, §9). The **`alias_prefix`** conditions
+  are likewise driven end-to-end and captured with runtime output: on **v2** (which has no
+  `check_alias_prefix` gate) a malformed **string** prefix surfaces as an unhandled **500**
+  `{"error":"Internal error"}` via `validate_email`, and a **non-string** prefix as **500** via
+  `.strip()` at `:64` (§9.6, matrix rows 21-22); on **v3** the same inputs are rejected earlier with a
+  clean **400** (`check_alias_prefix` `:167`, evidenced in §7.2.1, matrix row 21′). SQL-keyword-like but
+  valid prefixes are stored verbatim (201, no injection) and Unicode prefixes are transliterated (201) —
+  matrix rows 23-24, §9.6. This document therefore does **not** claim v2 rejects malformed prefixes; it
+  reports the actual `500` and, per the read-only scope (§12.4), flags it as a product issue left
+  unremediated.
+  The remaining conditions raised in review are likewise driven end-to-end and published with their
+  complete output: the two `signed_suffix` producers `GET /api/v4|v5/alias/options` (pair- vs object-shape,
+  §2.4.1); **in-trash** duplicates via `DeletedAlias`/`DomainDeletedAlias` (409, §3.3); all six quota
+  branches including the trial-is-still-capped case (§6.5); the per-user creation **bucket** threshold and
+  its Redis-absent no-op (§7.8); and a 40x unchanged-input repetition confirming the `412` collapse is 100%
+  deterministic (`{412: 40}`, §9.7).
 - **Stability.** The rate-limit observation was made with limiting **enabled** and confirmed
   identical across two isolated runs (`RUN1 == RUN2`, both `[201x5, 429, 429]`, §5).
 - **Pinned libraries, observed.** `itsdangerous 1.1.0`, `flask-limiter 1.4`, `flask 1.1.2`,
@@ -4144,7 +6158,7 @@ invocation in §2.3; source is in §11.
 | 12 | Every response emits a `DEBUG after_request` line (`server.py:284`); success also `INFO send_event` | Q2 | all probes | §4, §3.2 |
 | 13 | **No** `X-RateLimit-*` / `Retry-After` headers on any response (limiting on or off) | Q3 | `probe_ratelimit.py`, `probe_live.sh`, `probe_customdomain.py` | §5 (`ratelimit.out`), §3.1 (`live_429.txt`), §9.5 (`customdomain.out`) |
 | 14 | Boundary is `[201x5, 429, 429]`, first **429 at request #6**, stable `RUN1 == RUN2` | Q3 | `probe_ratelimit.py` | §5 (`ratelimit.out`) |
-| 15 | Flask-Limiter header-default fix is a **0.7.x**-series change (predates 1.4), **not** 1.5 | Q3 | `HISTORY.rst` + web check | §5 |
+| 15 | Flask-Limiter header-default fix is a **v0.7** change (2015-01-09; predates 1.4), **not** 1.5; installed 1.4 defaults `headers_enabled=False` and SimpleLogin never enables it | Q3 | shipped `Flask_Limiter-1.4.dist-info/METADATA` (v0.7 / Issue 22) + `grep extension.py` + `grep server.py` | §5.1 |
 | 16 | Key derivation: session -> `userid:{id}`, API-key-only -> `ip:{addr}`; lock keys `cl:{id}` / `cl:{addr}` | Q3 | `probe_ratelimit.py` | §5 (`ratelimit.out`) |
 | 17 | Quota gate is `User.can_create_new_alias()` (`models.py:867-884`) + `max_alias_for_free_account()` (`858-865`) | Q4 | `probe_functional.py` (COND13) | §6 (`functional.out`) |
 | 18 | **No** quota value is logged on the 201 path; the only quota log is the failure `LOG.d` (`new_custom_alias.py:49`/`:138`) | Q4 | `probe_functional.py` | §6 |
@@ -4153,24 +6167,39 @@ invocation in §2.3; source is in §11.
 | 21 | Parallel lock -> **HTTP 429** (werkzeug `TooManyRequests`) on contention; **no-op** when Redis absent (`parallel_limiter.py:55-58`) | Q5 | `probe_lock.py` | §7.7 (`lock.out`) |
 | 22 | The 412 collapse is **domain-independent** (verified custom domain: valid 201, tampered 412) | Q1/root | `probe_customdomain.py` | §9.5 (`customdomain.out`) |
 | 23 | Repository unchanged; DB/Redis net-zero; probes removed | scope | `run_all.sh`, `git status` | §2.5 (`run_all.out`) |
+| 24 | `signed_suffix` producers: **v4** returns `[suffix, signed_suffix]` **pairs**, **v5** returns `{suffix, signed_suffix, is_custom, is_premium}` **objects** (both `200`) | Q5/mint | `blitzy_probe_options.py` | §2.4.1 |
+| 25 | **In-trash** duplicate (public `DeletedAlias` and custom `DomainDeletedAlias`) and live duplicate all -> **409** `alias <addr> already exists` + `LOG.d :202` | Q1 | `blitzy_probe_duptrash.py` | §3.3 |
+| 26 | Quota gate keys on `lifetime_or_active_subscription()` (not `is_premium()`): free-at-cap and **trial**-at-cap -> `False`/`400`+`LOG.d :138`; old-plan cap=15; lifetime & active `ManualSubscription` -> `True`/`201` (no quota log) | Q4 | `blitzy_probe_quota.py` | §6.5 |
+| 27 | Per-user create **bucket** (`10/900` free) -> first **429** at the 11th bucket hit with `LOG.i rate_limiter.py:33 -> 11/10`; **no-op** (no 429) when `rate_limiter.lock_redis is None` | Q3/Q5 | `blitzy_probe_bucket.py` | §7.8 |
+| 28 | Unchanged input repeated **40x** -> `{412: 40}` for both tampered and expired (deterministic, no variance) | Q1/root | `blitzy_probe_stable40.py` | §9.7 |
 
 ### 12.3 Per-question coverage confirmation
 
 - **Q1 (status codes / error messages).** Answered in §3 and §8 with the complete status+body for
-  every condition; the tampered/expired/garbage collapse and the 500 non-string case are in §9.
+  every condition; the tampered/expired/garbage collapse and the non-string `signed_suffix` 500 are in
+  §9, and the v2 malformed/non-string **`alias_prefix`** 500s (vs. the v3 400) are in §9.6 (matrix
+  rows 21-24).
 - **Q2 (server-console log entries).** Answered in §4 with the raw captured buffer, the capture
   mechanism, and a per-emitter `file:line` table (`LOG.w` at `new_custom_alias.py:72`/`:187`;
   `LOG.d` quota at `new_custom_alias.py:49`/`:138`; `after_request` at `server.py:284`).
 - **Q3 (rate-limit headers).** Answered in §5: no `X-RateLimit-*`/`Retry-After` headers appear;
   the boundary and key-derivation are observed and stable; the header-default version nuance is
-  corrected.
+  corrected and grounded in the shipped `Flask_Limiter-1.4` changelog (v0.7 / Issue 22) with
+  reproduction commands (§5.1). The separate **per-user create bucket** (`10/900`) and its
+  Redis-absent no-op are observed in §7.8.
 - **Q4 (success-path quota checks / logged values).** Answered in §6: `can_create_new_alias()`
-  and `max_alias_for_free_account()` are the gates; **no** value is logged on success.
+  and `max_alias_for_free_account()` are the gates; **no** value is logged on success. Every quota
+  branch (free/old-plan/trial/lifetime/active-subscription) is observed in §6.5, including the
+  decisive **trial-is-still-capped** case (the gate keys on `lifetime_or_active_subscription()`,
+  not `is_premium()`).
 - **Q5 (execution-path trace / rejection conditions).** Answered in §7 (decorator chain + branch
-  order + mermaid trace) and §9 (root cause), naming each mechanism — `check_suffix_signature`,
-  `verify_prefix_suffix`, `can_create_new_alias`, `max_alias_for_free_account`, `@limiter.limit`,
-  `@require_api_auth`, `@parallel_limiter.lock` — with its `file:line` and the condition that
-  triggers each rejection.
+  order + version-split mermaid trace) and §9 (root cause), naming each mechanism —
+  `check_suffix_signature`, `verify_prefix_suffix`, `check_alias_prefix`, `can_create_new_alias`,
+  `max_alias_for_free_account`, `@limiter.limit`, `@require_api_auth`, `@parallel_limiter.lock` — with
+  its `file:line` and the condition that triggers each rejection. The **version-specific gate order** is
+  demonstrated at runtime in §7.2.1 (v3 validates prefix `:167` and mailbox `:171-181` **before** the
+  signature `:185`; v2 has no prefix gate, so the signature `:70` runs first and a malformed prefix
+  instead surfaces as a 500 at `Alias.create`, §9.6).
 
 ### 12.4 Scope verification (read-only)
 
@@ -4182,6 +6211,6 @@ invocation in §2.3; source is in §11.
   net-zero proof (§2.5).
 - **Sensitive-test-data hygiene.** Every signed suffix shown is synthetic, disposable, test-only,
   and time-limited; the signing key is the public, test-only `tests/test.env` value and is never a
-  credential; real API keys and session cookies are REDACTED throughout while their reproducible
+  credential; real API keys are withheld from stdout (written only to a `0600` file) and session cookies are redacted throughout every embedded transcript (Findings F-P4-2/F-P4-3) while their reproducible
   generation is described (§1, §11).
 
