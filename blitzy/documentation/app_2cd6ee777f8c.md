@@ -355,7 +355,7 @@ psycopg2.errors.UndefinedTable: relation "users" does not exist   (the DB-API ca
 sqlalchemy.exc.ProgrammingError: (psycopg2.errors.UndefinedTable) relation "users" does not exist
 ```
 
-The Python call chain in the traceback is exactly: Flask `full_dispatch_request` → `flask_debugtoolbar` → `cProfile.runcall` → `flask_limiter` → `app/app/auth/views/login.py:43` (`User.get_by`) → `app/app/models.py:84` (`Session.query(cls).filter_by(**kw).first()`) → SQLAlchemy ORM/engine → `psycopg2` `cursor.execute`. This confirms the Inferred path above: the connection opened fine, and the first query against the not-yet-created `users` relation is what fails.
+The Python call chain in the traceback is exactly: Flask `full_dispatch_request` → `flask_debugtoolbar` → `cProfile.runcall` → `flask_limiter` → `app/auth/views/login.py:43` (`User.get_by`) → `app/models.py:84` (`Session.query(cls).filter_by(**kw).first()`) → SQLAlchemy ORM/engine → `psycopg2` `cursor.execute`. This confirms the Inferred path above: the connection opened fine, and the first query against the not-yet-created `users` relation is what fails.
 
 #### Q1 Run 2 — driver transcript
 
