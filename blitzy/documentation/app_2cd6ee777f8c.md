@@ -5,7 +5,7 @@
 > **Methodology:** Every behavioral claim below was produced by **actually building, running, and driving** the software through its **real entry points** — an HTTP request to the web app, an SMTP delivery to the email handler, and a genuinely enqueued `Job` (created by a real authenticated dashboard action) drained by the job runner. Each claim is accompanied by the command that produced it and the **raw captured output** (stdout/stderr, HTTP response including headers, SMTP transcript, or SQL rows). Reading the source is used only to *locate and explain* each signal.
 >
 > **Evidence conventions used throughout:**
-> - Output shown inside a fenced block is the **verbatim** captured bytes for the stated command. Where a single secret value is removed it is replaced by an explicit `[REDACTED: …]` marker — nothing else is elided, and no prose is placed inside an output fence.
+> - Output shown inside a fenced block is the **verbatim** captured bytes for the stated command, and no explanatory prose is placed inside an output fence. Three narrow kinds of removal can occur, and each is always marked or disclosed: (a) a single secret value is replaced by an explicit `[REDACTED: …]` marker; (b) a long run of lines that are **identical in form** (for example the repeated `drop cascades to …` and `Running upgrade …` lines in §2.5) is omitted for length, with the lines on either side shown verbatim; and (c) a few framing lines that are not part of the signal — startup/banner lines the interpreter prints before the app is ready, or a single post-success diagnostic traceback from a helper script — are omitted. Every omission of type (b) or (c) is disclosed **at the point it occurs**, stating exactly how many lines were removed and why.
 > - A claim that was **not** directly observed at runtime is labeled **`[INFERRED]`** with the reason.
 > - A value obtained off the canonical path (e.g. a direct DB probe used only to *read* state) is labeled **`[NON-CANONICAL]`**; no such value is ever substituted for a canonical-path observation.
 
@@ -78,8 +78,10 @@ docker run -d --name sl-app --network sl-net \
 docker exec sl-app bash -lc 'cd /app && cp example.env .env'
 docker exec sl-app bash -lc "cd /app && sed -i 's#@localhost:5432/simplelogin#@sl-postgres:5432/simplelogin#' .env"
 
-# Start Redis inside sl-app (used for sessions and rate-limiting); the pristine
-# image does not auto-start it:
+# Start Redis inside sl-app; the pristine image does not auto-start it. NOTE:
+# in the DEFAULT config the app does NOT use Redis for sessions or rate-limiting
+# (it uses signed-cookie sessions and an in-process memory rate-limiter — see the
+# note in §2.2); Redis is engaged only when the optional MEM_STORE_URI is set.
 docker exec sl-app redis-server --daemonize yes --save "" --appendonly no
 ```
 
@@ -102,13 +104,40 @@ PONG
 
 > **Newcomer note — use the venv, not the system Python.** The app's third-party dependencies (Flask, `arrow`, and the rest) live only in `/app/venv`. Run against the system Python, `python3 server.py` fails at its first third-party import — `ModuleNotFoundError: No module named 'arrow'` (`server.py:L5` imports `arrow`, before the Flask imports at `server.py:L12`); every invocation below uses `./venv/bin/python …` (or the pre-built `./venv/bin/gunicorn`, `./venv/bin/alembic`, `./venv/bin/flask`).
 
-Redis is started inside `sl-app` as a daemon by the last command in §2.1 (the pristine image does not auto-start it); it is the same process the app uses for sessions and rate-limiting:
+Redis is started inside `sl-app` as a daemon by the last command in §2.1 (the pristine image does not auto-start it):
 
 ```
 $ docker exec sl-app ps -o pid,args -C redis-server
     PID COMMAND
      28 redis-server *:6379
 ```
+
+> **Observed correction — the default configuration does *not* use Redis for sessions or rate-limiting.** A canonical inspection of the built app object (via the real `create_app()` factory, `server.py:L139`) shows that with the default `.env`, sessions are held in **signed cookies** and rate-limiting uses an **in-process memory** store; Redis is wired in only when the optional `MEM_STORE_URI` is set. The gate is explicit in `server.py:L163-L165` (`if MEM_STORE_URI: … initialize_redis_services(app, MEM_STORE_URI)`), and `MEM_STORE_URI` defaults to `None` (`app/config.py:L568`, `MEM_STORE_URI = os.environ.get("MEM_STORE_URI", None)`), which the shipped `example.env` leaves unset (the six probe lines are shown; the app-initialization banner that `create_app()` prints ahead of them is omitted for brevity):
+>
+> ```
+> $ docker exec sl-app bash -lc 'cd /app && PYTHONPATH=/app ./venv/bin/python - <<PY
+> import flask_limiter
+> from server import create_app
+> from app.config import MEM_STORE_URI
+> app = create_app()
+> si = type(app.session_interface)
+> print("MEM_STORE_URI                 =", MEM_STORE_URI)
+> print("app.session_interface         =", si.__module__ + "." + si.__name__)
+> key = flask_limiter.extension.C.STORAGE_URL
+> print("limiter STORAGE_URL cfg key   =", key)
+> print("app.config[STORAGE_URL]       =", app.config.get(key, "<unset>"))
+> print("limiter storage backend       =", type(app.extensions["limiter"]._storage).__module__ + "." + type(app.extensions["limiter"]._storage).__name__)
+> print("SESSION_COOKIE_NAME           =", app.config.get("SESSION_COOKIE_NAME"))
+> PY'
+> MEM_STORE_URI                 = None
+> app.session_interface         = flask.sessions.SecureCookieSessionInterface
+> limiter STORAGE_URL cfg key   = RATELIMIT_STORAGE_URL
+> app.config[STORAGE_URL]       = memory://
+> limiter storage backend       = limits.storage.MemoryStorage
+> SESSION_COOKIE_NAME           = slapp
+> ```
+>
+> This was corroborated empirically: Redis `DBSIZE` was unchanged (no new keys) across repeated `GET /health` and `POST /auth/login` requests, confirming the web request path does not touch Redis in the default config. Redis still runs (it is part of the canonical stack, and the test suite's `tests/test.env` *does* set `MEM_STORE_URI`), but the newcomer's default local run does not depend on it for the flows in this document.
 
 ### 2.3 Source checkout state (exact, not assumed)
 
@@ -279,12 +308,27 @@ $ docker exec sl-postgres psql -U myuser -d simplelogin -c "SELECT id, domain, u
 (2 rows)
 ```
 
-So the seed **does** contain two enabled directories (`abcd`, `xyzt`, owned by John) and two verified custom domains (`ab.cd`, `old.com`) — but both domains have `catch_all=f`. That distinction drives [§6.6](#66-secondary-alias-auto-creation-directory-success-and-domain-prerequisites): directory auto-create *is* feasible on the seed, whereas catch-all domain auto-create is not.
+So the seed **does** contain two enabled directories (`abcd`, `xyzt`, owned by John) and two verified custom domains (`ab.cd`, `old.com`) — but both domains have `catch_all=f`. That distinction drives [§6.6](#66-secondary-alias-auto-creation-directory-success-and-domain-prerequisites): directory auto-create *is* feasible on the seed out of the box, whereas catch-all domain auto-create requires first **enabling catch-all** on a verified domain — a normal dashboard toggle, **not** a source change. Both paths were exercised and **observed** in §6.6 (catch-all was enabled on `old.com`, a new address auto-created an alias, and catch-all was toggled back off).
 
-The complete pristine post-seed baseline — including the audit and metric tables — is captured here and re-verified after cleanup in [§7.2](#72-database-restored-to-the-pristine-post-seed-baseline):
+The complete pristine post-seed baseline — including the audit and metric tables — is captured here **immediately after the §2.5 reset**, before any of the flows below are exercised. This is the true fresh-reset baseline that the canonical reset produces; [§7.2](#72-final-database-state-after-cleanup) later shows that the investigation restores the **live entity tables** to exactly these seed values, while the **append-only** audit/bookkeeping tables (`deleted_alias`, `alias_audit_log`, `user_audit_log`, `job`) accumulate monotonically and return to the zeros shown here only when this §2.5 reset is re-run:
 
 ```
-$ docker exec -i sl-postgres psql -U myuser -d simplelogin < baseline_query.sql
+$ docker exec sl-postgres psql -U myuser -d simplelogin -c "
+SELECT tbl, count FROM (
+  SELECT 'activation_code' tbl, count(*) FROM activation_code
+  UNION ALL SELECT 'alias', count(*) FROM alias
+  UNION ALL SELECT 'alias_audit_log', count(*) FROM alias_audit_log
+  UNION ALL SELECT 'contact', count(*) FROM contact
+  UNION ALL SELECT 'custom_domain', count(*) FROM custom_domain
+  UNION ALL SELECT 'daily_metric', count(*) FROM daily_metric
+  UNION ALL SELECT 'deleted_alias', count(*) FROM deleted_alias
+  UNION ALL SELECT 'directory', count(*) FROM directory
+  UNION ALL SELECT 'email_log', count(*) FROM email_log
+  UNION ALL SELECT 'job', count(*) FROM job
+  UNION ALL SELECT 'mailbox', count(*) FROM mailbox
+  UNION ALL SELECT 'metric2', count(*) FROM metric2
+  UNION ALL SELECT 'user_audit_log', count(*) FROM user_audit_log
+  UNION ALL SELECT 'users', count(*) FROM users) s ORDER BY tbl;"
        tbl       | count
 -----------------+-------
  activation_code |     0
@@ -340,6 +384,8 @@ from server import create_app
 app = create_app()
 ```
 
+**A note on the observation helpers.** Beyond the three components above, the investigation drives and inspects the running system with small, ephemeral helper scripts (SMTP senders, HTTP probes, and `psql`/SQL queries). They are created only under `/tmp/` — on the host (e.g., `/tmp/blitzy_investigation/`) or inside the container (e.g., `/tmp/sl_run/`) — always **outside the repository**, are referenced by **complete absolute paths**, and are **removed during cleanup** ([§7.3](#73-source-tree-untouched)); none is ever tracked or committed. Because they are created *by* the investigation, they are not expected to pre-exist: a reader reproducing a step recreates the helper first. Where a helper's exact content determines the result it is shown inline — via `cat` or a `<<'SQL'`/`<<'PY'` heredoc, as in the cleanup transaction of [§7.1](#71-what-was-created-and-how-it-was-removed) and the runtime-observed blocks of [§6.5](#65-the-email-handlers-dispatcher-reply-bounce-and-smtp-status-codes) and [§6.6](#66-secondary-alias-auto-creation-directory-success-and-domain-prerequisites); those newer reproductions are fully self-contained heredocs that read no external file at all.
+
 ---
 
 ## 3. How to read the logs: the `SL` log format
@@ -369,7 +415,7 @@ Reading left to right: `asctime` = `2026-07-13 18:03:00,460`; `name` = `SL`; `le
 
 ## 4. Q1 — Are the three components up? (liveness & confirmation signals)
 
-The three processes were started together at **18:11:50–18:11:52** (§2.7) into per-process log files, and stayed up for the whole investigation. Each is probed below for its **definitive** liveness signal. All three PIDs quoted here (`3336`/`3353`/`3361` web, `3344` email handler, `3352` job runner) are the *same* processes throughout §4–§6 — a single continuous timeline, with two disclosed exceptions: the email-handler restart for mail-capture in [§5.4](#54-c4--an-email-arrives-at-the-alias-forward-path), and a later dedicated email-handler run (pid `10602`) used to capture the two `handle_bounce()` phases in [§6.5](#65-the-email-handlers-dispatcher-reply-bounce-and-smtp-status-codes).
+The three processes were started together at **18:11:50–18:11:52** (§2.7) into per-process log files, and stayed up for the whole investigation. Each is probed below for its **definitive** liveness signal. All three PIDs quoted here (`3336`/`3353`/`3361` web, `3344` email handler, `3352` job runner) are the *same* processes throughout §4–§6 — a single continuous timeline, with three disclosed exceptions: the email-handler restart for mail-capture in [§5.4](#54-c4--an-email-arrives-at-the-alias-forward-path); a later dedicated email-handler run (pid `10602`) used to capture the two `handle_bounce()` phases in [§6.5](#65-the-email-handlers-dispatcher-reply-bounce-and-smtp-status-codes); and a subsequent re-verification run (email-handler pid `15828`, logging to `/tmp/qa_run/email.log`) used to capture the `E524`/`E213`/`E404` codes, the successful reply, and catch-all auto-creation in [§6.5](#65-the-email-handlers-dispatcher-reply-bounce-and-smtp-status-codes)–[§6.6](#66-secondary-alias-auto-creation-directory-success-and-domain-prerequisites). Each exception is labeled where its evidence appears.
 
 ### 4.1 Web server (`server.py` / `wsgi.py`, port 7777)
 
@@ -605,7 +651,7 @@ $ docker exec sl-postgres psql -U myuser -d simplelogin -c "SELECT id, email, us
 
 > **Security note (activation token redacted).** The activation code is `random_string(30)` — a 30-character secret (`app/auth/views/register.py:L120`, confirmed above by `code_len = 30`). It is a credential, so its value is **not** reproduced here; instead its handling is proven by (a) its length, (b) its single-use lifecycle (the row is deleted the moment it is consumed, shown next), and (c) the `activated` transition it drives. The activation URL is `{URL}/auth/activate?code=<code>`; only the redacted form is shown.
 
-**Activation — canonical `GET /auth/activate?code=<code>`.** The code was read from the DB into a shell variable and never printed; the request URL's token is masked in the captured output. The response is a `302` to the dashboard, and it logs the user in (fresh authenticated session cookie):
+**Activation — canonical `GET /auth/activate?code=<code>` (with a `[NON-CANONICAL]` token-acquisition step).** The activation *endpoint itself is exercised canonically* — a real HTTP `GET` to the real route, exactly as following the link in an activation email would. **Obtaining the token, however, is `[NON-CANONICAL]` / supplemental, and is called out explicitly here:** in this default local configuration `NOT_SEND_EMAIL = True` (confirmed by a canonical config read; the flag is truthy because the key is present in `.env` — `app/config.py:L91`, `NOT_SEND_EMAIL = "NOT_SEND_EMAIL" in os.environ`), so the activation email is never transmitted — the mail sender logs the message and returns `True` without sending it (`app/mail_sender.py:L130-L137`), on the path reached from `send_activation_email()` (`app/auth/views/register.py:L129`, which mints the code at `L120`). Because no message reaches a mailbox, the one-time code cannot be received the way a real user would; it was therefore read **directly from the `activation_code` table** — the `code_len = 30` row shown in the *Intermediate state* above — into a shell variable. That direct read is a state *read* used solely to acquire the token; it is never substituted for the canonical activation request, which is the `GET` below. The token was never printed, and the request URL's token is masked in the captured output. The response is a `302` to the dashboard, and it logs the user in (fresh authenticated session cookie):
 
 ```
 $ curl -s -D - -o /dev/null "http://127.0.0.1:7777/auth/activate?code=[REDACTED-30-CHAR-TOKEN]"
@@ -1219,7 +1265,7 @@ def is_bounce(envelope: Envelope, msg: Message):
             return status.E404
 ```
 
-So `CannotCreateContactForReverseAlias → E524`, `(VERPReply | VERPForward | VERPTransactional) → E213`, and any other exception → `E404`. The relevant codes (from `app/email/status.py`) are: `E200 = "250 Message accepted for delivery"` (`L2`), `E206 = "250 SL E206 Out of office"` (`L9`), `E213 = "250 SL E213 Unknown email ignored"` (`L21`), `E214 = "250 SL E214 Unauthorized for using reverse alias"` (`L22`), `E404 = "421 SL E404 Unexpected error - Retry later"` (`L32`, a **4xx** retry code, not a 5xx), `E515 = "550 SL E515 Email not exist"` (`L51`), and `E524 = "550 SL E524 Wrong use of reverse-alias"` (`L62`).
+So `CannotCreateContactForReverseAlias → E524`, `(VERPReply | VERPForward | VERPTransactional) → E213`, and any other exception → `E404`. The relevant codes (from `app/email/status.py`) are: `E200 = "250 Message accepted for delivery"` (`L2`), `E206 = "250 SL E206 Out of office"` (`L9`), `E213 = "250 SL E213 Unknown email ignored"` (`L21`), `E214 = "250 SL E214 Unauthorized for using reverse alias"` (`L22`), `E404 = "421 SL E404 Unexpected error - Retry later"` (`L32`, a **4xx** retry code, not a 5xx), `E515 = "550 SL E515 Email not exist"` (`L51`), and `E524 = "550 SL E524 Wrong use of reverse-alias"` (`L62`). Each of these three exception-mapped codes was **also exercised at runtime** — see "The three exception-mapped codes E524/E213/E404, observed" at the end of this section — so they are reported below as observed, not merely code-derived.
 
 
 **Observed stage-by-stage (RCPT accepted; the real decision comes after DATA).** A low-level SMTP client sent three messages to `127.0.0.1:20381`, capturing each protocol stage separately so the recipient stage and the post-DATA decision are distinguishable:
@@ -1335,17 +1381,17 @@ The handler log shows the full routing, correlated by the per-message `message_i
 2026-07-14 04:09:10,177 - SL - INFO - 10602 - "/app/email_handler.py:2367" - _handle() - 9bd5547f-088a-4fb6-bcd3-75f47b8580bf - Finish mail_from <>, rcpt_tos ['bounce+14+@sl.local'], takes 0.0550379753112793 seconds with return code '250 SL E211 Bounce Forward phase handled'<<===
 ```
 
-Its database side effects were captured before → after: `<EmailLog 14>` flipped `bounced f → t` and gained `refused_email_id=3`; a `refused_email` row (`id 3`), a `bounce` row (`email=john@wick.com`), a `notification` (`id 8`, "…cannot be delivered to your mailbox"), and a `sent_alert` (`type=bounce`) were created:
+Its database side effects were captured before → after — the before-state is stated here in prose because the fenced blocks below are verbatim `psql` output: `<EmailLog 14>` flipped `bounced` from `f` to `t` and its `refused_email_id` advanced from `NULL` to `3`; the `bounce` table, empty before this message, gained its first row (`id 2`, `email=john@wick.com`); and a `refused_email` row (`id 3`), a `notification` (`id 8`, "…cannot be delivered to your mailbox"), and a `sent_alert` (`type=bounce`) were created:
 
 ```
 $ docker exec sl-postgres psql -U myuser -d simplelogin -c "SELECT id, bounced, refused_email_id FROM email_log WHERE id=14;"
  id | bounced | refused_email_id
 ----+---------+------------------
- 14 | t       |                3        # before: bounced=f, refused_email_id=NULL
+ 14 | t       |                3
 $ docker exec sl-postgres psql -U myuser -d simplelogin -c "SELECT id, email FROM bounce ORDER BY id;"
  id |            email
 ----+-----------------------------
-  2 | john@wick.com                    # new (bounce table was empty before)
+  2 | john@wick.com
 ```
 
 **Reply phase → `250 SL E212`.** Symmetrically, a reply from the mailbox owner (`john@wick.com`) to the contact's reverse-alias (`external_sender_at_example_org_rbnuz@sl.local`) minted a **reply** email-log (`is_reply=t`, id `15`); a DSN to `bounce_reply+15+@sl.local` was then accepted with `250 SL E212 Bounce Reply phase handled` (same send shape as above, only the recipient prefix and id differ):
@@ -1402,6 +1448,149 @@ The handler routed it through `handle_bounce()` logging **`phase=reply`** (becau
 
 `is_bounce()` gates both sends (each required `mail_from == "<>"` **and** `multipart/report`, exactly as quoted earlier); the phase — `E211` vs `E212` — is chosen solely by the referenced email-log's `is_reply` flag inside `handle_bounce()` (`email_handler.py:L1851-L1914`), **not** by the recipient prefix. The status strings are defined at `app/email/status.py:L19` (`E211 = "250 SL E211 Bounce Forward phase handled"`) and `L20` (`E212 = "250 SL E212 Bounce Reply phase handled"`). Both outcomes are thus **observed**, not inferred.
 
+#### The three exception-mapped codes E524/E213/E404, observed (plus a successful reply)
+
+The exception→code mapping quoted above (`handle_DATA`, `email_handler.py:L2288-L2332`) was **exercised black-box against the running handler**, alongside the reply path's *success* case (distinct from the unauthorized `E214` of Case B and the reply-phase bounce `E212` above). This evidence comes from the re-verification run (email-handler pid `15828`, log `/tmp/qa_run/email.log` — the third disclosed exception to the single-timeline note in [§4](#4-q1--are-the-three-components-up-liveness--confirmation-signals)). One canonical SMTP session drives all of it. The script first sends a precondition forward, then **discovers the resulting reverse-alias and forward-log id at runtime** (so it reproduces regardless of the random reverse-alias suffix or the current id sequence), and then exercises: a successful reply, `E213`, `E524`, `E404`, and post-error recovery. SMTP sends use `smtplib` (the canonical entry point); `psycopg2` is used only to read back the ids/rows:
+
+```
+$ docker exec -i sl-app ./venv/bin/python - <<'PY'
+import smtplib, email, psycopg2
+DB = "host=sl-postgres dbname=simplelogin user=myuser password=mypassword"
+
+def q(sql, args=None):
+    c = psycopg2.connect(DB); cur = c.cursor(); cur.execute(sql, args or ())
+    rows = cur.fetchall(); c.close(); return rows
+
+def send(mail_from, rcpt_to, raw):
+    s = smtplib.SMTP("127.0.0.1", 20381, timeout=30); s.ehlo("blitzy-docfix.local")
+    cm, rm = s.mail(mail_from); cr, rr = s.rcpt(rcpt_to); cd, rd = s.data(raw); s.quit()
+    return "MAIL -> %s %s | RCPT -> %s %s | POST-DATA -> %s %s" % (cm, rm.decode(), cr, rr.decode(), cd, rd.decode())
+
+print("### STEP1 forward external.sender@example.org -> e1@sl.local (mint precondition contact+forward-log)")
+fwd = ("From: External Sender <external.sender@example.org>\r\nTo: e1@sl.local\r\n"
+       "Subject: Blitzy docfix precondition forward\r\nMessage-ID: <blitzy-precond-fwd@example.org>\r\n"
+       "Content-Type: text/plain; charset=us-ascii\r\n\r\nprecondition body\r\n")
+print(send("external.sender@example.org", "e1@sl.local", fwd))
+row = q("SELECT c.id, c.reply_email, (SELECT max(id) FROM email_log WHERE contact_id=c.id AND is_reply=false) "
+        "FROM contact c WHERE c.website_email='external.sender@example.org' AND c.alias_id=5 ORDER BY c.id DESC LIMIT 1")[0]
+CID, RA, FWD_LOG = row[0], row[1], row[2]
+print("PRECOND: contact_id=%s reverse_alias=%s forward_email_log_id=%s" % (CID, RA, FWD_LOG))
+print()
+
+print("### STEP2 [successful reply] john@wick.com -> %s" % RA)
+rep = ("From: John Wick <john@wick.com>\r\nTo: " + RA + "\r\n"
+       "Subject: Re: Blitzy docfix precondition forward\r\nMessage-ID: <blitzy-docfix-reply-2@wick.com>\r\n"
+       "Content-Type: text/plain; charset=us-ascii\r\n\r\nJohn replying via reverse-alias.\r\n")
+print(send("john@wick.com", RA, rep))
+print("REPLY email_log row:", q("SELECT id, alias_id, contact_id, is_reply, message_id "
+      "FROM email_log WHERE message_id='<blitzy-docfix-reply-2@wick.com>'"))
+print()
+
+print("### STEP3 [E213] normal msg to forward VERP bounce+%s+@sl.local" % FWD_LOG)
+e213 = ("From: Someone <someone@external.example>\r\nTo: bounce+%s+@sl.local\r\n"
+        "Subject: not a bounce\r\nMessage-ID: <blitzy-e213b@external.example>\r\n"
+        "Content-Type: text/plain; charset=us-ascii\r\n\r\nbody\r\n") % FWD_LOG
+print(send("someone@external.example", "bounce+%s+@sl.local" % FWD_LOG, e213))
+print()
+
+print("### STEP4 [E524] reverse-alias rep@sl.local as MAIL FROM in forward phase -> e0@sl.local")
+e524 = ("From: Reverse Alias <rep@sl.local>\r\nTo: e0@sl.local\r\n"
+        "Subject: reverse alias as sender\r\nMessage-ID: <blitzy-e524b@sl.local>\r\n"
+        "Content-Type: text/plain; charset=us-ascii\r\n\r\nbody\r\n")
+print(send("rep@sl.local", "e0@sl.local", e524))
+print()
+
+print("### STEP5 [E404] folded overlong Message-ID (>1024) -> e1@sl.local")
+folded = "<blitzy-e404b" + ("".join("\r\n " + ("z"*200) for _ in range(7))) + "@example.org>"
+raw404 = ("From: Sender <sender@external.example>\r\nTo: e1@sl.local\r\n"
+          "Subject: overlong folded message id\r\nMessage-ID: " + folded + "\r\n"
+          "Content-Type: text/plain; charset=us-ascii\r\n\r\nbody\r\n")
+print("parsed Message-ID length =", len(email.message_from_string(raw404)["Message-ID"]))
+print(send("sender@external.example", "e1@sl.local", raw404))
+print("ROLLBACK check: email_log rows with overlong z Message-ID =",
+      q("SELECT count(*) FROM email_log WHERE message_id LIKE '%%zzzz%%'")[0][0])
+print()
+
+print("### STEP6 [recovery] normal msg immediately after E404 (same handler, no restart)")
+rec = ("From: Sender3 <sender3@external.example>\r\nTo: e1@sl.local\r\n"
+       "Subject: recovery after E404\r\nMessage-ID: <blitzy-recovery-b@external.example>\r\n"
+       "Content-Type: text/plain; charset=us-ascii\r\n\r\nrecovery body\r\n")
+print(send("sender3@external.example", "e1@sl.local", rec))
+print("RECOVERY email_log row:", q("SELECT id, alias_id, contact_id, is_reply "
+      "FROM email_log WHERE message_id='<blitzy-recovery-b@external.example>'"))
+PY
+### STEP1 forward external.sender@example.org -> e1@sl.local (mint precondition contact+forward-log)
+MAIL -> 250 OK | RCPT -> 250 OK | POST-DATA -> 250 Message accepted for delivery
+PRECOND: contact_id=42 reverse_alias=external_sender_at_example_org_fbrcpf@sl.local forward_email_log_id=53
+
+### STEP2 [successful reply] john@wick.com -> external_sender_at_example_org_fbrcpf@sl.local
+MAIL -> 250 OK | RCPT -> 250 OK | POST-DATA -> 250 Message accepted for delivery
+REPLY email_log row: [(54, 5, 42, True, '<blitzy-docfix-reply-2@wick.com>')]
+
+### STEP3 [E213] normal msg to forward VERP bounce+53+@sl.local
+MAIL -> 250 OK | RCPT -> 250 OK | POST-DATA -> 250 SL E213 Unknown email ignored
+
+### STEP4 [E524] reverse-alias rep@sl.local as MAIL FROM in forward phase -> e0@sl.local
+MAIL -> 250 OK | RCPT -> 250 OK | POST-DATA -> 550 SL E524 Wrong use of reverse-alias
+
+### STEP5 [E404] folded overlong Message-ID (>1024) -> e1@sl.local
+parsed Message-ID length = 1447
+MAIL -> 250 OK | RCPT -> 250 OK | POST-DATA -> 421 SL E404 Unexpected error - Retry later
+ROLLBACK check: email_log rows with overlong z Message-ID = 0
+
+### STEP6 [recovery] normal msg immediately after E404 (same handler, no restart)
+MAIL -> 250 OK | RCPT -> 250 OK | POST-DATA -> 250 Message accepted for delivery
+RECOVERY email_log row: [(55, 5, 46, False)]
+```
+
+> **Note on the `E404` reproduction.** The overlong `Message-ID` must be **header-folded** across continuation lines. A single physical line longer than ~1000 bytes is rejected by `aiosmtpd` at the protocol layer with `500 Line too long (see RFC5321 4.5.3.1.6)` *before* the handler runs; folding keeps each physical line short while the unfolded value (here `1447` chars) still exceeds the `email_log.message_id` column's `character varying(1024)` limit, so the failure occurs where intended — on the `INSERT` inside `_handle()`.
+
+The handler log confirms each outcome (salient lines, correlated by the per-message `message_id`; note the handler pid is **`15828`** on every line — the same process handled all six messages, so the `E404` neither crashed nor restarted it):
+
+```
+# STEP2 successful reply (message_id e8c474c2-…) — reply phase, EmailLog 54 (is_reply=t), rewrite + outbound send, Finish 250
+2026-07-14 15:14:01,822 - SL - INFO - 15828 - "/app/email_handler.py:2343" - _handle() - e8c474c2-c09c-4326-b0a1-fbf628ee69e5 - New message, mail from john@wick.com, rctp tos ['external_sender_at_example_org_fbrcpf@sl.local']
+2026-07-14 15:14:01,827 - SL - DEBUG - 15828 - "/app/email_handler.py:2196" - handle() - e8c474c2-c09c-4326-b0a1-fbf628ee69e5 - Reply phase john@wick.com(John Wick <john@wick.com>) -> external_sender_at_example_org_fbrcpf@sl.local
+2026-07-14 15:14:01,832 - SL - DEBUG - 15828 - "/app/email_handler.py:1051" - handle_reply() - e8c474c2-c09c-4326-b0a1-fbf628ee69e5 - Create <EmailLog 54> for <Contact 42 external.sender@example.org 5>, <User 1 John Wick john@wick.com>, <Mailbox 1 john@wick.com>
+2026-07-14 15:14:01,837 - SL - DEBUG - 15828 - "/app/email_handler.py:1171" - handle_reply() - e8c474c2-c09c-4326-b0a1-fbf628ee69e5 - From header is e1@sl.local
+2026-07-14 15:14:01,846 - SL - DEBUG - 15828 - "/app/email_handler.py:1212" - handle_reply() - e8c474c2-c09c-4326-b0a1-fbf628ee69e5 - send email from e1@sl.local to external.sender@example.org, mail_options:[],rcpt_options:[]
+2026-07-14 15:14:01,846 - SL - DEBUG - 15828 - "/app/app/mail_sender.py:131" - send() - e8c474c2-c09c-4326-b0a1-fbf628ee69e5 - send email with subject 'Re: Blitzy docfix precondition forward', from 'e1@sl.local' to 'External Sender <external.sender@example.org>'
+2026-07-14 15:14:01,848 - SL - INFO - 15828 - "/app/email_handler.py:2367" - _handle() - e8c474c2-c09c-4326-b0a1-fbf628ee69e5 - Finish mail_from john@wick.com, rcpt_tos ['external_sender_at_example_org_fbrcpf@sl.local'], takes 0.025511980056762695 seconds with return code '250 Message accepted for delivery'<<===
+
+# STEP3 E213 (message_id b5278055-…) — VERPForward caught in handle_DATA (no Finish line)
+2026-07-14 15:14:01,864 - SL - INFO - 15828 - "/app/email_handler.py:2343" - _handle() - b5278055-2381-4711-be5a-8d5f64d627a5 - New message, mail from someone@external.example, rctp tos ['bounce+53+@sl.local']
+2026-07-14 15:14:01,869 - SL - WARNING - 15828 - "/app/email_handler.py:2309" - handle_DATA() - b5278055-2381-4711-be5a-8d5f64d627a5 - email handling fail with error:VERPForward  mail_from:someone@external.example, rcpt_tos:['bounce+53+@sl.local'], header_from:Someone <someone@external.example>, header_to:bounce+53+@sl.local
+
+# STEP4 E524 (message_id d46b6096-…) — forward phase sees a reverse-alias sender; CannotCreateContactForReverseAlias caught in handle_DATA (no Finish line)
+2026-07-14 15:14:01,871 - SL - INFO - 15828 - "/app/email_handler.py:2343" - _handle() - d46b6096-b4da-4d13-9214-07716c8db671 - New message, mail from rep@sl.local, rctp tos ['e0@sl.local']
+2026-07-14 15:14:01,881 - SL - DEBUG - 15828 - "/app/email_handler.py:2202" - handle() - d46b6096-b4da-4d13-9214-07716c8db671 - Forward phase rep@sl.local(Reverse Alias <rep@sl.local>) -> e0@sl.local
+2026-07-14 15:14:01,887 - SL - DEBUG - 15828 - "/app/email_handler.py:580" - handle_forward() - d46b6096-b4da-4d13-9214-07716c8db671 - Create or get contact for from_header:Reverse Alias <rep@sl.local>
+2026-07-14 15:14:01,897 - SL - WARNING - 15828 - "/app/email_handler.py:2298" - handle_DATA() - d46b6096-b4da-4d13-9214-07716c8db671 - Probably due to reverse-alias used in the forward phase, error:CannotCreateContactForReverseAlias <Contact 1 hey@google.com 2> mail_from:rep@sl.local, rcpt_tos:['e0@sl.local'], header_from:Reverse Alias <rep@sl.local>, header_to:e0@sl.local
+
+# STEP5 E404 (message_id e023f08c-…) — generic Exception (DB truncation) caught in handle_DATA at L2320 (no Finish line; row rolled back)
+2026-07-14 15:14:01,900 - SL - INFO - 15828 - "/app/email_handler.py:2343" - _handle() - e023f08c-dca1-4842-a3b9-c0481bf50ff5 - New message, mail from sender@external.example, rctp tos ['e1@sl.local']
+2026-07-14 15:14:01,920 - SL - ERROR - 15828 - "/app/email_handler.py:2320" - handle_DATA() - e023f08c-dca1-4842-a3b9-c0481bf50ff5 - email handling fail with error:(psycopg2.errors.StringDataRightTruncation) value too long for type character varying(1024)
+    (… Python traceback …)
+psycopg2.errors.StringDataRightTruncation: value too long for type character varying(1024)
+sqlalchemy.exc.DataError: (psycopg2.errors.StringDataRightTruncation) value too long for type character varying(1024)
+
+# STEP6 recovery (message_id 0d3a020b-…) — same process, EmailLog 55 created, Finish 250
+2026-07-14 15:14:01,937 - SL - INFO - 15828 - "/app/email_handler.py:2343" - _handle() - 0d3a020b-965f-4555-9d86-d19b5683b604 - New message, mail from sender3@external.example, rctp tos ['e1@sl.local']
+2026-07-14 15:14:01,974 - SL - DEBUG - 15828 - "/app/email_handler.py:688" - forward_email_to_mailbox() - 0d3a020b-965f-4555-9d86-d19b5683b604 - Forward <Contact 46 sender3@external.example 5> -> <Alias 5 e1@sl.local> -> <Mailbox 1 john@wick.com>
+2026-07-14 15:14:01,976 - SL - DEBUG - 15828 - "/app/email_handler.py:740" - forward_email_to_mailbox() - 0d3a020b-965f-4555-9d86-d19b5683b604 - Create <EmailLog 55> for <Contact 46 sender3@external.example 5>, <User 1 John Wick john@wick.com>, <Mailbox 1 john@wick.com>
+2026-07-14 15:14:01,981 - SL - INFO - 15828 - "/app/email_handler.py:2367" - _handle() - 0d3a020b-965f-4555-9d86-d19b5683b604 - Finish mail_from sender3@external.example, rcpt_tos ['e1@sl.local'], takes 0.04385852813720703 seconds with return code '250 Message accepted for delivery'<<===
+```
+
+Interpreting each, against the exception map in `handle_DATA`:
+
+- **Successful reply → `E200` (`250 Message accepted for delivery`).** The recipient `external_sender_at_example_org_fbrcpf@sl.local` is a reverse-alias, so the **reply** path runs (`email_handler.py:L2196`); `handle_reply()` creates a **reply** `<EmailLog 54>` (`is_reply=t`, `email_handler.py:L1051`), rewrites the `From:` to the alias `e1@sl.local` (`L1171`), and "sends" the message out to the real contact (`L1212`; the actual send is logged, not delivered, because `NOT_SEND_EMAIL=true`). Success is signalled by the same `2xx` string as a forward; the `is_reply=t` flag is what distinguishes a reply from a forward at the data layer (`email_log` row `(54, 5, 42, True, …)`).
+- **`E213` (`250 SL E213 Unknown email ignored`).** A *non-bounce* message addressed to a **forward VERP** address `bounce+53+@sl.local` raises `VERPForward` (the referenced `<EmailLog 53>` is not a bounce), which `handle_DATA` maps to `E213` (`email_handler.py:L2308-L2318`). Because the exception is caught in `handle_DATA` (outside `_handle()`), the terminal log line is the `LOG.w` at `email_handler.py:L2309` — there is **no** `Finish …<<===` line.
+- **`E524` (`550 SL E524 Wrong use of reverse-alias`).** A reverse-alias (`rep@sl.local`, the seed `<Contact 1>`'s reverse-alias) used as the **`MAIL FROM`** enters the forward phase; trying to create a contact *for a reverse-alias* raises `CannotCreateContactForReverseAlias`, mapped to `E524` (`email_handler.py:L2297-L2307`). Terminal line is the `LOG.w` at `email_handler.py:L2298`; again no `Finish` line.
+- **`E404` (`421 SL E404 Unexpected error - Retry later`).** The overlong `Message-ID` overflows `email_log.message_id` (`character varying(1024)`) on `INSERT`, raising `sqlalchemy.exc.DataError`; the generic `except Exception` maps it to `E404` — a **4xx** *retry* code, not a 5xx (`email_handler.py:L2319-L2332`). Terminal line is the `LOG.e` at `email_handler.py:L2320`; the transaction is rolled back, so **no** `email_log` row persists (the `ROLLBACK check` returns `0`).
+- **Recovery.** The very next message (STEP6) is processed normally by the **same** handler process (pid `15828`), creating `<EmailLog 55>` and returning `E200` — demonstrating that a per-message `DataError` does not take the handler down (each message runs in its own `create_light_app().app_context()`, so the failed transaction is isolated).
+
+All four codes (`E200` for the reply, `E213`, `E524`, `E404`) and the recovery are therefore **observed at runtime**, not inferred. The temporary rows they created (`<EmailLog 53/54/55>`, `<Contact 46>`) were removed during cleanup ([§7](#7-cleanup--the-repository-and-database-are-left-unchanged)).
+
 
 ### 6.6 Secondary: alias auto-creation (directory success) and domain prerequisites
 
@@ -1454,11 +1643,88 @@ $ docker exec sl-postgres psql -U myuser -d simplelogin -c "SELECT id, email, us
 
 Alias `16` (and its contact `3` and email-log `4`) are removed during the pristine-state restoration in [§7](#7-cleanup--the-repository-and-database-are-left-unchanged).
 
+**Observed — catch-all domain auto-creation (the second `try_auto_create` branch).** The `try_auto_create_via_domain()` branch (`app/alias_utils.py:L274`) that *declined* for the `sl.local` directory case above **does** fire for a **verified custom domain whose catch-all is enabled**. The seed ships `old.com` verified but with `catch_all=f` ([§2.6](#26-what-the-seed-actually-creates-the-real-baseline)), so this behavior is not available *by default* — but enabling it is a **normal dashboard action** (toggling "Catch-all" on the domain's settings page), **not** a source change. This was therefore exercised end-to-end against the running stack: catch-all was enabled through the real dashboard endpoint, a message was delivered to a brand-new address on `old.com`, and catch-all was then toggled back off — all in one canonical run (web UI over HTTP + SMTP delivery + `psycopg2` read-back; email-handler pid `15828`):
+
+```
+$ docker exec -i sl-app ./venv/bin/python - <<'PY'
+import re, smtplib, psycopg2, requests
+BASE = "http://127.0.0.1:7777"
+DB = "host=sl-postgres dbname=simplelogin user=myuser password=mypassword"
+TARGET = "qa-catchall-probe-8399b@old.com"
+
+def q(sql):
+    c = psycopg2.connect(DB); cur = c.cursor(); cur.execute(sql); rows = cur.fetchall(); c.close(); return rows
+def csrf(h):
+    m = re.search(r'name="csrf_token"[^>]*value="([^"]+)"', h); return m.group(1) if m else None
+def toggle(sess):
+    r = sess.get(BASE + "/auth/login", timeout=15); tok = csrf(r.text)
+    r = sess.post(BASE + "/auth/login", data={"csrf_token": tok, "email": "john@wick.com", "password": "password"}, allow_redirects=False, timeout=15)
+    login = (r.status_code, r.headers.get("Location"))
+    r = sess.get(BASE + "/dashboard/domains/2/info", timeout=15); tok = csrf(r.text)
+    r = sess.post(BASE + "/dashboard/domains/2/info", data={"csrf_token": tok, "form-name": "switch-catch-all"}, allow_redirects=False, timeout=15)
+    return login, (r.status_code, r.headers.get("Location"))
+
+print("catch_all BEFORE:", q("SELECT catch_all FROM custom_domain WHERE id=2")[0][0])
+login, tog = toggle(requests.Session())
+print("POST /auth/login ->", login[0], "Location:", login[1])
+print("POST switch-catch-all ->", tog[0], "Location:", tog[1])
+print("catch_all AFTER toggle-on:", q("SELECT catch_all FROM custom_domain WHERE id=2")[0][0])
+print()
+print("### SMTP to brand-new address on the catch-all domain")
+raw = ("From: External Sender <catchall.sender@example.org>\r\nTo: " + TARGET + "\r\n"
+       "Subject: Blitzy catch-all auto-create probe\r\nMessage-ID: <blitzy-catchall-2@example.org>\r\n"
+       "Content-Type: text/plain; charset=us-ascii\r\n\r\nMail to a brand-new address on a catch-all domain.\r\n")
+s = smtplib.SMTP("127.0.0.1", 20381, timeout=30); s.ehlo("blitzy-docfix.local")
+cm, rm = s.mail("catchall.sender@example.org"); cr, rr = s.rcpt(TARGET); cd, rd = s.data(raw); s.quit()
+print("MAIL -> %s %s | RCPT -> %s %s | POST-DATA -> %s %s" % (cm, rm.decode(), cr, rr.decode(), cd, rd.decode()))
+print()
+print("### auto-created rows")
+print("alias:", q("SELECT id, email, note FROM alias WHERE email='%s'" % TARGET))
+print("contact:", q("SELECT id, alias_id, website_email FROM contact WHERE website_email='catchall.sender@example.org' ORDER BY id DESC LIMIT 1"))
+print("email_log:", q("SELECT id, alias_id, contact_id, is_reply FROM email_log WHERE message_id='<blitzy-catchall-2@example.org>'"))
+print()
+print("### restore catch_all -> f")
+_, tog2 = toggle(requests.Session())
+print("POST switch-catch-all (restore) ->", tog2[0], "Location:", tog2[1])
+print("catch_all AFTER restore:", q("SELECT catch_all FROM custom_domain WHERE id=2")[0][0])
+PY
+catch_all BEFORE: False
+POST /auth/login -> 302 Location: http://127.0.0.1:7777/dashboard/
+POST switch-catch-all -> 302 Location: http://127.0.0.1:7777/dashboard/domains/2/info
+catch_all AFTER toggle-on: True
+
+### SMTP to brand-new address on the catch-all domain
+MAIL -> 250 OK | RCPT -> 250 OK | POST-DATA -> 250 Message accepted for delivery
+
+### auto-created rows
+alias: [(67, 'qa-catchall-probe-8399b@old.com', 'Created by catchall option')]
+contact: [(47, 67, 'catchall.sender@example.org')]
+email_log: [(56, 67, 47, False)]
+
+### restore catch_all -> f
+POST switch-catch-all (restore) -> 302 Location: http://127.0.0.1:7777/dashboard/domains/2/info
+catch_all AFTER restore: False
+```
+
+The handler log confirms the catch-all creation path (correlated by `message_id 30ace68d-…`; the alias is created, then a contact, then the forward proceeds exactly as a normal forward):
+
+```
+2026-07-14 15:18:47,855 - SL - INFO - 15828 - "/app/email_handler.py:2343" - _handle() - 30ace68d-2c79-463c-9dc1-15ca4bfe9044 - New message, mail from catchall.sender@example.org, rctp tos ['qa-catchall-probe-8399b@old.com']
+2026-07-14 15:18:47,867 - SL - DEBUG - 15828 - "/app/email_handler.py:545" - handle_forward() - 30ace68d-2c79-463c-9dc1-15ca4bfe9044 - alias qa-catchall-probe-8399b@old.com not exist. Try to see if it can be created on the fly
+2026-07-14 15:18:47,872 - SL - DEBUG - 15828 - "/app/app/alias_utils.py:140" - check_if_alias_can_be_auto_created_for_custom_domain() - 30ace68d-2c79-463c-9dc1-15ca4bfe9044 - Create alias via catchall
+2026-07-14 15:18:47,873 - SL - DEBUG - 15828 - "/app/app/alias_utils.py:299" - try_auto_create_via_domain() - 30ace68d-2c79-463c-9dc1-15ca4bfe9044 - create alias qa-catchall-probe-8399b@old.com for domain <Custom Domain 2 old.com>
+2026-07-14 15:18:47,899 - SL - DEBUG - 15828 - "/app/app/contact_utils.py:110" - create_contact() - 30ace68d-2c79-463c-9dc1-15ca4bfe9044 - Created contact <Contact 47 catchall.sender@example.org 67> for alias <Alias 67 qa-catchall-probe-8399b@old.com> with email catchall.sender@example.org invalid_email=False
+2026-07-14 15:18:47,908 - SL - DEBUG - 15828 - "/app/email_handler.py:740" - forward_email_to_mailbox() - 30ace68d-2c79-463c-9dc1-15ca4bfe9044 - Create <EmailLog 56> for <Contact 47 catchall.sender@example.org 67>, <User 1 John Wick john@wick.com>, <Mailbox 1 john@wick.com>
+2026-07-14 15:18:47,913 - SL - INFO - 15828 - "/app/email_handler.py:2367" - _handle() - 30ace68d-2c79-463c-9dc1-15ca4bfe9044 - Finish mail_from catchall.sender@example.org, rcpt_tos ['qa-catchall-probe-8399b@old.com'], takes 0.057846784591674805 seconds with return code '250 Message accepted for delivery'<<===
+```
+
+So catch-all auto-creation **is** feasible and was **observed**: the decisive difference from the directory path is the branch taken inside `try_auto_create()` (`try_auto_create_via_domain()` for a catch-all custom domain, `app/alias_utils.py:L274,L299`, vs `try_auto_create_directory()` for a directory). The newly created `<Alias 67>` carries the note **`Created by catchall option`** (set at `app/alias_utils.py:L285`), distinguishing it from the directory path's `Created by directory <name>` note. The toggle is idempotent for cleanup — the same run enabled catch-all and then disabled it again (`catch_all` returns to `False`), and the temporary rows (`<Alias 67>`, `<Contact 47>`, `<EmailLog 56>`) are removed during cleanup ([§7](#7-cleanup--the-repository-and-database-are-left-unchanged)).
+
 ---
 
 ## 7. Cleanup — the repository and database are left unchanged
 
-The investigation is read-only: **no existing repository file is modified, added to, or deleted** — the only committed artifact is this document (`blitzy/documentation/app_2cd6ee777f8c.md`). Every account, alias, contact, email-log, job, and audit/metric mutation created while exercising the flows above is removed here, restoring the exact pristine post-seed baseline captured in [§2.6](#26-what-the-seed-actually-creates-the-real-baseline). All temporary observation scripts live **outside** the repository (host `/tmp/blitzy_investigation/`, container `/tmp/sl_run/`) and are never tracked or committed.
+The investigation is read-only: **no existing repository file is modified, added to, or deleted** — the only committed artifact is this document (`blitzy/documentation/app_2cd6ee777f8c.md`). Every account, alias, contact, and email-log created while exercising the flows above is removed here; the **live entity tables — and the mutable `daily_metric` counter — are restored exactly to the seed baseline** of [§2.6](#26-what-the-seed-actually-creates-the-real-baseline), while the **append-only** audit/bookkeeping tables (`deleted_alias`, `alias_audit_log`, `user_audit_log`, `job`, and `sent_alert`) retain monotonic residual — a database that is pristine in *every* table is produced only by re-running the §2.5 reset, as detailed and quantified in [§7.2](#72-final-database-state-after-cleanup). All temporary observation scripts live **outside** the repository (under host and container `/tmp/`) and are never tracked or committed; they are inventoried and removed in [§7.3](#73-source-tree-untouched).
 
 ### 7.1 What was created, and how it was removed
 
@@ -1498,7 +1764,7 @@ UNION ALL SELECT 'user_audit_log id BETWEEN 1 AND 3', count(*) FROM user_audit_l
 Run immediately before the transaction, its per-target counts were `3, 2, 6, 4, 1, 7, 3` — matching the `DELETE` row-counts below exactly. Re-running the identical preflight *after* cleanup returns zero for every target, confirming the transaction affected exactly its intended scope and nothing outside it:
 
 ```
-$ docker exec -i sl-postgres psql -U myuser -d simplelogin < q6_preflight.sql
+$ docker exec -i sl-postgres psql -U myuser -d simplelogin < /tmp/blitzy_investigation/q6_preflight.sql
               target               | count
 -----------------------------------+-------
  email_log id IN (2,3,4)           |     0
@@ -1552,60 +1818,63 @@ UPDATE 1
 COMMIT
 ```
 
-### 7.2 Database restored to the pristine post-seed baseline
+### 7.2 Final database state after cleanup
 
-The definitive proof of a faithful cleanup is that the post-cleanup database is **byte-for-byte equal** to the pristine post-seed baseline of [§2.6](#26-what-the-seed-actually-creates-the-real-baseline) — same counts, same `daily_metric` values, same max ids, same surviving rows. First, the 14-table counts and metric values re-run after cleanup:
+Cleanup is proven at two levels, and the document is explicit that they behave differently.
 
-```
-$ docker exec -i sl-postgres psql -U myuser -d simplelogin < baseline_query.sql
-       tbl       | count
------------------+-------
- activation_code |     0
- alias           |    11
- alias_audit_log |    11
- contact         |     1
- custom_domain   |     2
- daily_metric    |     1
- deleted_alias   |     0
- directory       |     2
- email_log       |     1
- job             |     0
- mailbox         |     4
- metric2         |     0
- user_audit_log  |     0
- users           |     2
-(14 rows)
-
-$ docker exec sl-postgres psql -U myuser -d simplelogin -c "SELECT date, nb_new_web_non_proton_user, nb_alias FROM daily_metric;"
-    date    | nb_new_web_non_proton_user | nb_alias
-------------+----------------------------+----------
- 2026-07-13 |                          0 |       11
-(1 row)
-```
-
-An automated `diff` of the pristine baseline counts against the post-cleanup counts confirms they are identical for all 14 tables:
+**(a) The live entity tables are restored *exactly* to the seed baseline.** The rows created while exercising the flows — the signup/alias/forward rows of §5–§6.6, the exception-code and successful-reply probes of §6.5, and the catch-all aliases of §6.6 — are deleted in FK-safe order (children before parents; every child of `alias`/`contact`/`email_log` is `ON DELETE CASCADE`, so no orphan can survive) inside a single transaction. The before/after counts show `alias`, `contact`, and `email_log` returning to their exact seed counts and max ids, with the two seed users untouched:
 
 ```
-$ diff /tmp/blitzy_investigation/baseline_counts_expected.txt /tmp/blitzy_investigation/post_cleanup_counts.txt \
-    && echo "IDENTICAL — post-cleanup == pristine baseline for all 14 tables"
-IDENTICAL — post-cleanup == pristine baseline for all 14 tables
+$ docker exec -i sl-postgres psql -U myuser -d simplelogin <<'SQL'
+\pset border 1
+\echo ==== BEFORE (live entity tables) ====
+SELECT 'email_log' AS t, count(*) AS rows, max(id) AS max_id FROM email_log
+UNION ALL SELECT 'contact', count(*), max(id) FROM contact
+UNION ALL SELECT 'alias', count(*), max(id) FROM alias
+UNION ALL SELECT 'users', count(*), max(id) FROM users ORDER BY t;
+\echo ==== DELETE reproduction rows (FK-safe order: email_log -> contact -> alias) ====
+BEGIN;
+DELETE FROM email_log WHERE id BETWEEN 48 AND 56;
+DELETE FROM contact   WHERE id BETWEEN 42 AND 47;
+DELETE FROM alias     WHERE id IN (66,67);
+COMMIT;
+\echo ==== AFTER (live entity tables == seed baseline) ====
+SELECT 'email_log' AS t, count(*) AS rows, max(id) AS max_id FROM email_log
+UNION ALL SELECT 'contact', count(*), max(id) FROM contact
+UNION ALL SELECT 'alias', count(*), max(id) FROM alias
+UNION ALL SELECT 'users', count(*), max(id) FROM users ORDER BY t;
+SQL
+Border style is 1.
+==== BEFORE (live entity tables) ====
+     t     | rows | max_id
+-----------+------+--------
+ alias     |   13 |     67
+ contact   |    7 |     47
+ email_log |   10 |     56
+ users     |    2 |      2
+(4 rows)
+
+==== DELETE reproduction rows (FK-safe order: email_log -> contact -> alias) ====
+BEGIN
+DELETE 9
+DELETE 6
+DELETE 2
+COMMIT
+==== AFTER (live entity tables == seed baseline) ====
+     t     | rows | max_id
+-----------+------+--------
+ alias     |   11 |     11
+ contact   |    1 |      1
+ email_log |    1 |      1
+ users     |    2 |      2
+(4 rows)
 ```
 
-Counts alone could coincide while identities differ, so the max id of every table that grew during the investigation is checked back to its baseline value, and the surviving rows are confirmed to be exactly the seed rows:
+The `DELETE 9 / 6 / 2` counts are the nine reproduction `email_log` rows, six `contact` rows, and two catch-all `alias` rows; the `AFTER` block shows the three tables back at their seed counts (`alias` 11, `contact` 1, `email_log` 1) and max ids, with `users` unchanged at 2. Deleting via direct SQL (rather than the application's `delete_alias()`) intentionally does **not** write new `deleted_alias` trash rows.
+
+The surviving rows are confirmed to be exactly the seed rows — the two seed users and the eleven seed aliases (including the seeded `e1@sl.local`, id `5`) — and `old.com`'s `catch_all` flag is back at its seed value `f` (it was toggled on, then off, in §6.6):
 
 ```
-$ docker exec -i sl-postgres psql -U myuser -d simplelogin < q6_maxids.sql
-        t        | max_id
------------------+--------
- alias           |     11
- alias_audit_log |     11
- contact         |      1
- email_log       |      1
- job             |      0
- user_audit_log  |      0
- users           |      2
-(7 rows)
-
 $ docker exec sl-postgres psql -U myuser -d simplelogin -c "SELECT id, email FROM users ORDER BY id;"
  id |          email
 ----+-------------------------
@@ -1628,24 +1897,63 @@ $ docker exec sl-postgres psql -U myuser -d simplelogin -c "SELECT id, email FRO
  10 | john@example.com
  11 | wick@example.com
 (11 rows)
+
+$ docker exec sl-postgres psql -U myuser -d simplelogin -c "SELECT id, domain, catch_all FROM custom_domain ORDER BY id;"
+ id | domain  | catch_all
+----+---------+-----------
+  1 | ab.cd   | f
+  2 | old.com | f
+(2 rows)
 ```
 
-The test account (`users` id `3`) is gone; the two seed users remain. The five test aliases (ids `12`–`16`) are gone; the eleven seed aliases remain, including the seeded `e1@sl.local` (id `5`). A final targeted probe confirms **zero** investigation rows survive anywhere:
+The test account and every test alias are gone; the two seed users and eleven seed aliases remain, and both custom domains are back at `catch_all=f`. A final targeted probe confirms **zero** reproduction rows survive in the live entity tables:
 
 ```
-$ docker exec -i sl-postgres psql -U myuser -d simplelogin < q6_probe.sql
+$ docker exec sl-postgres psql -U myuser -d simplelogin -c "
+SELECT 'users id>2 (test accts)'      AS probe, count(*) FROM users     WHERE id > 2
+UNION ALL SELECT 'alias id>11 (test aliases)',   count(*) FROM alias     WHERE id > 11
+UNION ALL SELECT 'contact id>1 (test contacts)', count(*) FROM contact   WHERE id > 1
+UNION ALL SELECT 'email_log id>1 (test logs)',   count(*) FROM email_log WHERE id > 1;"
             probe             | count
 ------------------------------+-------
- users id=3 (test acct)       |     0
+ users id>2 (test accts)      |     0
  alias id>11 (test aliases)   |     0
  contact id>1 (test contacts) |     0
  email_log id>1 (test logs)   |     0
- job (baseline 0)             |     0
- deleted_alias (baseline 0)   |     0
- alias_audit_log id>11        |     0
- user_audit_log (baseline 0)  |     0
-(8 rows)
+(4 rows)
 ```
+
+The one **live counter** table, `daily_metric`, is likewise returned to its §2.6 baseline. Unlike the append-only tables in (b), `daily_metric` is *mutable* — the application both increments it (`DailyMetric.get_or_create_today_metric().nb_alias += 1` on every `Alias.create()`, `app/models.py:L1661`) and decrements it when an alias is deleted — so its per-day counter row is genuinely restorable by the same `UPDATE daily_metric SET nb_new_web_non_proton_user = 0, nb_alias = 11 WHERE id = 1` used in the §7.1 first-pass cleanup. Because the later §6.5/§6.6 reproductions re-touched the counter *after* that first-pass restore (and, having run past midnight, added a second per-day row for `2026-07-14`), the restore was re-applied as the final cleanup step — the `id 1` counters reset to the seed `(0, 11)` and the extra `2026-07-14` row deleted, in one transaction — leaving exactly the single baseline row §2.6 captured:
+
+```
+$ docker exec sl-postgres psql -U myuser -d simplelogin -c "SELECT id, date, nb_new_web_non_proton_user, nb_alias FROM daily_metric ORDER BY id;"
+ id |    date    | nb_new_web_non_proton_user | nb_alias
+----+------------+----------------------------+----------
+  1 | 2026-07-13 |                          0 |       11
+(1 row)
+```
+
+**(b) The append-only audit/bookkeeping tables retain monotonic residual — by design, not a cleanup failure.** `deleted_alias`, `alias_audit_log`, `user_audit_log`, `job`, and `sent_alert` are append-only in normal operation: the application only ever *inserts* into them, and PostgreSQL sequences never roll back, so deleting the entity rows does **not** reduce them. (`sent_alert` — an alert-deduplication log the handler writes whenever it sends an alert such as `reverse_alias_unknown_mailbox` or `bounce`, so it does not re-notify — is not one of the fourteen tables in the §2.6 baseline query above, but it is the same insert-only kind and is shown alongside the other four below for completeness. The *application* never prunes it; the investigation's scoped cleanups did remove the alert rows a given reproduction generated where they could be pinned to that run — §7.4, for example, deletes `sent_alert 6`/`7` — so the six rows that remain (ids `1` through `5`, which predate the §7.4 bounce checkpoint, plus id `10` from the later §6.6 catch-all run) are alerts whose individual rows were not separately targeted.) They therefore hold the cumulative rows written across the later reproductions (§6.5 exception-code, §6.6 catch-all, §7.4 bounce). The §7.1 first-pass and §7.4 bounce cleanups each removed the bookkeeping rows they could pin to their own run — the §7.4 transaction even deletes its `sent_alert 6`/`7` and `user_audit_log 15` — but rows that no cleanup targeted remain: `alias_audit_log` is pruned by no cleanup at all, and the audit and alert rows of runs whose bookkeeping was not individually enumerated stay behind. Combined with PostgreSQL sequence advancement that never rolls back, their counts are therefore *higher* than the fresh-reset pristine of §2.6:
+
+```
+$ docker exec sl-postgres psql -U myuser -d simplelogin -c "
+SELECT t, count, max_id FROM (
+  SELECT 'deleted_alias' t, count(*) count, max(id) max_id FROM deleted_alias
+  UNION ALL SELECT 'alias_audit_log', count(*), max(id) FROM alias_audit_log
+  UNION ALL SELECT 'user_audit_log', count(*), max(id) FROM user_audit_log
+  UNION ALL SELECT 'job', count(*), max(id) FROM job
+  UNION ALL SELECT 'sent_alert', count(*), max(id) FROM sent_alert) s ORDER BY t;"
+        t        | count | max_id
+-----------------+-------+--------
+ alias_audit_log |    48 |    121
+ deleted_alias   |    12 |     21
+ job             |     2 |     78
+ sent_alert      |     6 |     10
+ user_audit_log  |    13 |     56
+(5 rows)
+```
+
+This is the honest final state. The **live** tables that hold user-facing state (`users`, `alias`, `contact`, `email_log`, the mutable `daily_metric` counter, and the config tables `custom_domain`/`directory`/`mailbox`) are back at the seed values of §2.6; the **append-only** tables above (`deleted_alias`, `alias_audit_log`, `user_audit_log`, `job`, and `sent_alert`) are not, and cannot be by row-deletion alone. A database that is pristine in *every* table (the `deleted_alias`=0, `alias_audit_log`=11, `user_audit_log`=0, `job`=0 of §2.6) is produced only by re-running the canonical reset of [§2.5](#25-bring-the-database-to-head-and-seed-it). The investigation deliberately restores the live tables by scoped deletion rather than by that destructive reset, because a reset would regenerate *different* random-word alias local-parts — the seed's `word_test646` (id `2`) and `word568` (id `9`) come from `random_words()` (`app/utils.py:L29`), so a reset would invalidate every alias identifier quoted throughout this document. *(That a reset regenerates different local-parts is [INFERRED] from `random_words()` drawing on the unseeded `random` module at `app/utils.py:L29`; it was not re-observed, precisely because the investigation avoided the destructive reset.)*
 
 ### 7.3 Source tree untouched
 
@@ -1684,12 +1992,45 @@ $ git ls-files | grep -E 'blitzy_investigation|sl_run|q[0-9]_|blitzy_adhoc' || e
 (none tracked — clean)
 ```
 
+The helper scripts themselves are then deleted from `/tmp` on both the container and the host, and their removal is confirmed — the investigation leaves no script behind on either filesystem:
+
+```
+$ docker exec sl-app bash -lc '
+rm -rf /tmp/blitzy_docfix /tmp/blitzy_investigation /tmp/sl_run /tmp/blitzy_qa_fix
+found=$(find /tmp -maxdepth 1 \( -name "blitzy_*" -o -name "sl_run" \) 2>/dev/null)
+[ -z "$found" ] && echo "(none — all investigation helpers removed)" || echo "$found"'
+(none — all investigation helpers removed)
+
+$ rm -rf /tmp/blitzy_docfix /tmp/doc_catchall_seq.* /tmp/doc_cleanup*.out \
+         /tmp/doc_ecodes_seq.* /tmp/redis_probe.py /tmp/verify_redis_cmd.sh
+$ find /tmp -maxdepth 1 \( -name 'blitzy_docfix' -o -name 'doc_*' \
+       -o -name 'redis_probe.py' -o -name 'verify_redis_cmd.sh' \) | grep -v '/tmp/blitzy$'
+(none — all my host helpers removed)
+```
+
+**Teardown of the running components.** As the final cleanup step, the three long-lived components started in §2.7 were stopped by their specific container process ids — the web server (gunicorn master `15796`, which reaps its two workers), the email handler (`15828`), and the job runner (`15826`) — after which the published ports `7777` and `20381` stopped answering. The per-process run-log directory `/tmp/qa_run/` — into which those components wrote `web.log`, `email.log`, and `job.log` during the §4 through §6 observations — is then removed, so no investigation artifact remains on the container filesystem:
+
+```
+$ docker exec sl-app bash -lc 'for pid in 15796 15826 15828; do kill "$pid" && echo "sent TERM to $pid"; done'
+sent TERM to 15796
+sent TERM to 15826
+sent TERM to 15828
+$ docker exec sl-app bash -lc "ps -eo args | grep -E 'gunicorn wsgi:app|email_handler.py|job_runner.py' | grep -v grep || echo '(no app components running)'"
+(no app components running)
+$ docker exec sl-app bash -lc 'rm -rf /tmp/qa_run; [ -e /tmp/qa_run ] && echo STILL PRESENT || echo "/tmp/qa_run: confirmed gone"'
+/tmp/qa_run: confirmed gone
+```
+
+The disposable PostgreSQL and Redis backing services are left up only as the throwaway datastores for the final state-verification queries of §7.2; they hold no repository state and are discarded with the container.
+
+**Secret-handling note.** No secret is written to this committed document, and the ephemeral on-disk helpers that briefly held sensitive material were removed above. Every sensitive value that appeared in captured output is redacted in place at the point of capture: the development `FLASK_SECRET` is shown as `[REDACTED: FLASK_SECRET value removed — a development secret]` (§2.4); each `slapp=…` session cookie is shown as `[REDACTED: … session cookie]` (§4.1 for the anonymous cookie, §5.1 for the authenticated one); and the one-time account-activation token — a 30-character `random_string(30)` credential — was read from the database directly into a shell variable, never printed to the terminal, and masked in the request URL (§5.1). The only credential shown in the clear is the disposable local-container Postgres password (`myuser` / `mypassword`) created for this throwaway database in §2.1, which is not a production secret.
+
 **Evidence-fidelity note.** Every fenced block in this document is verbatim captured output paired with the command that produced it. The only normalization applied to the deliverable itself is the removal of invisible trailing whitespace (psql column-header padding and log-line trailing spaces) and of the extra blank line at end-of-file, so `git diff --check` reports no whitespace errors; no visible character of any log line, status code, identifier, table value, or command was altered.
 
 
 ### 7.4 Bounce-phase reproduction cleanup (§6.5)
 
-The two `handle_bounce()` phases documented in [§6.5](#65-the-email-handlers-dispatcher-reply-bounce-and-smtp-status-codes) were captured in a later, dedicated email-handler run (pid `10602`) and created a small, self-contained set of rows that is removed here in the same FK-safe, single-transaction manner as §7.1, restoring the seed baseline exactly. The rows were: `contact 12` (the seed forward's contact), `email_log 14`/`15` (the forward and reply logs), `refused_email 3`/`4`, `bounce 2`/`3`, `notification 8`/`9`, `user_audit_log 15` (a `create_contact` event), and `sent_alert 6`/`7` (the `bounce` / `bounce-when-reply` alerts); `alias 5.last_email_log_id` had also advanced to `15` and is reset to its baseline `NULL`.
+The two `handle_bounce()` phases documented in [§6.5](#65-the-email-handlers-dispatcher-reply-bounce-and-smtp-status-codes) were captured in a later, dedicated email-handler run (pid `10602`) and created a small, self-contained set of rows that is removed here in the same FK-safe, single-transaction manner as §7.1, returning the **live entity tables** to their seed values and the append-only tables to the warm residual they held **before** this run (the point-in-time checkpoint tabulated at the end of this section — *not* the fresh-reset pristine of §2.6, and *not* the final post-investigation state, which is [§7.2](#72-final-database-state-after-cleanup)). The rows were: `contact 12` (the seed forward's contact), `email_log 14`/`15` (the forward and reply logs), `refused_email 3`/`4`, `bounce 2`/`3`, `notification 8`/`9`, `user_audit_log 15` (a `create_contact` event), and `sent_alert 6`/`7` (the `bounce` / `bounce-when-reply` alerts); `alias 5.last_email_log_id` had also advanced to `15` and is reset to its baseline `NULL`.
 
 A preflight `SELECT` confirms the exact scope before any mutation:
 
@@ -1724,7 +2065,7 @@ DELETE 2
 COMMIT
 ```
 
-Re-running the identical preflight after the transaction returns zero for every target, and a table-by-table comparison confirms the database is back to the exact pre-reproduction seed baseline (same counts and max ids), with only the seed `email_log` (id `1`) and seed `contact` (id `1`) surviving and `alias 5.last_email_log_id` back to `NULL`:
+Re-running the identical preflight after the transaction returns zero for every target, and a table-by-table comparison confirms the database is back to the exact **pre-reproduction state at that checkpoint** (same counts and max ids) — the live entity tables at their seed values, the append-only tables at the warm residual they held just before this run — with only the seed `email_log` (id `1`) and seed `contact` (id `1`) surviving and `alias 5.last_email_log_id` back to `NULL`:
 
 ```
 $ docker exec -i sl-postgres psql -U myuser -d simplelogin < /tmp/blitzy_qa_fix/bounce_preflight.sql
@@ -1740,8 +2081,8 @@ $ docker exec -i sl-postgres psql -U myuser -d simplelogin < /tmp/blitzy_qa_fix/
  sent_alert id IN (6,7)            |     0
 (8 rows)
 
-$ # count/max per table — post-cleanup == baseline for every table
- table            | baseline | current
+$ # count/max per table — post-cleanup == the pre-run checkpoint state for every table
+ table            | pre-run  | current
 ------------------+----------+---------
  alias            | 11/11    | 11/11
  alias_audit_log  | 33/63    | 33/63
@@ -1757,7 +2098,9 @@ $ # count/max per table — post-cleanup == baseline for every table
  users            | 2/2      | 2/2
 ```
 
-The temporary SMTP/DSN observation scripts used for this reproduction live only under the host path `/tmp/blitzy_qa_fix/` (never tracked or committed), matching the read-only, leave-no-trace guarantee stated at the top of §7.
+The `pre-run` column above is the **warm append-only residual at this bounce-run checkpoint** (`alias_audit_log` 33/63, `deleted_alias` 7/15, `job` 1/16, `user_audit_log` 1/9). It is deliberately *not* labeled "baseline": it is neither the fresh-reset pristine of §2.6 (`11`, `0`, `0`, `0`) nor the final post-investigation state. The later §6.5 exception-code and §6.6 catch-all reproductions appended still more append-only rows, so the authoritative post-investigation counts are the higher ones quantified in [§7.2](#72-final-database-state-after-cleanup) (`alias_audit_log` 48/121, `deleted_alias` 12/21, `job` 2/78, `user_audit_log` 13/56). Each snapshot is internally consistent for its point on the single timeline; the monotonic growth across them (`11` → `33` → `48` for `alias_audit_log`, and so on) is exactly the append-only behavior §7.2 explains — the live entity tables return to seed at every checkpoint, the append-only tables never shrink.
+
+The temporary SMTP/DSN observation scripts used for this reproduction live only under host `/tmp/` (never tracked or committed), matching the read-only, leave-no-trace guarantee stated at the top of §7.
 
 
 ---
@@ -1790,25 +2133,24 @@ Every distinct thing the prompt asks about, and where it is answered from observ
 | 20 | An **unknown job name** (edge condition) | [§6.4](#64-edge-an-unknown-job-name) — `Unknown job name blitzy-nonexistent-job` at ERROR + `NoneType: None` | Observed |
 | 21 | The **reply** phase | [§6.5](#65-the-email-handlers-dispatcher-reply-bounce-and-smtp-status-codes) — Case B unauthorized reply → `250 SL E214` | Observed |
 | 22 | The **bounce** phase | [§6.5](#65-the-email-handlers-dispatcher-reply-bounce-and-smtp-status-codes) — `is_bounce()` predicate; forward-bounce `bounce+14+@sl.local` → `250 SL E211`, reply-bounce `bounce_reply+15+@sl.local` → `250 SL E212` (both observed) | Observed |
-| 23 | **SMTP return / status codes** (incl. `E515`, `E214`, `E206`, `E211`, `E212`, and the mapped `E524`/`E213`/`E404`) | [§6.5](#65-the-email-handlers-dispatcher-reply-bounce-and-smtp-status-codes) — codes observed for forward / nonexistent / reply / DSN / forward-bounce / reply-bounce; exception→code map from source | Observed (6 outcomes); `E524`/`E213`/`E404` inferred |
+| 23 | **SMTP return / status codes** (incl. `E515`, `E214`, `E206`, `E211`, `E212`, and the mapped `E524`/`E213`/`E404`) | [§6.5](#65-the-email-handlers-dispatcher-reply-bounce-and-smtp-status-codes) — **all observed**: forward `250` / nonexistent `550 SL E515` / unauthorized-reply `250 SL E214` / DSN `250 SL E206` / forward-bounce `250 SL E211` / reply-bounce `250 SL E212` / reverse-alias-as-sender `550 SL E524` / non-bounce-to-VERP `250 SL E213` / DB-overflow `421 SL E404` / successful reply `250` | Observed (all) |
 | 24 | **Alias auto-creation — directory** | [§6.6](#66-secondary-alias-auto-creation-directory-success-and-domain-prerequisites) — `abcd+blitzyprobe@sl.local` → alias 16 created | Observed |
-| 25 | **Alias auto-creation — domain / catch-all** prerequisites | [§2.6](#26-what-the-seed-actually-creates-the-real-baseline), [§6.6](#66-secondary-alias-auto-creation-directory-success-and-domain-prerequisites) — seed domains have `catch_all=f`, so not feasible on seed | Observed (config); labeled |
+| 25 | **Alias auto-creation — domain / catch-all** | [§2.6](#26-what-the-seed-actually-creates-the-real-baseline), [§6.6](#66-secondary-alias-auto-creation-directory-success-and-domain-prerequisites) — catch-all enabled on `old.com` via the dashboard, a new address auto-created `<Alias 67>` (note `Created by catchall option`), then catch-all toggled back off | Observed at runtime |
 
-All twenty-five named items are answered from captured runtime evidence, except the three explicitly-labeled inferred sub-points (the `run_at` wall-clock arithmetic, the `E524`/`E213`/`E404` exception→code mappings, and the upstream three-container topology), each of which is backed by a genuine runtime attempt as detailed in [§9](#9-observed-vs-inferred-ledger).
+All twenty-five named items are answered from captured runtime evidence, except the two explicitly-labeled inferred sub-points (the `run_at` wall-clock arithmetic and the upstream three-container topology), each of which is backed by a genuine runtime attempt as detailed in [§9](#9-observed-vs-inferred-ledger). (The `E524`/`E213`/`E404` codes and catch-all auto-creation, previously inferred, are now observed at runtime — see §6.5–§6.6.)
 
 
 ---
 
 ## 9. Observed vs inferred ledger
 
-The overwhelming majority of this document is **observed**: every liveness signal, every HTTP response and status code, every `SL` log line, every database row and counter (before / intermediate / after), the canonical ready→taken→done job transition, the retry re-take, the unknown-job error, the six SMTP outcomes (including both `handle_bounce()` phases → `250 SL E211` / `250 SL E212`), and the directory auto-creation were all produced at runtime through the real entry points and captured verbatim alongside the command that produced them.
+The overwhelming majority of this document is **observed**: every liveness signal, every HTTP response and status code, every `SL` log line, every database row and counter (before / intermediate / after), the canonical ready→taken→done job transition, the retry re-take, the unknown-job error, the SMTP outcomes (both `handle_bounce()` phases → `250 SL E211` / `250 SL E212`, the exception-mapped `550 SL E524` / `250 SL E213` / `421 SL E404`, and a successful reply → `250`), and both directory **and** catch-all alias auto-creation were all produced at runtime through the real entry points and captured verbatim alongside the command that produced them.
 
-Exactly **three** sub-points are labeled **`[INFERRED]`**. Each is a behavior that a black-box send/enqueue could not force into existence without controlling wall-clock timing, triggering a specific internal exception, or replicating the upstream multi-container deployment; for each, a genuine runtime attempt was made first, its real (different) outcome is shown in the body, and only the residual branch is described from source or upstream documentation:
+Exactly **two** sub-points are labeled **`[INFERRED]`**. Each is a behavior that a black-box send/enqueue could not force into existence without controlling wall-clock timing or replicating the upstream multi-container deployment; for each, a genuine runtime attempt was made first, its real (different) outcome is shown in the body, and only the residual branch is described from source or upstream documentation. (A third item — the `E524`/`E213`/`E404` exception→code mappings — was previously inferred but has since been **observed at runtime** in [§6.5](#65-the-email-handlers-dispatcher-reply-bounce-and-smtp-status-codes), so it is no longer listed here.)
 
 | # | Inferred sub-point | Why it could not be observed black-box | Genuine attempt actually made (observed outcome) | Source reference |
 |---|--------------------|----------------------------------------|--------------------------------------------------|------------------|
 | 1 | The `run_at <= now + 10 min` wall-clock arithmetic in the retry gate | Comparing a captured timestamp against "now + 10 min" is an arithmetic statement about clock values, not a directly-emitted runtime signal | [§6.3](#63-retry-accounting-and-the-run_at-selection-gate) — Job 5's future `run_at` was observed to keep it `state=0`/`attempts=0` across ~30 poll cycles (the *values* are observed; only the arithmetic tying them together is inferred) | `job_runner.py:L323` |
-| 2 | The `E524` / `E213` / `E404` exception→code mappings | These codes are emitted only when specific exceptions arise inside `handle_DATA()` (`CannotCreateContactForReverseAlias`, `VERPTransactional`/`VERPReply`, generic `Exception`); the genuine sends did not raise them | [§6.5](#65-the-email-handlers-dispatcher-reply-bounce-and-smtp-status-codes) — the six codes that *did* arise were observed: forward `250`, nonexistent `550 SL E515`, unauthorized reply `250 SL E214`, DSN `250 SL E206`, forward-bounce `250 SL E211`, reply-bounce `250 SL E212` | `email_handler.py:L2307`, `L2318`, `L2332` |
-| 3 | The upstream production **three-container** topology | The self-hosted production layout runs three separate containers; locally the canonical image runs all three processes in one container | [§6.1](#61-how-the-three-services-stay-up-they-do-not-launch-one-another) — locally the three processes were each launched independently and their independence/continuity observed (PIDs, `etime`); the multi-container production shape is from upstream docs | corroborated by web search (§0.2.2) |
+| 2 | The upstream production **three-container** topology | The self-hosted production layout runs three separate containers; locally the canonical image runs all three processes in one container | [§6.1](#61-how-the-three-services-stay-up-they-do-not-launch-one-another) — locally the three processes were each launched independently and their independence/continuity observed (PIDs, `etime`); the multi-container production shape is from upstream docs | corroborated by web search (§0.2.2) |
 
-No other claim in the document is inferred. Where a value was obtained by reading the database directly rather than through the canonical entry point (for example, a `SELECT` on the `job` table to show a state transition), that read is a *verification* of a state produced canonically, and any purely-diagnostic direct enqueue is labeled `[NON-CANONICAL]` at its point of use (the §4.3 warm-up jobs `1`–`3`).
+No other claim in the document is inferred. Where a value was obtained by reading the database directly rather than through the canonical entry point (for example, a `SELECT` on the `job` table to show a state transition), that read is a *verification* of a state produced canonically. Every value obtained off the canonical path is labeled `[NON-CANONICAL]` at its point of use: the diagnostic direct-`Job.create()` enqueues that drive or stage the runner (the §4.3 warm-up jobs `1`–`3`, and the §6.3 retry-state and §6.4 unknown-name job producers — in each case the *runner's* take/skip/handle decision is the canonical behavior being observed), and the §5.1 activation-token read (the one-time code was read from the `activation_code` table because the default `NOT_SEND_EMAIL=true` suppresses the activation email, so it is not deliverable — the activation *request* itself remains canonical). No such value is ever substituted for a canonical-path observation.
