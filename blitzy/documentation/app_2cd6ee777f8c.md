@@ -473,7 +473,7 @@ expired** signed suffix produce the *same* response:
 | **Duplicate** alias | v2 & v3 | **409 CONFLICT** | `{"error":"alias <full-address> already exists"}` | (varies) |
 | Two consecutive dots in prefix | v2 & v3 | **400 BAD REQUEST** | `{"error":"2 consecutive dot signs aren't allowed in an email address"}` | 71 |
 | Wrong prefix / wrong suffix / wrong domain | v2 & v3 | **400 BAD REQUEST** | `{"error":"wrong alias prefix or suffix"}` | 41 |
-| **Valid** suffix, under quota | v2 & v3 | **201 CREATED** | serialized alias object | 430 |
+| **Valid** suffix, under quota | v2 & v3 | **201 CREATED** | serialized alias object | 430 (varies) |
 
 The three signature-failure rows collapse to one 412 because `check_suffix_signature` returns `None` for
 tampered, expired *and* garbage input alike — see the runtime proof in §9. The distinct
@@ -4110,10 +4110,17 @@ capturing its actual output, not by reading alone:
 - **Pinned libraries, observed.** `itsdangerous 1.1.0`, `flask-limiter 1.4`, `flask 1.1.2`,
   `werkzeug 1.0.1`, `redis 4.6.0`, `sqlalchemy 1.3.24` on Python 3.10.18 — printed at runtime in
   §2.1 — so the reported behaviour reflects the shipping application.
-- **Single-run coherence.** The per-condition evidence in §3–§9 all comes from **one**
-  `run_all.sh` execution (process timestamps `19:30:31`–`19:30:47`); the net-zero cleanup proof in
-  §2.5 is a **separate** fresh run at the clean `824`-alias baseline (it cites only aggregate
-  counts, never per-alias IDs, so the two are independent and non-conflicting).
+- **Single-run coherence (primary transcripts) with disclosed separate runs.** The *primary*
+  per-condition transcripts — the success/failure, quota and rate-limit captures in §3, §5, §6 and
+  §9's core — come from **one** `run_all.sh` execution (process timestamps `19:30:31`–`19:30:47`).
+  Two transcripts are deliberately from **separate** runs and are disclosed as such: §4's
+  *illustrative* log lines (timestamps `19:16:50`, PID `6845`) and §9.5's custom-domain transcript
+  (timestamps `20:45`, PID `9565`; `probe_customdomain.py` is **not** one of the six probes that
+  `run_all.sh` drives). This run-to-run variance in timestamp and PID — with the level, emitter
+  (`file:line` + `funcName`) and message text staying stable — is exactly what §4.2 documents, so
+  the separate runs are non-conflicting. The net-zero cleanup proof in §2.5 is likewise a
+  **separate** fresh run at the clean `824`-alias baseline (it cites only aggregate counts, never
+  per-alias IDs, so all runs are independent and non-conflicting).
 
 ### 12.2 Evidence matrix
 
@@ -4140,7 +4147,7 @@ invocation in §2.3; source is in §11.
 | 15 | Flask-Limiter header-default fix is a **0.7.x**-series change (predates 1.4), **not** 1.5 | Q3 | `HISTORY.rst` + web check | §5 |
 | 16 | Key derivation: session -> `userid:{id}`, API-key-only -> `ip:{addr}`; lock keys `cl:{id}` / `cl:{addr}` | Q3 | `probe_ratelimit.py` | §5 (`ratelimit.out`) |
 | 17 | Quota gate is `User.can_create_new_alias()` (`models.py:867-884`) + `max_alias_for_free_account()` (`858-865`) | Q4 | `probe_functional.py` (COND13) | §6 (`functional.out`) |
-| 18 | **No** quota value is logged on the 201 path; the only quota log is the failure `LOG.d` (`models.py:49`/`:138`) | Q4 | `probe_functional.py` | §6 |
+| 18 | **No** quota value is logged on the 201 path; the only quota log is the failure `LOG.d` (`new_custom_alias.py:49`/`:138`) | Q4 | `probe_functional.py` | §6 |
 | 19 | Quota check precedes the signature check, so a quota-exhausted user gets the 400 quota message regardless of suffix validity | Q4/Q5 | `probe_functional.py` (COND13c) | §6.4 |
 | 20 | Decorator order `@limiter.limit` -> `@require_api_auth` -> `@parallel_limiter.lock` (v2 L28-30 / v3 L115-117) | Q5 | source | §7.1 |
 | 21 | Parallel lock -> **HTTP 429** (werkzeug `TooManyRequests`) on contention; **no-op** when Redis absent (`parallel_limiter.py:55-58`) | Q5 | `probe_lock.py` | §7.7 (`lock.out`) |
@@ -4153,7 +4160,7 @@ invocation in §2.3; source is in §11.
   every condition; the tampered/expired/garbage collapse and the 500 non-string case are in §9.
 - **Q2 (server-console log entries).** Answered in §4 with the raw captured buffer, the capture
   mechanism, and a per-emitter `file:line` table (`LOG.w` at `new_custom_alias.py:72`/`:187`;
-  `LOG.d` quota at `models.py:49`/`:138`; `after_request` at `server.py:284`).
+  `LOG.d` quota at `new_custom_alias.py:49`/`:138`; `after_request` at `server.py:284`).
 - **Q3 (rate-limit headers).** Answered in §5: no `X-RateLimit-*`/`Retry-After` headers appear;
   the boundary and key-derivation are observed and stable; the header-default version nuance is
   corrected.
