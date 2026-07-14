@@ -1793,9 +1793,9 @@ direct `psql` reads are labelled **NON-CANONICAL** inspection; the triggers and 
 The runner's `__main__` loop wraps each cycle in `create_light_app().app_context()`
 [`job_runner.py:L332`], calls `get_jobs_to_run()` [`job_runner.py:L307`], logs
 `Take job %s` [`job_runner.py:L334`], moves the job `ready → taken` (`JobState.taken`)
-[`job_runner.py:L338`], dispatches through `process_job()` [`job_runner.py:L188`] (the
+[`job_runner.py:L337-L339`], dispatches through `process_job()` [`job_runner.py:L188`] (the
 `send-user-report` branch at [`job_runner.py:L285`] runs `ExportUserDataJob`), moves it to
-`done` [`job_runner.py:L343`], and sleeps `time.sleep(10)` between polls [`job_runner.py:L347`].
+`done` [`job_runner.py:L344`], and sleeps `time.sleep(10)` between polls [`job_runner.py:L347`].
 
 The job is enqueued canonically from the dashboard: `POST /dashboard/account_setting` with
 `form-name=send-full-user-report` [`app/dashboard/views/account_setting.py:L130`] calls
@@ -1815,8 +1815,8 @@ form-name=send-full-user-report [app/dashboard/views/account_setting.py:L130-131
 `Job(name="send-user-report")` via ExportUserDataJob.store_job_in_db()
 [app/jobs/export_user_data_job.py:L186-190] with run_at=now(). The running job_runner.py loop then
 picks it up: LOG.d("Take job %s") [job_runner.py:L334], state ready(0)->taken(1)
-[job_runner.py:L338], process_job() dispatch [job_runner.py:L285], state ->done(2)
-[job_runner.py:L343]. Loop sleeps time.sleep(10) between polls [job_runner.py:L347].
+[job_runner.py:L337-L339], process_job() dispatch [job_runner.py:L285], state ->done(2)
+[job_runner.py:L344]. Loop sleeps time.sleep(10) between polls [job_runner.py:L347].
 
 Logs in as the canonical seed demo account john@wick.com / password. Polls the Job row every 0.1s to
 capture the ready->taken->done transition, and measures the pickup latency twice (M4-08). All psql
@@ -2097,7 +2097,7 @@ Creating an alias calls `EventDispatcher.send_event(user, EventContent(alias_cre
 in order: **#1** `EVENT_WEBHOOK_DISABLE` [`event_dispatcher.py:L57`], **#2** `not EVENT_WEBHOOK`
 [`event_dispatcher.py:L61-64`], **#3** `not partner_user` [`event_dispatcher.py:L66-69`]; only on
 passing all three does it reach the success path — `PostgresDispatcher.send()`, which creates a `SyncEvent` row and
-issues `NOTIFY simplelogin_sync_events` [`event_dispatcher.py:L23-25`] and logs
+issues `NOTIFY simplelogin_sync_events` [`event_dispatcher.py:L23-26`] and logs
 `Sent event to the dispatcher` [`event_dispatcher.py:L84`].
 
 Under the default config (`EVENT_WEBHOOK=None` [`app/config.py:L612`], `EVENT_WEBHOOK_DISABLE=False`
@@ -2519,7 +2519,7 @@ of the application behaving on its own).
 | # | Manipulation | Where | Why used |
 |---|--------------|-------|----------|
 | 1 | Direct `activation_code` table **read** to obtain the code | §4.3 | Under `NOT_SEND_EMAIL=true` the code/link is never logged, so it is read from the DB purely to continue the canonical `GET /auth/activate` flow |
-| 2 | Direct `activation_code` **write** to age `expired_at` into the past | §4.9 | To reach the `Activation code was expired` `400` branch without waiting one hour |
+| 2 | Direct `activation_code` **write** to age `expired` into the past | §4.9 | To reach the `Activation code was expired` `400` branch without waiting one hour |
 | 3 | Raw two-connection `psql` `LISTEN`/`NOTIFY` **substrate probe** | §5.4 | Proves the Postgres channel works at the DB level; the application itself issues no `NOTIFY` under the default (guard #2) |
 
 ## 7. Coverage matrix — every named item, with evidence status
@@ -2581,7 +2581,7 @@ own.
 | `handle_reply` / `handle_bounce` phases [`email_handler.py:L966,L1851`] | §6.2 | Source-derived | Only the forward phase was driven |
 | `NOTIFY simplelogin_sync_events` channel [`app/events/event_dispatcher.py:L14`] | §5.4 | Source-derived + Non-canonical | App issues **no** `NOTIFY` under default (guard #2); channel proven only via a **Non-canonical** `psql` probe |
 | Event dispatch default no-op [`app/events/event_dispatcher.py:L61-64`] | §5.4 | Observed (negative) | `Not sending events because webhook is not configured and allowed to be empty`; `sync_event` = 0 |
-| Event **success** path (`SyncEvent` + `NOTIFY` + `Sent event to the dispatcher`) [`event_dispatcher.py:L23-25,L84`] | §6.2 | Source-derived | Never reached (default stops at guard #2) |
+| Event **success** path (`SyncEvent` + `NOTIFY` + `Sent event to the dispatcher`) [`event_dispatcher.py:L23-26,L84`] | §6.2 | Source-derived | Never reached (default stops at guard #2) |
 | `event_listener.py listener` [`event_listener.py:L29,L34-43`] | §5.5 | Observed | `Using PostgresEventSource` → `Starting to listen to events` [`events/event_source.py:L49`] → blocks → exit `124` |
 | `cron.py` / yacron scheduler [`cron.py:L1263`, `crontab.yml`] | §5.6 | Observed + Source-derived | `cron.py -j stats` observed (exit 0); the 15-job schedule + other jobs are source-derived from `crontab.yml` |
 | `send_undelivered_mails` every 5 min (`*/5 * * * *`) | §5.6 | Source-derived | Most frequent schedule entry in `crontab.yml`; not individually run |
