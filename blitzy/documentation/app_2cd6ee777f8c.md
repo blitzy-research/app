@@ -369,7 +369,7 @@ Reading left to right: `asctime` = `2026-07-13 18:03:00,460`; `name` = `SL`; `le
 
 ## 4. Q1 — Are the three components up? (liveness & confirmation signals)
 
-The three processes were started together at **18:11:50–18:11:52** (§2.7) into per-process log files, and stayed up for the whole investigation. Each is probed below for its **definitive** liveness signal. All three PIDs quoted here (`3336`/`3353`/`3361` web, `3344` email handler, `3352` job runner) are the *same* processes throughout §4–§6 — a single continuous timeline, with the one disclosed exception of the email-handler restart for mail-capture in [§5.4](#54-c4--an-email-arrives-at-the-alias-forward-path).
+The three processes were started together at **18:11:50–18:11:52** (§2.7) into per-process log files, and stayed up for the whole investigation. Each is probed below for its **definitive** liveness signal. All three PIDs quoted here (`3336`/`3353`/`3361` web, `3344` email handler, `3352` job runner) are the *same* processes throughout §4–§6 — a single continuous timeline, with two disclosed exceptions: the email-handler restart for mail-capture in [§5.4](#54-c4--an-email-arrives-at-the-alias-forward-path), and a later dedicated email-handler run (pid `10602`) used to capture the two `handle_bounce()` phases in [§6.5](#65-the-email-handlers-dispatcher-reply-bounce-and-smtp-status-codes).
 
 ### 4.1 Web server (`server.py` / `wsgi.py`, port 7777)
 
@@ -947,7 +947,7 @@ def main(port: int):
         time.sleep(2)
 ```
 
-Each inbound message is handled by `MailHandler.handle_DATA()` → `_handle()`, which opens a **fresh** `create_light_app().app_context()` **per message** (`email_handler.py:L2352`) — so the process stays up continuously while each message gets a clean application context. The single-message lifecycle captured in §5.4 (and the four SMTP cases in §6.5) were all served by one long-running handler process.
+Each inbound message is handled by `MailHandler.handle_DATA()` → `_handle()`, which opens a **fresh** `create_light_app().app_context()` **per message** (`email_handler.py:L2352`) — so the process stays up continuously while each message gets a clean application context. The single-message lifecycle captured in §5.4 (and the nonexistent-alias / unauthorized-reply / out-of-office SMTP cases in §6.5) were all served by one long-running handler process; the two `handle_bounce()` phases in §6.5 were captured in a separate, later handler run (pid `10602`).
 
 **The job runner's poll loop.** The runner's `__main__` block is an infinite `while True:` (`job_runner.py:L330`) that, on each iteration, opens a fresh `create_light_app().app_context()` (`job_runner.py:L332`), drains **all** currently-eligible jobs via `get_jobs_to_run()` (`job_runner.py:L333`), and then sleeps 10 seconds (`job_runner.py:L347`) before polling again (full loop quoted in §6.3).
 
@@ -1273,7 +1273,134 @@ In **every** case `RCPT TO` returns `250 OK` and the actual accept/reject arrive
 - **Case B (reply from an unauthorized sender):** the recipient `rep@sl.local` is a reverse-alias, so the reply path runs; the sender is not one of the alias's authorized mailboxes, so `handle_unknown_mailbox()` logs the rejection (`email_handler.py:L1393`) and `handle_reply()` returns `250 SL E214` (`email_handler.py:L1034`) — deliberately a `2xx` "to avoid Postfix sending out bounces and avoid backscatter issue" (comment at `email_handler.py:L1033`).
 - **Case C (`MAIL FROM:<>` DSN to a reverse-alias):** although the message matched `is_bounce()`'s content-type test, it did **not** reach `handle_bounce()`. Because the single recipient is a **reverse-alias** (not a VERP bounce address), it matched the earlier out-of-office guard (`email_handler.py:L2166-L2172`) and returned `250 SL E206 Out of office`. This is reported exactly as observed.
 
-**On `handle_bounce()` specifically (labeled inferred).** The dedicated bounce handler (`handle_bounce()` `email_handler.py:L1851`, with `handle_bounce_forward_phase()` `L1432` and `handle_bounce_reply_phase()` `L1595`) is reached only when the DSN's recipient is a **VERP bounce address** — `{BOUNCE_PREFIX}{email_log.id}{BOUNCE_SUFFIX}` — carrying an HMAC-signed email-log reference produced by a prior outbound forward. Constructing a valid signed VERP recipient by hand was outside a plausible black-box send (the genuine attempt in Case C, aimed at a reverse-alias, was instead classified as out-of-office as shown above), so the `handle_bounce()` forward-/reply-phase behavior is described here **from source and labeled inferred**, distinct from the four SMTP outcomes above that were observed at runtime.
+**`handle_bounce()` — both phases observed at runtime.** Case C above (a DSN aimed at a *reverse-alias*) is classified out-of-office; the dedicated bounce handler is instead reached when the DSN's recipient is a **VERP bounce address**. Contrary to an earlier reading, that address is **not** HMAC-signed and **can** be constructed by hand from a known `email_log.id`. The forward-phase trigger matches any single recipient that `startswith(BOUNCE_PREFIX)` **and** `endswith(BOUNCE_SUFFIX)` (`email_handler.py:L2057-L2061`); the reply-phase trigger matches a recipient that `startswith(f"{BOUNCE_PREFIX_FOR_REPLY_PHASE}+")` (`email_handler.py:L2077-L2080`); and in both branches the id is recovered by `parse_id_from_bounce()`, which is a plain `int()` of the substring between the first and last `+` — no signature, no secret (`app/email_utils.py:L1258-L1259`):
+
+```
+def parse_id_from_bounce(email_address: str) -> int:
+    return int(email_address[email_address.find("+") : email_address.rfind("+")])
+```
+
+With the default config values `BOUNCE_PREFIX = "bounce+"`, `BOUNCE_SUFFIX = "+@sl.local"`, and `BOUNCE_PREFIX_FOR_REPLY_PHASE = "bounce_reply"` (`app/config.py:L100-L101,L108-L110`; `EMAIL_DOMAIN=sl.local`), the two VERP forms are simply `bounce+{id}+@sl.local` and `bounce_reply+{id}+@sl.local`. Both phases were therefore exercised black-box against the running handler (a dedicated later run, pid `10602` — the second disclosed exception to the single-timeline note in [§4](#4-q1--are-the-three-components-up-liveness--confirmation-signals)). The temporary rows they produced were removed during cleanup ([§7](#7-cleanup--the-repository-and-database-are-left-unchanged)).
+
+**Forward phase → `250 SL E211`.** First a normal forward to `e1@sl.local` minted a **forward** email-log (`is_reply=f`); its id (`14`) was then used to build the VERP bounce recipient. A DSN with `MAIL FROM:<>` and `Content-Type: multipart/report` (the two conditions `is_bounce()` requires) was sent to `bounce+14+@sl.local` over the real SMTP socket:
+
+```
+$ docker exec -i sl-app ./venv/bin/python - <<'PY'
+import smtplib
+b = "=_blitzy_dsn_boundary_x1"
+dsn = (
+    'Content-Type: multipart/report; report-type=delivery-status; boundary="%s"\r\n'
+    'From: MAILER-DAEMON@example.org\r\n'
+    'To: bounce+14+@sl.local\r\n'
+    'Subject: Delivery Status Notification (Failure)\r\n'
+    'Auto-Submitted: auto-replied\r\n\r\n'
+    '--%s\r\nContent-Type: text/plain; charset=us-ascii\r\n\r\n'
+    'Delivery to the following recipient failed permanently:\r\n  john@wick.com\r\n\r\n'
+    '--%s\r\nContent-Type: message/delivery-status\r\n\r\n'
+    'Reporting-MTA: dns; mta.example.org\r\n\r\n'
+    'Final-Recipient: rfc822; john@wick.com\r\nAction: failed\r\nStatus: 5.1.1\r\n'
+    'Diagnostic-Code: smtp; 550 5.1.1 User unknown\r\n\r\n'
+    '--%s--\r\n'
+) % (b, b, b, b)
+s = smtplib.SMTP("127.0.0.1", 20381, timeout=30)
+s.ehlo("blitzy-repro.local")
+cm, rm = s.mail("")                        # MAIL FROM:<>
+cr, rr = s.rcpt("bounce+14+@sl.local")     # VERP forward-bounce recipient
+cd, rd = s.data(dsn)
+print("MAIL:", cm, rm.decode()); print("RCPT:", cr, rr.decode()); print("DATA:", cd, rd.decode())
+s.quit()
+PY
+MAIL: 250 OK
+RCPT: 250 OK
+DATA: 250 SL E211 Bounce Forward phase handled
+```
+
+The handler log shows the full routing, correlated by the per-message `message_id 9bd5547f-…`: the message boundary and `New message, mail from <>, rctp tos ['bounce+14+@sl.local']`; `handle_bounce()` (log at `email_handler.py:L1862`; def `L1851`) logging **`phase=forward`** (because the referenced `<EmailLog 14>` has `is_reply=False`); `handle_bounce_forward_phase()` (log at `email_handler.py:L1456`; def `L1432`); the refused-email/notification side effects; and the finishing line carrying `status.E211` (returned at `email_handler.py:L1914`):
+
+```
+2026-07-14 04:09:10,122 - SL - DEBUG - 10602 - "/app/app/log.py:24" - set_message_id() - 96c3d5d4-9223-49b0-937a-69e04f6f7cc8 - set message_id 9bd5547f-088a-4fb6-bcd3-75f47b8580bf
+2026-07-14 04:09:10,122 - SL - DEBUG - 10602 - "/app/email_handler.py:2342" - _handle() - 9bd5547f-088a-4fb6-bcd3-75f47b8580bf - ====>=====>====>====>====>====>====>====>
+2026-07-14 04:09:10,122 - SL - INFO - 10602 - "/app/email_handler.py:2343" - _handle() - 9bd5547f-088a-4fb6-bcd3-75f47b8580bf - New message, mail from <>, rctp tos ['bounce+14+@sl.local']
+2026-07-14 04:09:10,123 - SL - INFO - 10602 - "/app/email_handler.py:1956" - handle() - 9bd5547f-088a-4fb6-bcd3-75f47b8580bf - Set CONTENT_TRANSFER_ENCODING
+2026-07-14 04:09:10,123 - SL - DEBUG - 10602 - "/app/email_handler.py:1963" - handle() - 9bd5547f-088a-4fb6-bcd3-75f47b8580bf - Cannot parse Postfix queue ID from None None
+2026-07-14 04:09:10,124 - SL - DEBUG - 10602 - "/app/email_handler.py:1980" - handle() - 9bd5547f-088a-4fb6-bcd3-75f47b8580bf - ==>> Handle mail_from:<>, rcpt_tos:['bounce+14+@sl.local'], header_from:MAILER-DAEMON@example.org, header_to:bounce+14+@sl.local, cc:None, reply-to:None, message_id:None, client_ip:None, headers:[('Content-Type', 'multipart/report; report-type=delivery-status; boundary="=_blitzy_dsn_boundary_x1"'), ('From', 'MAILER-DAEMON@example.org'), ('To', 'bounce+14+@sl.local'), ('Subject', 'Delivery Status Notification (Failure)'), ('Auto-Submitted', 'auto-replied'), ('Content-Transfer-Encoding', '7bit')], mail_options:[], rcpt_options:[]
+2026-07-14 04:09:10,133 - SL - DEBUG - 10602 - "/app/email_handler.py:1862" - handle_bounce() - 9bd5547f-088a-4fb6-bcd3-75f47b8580bf - handle bounce for <EmailLog 14>, phase=forward, contact=<Contact 12 external.sender@example.org 5>, alias=<Alias 5 e1@sl.local>
+2026-07-14 04:09:10,135 - SL - WARNING - 10602 - "/app/app/email_utils.py:727" - get_mailbox_bounce_info() - 9bd5547f-088a-4fb6-bcd3-75f47b8580bf - add missing content-transfer-encoding header
+2026-07-14 04:09:10,138 - SL - DEBUG - 10602 - "/app/email_handler.py:1456" - handle_bounce_forward_phase() - 9bd5547f-088a-4fb6-bcd3-75f47b8580bf - Handle forward bounce <Contact 12 external.sender@example.org 5> -> <Alias 5 e1@sl.local> -> <Mailbox 1 john@wick.com>. <EmailLog 14>
+2026-07-14 04:09:10,141 - SL - WARNING - 10602 - "/app/email_handler.py:1474" - handle_bounce_forward_phase() - 9bd5547f-088a-4fb6-bcd3-75f47b8580bf - Cannot parse original message from bounce message <Alias 5 e1@sl.local> <User 1 John Wick john@wick.com> <Contact 12 external.sender@example.org 5> refused-emails/full-32965e88-a86c-433e-807e-3bbf1f5696f2.eml
+2026-07-14 04:09:10,144 - SL - DEBUG - 10602 - "/app/email_handler.py:1491" - handle_bounce_forward_phase() - 9bd5547f-088a-4fb6-bcd3-75f47b8580bf - Create refused email <Refused Email 3 None 2026-07-21T04:09:10.144034+00:00>
+2026-07-14 04:09:10,148 - SL - DEBUG - 10602 - "/app/email_handler.py:1542" - handle_bounce_forward_phase() - 9bd5547f-088a-4fb6-bcd3-75f47b8580bf - Inform user <User 1 John Wick john@wick.com> about a bounce from contact <Contact 12 external.sender@example.org 5> to alias <Alias 5 e1@sl.local>
+2026-07-14 04:09:10,176 - SL - DEBUG - 10602 - "/app/app/email_utils.py:303" - send_email() - 9bd5547f-088a-4fb6-bcd3-75f47b8580bf - send email to john@wick.com, subject 'An email sent to e1@sl.local cannot be delivered to your mailbox'
+2026-07-14 04:09:10,177 - SL - DEBUG - 10602 - "/app/app/mail_sender.py:131" - send() - 9bd5547f-088a-4fb6-bcd3-75f47b8580bf - send email with subject 'An email sent to e1@sl.local cannot be delivered to your mailbox', from '"noreply@sl.local" <noreply@sl.local>' to 'john@wick.com'
+2026-07-14 04:09:10,177 - SL - INFO - 10602 - "/app/email_handler.py:2367" - _handle() - 9bd5547f-088a-4fb6-bcd3-75f47b8580bf - Finish mail_from <>, rcpt_tos ['bounce+14+@sl.local'], takes 0.0550379753112793 seconds with return code '250 SL E211 Bounce Forward phase handled'<<===
+```
+
+Its database side effects were captured before → after: `<EmailLog 14>` flipped `bounced f → t` and gained `refused_email_id=3`; a `refused_email` row (`id 3`), a `bounce` row (`email=john@wick.com`), a `notification` (`id 8`, "…cannot be delivered to your mailbox"), and a `sent_alert` (`type=bounce`) were created:
+
+```
+$ docker exec sl-postgres psql -U myuser -d simplelogin -c "SELECT id, bounced, refused_email_id FROM email_log WHERE id=14;"
+ id | bounced | refused_email_id
+----+---------+------------------
+ 14 | t       |                3        # before: bounced=f, refused_email_id=NULL
+$ docker exec sl-postgres psql -U myuser -d simplelogin -c "SELECT id, email FROM bounce ORDER BY id;"
+ id |            email
+----+-----------------------------
+  2 | john@wick.com                    # new (bounce table was empty before)
+```
+
+**Reply phase → `250 SL E212`.** Symmetrically, a reply from the mailbox owner (`john@wick.com`) to the contact's reverse-alias (`external_sender_at_example_org_rbnuz@sl.local`) minted a **reply** email-log (`is_reply=t`, id `15`); a DSN to `bounce_reply+15+@sl.local` was then accepted with `250 SL E212 Bounce Reply phase handled` (same send shape as above, only the recipient prefix and id differ):
+
+```
+$ docker exec -i sl-app ./venv/bin/python - <<'PY'
+import smtplib
+b = "=_blitzy_dsn_boundary_r1"
+dsn = (
+    'Content-Type: multipart/report; report-type=delivery-status; boundary="%s"\r\n'
+    'From: MAILER-DAEMON@example.org\r\n'
+    'To: bounce_reply+15+@sl.local\r\n'
+    'Subject: Delivery Status Notification (Failure)\r\n'
+    'Auto-Submitted: auto-replied\r\n\r\n'
+    '--%s\r\nContent-Type: text/plain; charset=us-ascii\r\n\r\n'
+    'Delivery to the following recipient failed permanently:\r\n  external.sender@example.org\r\n\r\n'
+    '--%s\r\nContent-Type: message/delivery-status\r\n\r\n'
+    'Reporting-MTA: dns; mta.example.org\r\n\r\n'
+    'Final-Recipient: rfc822; external.sender@example.org\r\nAction: failed\r\nStatus: 5.1.1\r\n'
+    'Diagnostic-Code: smtp; 550 5.1.1 User unknown\r\n\r\n'
+    '--%s--\r\n'
+) % (b, b, b, b)
+s = smtplib.SMTP("127.0.0.1", 20381, timeout=30)
+s.ehlo("blitzy-repro.local")
+cm, rm = s.mail("")                             # MAIL FROM:<>
+cr, rr = s.rcpt("bounce_reply+15+@sl.local")    # VERP reply-bounce recipient
+cd, rd = s.data(dsn)
+print("MAIL:", cm, rm.decode()); print("RCPT:", cr, rr.decode()); print("DATA:", cd, rd.decode())
+s.quit()
+PY
+MAIL: 250 OK
+RCPT: 250 OK
+DATA: 250 SL E212 Bounce Reply phase handled
+```
+
+The handler routed it through `handle_bounce()` logging **`phase=reply`** (because `<EmailLog 15>.is_reply=True`) into `handle_bounce_reply_phase()` (log at `email_handler.py:L1605`; def `L1595`), returning `status.E212` (returned at `email_handler.py:L1911`):
+
+```
+2026-07-14 04:10:58,921 - SL - DEBUG - 10602 - "/app/app/log.py:24" - set_message_id() - 9407581a-7604-4d54-b713-3a61f4bdd599 - set message_id 20b1d172-9097-4a1f-b1bf-26c1445d6f01
+2026-07-14 04:10:58,921 - SL - DEBUG - 10602 - "/app/email_handler.py:2342" - _handle() - 20b1d172-9097-4a1f-b1bf-26c1445d6f01 - ====>=====>====>====>====>====>====>====>
+2026-07-14 04:10:58,921 - SL - INFO - 10602 - "/app/email_handler.py:2343" - _handle() - 20b1d172-9097-4a1f-b1bf-26c1445d6f01 - New message, mail from <>, rctp tos ['bounce_reply+15+@sl.local']
+2026-07-14 04:10:58,921 - SL - INFO - 10602 - "/app/email_handler.py:1956" - handle() - 20b1d172-9097-4a1f-b1bf-26c1445d6f01 - Set CONTENT_TRANSFER_ENCODING
+2026-07-14 04:10:58,922 - SL - DEBUG - 10602 - "/app/email_handler.py:1963" - handle() - 20b1d172-9097-4a1f-b1bf-26c1445d6f01 - Cannot parse Postfix queue ID from None None
+2026-07-14 04:10:58,923 - SL - DEBUG - 10602 - "/app/email_handler.py:1980" - handle() - 20b1d172-9097-4a1f-b1bf-26c1445d6f01 - ==>> Handle mail_from:<>, rcpt_tos:['bounce_reply+15+@sl.local'], header_from:MAILER-DAEMON@example.org, header_to:bounce_reply+15+@sl.local, cc:None, reply-to:None, message_id:None, client_ip:None, headers:[('Content-Type', 'multipart/report; report-type=delivery-status; boundary="=_blitzy_dsn_boundary_r1"'), ('From', 'MAILER-DAEMON@example.org'), ('To', 'bounce_reply+15+@sl.local'), ('Subject', 'Delivery Status Notification (Failure)'), ('Auto-Submitted', 'auto-replied'), ('Content-Transfer-Encoding', '7bit')], mail_options:[], rcpt_options:[]
+2026-07-14 04:10:58,928 - SL - DEBUG - 10602 - "/app/email_handler.py:1862" - handle_bounce() - 20b1d172-9097-4a1f-b1bf-26c1445d6f01 - handle bounce for <EmailLog 15>, phase=reply, contact=<Contact 12 external.sender@example.org 5>, alias=<Alias 5 e1@sl.local>
+2026-07-14 04:10:58,929 - SL - DEBUG - 10602 - "/app/email_handler.py:1605" - handle_bounce_reply_phase() - 20b1d172-9097-4a1f-b1bf-26c1445d6f01 - Handle reply bounce <Mailbox 1 john@wick.com> -> <Alias 5 e1@sl.local> -> <Contact 12 external.sender@example.org 5>.<EmailLog 15>
+2026-07-14 04:10:58,929 - SL - WARNING - 10602 - "/app/app/email_utils.py:727" - get_mailbox_bounce_info() - 20b1d172-9097-4a1f-b1bf-26c1445d6f01 - add missing content-transfer-encoding header
+2026-07-14 04:10:58,934 - SL - DEBUG - 10602 - "/app/email_handler.py:1640" - handle_bounce_reply_phase() - 20b1d172-9097-4a1f-b1bf-26c1445d6f01 - Create refused email <Refused Email 4 None 2026-07-21T04:10:58.933720+00:00>
+2026-07-14 04:10:58,939 - SL - DEBUG - 10602 - "/app/email_handler.py:1651" - handle_bounce_reply_phase() - 20b1d172-9097-4a1f-b1bf-26c1445d6f01 - Inform user <User 1 John Wick john@wick.com> about bounced email sent by <Alias 5 e1@sl.local> to <Contact 12 external.sender@example.org 5>
+2026-07-14 04:10:58,962 - SL - DEBUG - 10602 - "/app/app/email_utils.py:303" - send_email() - 20b1d172-9097-4a1f-b1bf-26c1445d6f01 - send email to john@wick.com, subject 'Email cannot be sent to external.sender@example.org from your alias e1@sl.local'
+2026-07-14 04:10:58,963 - SL - DEBUG - 10602 - "/app/app/mail_sender.py:131" - send() - 20b1d172-9097-4a1f-b1bf-26c1445d6f01 - send email with subject 'Email cannot be sent to external.sender@example.org from your alias e1@sl.local', from '"noreply@sl.local" <noreply@sl.local>' to 'john@wick.com'
+2026-07-14 04:10:58,963 - SL - INFO - 10602 - "/app/email_handler.py:2367" - _handle() - 20b1d172-9097-4a1f-b1bf-26c1445d6f01 - Finish mail_from <>, rcpt_tos ['bounce_reply+15+@sl.local'], takes 0.0421900749206543 seconds with return code '250 SL E212 Bounce Reply phase handled'<<===
+```
+
+`is_bounce()` gates both sends (each required `mail_from == "<>"` **and** `multipart/report`, exactly as quoted earlier); the phase — `E211` vs `E212` — is chosen solely by the referenced email-log's `is_reply` flag inside `handle_bounce()` (`email_handler.py:L1851-L1914`), **not** by the recipient prefix. The status strings are defined at `app/email/status.py:L19` (`E211 = "250 SL E211 Bounce Forward phase handled"`) and `L20` (`E212 = "250 SL E212 Bounce Reply phase handled"`). Both outcomes are thus **observed**, not inferred.
 
 
 ### 6.6 Secondary: alias auto-creation (directory success) and domain prerequisites
@@ -1560,6 +1687,79 @@ $ git ls-files | grep -E 'blitzy_investigation|sl_run|q[0-9]_|blitzy_adhoc' || e
 **Evidence-fidelity note.** Every fenced block in this document is verbatim captured output paired with the command that produced it. The only normalization applied to the deliverable itself is the removal of invisible trailing whitespace (psql column-header padding and log-line trailing spaces) and of the extra blank line at end-of-file, so `git diff --check` reports no whitespace errors; no visible character of any log line, status code, identifier, table value, or command was altered.
 
 
+### 7.4 Bounce-phase reproduction cleanup (§6.5)
+
+The two `handle_bounce()` phases documented in [§6.5](#65-the-email-handlers-dispatcher-reply-bounce-and-smtp-status-codes) were captured in a later, dedicated email-handler run (pid `10602`) and created a small, self-contained set of rows that is removed here in the same FK-safe, single-transaction manner as §7.1, restoring the seed baseline exactly. The rows were: `contact 12` (the seed forward's contact), `email_log 14`/`15` (the forward and reply logs), `refused_email 3`/`4`, `bounce 2`/`3`, `notification 8`/`9`, `user_audit_log 15` (a `create_contact` event), and `sent_alert 6`/`7` (the `bounce` / `bounce-when-reply` alerts); `alias 5.last_email_log_id` had also advanced to `15` and is reset to its baseline `NULL`.
+
+A preflight `SELECT` confirms the exact scope before any mutation:
+
+```
+$ docker exec -i sl-postgres psql -U myuser -d simplelogin < /tmp/blitzy_qa_fix/bounce_preflight.sql
+              target               | count
+-----------------------------------+-------
+ alias5.last_email_log_id not null |     1
+ email_log id IN (14,15)           |     2
+ refused_email id IN (3,4)         |     2
+ contact id = 12                   |     1
+ bounce id IN (2,3)                |     2
+ notification id IN (8,9)          |     2
+ user_audit_log id = 15            |     1
+ sent_alert id IN (6,7)            |     2
+(8 rows)
+```
+
+The scoped cleanup transaction (children before parents; `ON_ERROR_STOP` rolls back the whole batch on any FK violation) — each `DELETE n` / `UPDATE n` matches the preflight counts above:
+
+```
+$ docker exec -i sl-postgres psql -U myuser -d simplelogin < /tmp/blitzy_qa_fix/bounce_cleanup.sql
+BEGIN
+UPDATE 1
+DELETE 2
+DELETE 2
+DELETE 1
+DELETE 2
+DELETE 2
+DELETE 1
+DELETE 2
+COMMIT
+```
+
+Re-running the identical preflight after the transaction returns zero for every target, and a table-by-table comparison confirms the database is back to the exact pre-reproduction seed baseline (same counts and max ids), with only the seed `email_log` (id `1`) and seed `contact` (id `1`) surviving and `alias 5.last_email_log_id` back to `NULL`:
+
+```
+$ docker exec -i sl-postgres psql -U myuser -d simplelogin < /tmp/blitzy_qa_fix/bounce_preflight.sql
+              target               | count
+-----------------------------------+-------
+ alias5.last_email_log_id not null |     0
+ email_log id IN (14,15)           |     0
+ refused_email id IN (3,4)         |     0
+ contact id = 12                   |     0
+ bounce id IN (2,3)                |     0
+ notification id IN (8,9)          |     0
+ user_audit_log id = 15            |     0
+ sent_alert id IN (6,7)            |     0
+(8 rows)
+
+$ # count/max per table — post-cleanup == baseline for every table
+ table            | baseline | current
+------------------+----------+---------
+ alias            | 11/11    | 11/11
+ alias_audit_log  | 33/63    | 33/63
+ bounce           | 0/0      | 0/0
+ contact          | 1/1      | 1/1
+ deleted_alias    | 7/15     | 7/15
+ email_log        | 1/1      | 1/1
+ job              | 1/16     | 1/16
+ notification     | 6/6      | 6/6
+ refused_email    | 1/1      | 1/1
+ sent_alert       | 5/5      | 5/5
+ user_audit_log   | 1/9      | 1/9
+ users            | 2/2      | 2/2
+```
+
+The temporary SMTP/DSN observation scripts used for this reproduction live only under the host path `/tmp/blitzy_qa_fix/` (never tracked or committed), matching the read-only, leave-no-trace guarantee stated at the top of §7.
+
+
 ---
 
 ## 8. Coverage pass
@@ -1589,27 +1789,26 @@ Every distinct thing the prompt asks about, and where it is answered from observ
 | 19 | The **`run_at` selection gate** (`run_at <= now + 10 min`) | [§6.3](#63-retry-accounting-and-the-run_at-selection-gate) — Job 5 future `run_at` held back | Observed (state); wall-clock arithmetic inferred |
 | 20 | An **unknown job name** (edge condition) | [§6.4](#64-edge-an-unknown-job-name) — `Unknown job name blitzy-nonexistent-job` at ERROR + `NoneType: None` | Observed |
 | 21 | The **reply** phase | [§6.5](#65-the-email-handlers-dispatcher-reply-bounce-and-smtp-status-codes) — Case B unauthorized reply → `250 SL E214` | Observed |
-| 22 | The **bounce** phase | [§6.5](#65-the-email-handlers-dispatcher-reply-bounce-and-smtp-status-codes) — `is_bounce()` predicate; Case C DSN → OOO `E206`; `handle_bounce()` labeled inferred | Observed (dispatch/OOO); `handle_bounce()` inferred |
-| 23 | **SMTP return / status codes** (incl. `E515`, `E214`, `E206`, and the mapped `E524`/`E213`/`E404`) | [§6.5](#65-the-email-handlers-dispatcher-reply-bounce-and-smtp-status-codes) — codes observed for forward/nonexistent/reply/DSN; exception→code map from source | Observed (4 outcomes); `E524`/`E213`/`E404` inferred |
+| 22 | The **bounce** phase | [§6.5](#65-the-email-handlers-dispatcher-reply-bounce-and-smtp-status-codes) — `is_bounce()` predicate; forward-bounce `bounce+14+@sl.local` → `250 SL E211`, reply-bounce `bounce_reply+15+@sl.local` → `250 SL E212` (both observed) | Observed |
+| 23 | **SMTP return / status codes** (incl. `E515`, `E214`, `E206`, `E211`, `E212`, and the mapped `E524`/`E213`/`E404`) | [§6.5](#65-the-email-handlers-dispatcher-reply-bounce-and-smtp-status-codes) — codes observed for forward / nonexistent / reply / DSN / forward-bounce / reply-bounce; exception→code map from source | Observed (6 outcomes); `E524`/`E213`/`E404` inferred |
 | 24 | **Alias auto-creation — directory** | [§6.6](#66-secondary-alias-auto-creation-directory-success-and-domain-prerequisites) — `abcd+blitzyprobe@sl.local` → alias 16 created | Observed |
 | 25 | **Alias auto-creation — domain / catch-all** prerequisites | [§2.6](#26-what-the-seed-actually-creates-the-real-baseline), [§6.6](#66-secondary-alias-auto-creation-directory-success-and-domain-prerequisites) — seed domains have `catch_all=f`, so not feasible on seed | Observed (config); labeled |
 
-All twenty-five named items are answered from captured runtime evidence, except the four explicitly-labeled inferred sub-points (the `handle_bounce()` forward/reply phases, the `run_at` wall-clock arithmetic, and the `E524`/`E213`/`E404` exception→code mappings), each of which is backed by a genuine runtime attempt as detailed in [§9](#9-observed-vs-inferred-ledger).
+All twenty-five named items are answered from captured runtime evidence, except the three explicitly-labeled inferred sub-points (the `run_at` wall-clock arithmetic, the `E524`/`E213`/`E404` exception→code mappings, and the upstream three-container topology), each of which is backed by a genuine runtime attempt as detailed in [§9](#9-observed-vs-inferred-ledger).
 
 
 ---
 
 ## 9. Observed vs inferred ledger
 
-The overwhelming majority of this document is **observed**: every liveness signal, every HTTP response and status code, every `SL` log line, every database row and counter (before / intermediate / after), the canonical ready→taken→done job transition, the retry re-take, the unknown-job error, the four SMTP outcomes, and the directory auto-creation were all produced at runtime through the real entry points and captured verbatim alongside the command that produced them.
+The overwhelming majority of this document is **observed**: every liveness signal, every HTTP response and status code, every `SL` log line, every database row and counter (before / intermediate / after), the canonical ready→taken→done job transition, the retry re-take, the unknown-job error, the six SMTP outcomes (including both `handle_bounce()` phases → `250 SL E211` / `250 SL E212`), and the directory auto-creation were all produced at runtime through the real entry points and captured verbatim alongside the command that produced them.
 
-Exactly **four** sub-points are labeled **`[INFERRED]`**. Each is a behavior that a black-box send/enqueue could not force into existence without fabricating cryptographic or timing preconditions; for each, a genuine runtime attempt was made first, its real (different) outcome is shown in the body, and only the residual branch is described from source:
+Exactly **three** sub-points are labeled **`[INFERRED]`**. Each is a behavior that a black-box send/enqueue could not force into existence without controlling wall-clock timing, triggering a specific internal exception, or replicating the upstream multi-container deployment; for each, a genuine runtime attempt was made first, its real (different) outcome is shown in the body, and only the residual branch is described from source or upstream documentation:
 
 | # | Inferred sub-point | Why it could not be observed black-box | Genuine attempt actually made (observed outcome) | Source reference |
 |---|--------------------|----------------------------------------|--------------------------------------------------|------------------|
-| 1 | `handle_bounce()` forward-/reply-phase behavior | The bounce handler is reached only when the DSN recipient is a **VERP bounce address** `{BOUNCE_PREFIX}{email_log.id}{BOUNCE_SUFFIX}` carrying an HMAC-signed email-log reference produced by a *prior outbound forward*; a valid signed VERP recipient cannot be hand-crafted in a black-box send | [§6.5](#65-the-email-handlers-dispatcher-reply-bounce-and-smtp-status-codes) Case C — a real DSN (`mail_from=<>` + `multipart/report`) sent to a reverse alias was classified **out-of-office → `250 SL E206`**, not routed to `handle_bounce()` | `email_handler.py:L1851`, `L1432`, `L1595` |
-| 2 | The `run_at <= now + 10 min` wall-clock arithmetic in the retry gate | Comparing a captured timestamp against "now + 10 min" is an arithmetic statement about clock values, not a directly-emitted runtime signal | [§6.3](#63-retry-accounting-and-the-run_at-selection-gate) — Job 5's future `run_at` was observed to keep it `state=0`/`attempts=0` across ~30 poll cycles (the *values* are observed; only the arithmetic tying them together is inferred) | `job_runner.py:L323` |
-| 3 | The `E524` / `E213` / `E404` exception→code mappings | These codes are emitted only when specific exceptions arise inside `handle_DATA()` (`CannotCreateContactForReverseAlias`, `VERPTransactional`/`VERPReply`, generic `Exception`); the genuine sends did not raise them | [§6.5](#65-the-email-handlers-dispatcher-reply-bounce-and-smtp-status-codes) — the four codes that *did* arise were observed: forward `250`, nonexistent `550 SL E515`, unauthorized reply `250 SL E214`, DSN `250 SL E206` | `email_handler.py:L2307`, `L2318`, `L2332` |
-| 4 | The upstream production **three-container** topology | The self-hosted production layout runs three separate containers; locally the canonical image runs all three processes in one container | [§6.1](#61-how-the-three-services-stay-up-they-do-not-launch-one-another) — locally the three processes were each launched independently and their independence/continuity observed (PIDs, `etime`); the multi-container production shape is from upstream docs | corroborated by web search (§0.2.2) |
+| 1 | The `run_at <= now + 10 min` wall-clock arithmetic in the retry gate | Comparing a captured timestamp against "now + 10 min" is an arithmetic statement about clock values, not a directly-emitted runtime signal | [§6.3](#63-retry-accounting-and-the-run_at-selection-gate) — Job 5's future `run_at` was observed to keep it `state=0`/`attempts=0` across ~30 poll cycles (the *values* are observed; only the arithmetic tying them together is inferred) | `job_runner.py:L323` |
+| 2 | The `E524` / `E213` / `E404` exception→code mappings | These codes are emitted only when specific exceptions arise inside `handle_DATA()` (`CannotCreateContactForReverseAlias`, `VERPTransactional`/`VERPReply`, generic `Exception`); the genuine sends did not raise them | [§6.5](#65-the-email-handlers-dispatcher-reply-bounce-and-smtp-status-codes) — the six codes that *did* arise were observed: forward `250`, nonexistent `550 SL E515`, unauthorized reply `250 SL E214`, DSN `250 SL E206`, forward-bounce `250 SL E211`, reply-bounce `250 SL E212` | `email_handler.py:L2307`, `L2318`, `L2332` |
+| 3 | The upstream production **three-container** topology | The self-hosted production layout runs three separate containers; locally the canonical image runs all three processes in one container | [§6.1](#61-how-the-three-services-stay-up-they-do-not-launch-one-another) — locally the three processes were each launched independently and their independence/continuity observed (PIDs, `etime`); the multi-container production shape is from upstream docs | corroborated by web search (§0.2.2) |
 
 No other claim in the document is inferred. Where a value was obtained by reading the database directly rather than through the canonical entry point (for example, a `SELECT` on the `job` table to show a state transition), that read is a *verification* of a state produced canonically, and any purely-diagnostic direct enqueue is labeled `[NON-CANONICAL]` at its point of use (the §4.3 warm-up jobs `1`–`3`).
