@@ -119,7 +119,7 @@ Version: 0.14.0
 
 ### 0.2 The `.env` prerequisite, and a distinct pre-database failure (Observed)
 
-`app/config.py` reads several **mandatory** environment variables at *import time*: `URL = os.environ["URL"]` (`app/config.py:79`), `EMAIL_DOMAIN = os.environ["EMAIL_DOMAIN"]` (`app/config.py:92`), and `SUPPORT_EMAIL = os.environ["SUPPORT_EMAIL"]` (`app/config.py:93`). If none of these is set, importing the configuration raises a `KeyError` **before** any database work happens at all. That is a *different* failure from the empty-database error Q1 asks about, so it is demonstrated and set aside here first. The capture below moves the provisioned `.env` aside, imports `app.config` under an empty environment, observes the `KeyError`, and then restores `.env`.
+`app/config.py` reads several **mandatory** environment variables at *import time*: `URL = os.environ["URL"]` (`app/config.py:79`), `EMAIL_DOMAIN = os.environ["EMAIL_DOMAIN"].lower()` (`app/config.py:92`), and `SUPPORT_EMAIL = os.environ["SUPPORT_EMAIL"]` (`app/config.py:93`). If none of these is set, importing the configuration raises a `KeyError` **before** any database work happens at all. That is a *different* failure from the empty-database error Q1 asks about, so it is demonstrated and set aside here first. The capture below moves the provisioned `.env` aside, imports `app.config` under an empty environment, observes the `KeyError`, and then restores `.env`.
 
 ```text
 $ ls -l /app/.env && git -C /app check-ignore .env && echo '(.env is git-ignored)'
@@ -159,7 +159,7 @@ config import OK; URL= http://localhost:7777
 
 ### Q1 — Why the process starts but the request fails (Inferred from source)
 
-`app/db.py` builds the engine and opens a connection at **import time**: `engine = create_engine(config.DB_URI)` (`app/db.py:9-11`) and `connection = engine.connect()` (`app/db.py:12`), with `Session = scoped_session(...)` (`app/db.py:14`). Connecting to an *empty* database succeeds — there is nothing schema-specific about opening a connection — so the process boots normally. The failure only appears when the **first query against a missing relation** is issued. The root route `/` redirects to the login view (`server.py:249-255`), the login page is served by `@auth_bp.route("/login")` at `app/auth/views/login.py:21-25` (the blueprint is mounted at `url_prefix="/auth"`, `app/auth/base.py:3-5`, so the browser URL is `/auth/login`), and submitting the form runs `user = User.get_by(email=email) or User.get_by(email=canonical_email)` at `app/auth/views/login.py:43`, which calls `Session.query(cls).filter_by(**kw).first()` at `app/models.py:84`. That is the first statement to touch the `users` table (`User.__tablename__ = "users"`, `app/models.py:337`). The observations below confirm each step of this reasoning at runtime.
+`app/db.py` builds the engine and opens a connection at **import time**: `engine = create_engine(config.DB_URI, connect_args={"application_name": config.DB_CONN_NAME})` (`app/db.py:9-11`) and `connection = engine.connect()` (`app/db.py:12`), with `Session = scoped_session(...)` (`app/db.py:14`). Connecting to an *empty* database succeeds — there is nothing schema-specific about opening a connection — so the process boots normally. The failure only appears when the **first query against a missing relation** is issued. The root route `/` redirects to the login view (`server.py:249-255`), the login page is served by `@auth_bp.route("/login")` at `app/auth/views/login.py:21-25` (the blueprint is mounted at `url_prefix="/auth"`, `app/auth/base.py:3-5`, so the browser URL is `/auth/login`), and submitting the form runs `user = User.get_by(email=email) or User.get_by(email=canonical_email)` at `app/auth/views/login.py:43`, which calls `Session.query(cls).filter_by(**kw).first()` at `app/models.py:84`. That is the first statement to touch the `users` table (`User.__tablename__ = "users"`, `app/models.py:337`). The observations below confirm each step of this reasoning at runtime.
 
 ### Q1 — Reproduction (Observed)
 
@@ -595,7 +595,7 @@ The required service set is **inferred** from three grounding sources and then e
 4. **`cron.py`** — scheduled one-shot jobs invoked by the yacron scheduler per `crontab.yml`. **No client-facing port.**
 5. **`event_listener.py listener`** — background consumer of PostgreSQL `LISTEN`/`NOTIFY` events. **No client-facing port.**
 
-Two of the five are **port-binding services** that accept client connections (web app on 7777, SMTP handler on 20381); the other three are **background workers** whose readiness is proven by a log line rather than a listening socket. The “ready” evidence therefore differs in kind between the two groups, and both kinds are captured below.
+Two of the five are **port-binding services** that accept client connections (web app on 7777, SMTP handler on 20381); the other three are **background workers** whose readiness is proven by a log line rather than a listening socket. The “ready” evidence therefore differs in kind between the two groups, and both kinds are captured below. Beyond the per-service runs, all four long-lived services are additionally brought up **simultaneously** as one integrated topology — with concurrent HTTP/SMTP client probes, live job-runner and event-listener activity, a one-shot `cron.py` run while the set stays alive, and an integrated teardown — in *Q2 — Integrated topology* below.
 
 **Port clarification (Observed vs. a common misconception).** The *Python* SMTP service binds **20381**, not 25. The public MTA (Postfix) listens on port 25 and *relays* inbound mail to the Python handler at `smtp:127.0.0.1:20381` (`README.md:367-369`); nginx reverse-proxies the web app at `http://localhost:7777` (`README.md:513`). The values observed for the Python services are therefore **7777** and **20381**.
 
@@ -932,6 +932,250 @@ $ ps -eo pid,stat,cmd | grep '[e]vent_listener.py' | grep -v defunct || echo '  
 ```
 
 **Observed:** both runs emit the identical readiness sequence — `Using PostgresEventSource` (`event_listener.py:34`) → `Starting with HttpEventSink` (`event_listener.py:43`) → `Starting to listen to events` (`events/event_source.py:49`) — within ~1s; `kill -0` confirms the process stays alive in its poll loop; and `SIGTERM` stops it cleanly with no residual process.
+
+### Q2 — Integrated topology: all four long-lived services running simultaneously (Observed)
+
+The per-service runs above start and stop each service in isolation. This subsection proves the **initialized** system operates as one **integrated topology**: the four long-lived services — the gunicorn web app (7777), the `email_handler.py` SMTP listener (20381), `job_runner.py`, and `event_listener.py listener` — are brought up **simultaneously** and held alive together as one **persistent process set** against the fully-initialized database (`sl_q2`: migrated to Alembic head `32f25cbf12f6` and then seeded by `python init_app.py`, so `public_domain` contains the single row `sl.local`). While all four run together they are exercised concurrently — an HTTP `/health` probe, an SMTP banner probe, a real job enqueued and processed by `job_runner`, and a live PostgreSQL `LISTEN` connection from `event_listener` — after which `cron.py` is run as a one-shot **while all four remain alive**, and finally the whole set is torn down and both ports are confirmed released. (`cron.py` is the fifth required service; because it is a one-shot rather than a long-lived daemon, it is exercised *within* — not held alongside — the persistent set.)
+
+Because the canonical image ships neither `ss` nor `lsof`, port ownership is established directly from the kernel: a small temporary helper reads the `LISTEN` socket inode for a port from `/proc/net/tcp` (+`/proc/net/tcp6`) and matches it against every process's `/proc/<pid>/fd/*` socket symlinks. The two temporary observation helpers used below — both removed in the Cleanup section, leaving the repository unchanged — are:
+
+`port_owner.py` — maps a listening TCP port to the owning PID(s) without `ss`/`lsof`:
+
+```python
+#!/usr/bin/env python3
+"""Temporary observation helper: map a listening TCP port to the owning PID(s)
+without ss/lsof (neither is installed in the image). It reads the LISTEN socket
+inode for the port from /proc/net/tcp (+tcp6), then finds every PID whose
+/proc/<pid>/fd/* symlink points at that socket inode. Prints the port, the
+listen inode(s), and each owning "PID (cmdline)". Read-only; creates nothing."""
+import glob
+import os
+import sys
+
+
+def listen_inodes(port: int):
+    hexport = "%04X" % port
+    inodes = set()
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(path) as fh:
+                next(fh)  # skip header
+                for line in fh:
+                    p = line.split()
+                    local, state, inode = p[1], p[3], p[9]
+                    if state != "0A":  # 0A == LISTEN
+                        continue
+                    if local.split(":")[1].upper() == hexport:
+                        inodes.add(inode)
+        except FileNotFoundError:
+            pass
+    return inodes
+
+
+def pids_for_inodes(inodes):
+    pids = set()
+    for fd in glob.glob("/proc/[0-9]*/fd/*"):
+        try:
+            target = os.readlink(fd)
+        except OSError:
+            continue
+        if target.startswith("socket:[") and target[8:-1] in inodes:
+            pids.add(fd.split("/")[2])
+    return sorted(pids, key=int)
+
+
+def cmdline(pid: str) -> str:
+    try:
+        with open("/proc/%s/cmdline" % pid, "rb") as fh:
+            return fh.read().replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+    except OSError:
+        return "?"
+
+
+def main():
+    port = int(sys.argv[1])
+    inodes = listen_inodes(port)
+    pids = pids_for_inodes(inodes)
+    owners = ", ".join("%s (%s)" % (pid, cmdline(pid)) for pid in pids) or "(none)"
+    print("PORT %d LISTEN inode(s)=%s owner PID(s): %s" % (port, sorted(inodes), owners))
+
+
+if __name__ == "__main__":
+    main()
+```
+
+`enqueue_job.py` — inserts one valid, bounded, no-op `Job` so the running `job_runner.py` exercises a recognized job name (`config.JOB_SEND_ALIAS_CREATION_EVENTS`, `app/config.py:311`); the empty payload makes the branch a no-op (`user_id=None` → `User.get(None)=None`, `job_runner.py:295-302`), and the row is deleted afterward:
+
+```python
+#!/usr/bin/env python3
+"""Temporary observation helper: enqueue ONE valid, bounded, no-op job so a
+running job_runner.py exercises a RECOGNIZED job name
+(config.JOB_SEND_ALIAS_CREATION_EVENTS [app/config.py:311]). An empty payload ->
+user_id None -> User.get(None) -> None -> process_job no-ops -> job marked done.
+The row is deleted after observation (net-zero for the job table)."""
+from app.db import Session
+from app.models import Job
+from app import config
+
+job = Job.create(name=config.JOB_SEND_ALIAS_CREATION_EVENTS, payload={})
+Session.commit()
+print(
+    "ENQUEUED job id=%s name=%r state=%s taken=%s payload=%s"
+    % (job.id, job.name, job.state, job.taken, job.payload)
+)
+```
+
+The four services are launched with their canonical entry commands (the gunicorn line is verbatim the `Dockerfile` CMD, `Dockerfile:47`), each backgrounded so the set runs concurrently; `PYTHONPATH=/app` is exported so the helper scripts resolve the `app` package. In this environment the canonical `python`/`gunicorn` resolve to the project virtualenv at `/app/venv/bin/`, as the `ps` cmdlines in the capture below show:
+
+```bash
+$ export DB_URI="postgresql://myuser:mypassword@localhost:5432/sl_q2"   # migrated + init_app.py (public_domain=sl.local)
+$ export EVENT_LISTENER_DB_URI="$DB_URI"; export PYTHONPATH=/app
+$ gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15 &   # web app (Dockerfile:47)
+$ python email_handler.py &                                # SMTP listener on 20381
+$ python job_runner.py &                                   # background job worker
+$ python event_listener.py listener &                      # PG LISTEN/NOTIFY consumer
+```
+
+The complete, unedited combined output of the integrated run follows (produced by a temporary driver, `f1_topology.sh`, that runs exactly the commands above plus the probes described, and is removed in Cleanup). Machine-readable summary labels — `INTEGRATED_ROOT_PIDS`, `PERSISTENT_ALIVE_*`, `PORT_7777_OWNER_PIDS`, `PORT_20381_OWNER_PIDS`, `INTEGRATED_HEALTH_HTTP`, `INTEGRATED_EVENT_STATE`, `INTEGRATED_JOB_STATE`, `INTEGRATED_CRON_EXIT`, and `POST_CLEANUP_PORT_*` — are printed by the driver itself at runtime:
+
+```text
+############ SECTION 1: START FOUR SERVICES SIMULTANEOUSLY (one persistent process set) ############
+DB_URI=postgresql://myuser:mypassword@localhost:5432/sl_q2
+start_utc=2026-07-14T01:15:21Z
+INTEGRATED_ROOT_PIDS gunicorn_master=18618 email_handler=18619 job_runner=18620 event_listener=18621
+
+############ SECTION 2: WAIT FOR READINESS ############
+port 7777 ready after 2s
+port 20381 ready after 1s
+event_listener ready after 1s
+
+############ SECTION 3: ALL FOUR ALIVE SIMULTANEOUSLY (ps) ############
+    PID    PPID   RSS ELAPSED CMD
+  18618   18614 24252       3 /app/venv/bin/python /app/venv/bin/gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15
+  18619   18614 140128      3 /app/venv/bin/python email_handler.py
+  18620   18614 138292      3 /app/venv/bin/python job_runner.py
+  18621   18614 91764       3 /app/venv/bin/python event_listener.py listener
+--- gunicorn worker children of master 18618 ---
+    PID    PPID   RSS ELAPSED CMD
+  18625   18618 139056      3 /app/venv/bin/python /app/venv/bin/gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15
+  18626   18618 138668      3 /app/venv/bin/python /app/venv/bin/gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15
+PERSISTENT_ALIVE_AT_STARTUP=4/4
+
+############ SECTION 4: PORT BINDINGS (listener ownership) ############
+--- /proc/net/tcp LISTEN rows (7777=hex 1E61, 20381=hex 4F9D) ---
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode                                                     
+   2: 00000000:1E61 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 907557609 1 0000000000000000 100 0 0 10 0                 
+   3: 00000000:4F9D 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 907517884 1 0000000000000000 100 0 0 10 0                 
+--- port_owner.py (full) ---
+PORT 7777 LISTEN inode(s)=['907557609'] owner PID(s): 18618 (/app/venv/bin/python /app/venv/bin/gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15), 18625 (/app/venv/bin/python /app/venv/bin/gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15), 18626 (/app/venv/bin/python /app/venv/bin/gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15)
+PORT 20381 LISTEN inode(s)=['907517884'] owner PID(s): 18619 (/app/venv/bin/python email_handler.py)
+PORT_7777_OWNER_PIDS: 18618 (/app/venv/bin/python /app/venv/bin/gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15), 18625 (/app/venv/bin/python /app/venv/bin/gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15), 18626 (/app/venv/bin/python /app/venv/bin/gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15)
+PORT_20381_OWNER_PIDS: 18619 (/app/venv/bin/python email_handler.py)
+
+############ SECTION 5: HTTP /health CLIENT PROBE (web app) ############
+$ curl -s -w '\nHTTP_CODE=%{http_code}\n' http://127.0.0.1:7777/health
+success
+HTTP_CODE=200
+INTEGRATED_HEALTH_HTTP=200 body=success
+
+############ SECTION 6: SMTP 220 BANNER CLIENT PROBE (email handler) ############
+$ exec 3<>/dev/tcp/127.0.0.1/20381; read banner; QUIT
+220 f411db182cde Python SMTP 1.4.2
+221 Bye
+
+############ SECTION 7: EVENT_LISTENER READINESS + LIVE PG LISTEN CONNECTION ############
+--- event_listener.log ---
+>>> URL: http://localhost:7777
+MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value
+Paddle param not set
+WARNING: Use a temp directory for GNUPGHOME /tmp/osshwgtcbzolyektwpnj
+Upload files to local dir
+>>> init logging <<<
+2026-07-14 01:15:21,823 - SL - DEBUG - 18621 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+2026-07-14 01:15:21,938 - SL - INFO - 18621 - "/app/event_listener.py:34" - main() -  - Using PostgresEventSource
+2026-07-14 01:15:21,946 - SL - INFO - 18621 - "/app/event_listener.py:43" - main() -  - Starting with HttpEventSink
+2026-07-14 01:15:21,946 - SL - INFO - 18621 - "/app/events/event_source.py:49" - __listen() -  - Starting to listen to events
+--- pg_stat_activity: sl-event-listen connection ---
+  pid  | application_name | state |              query              
+-------+------------------+-------+---------------------------------
+ 18629 | sl-event-listen  | idle  | LISTEN simplelogin_sync_events;
+(1 row)
+
+INTEGRATED_EVENT_STATE=listening channel=simplelogin_sync_events pg_backend_pid=18629
+
+############ SECTION 8: JOB_RUNNER EXERCISED WITH A REAL ENQUEUED JOB ############
+job count before=0
+$ PYTHONPATH=/app python /tmp/blitzy_obs/enqueue_job.py
+>>> URL: http://localhost:7777
+MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value
+Paddle param not set
+WARNING: Use a temp directory for GNUPGHOME /tmp/yfndbmcbwdjsqcerwjtg
+Upload files to local dir
+>>> init logging <<<
+2026-07-14 01:15:25,945 - SL - DEBUG - 18687 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+ENQUEUED job id=3 name='send-alias-creation-events' state=0 taken=False payload={}
+--- job row immediately after enqueue ---
+ id |            name            | state | taken | attempts 
+----+----------------------------+-------+-------+----------
+  3 | send-alias-creation-events |     0 | f     |        0
+(1 row)
+
+--- waiting up to 25s for job_runner to take & finish ---
+job reached state=2 (done) after 8s
+--- job_runner.log 'Take job' line ---
+8:2026-07-14 01:15:32,827 - SL - DEBUG - 18620 - "/app/job_runner.py:334" - <module>() -  - Take job <Job 3 send-alias-creation-events {}>
+--- job row AFTER ---
+ id |            name            | state | taken | attempts 
+----+----------------------------+-------+-------+----------
+  3 | send-alias-creation-events |     2 | t     |        1
+(1 row)
+
+INTEGRATED_JOB_STATE enqueued_id=3 before=0 ready=0 final=2 (JobState ready=0 taken=1 done=2)
+
+############ SECTION 9: CRON RUNS WHILE THE FOUR STAY ALIVE ############
+PERSISTENT_ALIVE_BEFORE_CRON=4/4
+$ python cron.py -j delete_old_monitoring
+>>> URL: http://localhost:7777
+MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value
+Paddle param not set
+WARNING: Use a temp directory for GNUPGHOME /tmp/likjypamlepnvomzlsdo
+Upload files to local dir
+>>> init logging <<<
+2026-07-14 01:15:34,415 - SL - DEBUG - 18754 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+2026-07-14 01:15:35,303 - SL - DEBUG - 18754 - "/app/cron.py:1263" - <module>() -  - Start running cronjob
+2026-07-14 01:15:35,305 - SL - DEBUG - 18754 - "/app/cron.py:1299" - <module>() -  - Delete old monitoring records
+2026-07-14 01:15:35,429 - SL - DEBUG - 18754 - "/app/cron.py:961" - delete_old_monitoring() -  - delete monitoring records older than 2026-06-14T01:15:35.305326+00:00, nb row 0
+INTEGRATED_CRON_EXIT=0
+PERSISTENT_ALIVE_AFTER_CRON=4/4
+
+############ SECTION 10: NET-ZERO — delete observed job row ############
+DELETE 1
+job count after cleanup=0
+
+############ SECTION 11: INTEGRATED TEARDOWN — stop the whole set ############
+PERSISTENT_ALIVE_AFTER_TEARDOWN=0/4
+PORT 7777 LISTEN inode(s)=[] owner PID(s): (none)
+PORT 20381 LISTEN inode(s)=[] owner PID(s): (none)
+POST_CLEANUP_PORT_7777=free
+POST_CLEANUP_PORT_20381=free
+stop_utc=2026-07-14T01:15:38Z
+############ DONE ############
+```
+
+**Observed — what this integrated run proves (each item is a line in the capture above):**
+
+- **All four alive simultaneously.** `INTEGRATED_ROOT_PIDS` records the four root PIDs (gunicorn master `18618`, `email_handler` `18619`, `job_runner` `18620`, `event_listener` `18621`); the `ps` listing shows all four plus the two gunicorn workers (`18625`, `18626`, children of the master `18618`); and `PERSISTENT_ALIVE_AT_STARTUP=4/4`.
+- **Listener ownership while co-running.** `/proc/net/tcp` shows `LISTEN` (state `0A`) on hex `1E61` (7777) and `4F9D` (20381). `PORT_7777_OWNER_PIDS` maps 7777 to the gunicorn master **and both workers** (`18618`, `18625`, `18626` — they share one inherited listening socket, inode `907557609`); `PORT_20381_OWNER_PIDS` maps 20381 to the single `email_handler.py` process (`18619`, inode `907517884`).
+- **HTTP client probe.** `curl http://127.0.0.1:7777/health` returns body `success` with `INTEGRATED_HEALTH_HTTP=200`; the route returns `"success", 200` (`server.py:213-215`).
+- **SMTP client probe.** The handler answers `220 f411db182cde Python SMTP 1.4.2` and, on `QUIT`, `221 Bye` (aiosmtpd 1.4.2 bound to 20381).
+- **Event-listener activity.** The console shows the readiness chain `Using PostgresEventSource` (`event_listener.py:34`) → `Starting with HttpEventSink` (`event_listener.py:43`) → `Starting to listen to events` (`events/event_source.py:49`); `pg_stat_activity` shows the live backend `sl-event-listen` (pid `18629`) holding `LISTEN simplelogin_sync_events;` — the channel defined at `app/events/event_dispatcher.py:14` (`EVENT_LISTENER_DB_URI` defaults to `DB_URI`, `app/config.py:637`). Summary: `INTEGRATED_EVENT_STATE=listening channel=simplelogin_sync_events pg_backend_pid=18629`.
+- **Job-runner activity — full state transition.** A real job is enqueued (`ENQUEUED job id=3 name='send-alias-creation-events' state=0 taken=False payload={}`); the row starts at `state=0` (ready), and within 8 s `job_runner` logs `Take job <Job 3 send-alias-creation-events {}>` (`job_runner.py:334`, PID `18620`) and drives it to `state=2` (done, `taken=t`, `attempts=1`). `INTEGRATED_JOB_STATE … before=0 ready=0 final=2`, interpreted against `JobState ready=0 / taken=1 / done=2` (`app/models.py:253-257`).
+- **Cron one-shot while the set stays alive.** With `PERSISTENT_ALIVE_BEFORE_CRON=4/4`, `python cron.py -j delete_old_monitoring` logs `Start running cronjob` (`cron.py:1263`) → `Delete old monitoring records` (`cron.py:1299`) → `delete monitoring records older than …, nb row 0` (`cron.py:961`, `delete_old_monitoring()`) and exits `INTEGRATED_CRON_EXIT=0`; afterward `PERSISTENT_ALIVE_AFTER_CRON=4/4` — the four long-lived services are unaffected by the one-shot.
+- **Integrated teardown.** After `SIGTERM` to the whole set, `PERSISTENT_ALIVE_AFTER_TEARDOWN=0/4`, and both ports are released: the post-cleanup `/proc/net/tcp` read finds no `LISTEN` inode, giving `POST_CLEANUP_PORT_7777=free` and `POST_CLEANUP_PORT_20381=free`.
+
+**Inferred (labelled).** Only the *reason* the gunicorn master and its two workers all co-own port 7777 is inferred rather than separately instrumented: gunicorn's master binds the listening socket and `fork()`s workers that inherit the same file descriptor, so all three PIDs resolve to one shared socket inode — consistent with the single inode (`907557609`) reported for all three in `PORT_7777_OWNER_PIDS`.
+
+**Reproducibility.** The integrated run was repeated; the qualitative result was identical across runs — `4/4` liveness at startup and both before and after cron, `INTEGRATED_HEALTH_HTTP=200`, the `220` SMTP banner, the job `0 → 2` transition, `INTEGRATED_CRON_EXIT=0`, and `POST_CLEANUP_PORT_*=free`. Only the PIDs, socket inodes, timestamps, and the enqueued job id differ between runs.
 
 ### Q2 — Answer
 
@@ -1476,7 +1720,7 @@ $ psql -U myuser -h localhost -d sl_probe_obs -tAc "SELECT count(*) AS ignore_bo
 0
 ```
 
-**What this shows (Observed).** With the sender listed in `ignore_bounce_sender`, the identical undeliverable message returns **`250 SL E207 No bounce report`** instead of E515 — confirming the branch at `email_handler.py:552-555`. For a normal sender (not in that table) the result is E515.
+**What this shows (Observed).** With the sender listed in `ignore_bounce_sender`, the identical undeliverable message returns **`250 SL E207 No bounce report`** instead of E515 — confirming the branch at `email_handler.py:552-555`. For a normal sender (not in that table) the result is E515. A protocol-true null reverse-path (`MAIL FROM:<>`) — both without and with an exact `<>` ignore-bounce row — together with the recipient-scoped before/after DB state is exercised in *Q3 — Literal null reverse-path and recipient-scoped DB side-effects* below.
 
 ### Q3 — Stability across two runs (Observed)
 
@@ -1633,9 +1877,424 @@ $ ps -eo pid,stat,cmd | grep '[e]mail_handler.py' | grep -v defunct || echo '  (
 
 **What this shows (Observed).** `public_domain` now contains `1 | sl.local | t`, yet the same injection still returns **`550 SL E515 Email not exist`** (`message_id 230e8312-...`). The handler log is the *same* rejection chain as the pre-initialization run — note in particular that `app/alias_utils.py:104` still reports `no custom domain for sl.local`: that check consults the `custom_domain` table (`CustomDomain`), which is distinct from the now-seeded `public_domain` (`SLDomain`). This **confirms the causal nuance**: seeding `public_domain` does not change the result, because the forward auto-create path never consults it. The port was bound on `0.0.0.0:20381`, the handler was terminated with `SIGTERM`, and the port was confirmed released.
 
+### Q3 — Literal null reverse-path (`MAIL FROM:<>`) and recipient-scoped DB side-effects (Observed)
+
+The alternate-branch demonstration above used a *named* sender (`sender@example.com`) placed in `ignore_bounce_sender`. A named address is **not** protocol-equivalent to a true SMTP **null reverse-path** — the empty `MAIL FROM:<>` that RFC 5321 §4.5.5 reserves for bounce/DSN traffic, and precisely the empty-envelope case `should_ignore_bounce` exists to suppress. This follow-up subsection therefore exercises the **literal empty-envelope** (`MAIL FROM:<>`) through the same real aiosmtpd listener on `20381`, in **both** sub-cases — with **no** ignore row (expect `550 SL E515`) and with an **exact `<>` ignore-bounce row** (expect `250 SL E207`) — and, for **every** injection, captures the **recipient-scoped** `Alias`/`CustomDomain`/`Directory`/`Contact`/`EmailLog` state **before and after** the send, proving the rejection has **no** database side-effect. It was captured on the same canonical runtime as the rest of this document (container `f411db182cde`, commit `2cd6ee777f8c`); only the timestamps, PIDs, and `message_id`s differ from the runs above.
+
+A fresh migrated-but-uninitialized database `sl_probe_obs` is provisioned for this capture (`DB_URI=postgresql://myuser:mypassword@localhost:5432/sl_probe_obs /app/venv/bin/alembic upgrade head`, leaving `public_domain = 0`), and the real handler is started with `/app/venv/bin/python email_handler.py` (cwd `/app`). Port ownership is proven from `/proc/net/tcp` exactly as in Q2. The SMTP client is the same self-contained injector shown in *Q3 — The SMTP injection client* above; here it is invoked with an **empty** `mail_from` argument, so it transmits the literal `MAIL FROM:<>` on the wire. In every capture below `python` is `/app/venv/bin/python`, and each `psql -d sl_probe_obs …` echo runs with `-w -h localhost -U myuser`; the scratch DB is dropped in the *Cleanup and net-zero verification* section, which already lists `sl_probe_obs`.
+
+```text
+############ SECTION 0: PROVISION migrated-but-UNINITIALIZED sl_probe_obs ############
+$ DB_URI=...sl_probe_obs alembic upgrade head
+alembic exit=0
+INFO  [alembic.runtime.migration] Running upgrade 91ed7f46dc81 -> 7d7b84779837, user_audit_log
+INFO  [alembic.runtime.migration] Running upgrade 7d7b84779837 -> 32f25cbf12f6, alias_audit_log_index_created_at
+$ psql -d sl_probe_obs -tAc 'SELECT count(*) FROM public_domain'  (uninitialized => 0)
+0
+alembic head:
+32f25cbf12f6
+
+############ SECTION 1: START real aiosmtpd handler on 20381 (pre-init) ############
+handler PID=76307 ready=yes (waited 3s)
+--- handler startup readiness log ---
+1:>>> URL: http://localhost:7777
+6:>>> init logging <<<
+8:2026-07-14 01:54:21,413 - SL - INFO - 76307 - "/app/email_handler.py:2403" - <module>() -  - Listen for port 20381
+--- /proc/net/tcp LISTEN 20381 (hex 4F9D) ---
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode                                                     
+   2: 00000000:4F9D 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 909672191 1 0000000000000000 100 0 0 10 0                 
+--- port_owner.py 20381 ---
+PORT 20381 LISTEN inode(s)=['909672191'] owner PID(s): 76307 (/app/venv/bin/python email_handler.py)
+
+```
+
+**Recipient-scoped baseline (before any injection).** For the recipient `nonexistent@sl.local` the related tables are empty. This is the `before` state each post-send snapshot is compared against; the exact queries are `SELECT count(*) FROM alias WHERE email = 'nonexistent@sl.local'`, `SELECT count(*) FROM custom_domain WHERE domain = 'sl.local'`, and the `directory`/`contact`/`email_log` counts:
+
+```text
+############ SECTION 2: F3 baseline — STATE_PREINIT (before any injection) ############
+----- recipient-scoped DB state: STATE_PREINIT (recipient nonexistent@sl.local) -----
+$ psql -d sl_probe_obs -c "SELECT count(*) AS alias_cnt FROM alias WHERE email = 'nonexistent@sl.local'"
+ alias_cnt 
+-----------
+         0
+(1 row)
+
+$ psql -d sl_probe_obs -c "SELECT count(*) AS custom_domain_cnt FROM custom_domain WHERE domain = 'sl.local'"
+ custom_domain_cnt 
+-------------------
+                 0
+(1 row)
+
+$ psql -d sl_probe_obs -c "SELECT count(*) AS directory_cnt FROM directory"
+ directory_cnt 
+---------------
+             0
+(1 row)
+
+$ psql -d sl_probe_obs -c "SELECT count(*) AS contact_cnt FROM contact"
+ contact_cnt 
+-------------
+           0
+(1 row)
+
+$ psql -d sl_probe_obs -c "SELECT count(*) AS email_log_cnt FROM email_log"
+ email_log_cnt 
+---------------
+             0
+(1 row)
+
+STATE_PREINIT: ALIAS=0 CUSTOM_DOMAIN=0 DIRECTORY=0 CONTACT=0 EMAIL_LOG=0
+
+```
+
+**Sub-case A — normal sender → `550 SL E515` (ties to the primary result, now with recipient-scoped before/after SQL).** The `sender@example.com → nonexistent@sl.local` injection returns `550 SL E515 Email not exist`; the `Forward phase sender@example.com(...) -> nonexistent@sl.local` (`email_handler.py:2202`) and the failed auto-create chain match the primary capture. The recipient-scoped `alias`/`custom_domain`/`directory` counts taken **post-send** — i.e. **after the normal-sender injection** — are unchanged from the baseline (all zero):
+
+```text
+############ SECTION 3: normal sender -> 550 E515 (ties to existing primary result) ############
+===== INJECTION [NORMAL sender@example.com]: MAIL FROM:<sender@example.com>  RCPT TO:<nonexistent@sl.local> =====
+$ python /tmp/blitzy_obs/sl_inject.py 127.0.0.1 20381 'sender@example.com' 'nonexistent@sl.local'
+S: 220 f411db182cde Python SMTP 1.4.2
+C: EHLO test.blitzy.local
+S: 250-f411db182cde
+S: 250-SIZE 33554432
+S: 250-8BITMIME
+S: 250-SMTPUTF8
+S: 250 HELP
+C: MAIL FROM:<sender@example.com>
+S: 250 OK
+C: RCPT TO:<nonexistent@sl.local>
+S: 250 OK
+C: DATA
+S: 354 End data with <CR><LF>.<CR><LF>
+C: From: sender@example.com
+C: To: nonexistent@sl.local
+C: Subject: q3 test
+C: Content-Transfer-Encoding: 7bit
+C: 
+C: q3 test body
+C: .
+S: 550 SL E515 Email not exist
+C: QUIT
+S: 221 Bye
+=== FINAL_SERVER_REPLY_TO_SENDER: 550 SL E515 Email not exist
+----- email_handler.py log emitted for THIS message -----
+2026-07-14 01:54:22,402 - SL - DEBUG - 76307 - "/app/app/log.py:24" - set_message_id() -  - set message_id e1eea9bd-9c76-4fa3-b50c-a7f42ea18183
+2026-07-14 01:54:22,402 - SL - DEBUG - 76307 - "/app/email_handler.py:2342" - _handle() - e1eea9bd-9c76-4fa3-b50c-a7f42ea18183 - ====>=====>====>====>====>====>====>====>
+2026-07-14 01:54:22,402 - SL - INFO - 76307 - "/app/email_handler.py:2343" - _handle() - e1eea9bd-9c76-4fa3-b50c-a7f42ea18183 - New message, mail from sender@example.com, rctp tos ['nonexistent@sl.local'] 
+2026-07-14 01:54:22,403 - SL - DEBUG - 76307 - "/app/email_handler.py:1963" - handle() - e1eea9bd-9c76-4fa3-b50c-a7f42ea18183 - Cannot parse Postfix queue ID from None None
+2026-07-14 01:54:22,520 - SL - DEBUG - 76307 - "/app/email_handler.py:1980" - handle() - e1eea9bd-9c76-4fa3-b50c-a7f42ea18183 - ==>> Handle mail_from:sender@example.com, rcpt_tos:['nonexistent@sl.local'], header_from:sender@example.com, header_to:nonexistent@sl.local, cc:None, reply-to:None, message_id:None, client_ip:None, headers:[('From', 'sender@example.com'), ('To', 'nonexistent@sl.local'), ('Subject', 'q3 test'), ('Content-Transfer-Encoding', '7bit')], mail_options:[], rcpt_options:[]
+2026-07-14 01:54:22,525 - SL - DEBUG - 76307 - "/app/email_handler.py:2202" - handle() - e1eea9bd-9c76-4fa3-b50c-a7f42ea18183 - Forward phase sender@example.com(sender@example.com) -> nonexistent@sl.local
+2026-07-14 01:54:22,535 - SL - DEBUG - 76307 - "/app/email_handler.py:545" - handle_forward() - e1eea9bd-9c76-4fa3-b50c-a7f42ea18183 - alias nonexistent@sl.local not exist. Try to see if it can be created on the fly
+2026-07-14 01:54:22,545 - SL - INFO - 76307 - "/app/app/alias_utils.py:104" - check_if_alias_can_be_auto_created_for_custom_domain() - e1eea9bd-9c76-4fa3-b50c-a7f42ea18183 - Cannot auto-create custom domain alias for nonexistent@sl.local because there's no custom domain for sl.local
+2026-07-14 01:54:22,545 - SL - INFO - 76307 - "/app/app/alias_utils.py:165" - check_if_alias_can_be_auto_created_for_a_directory() - e1eea9bd-9c76-4fa3-b50c-a7f42ea18183 - Cannot auto-create nonexistent@sl.local since it has no directory separator
+2026-07-14 01:54:22,545 - SL - DEBUG - 76307 - "/app/email_handler.py:551" - handle_forward() - e1eea9bd-9c76-4fa3-b50c-a7f42ea18183 - alias nonexistent@sl.local cannot be created on-the-fly, return 550
+2026-07-14 01:54:22,546 - SL - INFO - 76307 - "/app/email_handler.py:2367" - _handle() - e1eea9bd-9c76-4fa3-b50c-a7f42ea18183 - Finish mail_from sender@example.com, rcpt_tos ['nonexistent@sl.local'], takes 0.1439990997314453 seconds with return code '550 SL E515 Email not exist'<<===
+----- recipient-scoped DB state: STATE_AFTER_NORMAL (recipient nonexistent@sl.local) -----
+$ psql -d sl_probe_obs -c "SELECT count(*) AS alias_cnt FROM alias WHERE email = 'nonexistent@sl.local'"
+ alias_cnt 
+-----------
+         0
+(1 row)
+
+$ psql -d sl_probe_obs -c "SELECT count(*) AS custom_domain_cnt FROM custom_domain WHERE domain = 'sl.local'"
+ custom_domain_cnt 
+-------------------
+                 0
+(1 row)
+
+$ psql -d sl_probe_obs -c "SELECT count(*) AS directory_cnt FROM directory"
+ directory_cnt 
+---------------
+             0
+(1 row)
+
+$ psql -d sl_probe_obs -c "SELECT count(*) AS contact_cnt FROM contact"
+ contact_cnt 
+-------------
+           0
+(1 row)
+
+$ psql -d sl_probe_obs -c "SELECT count(*) AS email_log_cnt FROM email_log"
+ email_log_cnt 
+---------------
+             0
+(1 row)
+
+STATE_AFTER_NORMAL: ALIAS=0 CUSTOM_DOMAIN=0 DIRECTORY=0 CONTACT=0 EMAIL_LOG=0
+
+```
+
+**Sub-case B — literal null reverse-path `MAIL FROM:<>`, no ignore row → `550 SL E515`.** Now the true empty-envelope is transmitted (the injector is given an empty `mail_from`, so the wire carries the literal `MAIL FROM:<>`). Observed: aiosmtpd represents the empty reverse-path as the literal two-character string `<>` — the handler logs `New message, mail from <>` (`email_handler.py:2343`) and `Forward phase <>() -> nonexistent@sl.local` (`email_handler.py:2202`). With `<>` **absent** from `ignore_bounce_sender`, `should_ignore_bounce` returns `False` and the result is `550 SL E515 Email not exist`. The recipient-scoped counts taken **post-send** — **after this null-reverse-path injection** — remain zero:
+
+```text
+############ SECTION 4: F2 null reverse-path, NO ignore row -> 550 E515 ############
+(literal SMTP null reverse-path / empty-envelope: the client sends MAIL FROM:<>)
+===== INJECTION [NULL <> no-row]: MAIL FROM:<>  RCPT TO:<nonexistent@sl.local> =====
+$ python /tmp/blitzy_obs/sl_inject.py 127.0.0.1 20381 '' 'nonexistent@sl.local'
+S: 220 f411db182cde Python SMTP 1.4.2
+C: EHLO test.blitzy.local
+S: 250-f411db182cde
+S: 250-SIZE 33554432
+S: 250-8BITMIME
+S: 250-SMTPUTF8
+S: 250 HELP
+C: MAIL FROM:<>
+S: 250 OK
+C: RCPT TO:<nonexistent@sl.local>
+S: 250 OK
+C: DATA
+S: 354 End data with <CR><LF>.<CR><LF>
+C: From: 
+C: To: nonexistent@sl.local
+C: Subject: q3 test
+C: Content-Transfer-Encoding: 7bit
+C: 
+C: q3 test body
+C: .
+S: 550 SL E515 Email not exist
+C: QUIT
+S: 221 Bye
+=== FINAL_SERVER_REPLY_TO_SENDER: 550 SL E515 Email not exist
+----- email_handler.py log emitted for THIS message -----
+2026-07-14 01:54:24,038 - SL - DEBUG - 76307 - "/app/app/log.py:24" - set_message_id() - e1eea9bd-9c76-4fa3-b50c-a7f42ea18183 - set message_id 66ce963f-68f9-4f5b-b310-c62f85b520b9
+2026-07-14 01:54:24,038 - SL - DEBUG - 76307 - "/app/email_handler.py:2342" - _handle() - 66ce963f-68f9-4f5b-b310-c62f85b520b9 - ====>=====>====>====>====>====>====>====>
+2026-07-14 01:54:24,038 - SL - INFO - 76307 - "/app/email_handler.py:2343" - _handle() - 66ce963f-68f9-4f5b-b310-c62f85b520b9 - New message, mail from <>, rctp tos ['nonexistent@sl.local'] 
+2026-07-14 01:54:24,039 - SL - DEBUG - 76307 - "/app/email_handler.py:1963" - handle() - 66ce963f-68f9-4f5b-b310-c62f85b520b9 - Cannot parse Postfix queue ID from None None
+2026-07-14 01:54:24,041 - SL - DEBUG - 76307 - "/app/email_handler.py:1980" - handle() - 66ce963f-68f9-4f5b-b310-c62f85b520b9 - ==>> Handle mail_from:<>, rcpt_tos:['nonexistent@sl.local'], header_from:, header_to:nonexistent@sl.local, cc:None, reply-to:None, message_id:None, client_ip:None, headers:[('From', ''), ('To', 'nonexistent@sl.local'), ('Subject', 'q3 test'), ('Content-Transfer-Encoding', '7bit')], mail_options:[], rcpt_options:[]
+2026-07-14 01:54:24,044 - SL - DEBUG - 76307 - "/app/email_handler.py:2202" - handle() - 66ce963f-68f9-4f5b-b310-c62f85b520b9 - Forward phase <>() -> nonexistent@sl.local
+2026-07-14 01:54:24,050 - SL - DEBUG - 76307 - "/app/email_handler.py:545" - handle_forward() - 66ce963f-68f9-4f5b-b310-c62f85b520b9 - alias nonexistent@sl.local not exist. Try to see if it can be created on the fly
+2026-07-14 01:54:24,054 - SL - INFO - 76307 - "/app/app/alias_utils.py:104" - check_if_alias_can_be_auto_created_for_custom_domain() - 66ce963f-68f9-4f5b-b310-c62f85b520b9 - Cannot auto-create custom domain alias for nonexistent@sl.local because there's no custom domain for sl.local
+2026-07-14 01:54:24,055 - SL - INFO - 76307 - "/app/app/alias_utils.py:165" - check_if_alias_can_be_auto_created_for_a_directory() - 66ce963f-68f9-4f5b-b310-c62f85b520b9 - Cannot auto-create nonexistent@sl.local since it has no directory separator
+2026-07-14 01:54:24,055 - SL - DEBUG - 76307 - "/app/email_handler.py:551" - handle_forward() - 66ce963f-68f9-4f5b-b310-c62f85b520b9 - alias nonexistent@sl.local cannot be created on-the-fly, return 550
+2026-07-14 01:54:24,055 - SL - INFO - 76307 - "/app/email_handler.py:2367" - _handle() - 66ce963f-68f9-4f5b-b310-c62f85b520b9 - Finish mail_from <>, rcpt_tos ['nonexistent@sl.local'], takes 0.01698136329650879 seconds with return code '550 SL E515 Email not exist'<<===
+----- recipient-scoped DB state: STATE_AFTER_NULL_NOROW (recipient nonexistent@sl.local) -----
+$ psql -d sl_probe_obs -c "SELECT count(*) AS alias_cnt FROM alias WHERE email = 'nonexistent@sl.local'"
+ alias_cnt 
+-----------
+         0
+(1 row)
+
+$ psql -d sl_probe_obs -c "SELECT count(*) AS custom_domain_cnt FROM custom_domain WHERE domain = 'sl.local'"
+ custom_domain_cnt 
+-------------------
+                 0
+(1 row)
+
+$ psql -d sl_probe_obs -c "SELECT count(*) AS directory_cnt FROM directory"
+ directory_cnt 
+---------------
+             0
+(1 row)
+
+$ psql -d sl_probe_obs -c "SELECT count(*) AS contact_cnt FROM contact"
+ contact_cnt 
+-------------
+           0
+(1 row)
+
+$ psql -d sl_probe_obs -c "SELECT count(*) AS email_log_cnt FROM email_log"
+ email_log_cnt 
+---------------
+             0
+(1 row)
+
+STATE_AFTER_NULL_NOROW: ALIAS=0 CUSTOM_DOMAIN=0 DIRECTORY=0 CONTACT=0 EMAIL_LOG=0
+
+```
+
+**Sub-case C — literal null reverse-path `MAIL FROM:<>`, exact `<>` ignore-bounce row → `250 SL E207`.** The empty reverse-path is inserted into `ignore_bounce_sender` with its exact stored value `'<>'` (`INSERT INTO ignore_bounce_sender (mail_from, created_at) VALUES ('<>', now())`), the row is queried to confirm it, and the **identical** `MAIL FROM:<>` message is re-injected. This time `should_ignore_bounce(envelope.mail_from)` matches and the reply flips to `250 SL E207 No bounce report`, with the decisive log line `should_ignore_bounce() … do not send back bounce report to <>` (`app/email_utils.py:1363`). The probe row is then deleted and its absence proven (net-zero for this table); the recipient-scoped counts taken **post-send** — **after this E207 send** — are still zero:
+
+```text
+############ SECTION 5: F2 null reverse-path, EXACT <> ignore-bounce row -> 250 E207 ############
+$ psql -d sl_probe_obs -c "INSERT INTO ignore_bounce_sender (mail_from, created_at) VALUES ('<>', now())"
+INSERT 0 1
+$ psql -d sl_probe_obs -c "SELECT id, mail_from FROM ignore_bounce_sender"
+ id | mail_from 
+----+-----------
+  1 | <>
+(1 row)
+
+===== INJECTION [NULL <> with-row]: MAIL FROM:<>  RCPT TO:<nonexistent@sl.local> =====
+$ python /tmp/blitzy_obs/sl_inject.py 127.0.0.1 20381 '' 'nonexistent@sl.local'
+S: 220 f411db182cde Python SMTP 1.4.2
+C: EHLO test.blitzy.local
+S: 250-f411db182cde
+S: 250-SIZE 33554432
+S: 250-8BITMIME
+S: 250-SMTPUTF8
+S: 250 HELP
+C: MAIL FROM:<>
+S: 250 OK
+C: RCPT TO:<nonexistent@sl.local>
+S: 250 OK
+C: DATA
+S: 354 End data with <CR><LF>.<CR><LF>
+C: From: 
+C: To: nonexistent@sl.local
+C: Subject: q3 test
+C: Content-Transfer-Encoding: 7bit
+C: 
+C: q3 test body
+C: .
+S: 250 SL E207 No bounce report
+C: QUIT
+S: 221 Bye
+=== FINAL_SERVER_REPLY_TO_SENDER: 250 SL E207 No bounce report
+----- email_handler.py log emitted for THIS message -----
+2026-07-14 01:54:25,618 - SL - DEBUG - 76307 - "/app/app/log.py:24" - set_message_id() - 66ce963f-68f9-4f5b-b310-c62f85b520b9 - set message_id 0eeb3944-bf26-4303-a501-cdf7fa1e920e
+2026-07-14 01:54:25,618 - SL - DEBUG - 76307 - "/app/email_handler.py:2342" - _handle() - 0eeb3944-bf26-4303-a501-cdf7fa1e920e - ====>=====>====>====>====>====>====>====>
+2026-07-14 01:54:25,618 - SL - INFO - 76307 - "/app/email_handler.py:2343" - _handle() - 0eeb3944-bf26-4303-a501-cdf7fa1e920e - New message, mail from <>, rctp tos ['nonexistent@sl.local'] 
+2026-07-14 01:54:25,619 - SL - DEBUG - 76307 - "/app/email_handler.py:1963" - handle() - 0eeb3944-bf26-4303-a501-cdf7fa1e920e - Cannot parse Postfix queue ID from None None
+2026-07-14 01:54:25,621 - SL - DEBUG - 76307 - "/app/email_handler.py:1980" - handle() - 0eeb3944-bf26-4303-a501-cdf7fa1e920e - ==>> Handle mail_from:<>, rcpt_tos:['nonexistent@sl.local'], header_from:, header_to:nonexistent@sl.local, cc:None, reply-to:None, message_id:None, client_ip:None, headers:[('From', ''), ('To', 'nonexistent@sl.local'), ('Subject', 'q3 test'), ('Content-Transfer-Encoding', '7bit')], mail_options:[], rcpt_options:[]
+2026-07-14 01:54:25,624 - SL - DEBUG - 76307 - "/app/email_handler.py:2202" - handle() - 0eeb3944-bf26-4303-a501-cdf7fa1e920e - Forward phase <>() -> nonexistent@sl.local
+2026-07-14 01:54:25,630 - SL - DEBUG - 76307 - "/app/email_handler.py:545" - handle_forward() - 0eeb3944-bf26-4303-a501-cdf7fa1e920e - alias nonexistent@sl.local not exist. Try to see if it can be created on the fly
+2026-07-14 01:54:25,634 - SL - INFO - 76307 - "/app/app/alias_utils.py:104" - check_if_alias_can_be_auto_created_for_custom_domain() - 0eeb3944-bf26-4303-a501-cdf7fa1e920e - Cannot auto-create custom domain alias for nonexistent@sl.local because there's no custom domain for sl.local
+2026-07-14 01:54:25,634 - SL - INFO - 76307 - "/app/app/alias_utils.py:165" - check_if_alias_can_be_auto_created_for_a_directory() - 0eeb3944-bf26-4303-a501-cdf7fa1e920e - Cannot auto-create nonexistent@sl.local since it has no directory separator
+2026-07-14 01:54:25,634 - SL - DEBUG - 76307 - "/app/email_handler.py:551" - handle_forward() - 0eeb3944-bf26-4303-a501-cdf7fa1e920e - alias nonexistent@sl.local cannot be created on-the-fly, return 550
+2026-07-14 01:54:25,635 - SL - WARNING - 76307 - "/app/app/email_utils.py:1363" - should_ignore_bounce() - 0eeb3944-bf26-4303-a501-cdf7fa1e920e - do not send back bounce report to <>
+2026-07-14 01:54:25,635 - SL - INFO - 76307 - "/app/email_handler.py:2367" - _handle() - 0eeb3944-bf26-4303-a501-cdf7fa1e920e - Finish mail_from <>, rcpt_tos ['nonexistent@sl.local'], takes 0.0167539119720459 seconds with return code '250 SL E207 No bounce report'<<===
+--- net-zero: delete the probe ignore row ---
+$ psql -d sl_probe_obs -c "DELETE FROM ignore_bounce_sender WHERE mail_from = '<>'"
+DELETE 1
+$ psql -d sl_probe_obs -tAc "SELECT count(*) FROM ignore_bounce_sender"  (=> 0)
+0
+----- recipient-scoped DB state: STATE_AFTER_NULL_E207 (recipient nonexistent@sl.local) -----
+$ psql -d sl_probe_obs -c "SELECT count(*) AS alias_cnt FROM alias WHERE email = 'nonexistent@sl.local'"
+ alias_cnt 
+-----------
+         0
+(1 row)
+
+$ psql -d sl_probe_obs -c "SELECT count(*) AS custom_domain_cnt FROM custom_domain WHERE domain = 'sl.local'"
+ custom_domain_cnt 
+-------------------
+                 0
+(1 row)
+
+$ psql -d sl_probe_obs -c "SELECT count(*) AS directory_cnt FROM directory"
+ directory_cnt 
+---------------
+             0
+(1 row)
+
+$ psql -d sl_probe_obs -c "SELECT count(*) AS contact_cnt FROM contact"
+ contact_cnt 
+-------------
+           0
+(1 row)
+
+$ psql -d sl_probe_obs -c "SELECT count(*) AS email_log_cnt FROM email_log"
+ email_log_cnt 
+---------------
+             0
+(1 row)
+
+STATE_AFTER_NULL_E207: ALIAS=0 CUSTOM_DOMAIN=0 DIRECTORY=0 CONTACT=0 EMAIL_LOG=0
+
+```
+
+**Sub-case D — post-init cross-check on this same DB (`public_domain` 0 → 1) → still `550 SL E515`.** Running `python init_app.py` seeds `public_domain` (log `Add sl.local to SL domain`, `init_app.py:44`; count 0 → 1); the handler is restarted against the now-initialized DB and a normal-sender message is re-injected. The reply is still `550 SL E515` and the recipient-scoped counts taken **post-send** — **after this post-init send** — remain zero, confirming (as the causal-nuance section argues) that seeding the domain table does not change the outcome and that no send created an `alias`/`custom_domain`/`directory` row:
+
+```text
+############ SECTION 6: POST-INIT cross-check (public_domain 0 -> 1), resend -> still 550 E515 ############
+$ kill handler PID 76307 (stop pre-init handler)
+$ python init_app.py   (seeds public_domain)
+init_app exit=0
+8:2026-07-14 01:54:30,732 - SL - DEBUG - 76490 - "/app/init_app.py:36" - load_pgp_public_keys() -  - Finish load_pgp_public_keys
+9:2026-07-14 01:54:30,734 - SL - INFO - 76490 - "/app/init_app.py:44" - add_sl_domains() -  - Add sl.local to SL domain
+$ psql -d sl_probe_obs -tAc 'SELECT count(*) FROM public_domain'  (=> 1)
+1
+--- restart handler against the now-initialized DB ---
+handler PID=76499 ready=yes (waited 3s)
+===== INJECTION [POSTINIT normal sender]: MAIL FROM:<sender@example.com>  RCPT TO:<nonexistent@sl.local> =====
+$ python /tmp/blitzy_obs/sl_inject.py 127.0.0.1 20381 'sender@example.com' 'nonexistent@sl.local'
+S: 220 f411db182cde Python SMTP 1.4.2
+C: EHLO test.blitzy.local
+S: 250-f411db182cde
+S: 250-SIZE 33554432
+S: 250-8BITMIME
+S: 250-SMTPUTF8
+S: 250 HELP
+C: MAIL FROM:<sender@example.com>
+S: 250 OK
+C: RCPT TO:<nonexistent@sl.local>
+S: 250 OK
+C: DATA
+S: 354 End data with <CR><LF>.<CR><LF>
+C: From: sender@example.com
+C: To: nonexistent@sl.local
+C: Subject: q3 test
+C: Content-Transfer-Encoding: 7bit
+C: 
+C: q3 test body
+C: .
+S: 550 SL E515 Email not exist
+C: QUIT
+S: 221 Bye
+=== FINAL_SERVER_REPLY_TO_SENDER: 550 SL E515 Email not exist
+----- email_handler.py log emitted for THIS message -----
+2026-07-14 01:54:33,078 - SL - DEBUG - 76499 - "/app/app/log.py:24" - set_message_id() -  - set message_id d6332929-c0cc-45de-b81b-c536cc4ab49d
+2026-07-14 01:54:33,078 - SL - DEBUG - 76499 - "/app/email_handler.py:2342" - _handle() - d6332929-c0cc-45de-b81b-c536cc4ab49d - ====>=====>====>====>====>====>====>====>
+2026-07-14 01:54:33,078 - SL - INFO - 76499 - "/app/email_handler.py:2343" - _handle() - d6332929-c0cc-45de-b81b-c536cc4ab49d - New message, mail from sender@example.com, rctp tos ['nonexistent@sl.local'] 
+2026-07-14 01:54:33,079 - SL - DEBUG - 76499 - "/app/email_handler.py:1963" - handle() - d6332929-c0cc-45de-b81b-c536cc4ab49d - Cannot parse Postfix queue ID from None None
+2026-07-14 01:54:33,205 - SL - DEBUG - 76499 - "/app/email_handler.py:1980" - handle() - d6332929-c0cc-45de-b81b-c536cc4ab49d - ==>> Handle mail_from:sender@example.com, rcpt_tos:['nonexistent@sl.local'], header_from:sender@example.com, header_to:nonexistent@sl.local, cc:None, reply-to:None, message_id:None, client_ip:None, headers:[('From', 'sender@example.com'), ('To', 'nonexistent@sl.local'), ('Subject', 'q3 test'), ('Content-Transfer-Encoding', '7bit')], mail_options:[], rcpt_options:[]
+2026-07-14 01:54:33,210 - SL - DEBUG - 76499 - "/app/email_handler.py:2202" - handle() - d6332929-c0cc-45de-b81b-c536cc4ab49d - Forward phase sender@example.com(sender@example.com) -> nonexistent@sl.local
+2026-07-14 01:54:33,220 - SL - DEBUG - 76499 - "/app/email_handler.py:545" - handle_forward() - d6332929-c0cc-45de-b81b-c536cc4ab49d - alias nonexistent@sl.local not exist. Try to see if it can be created on the fly
+2026-07-14 01:54:33,229 - SL - INFO - 76499 - "/app/app/alias_utils.py:104" - check_if_alias_can_be_auto_created_for_custom_domain() - d6332929-c0cc-45de-b81b-c536cc4ab49d - Cannot auto-create custom domain alias for nonexistent@sl.local because there's no custom domain for sl.local
+2026-07-14 01:54:33,229 - SL - INFO - 76499 - "/app/app/alias_utils.py:165" - check_if_alias_can_be_auto_created_for_a_directory() - d6332929-c0cc-45de-b81b-c536cc4ab49d - Cannot auto-create nonexistent@sl.local since it has no directory separator
+2026-07-14 01:54:33,229 - SL - DEBUG - 76499 - "/app/email_handler.py:551" - handle_forward() - d6332929-c0cc-45de-b81b-c536cc4ab49d - alias nonexistent@sl.local cannot be created on-the-fly, return 550
+2026-07-14 01:54:33,230 - SL - INFO - 76499 - "/app/email_handler.py:2367" - _handle() - d6332929-c0cc-45de-b81b-c536cc4ab49d - Finish mail_from sender@example.com, rcpt_tos ['nonexistent@sl.local'], takes 0.1523430347442627 seconds with return code '550 SL E515 Email not exist'<<===
+----- recipient-scoped DB state: STATE_POSTINIT (recipient nonexistent@sl.local) -----
+$ psql -d sl_probe_obs -c "SELECT count(*) AS alias_cnt FROM alias WHERE email = 'nonexistent@sl.local'"
+ alias_cnt 
+-----------
+         0
+(1 row)
+
+$ psql -d sl_probe_obs -c "SELECT count(*) AS custom_domain_cnt FROM custom_domain WHERE domain = 'sl.local'"
+ custom_domain_cnt 
+-------------------
+                 0
+(1 row)
+
+$ psql -d sl_probe_obs -c "SELECT count(*) AS directory_cnt FROM directory"
+ directory_cnt 
+---------------
+             0
+(1 row)
+
+$ psql -d sl_probe_obs -c "SELECT count(*) AS contact_cnt FROM contact"
+ contact_cnt 
+-------------
+           0
+(1 row)
+
+$ psql -d sl_probe_obs -c "SELECT count(*) AS email_log_cnt FROM email_log"
+ email_log_cnt 
+---------------
+             0
+(1 row)
+
+STATE_POSTINIT: ALIAS=0 CUSTOM_DOMAIN=0 DIRECTORY=0 CONTACT=0 EMAIL_LOG=0
+
+```
+
+**Teardown (net-zero).** The follow-up handler is stopped, port `20381` is released, and `ignore_bounce_sender` is back to `0` rows; the scratch `sl_probe_obs` is dropped in the consolidated *Cleanup and net-zero verification* section:
+
+```text
+############ SECTION 7: TEARDOWN + net-zero ############
+--- port 20381 after teardown (expect none) ---
+PORT 20381 LISTEN inode(s)=[] owner PID(s): (none)
+--- ignore_bounce_sender final count (net-zero => 0) ---
+0
+############ DONE ############
+```
+
+**What this shows (Observed).** Through the real listener on `20381`, a literal SMTP null reverse-path (`MAIL FROM:<>`) to `nonexistent@sl.local` is rejected `550 SL E515 Email not exist` when `<>` is **not** in `ignore_bounce_sender`, and returns `250 SL E207 No bounce report` — with the log `do not send back bounce report to <>` (`app/email_utils.py:1363`) — when the exact `<>` row **is** present; this reproduces the E515/E207 branch (`email_handler.py:552-555`) via the protocol-true empty envelope rather than a named stand-in. Across the baseline and **every** post-send snapshot (normal E515, null-`<>` E515, null-`<>` E207, and post-init E515) the recipient-scoped `Alias` (`SELECT count(*) … FROM alias WHERE email = 'nonexistent@sl.local'`), `CustomDomain` (`WHERE domain = 'sl.local'`), `Directory`, `Contact`, and `EmailLog` counts are **all zero** — an Observed confirmation that an undeliverable inbound message creates **no** on-the-fly alias or related rows (the `try_auto_create` strategies at `app/alias_utils.py:202` return `None` without inserting; `handle_forward`, `email_handler.py:549-555`).
+
 ### Q3 — Answer (migrations run, `init_app.py` not run)
 
-For a normal sender, mail to any `nonexistent@sl.local` is **permanently rejected** with SMTP status **`550 SL E515 Email not exist`** (`app/email/status.py:51`), returned by `handle_forward` at `email_handler.py:555`. The handler logs the rejection as this chain (verbatim above): `alias nonexistent@sl.local not exist ...` (`email_handler.py:545`) → `Cannot auto-create custom domain alias ... no custom domain for sl.local` (`app/alias_utils.py:104`) → `Cannot auto-create ... no directory separator` (`app/alias_utils.py:165`) → `alias nonexistent@sl.local cannot be created on-the-fly, return 550` (`email_handler.py:551`) → `Finish ... with return code '550 SL E515 Email not exist'` (`email_handler.py:2367`). If — and only if — the sender is in the `ignore_bounce_sender` table, the same undeliverable message instead returns **`250 SL E207 No bounce report`** (`app/email/status.py:12`, via `email_handler.py:553`).
+For a normal sender, mail to any `nonexistent@sl.local` is **permanently rejected** with SMTP status **`550 SL E515 Email not exist`** (`app/email/status.py:51`), returned by `handle_forward` at `email_handler.py:555`. The handler logs the rejection as this chain (verbatim above): `alias nonexistent@sl.local not exist ...` (`email_handler.py:545`) → `Cannot auto-create custom domain alias ... no custom domain for sl.local` (`app/alias_utils.py:104`) → `Cannot auto-create ... no directory separator` (`app/alias_utils.py:165`) → `alias nonexistent@sl.local cannot be created on-the-fly, return 550` (`email_handler.py:551`) → `Finish ... with return code '550 SL E515 Email not exist'` (`email_handler.py:2367`). If — and only if — the sender is in the `ignore_bounce_sender` table, the same undeliverable message instead returns **`250 SL E207 No bounce report`** (`app/email/status.py:12`, via `email_handler.py:553`). This includes the protocol-true empty envelope: a literal `MAIL FROM:<>` (null reverse-path) is rejected `550 SL E515` with no `<>` row, and returns `250 SL E207` only when the exact `<>` value is present in `ignore_bounce_sender` (see *Q3 — Literal null reverse-path and recipient-scoped DB side-effects*).
 
 ## Coverage — every named item and implied condition
 
@@ -1645,7 +2304,7 @@ This section is a checklist confirming that every distinct thing the three quest
 |---|---|---|---|
 | Q1-a | `python server.py` starts against an empty DB | Q1 — boot | Observed |
 | Q1-b | import-time `engine.connect()` succeeds on the empty DB (`app/db.py:12`) | Q1 — boot (no startup error) | Observed (boundary), confirmed by code |
-| Q1-c | opening the login page issues the first ORM query (`/` → `/auth/login`) | Q1 — GET/POST `/auth/login` | Observed |
+| Q1-c | the login-page GET renders with no user query (HTTP 200); the login-form **POST** issues the first ORM query against `users` (`/` → `/auth/login`) | Q1 — GET/POST `/auth/login` | Observed |
 | Q1-d | the full Python exception and traceback | Q1 — server console | Observed |
 | Q1-e | exact missing relation name (`users`) | `relation "users" does not exist` | Observed |
 | Q1-f | exception class `sqlalchemy.exc.ProgrammingError` wrapping `psycopg2.errors.UndefinedTable` | Q1 — server console | Observed |
@@ -1663,6 +2322,12 @@ This section is a checklist confirming that every distinct thing the three quest
 | Q2-i | the three background workers have **no** client-facing port | Q2 — Services C/D/E (no LISTEN socket) | Observed |
 | Q2-j | the Python SMTP port is `20381`, not Postfix’s `25` (`README.md:367-369`) | Q2 — clarification | Observed, confirmed by code |
 | Q2-k | listener readiness stable across two runs | Q2 — Service E run 1 and run 2 | Observed (2 runs) |
+| Q2-l | all enumerated services run **simultaneously** as one persistent process set (integrated topology); `4/4` alive at startup | Q2 — Integrated topology | Observed |
+| Q2-m | 7777 and 20381 **ownership** mapped to PIDs while the set co-runs (`/proc/net/tcp` inode → `/proc/<pid>/fd`); gunicorn master+2 workers share 7777, `email_handler` owns 20381 | Q2 — Integrated topology | Observed |
+| Q2-n | concurrent client probes while the set is up: HTTP `/health` → `200 success` and the SMTP `220` banner | Q2 — Integrated topology | Observed |
+| Q2-o | concurrent worker activity: `job_runner` drives an enqueued job `0 → 2 (done)` and `event_listener` holds a live `LISTEN simplelogin_sync_events` connection | Q2 — Integrated topology | Observed |
+| Q2-p | `cron.py -j delete_old_monitoring` runs (exit `0`) **while all four long-lived services stay alive** (`4/4` before and after) | Q2 — Integrated topology | Observed |
+| Q2-q | integrated teardown: the whole set is stopped and both ports are released (`POST_CLEANUP_PORT_7777=free`, `POST_CLEANUP_PORT_20381=free`) | Q2 — Integrated topology | Observed |
 | Q3-a | migrated-but-uninitialized DB (`public_domain` empty) | Q3 — setup | Observed |
 | Q3-b | inbound mail to `nonexistent@sl.local` via the real aiosmtpd listener | Q3 — primary injection | Observed |
 | Q3-c | SMTP status to sender = `550 SL E515 Email not exist` (`app/email/status.py:51`) | Q3 — primary transcript | Observed, confirmed by code |
@@ -1675,6 +2340,12 @@ This section is a checklist confirming that every distinct thing the three quest
 | Q3-j | `SLDomain.__tablename__ = "public_domain"` (`app/models.py:3119`) | Q3 — setup | Observed, confirmed by code |
 | Q3-k | causal nuance: the empty `public_domain` is *not* the direct cause | Q3 — causal nuance | Inferred, confirmed by the post-init cross-check |
 | Q3-l | post-init cross-check: identical injection with `public_domain = 1` still returns `550 SL E515` | Q3 — post-init cross-check | Observed |
+| Q3-m | literal SMTP null reverse-path `MAIL FROM:<>` through the real listener (empty-envelope), no ignore row -> `550 SL E515` | Q3 -- null reverse-path (sub-case B) | Observed |
+| Q3-n | literal `MAIL FROM:<>` with the exact `<>` row in `ignore_bounce_sender` -> `250 SL E207`; decisive log `do not send back bounce report to <>` (`app/email_utils.py:1363`) | Q3 -- null reverse-path (sub-case C) | Observed, confirmed by code |
+| Q3-o | exact `<>` ignore-bounce SQL lifecycle: `INSERT ... VALUES ('<>', now())` -> query -> re-inject -> `DELETE ... '<>'` -> zero-count (net-zero for the table) | Q3 -- null reverse-path | Observed (before/during/after) |
+| Q3-p | recipient-scoped `Alias`/`CustomDomain`/`Directory`/`Contact`/`EmailLog` **baseline** before any injection (all zero) | Q3 -- null reverse-path (STATE_PREINIT) | Observed |
+| Q3-q | recipient-scoped counts **post-send** after every injection (normal E515, null-`<>` E515, null-`<>` E207) remain zero -- no DB side-effect | Q3 -- null reverse-path (STATE_AFTER_*) | Observed (before/after) |
+| Q3-r | recipient-scoped counts **post-init** (after `init_app.py` seeds `public_domain` 0->1 and resend) remain zero | Q3 -- null reverse-path (STATE_POSTINIT) | Observed |
 | X-a | net-zero cleanup (scratch DBs dropped, scratch files removed, `.env` removed, ports free) | Cleanup section | Observed |
 
 Every row above is stated explicitly, by name, in the section indicated, and is backed by either a verbatim capture or an exact `file:line` reference (usually both).
