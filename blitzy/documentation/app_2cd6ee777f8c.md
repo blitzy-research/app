@@ -37,7 +37,7 @@ it is explicitly labeled **inferred**.
 | Q2 | What do the startup / initialization logs look like? | Gunicorn arbiter `[INFO]` lines on **stderr** + the app's import-time **stdout** printed **once per worker**, incl. the banner `>>> init logging <<<`. The `werkzeug` logger is disabled. |
 | Q3 | What does the health-check endpoint return? | Body `success`, HTTP `200 OK`, `Content-Type: text/html; charset=utf-8`, `Content-Length: 7` |
 | Q4 | Alias creation via REST API — JSON response + DB persistence? | HTTP `201`, a 17-key JSON object; a row is inserted into the `alias` table (API `id` == DB `id`) |
-| Q5 | What happens if PostgreSQL is down at startup? | Master binds `:7777`; each worker raises `sqlalchemy.exc.OperationalError` (Connection refused) at `app/db.py:12`; `Reason: Worker failed to boot.`, exit code `3` |
+| Q5 | What happens if PostgreSQL is down at startup? | Master binds `:7777`; each worker raises `sqlalchemy.exc.OperationalError` (Connection refused) at `app/db.py:12`; `Reason: Worker failed to boot.` The process exit code is **non-deterministic** — `3` in ~75% of boots (clean master shutdown) and `1` in ~25% (a re-entrant-SIGCHLD `HaltServer` race in the Gunicorn master) |
 
 ---
 
@@ -1064,11 +1064,17 @@ the output — that is why `alias` appears first and `support_pgp` last. In both
 
 The two responses are **not byte-identical**: they describe different aliases (`"id"` 2 vs 3, a
 different random `email`, different `creation_date`/`creation_timestamp`, and a different `note`),
-and each carries a freshly re-signed `slapp` session cookie. What they share is the **same parsed
-JSON content and structure** — the same 17 keys in the same (alphabetized) order. Both payloads are
-shown above **verbatim**, exactly as Flask's `jsonify` emits them (compact single-line, not
-pretty-printed). (This corrects an earlier characterization
-of the two payloads as "the same bytes"; only the shape is identical, not the bytes.)
+and each carries a freshly re-signed `slapp` session cookie. What they share is the **same JSON
+schema** — the same 17 keys, in the same (alphabetized) order, with the same value *types/shape*
+(for example `id` is always an integer, `mailboxes` is always a one-element array of `{email, id}`
+objects, and `name`/`latest_activity` are `null` for a freshly created alias). The run-specific
+*values* differ (as itemized just above: different `id`, random `email`, `creation_date`/
+`creation_timestamp`, and `note`). Put precisely: the two payloads are equal as JSON **schemas**,
+not as parsed **values**, and not as raw **bytes**. Both are shown above **verbatim**, exactly as
+Flask's `jsonify` emits them (compact single-line, not pretty-printed). (This corrects an earlier
+characterization of the two payloads as "the same bytes", and sharpens a later one that called them
+"the same parsed JSON content": the *content/values* differ between runs — only the *schema* — key
+set, ordering, and value types — is identical.)
 
 ### Q4.2 — What is persisted (the `alias` table) and the persistence semantics
 
@@ -1120,13 +1126,26 @@ mailbox), `name` NULL, `enabled=t`, `flags=0`, `pinned=f`, and `automatic_creati
 [app/models.py:1628-1692] — which shadows the base `ModelMixin.create` [app/models.py:116] for
 the alias path — where **both** arguments default to `False`: `commit = kw.pop("commit", False)`
 [app/models.py:1629] and `flush = kw.pop("flush", False)` [app/models.py:1630]. The override adds
-the row with `Session.add(new_alias)` [app/models.py:1660], then commits or flushes only if those
-flags are set; since both are `False` it does neither and returns the instance
-[app/models.py:1692] in the SQLAlchemy **pending** state — no `INSERT` has been emitted yet. The row is not sent to PostgreSQL until the
-endpoint issues an explicit `Session.commit()` [app/api/views/new_random_alias.py:107], which
-flushes the pending `INSERT` and commits the transaction. (This corrects the earlier claim that
-`create(commit=False)` had "already flushed" the alias: it had not, because `flush` is `False` by
-default as well — the object stays pending until the endpoint's own commit.)
+the row with `Session.add(new_alias)` [app/models.py:1660], which places the instance in the
+SQLAlchemy **pending** state (no `INSERT` yet); because both flags are `False`, the override itself
+does **not** commit or flush. However, the very next statement in the override —
+`DailyMetric.get_or_create_today_metric()` [app/models.py:1661] — issues a `SELECT` against the
+`daily_metric` table, and with the `Session`'s default `autoflush=True` that query **auto-flushes
+the pending `INSERT` first**. So by the time `create_new_random` returns the instance
+[app/models.py:1692], the `INSERT INTO alias` has **already been emitted** and the object is
+**persistent** (its `id` is populated) — but only inside the still-open transaction. This was
+confirmed at runtime by registering a `before_cursor_execute` listener while calling
+`Alias.create_new_random(...)` with no surrounding commit: the emitted SQL shows `INSERT INTO alias`
+firing immediately **before** the `SELECT ... FROM daily_metric`, and `inspect(alias).persistent`
+is `True` with a populated `alias.id` **before** the endpoint runs any commit. The endpoint's
+explicit `Session.commit()` [app/api/views/new_random_alias.py:107] therefore does not *trigger*
+the `INSERT` (autoflush already did) — it **makes the transaction durable**. The converse confirms
+this: substituting a `Session.rollback()` for the commit discards the row even though the `INSERT`
+had been emitted, leaving the durable `alias` count unchanged. (This corrects two earlier
+statements: `create(commit=False)` does not flush the alias *by itself*, and it is not true that
+"no `INSERT` has been emitted" before the endpoint commit — one has, caused by the subsequent
+autoflushing `SELECT` at [app/models.py:1661], with the endpoint's commit only persisting the
+transaction.)
 
 ### Q4.3 — Negative (authentication) cases and stability
 
@@ -1211,6 +1230,45 @@ form data, resulting status, and elapsed time — confirming (a) that disabling 
 does **not** remove per-request logging (the app keeps its own), and (b) that `/health` is
 deliberately silent.
 
+**Request-body handling — valid, empty, and malformed JSON (observed; documented, not fixed).** The
+endpoint reads its optional `note` defensively: `note = None`
+[app/api/views/new_random_alias.py:45], `data = request.get_json(silent=True)`
+[app/api/views/new_random_alias.py:46], `if data:` [app/api/views/new_random_alias.py:47], then
+`note = data.get("note")` [app/api/views/new_random_alias.py:48]. Exercised through the canonical
+`Authentication`-authenticated route with `select count(*) from alias` sampled before and after each
+call, this produces three distinct, runtime-observed behaviors:
+
+- **Valid JSON object** (e.g. `{"note":"hello"}`) → **HTTP 201**; alias created with the supplied
+  note (`note='hello'`); count increases by one.
+- **Missing body, empty object `{}`, or unparseable body** (e.g. `{bad,,,`) → **HTTP 201**; alias
+  created with `note=null`; count increases by one. `get_json(silent=True)` returns `None` for the
+  missing/unparseable cases, and `{}` is falsy, so `if data:` is `False`, `note` stays `None`, and
+  no attribute access occurs.
+- **Non-object JSON** (a bare number `123`, a string `"x"`, or an array `[1,2,3]`), **or** a
+  non-string `note` (e.g. `{"note":123}`) → **HTTP 500**; **no row is persisted** (count unchanged).
+  A truthy non-`dict` `data` makes `data.get(...)` [app/api/views/new_random_alias.py:48] raise
+  `AttributeError` (`'int'/'str'/'list' object has no attribute 'get'`), and a non-string `note`
+  raises a downstream type error; either exception is caught by the global handler
+  `@app.errorhandler(Exception)` [server.py:388], which — because the path starts with `/api/`
+  [server.py:391] — returns `jsonify(error="Internal error"), 500` [server.py:392].
+
+The observed 500 response is exactly the following (note that no stack trace is leaked to the
+client; `Content-Length: 27` counts the 26-character body plus the trailing newline `jsonify`
+appends):
+
+```
+HTTP/1.1 500 INTERNAL SERVER ERROR
+Content-Type: application/json
+Content-Length: 27
+
+{"error":"Internal error"}
+```
+
+This 500-on-non-object outcome is an **inherited property of the source** — the endpoint does not
+assert that the parsed body is a JSON object before calling `.get` on it — and it was reproduced
+here through the real authenticated route, not a bypass. Per the read-only scope of this task
+(AAP §0.3.2), it is **documented, not fixed**: no source file is modified.
+
 ### Q4.4 — Reproduction caveat: the `pg_trgm` migration (setup context, not the runtime answer)
 
 **Labelled inferred / setup context.** Building the schema for Q4 requires a *fresh* database in
@@ -1238,10 +1296,15 @@ the WSGI application. The break point is the module-level eager connection
 `connection = engine.connect()` [app/db.py:12], reached through the import chain
 `wsgi.py:1 → server.py:31 → app/admin_model.py:11 → app/models.py:32 → app/db.py:12`. Each worker
 raises **`sqlalchemy.exc.OperationalError`** wrapping **`psycopg2.OperationalError: … Connection
-refused`** (tried both `::1` and `127.0.0.1`). After the second worker fails, the master logs
-**`Shutting down: Master`** / **`Reason: Worker failed to boot.`** and the whole process exits with
-**status code 3**. The failure is a hard boot failure with no graceful degradation, because the
-connection is opened at *import* time — before the Flask app object even exists.
+refused`** (tried both `::1` and `127.0.0.1`). After the second worker fails, the master reports
+**`Reason: Worker failed to boot.`** and terminates. The **process exit code is non-deterministic**:
+in a 24-boot sample it was **`3` in 18 boots (~75%)** — the master logs a clean
+**`Shutting down: Master`** / **`Reason: Worker failed to boot.`** and calls `sys.exit(3)` — and
+**`1` in 6 boots (~25%)**, where a re-entrant `SIGCHLD` in the master raises a second, unhandled
+`gunicorn.errors.HaltServer` during shutdown that escapes through `sys.exit(run())`, so Python exits
+`1` (see Q5.3 for both verbatim signatures and the tally). Either way the failure is a hard boot
+failure with no graceful degradation, because the connection is opened at *import* time — before the
+Flask app object even exists.
 
 ### Q5.0 — How the failure was produced (exact commands)
 
@@ -1266,15 +1329,25 @@ CONFIG=<config> /app/venv/bin/gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 1
 echo "exit=$?"
 ```
 
-Observed exit codes for the two independent boots:
+Because a first, small sample suggested a single outcome, the identical boot was then repeated
+**24 times** back-to-back (same command, PostgreSQL kept down), recording the process exit code on
+each run. The exit code is **not** constant:
 
 ```
-Q5B_RUN1_EXIT=3
-Q5B_RUN2_EXIT=3
+### exit-code tally over 24 identical DB-down boots ###
+     18 EXIT=3      # clean master shutdown (281-line log)
+      6 EXIT=1      # re-entrant HaltServer race (312-line log)
 ```
 
-(After capture, PostgreSQL was restarted with `pg_ctlcluster 15 main start` — `restart_exit=0`,
-`DB back up OK` — to restore the observation database.)
+That is **exit `3` in 18 of 24 boots (~75%)** and **exit `1` in 6 of 24 boots (~25%)** — a stable
+frequency across the sample, not a one-off. The exit code correlates exactly with the log length:
+every `EXIT=3` capture is 281 lines and every `EXIT=1` capture is 312 lines. (The two boots
+transcribed in full in Q5.2 and Q5.3 below both landed on the majority `EXIT=3` path; the minority
+`EXIT=1` signature — the extra 31 lines — is shown verbatim in Q5.3.) Both paths reach the identical
+worker-level failure first; they differ only in how the **master** finally terminates.
+
+(After capture, PostgreSQL was restarted — `DB back up OK`, the seed `alias` rows intact
+(`count = 3`) — and a normal boot then served `GET /health` → `200` again, confirming recovery.)
 
 ### Q5.1 — The import chain to the break point (observed frames + citations)
 
@@ -1596,10 +1669,10 @@ Upload files to local dir
 [2026-07-13 18:00:38 +0000] [1248] [INFO] Reason: Worker failed to boot.
 ```
 
-### Q5.3 — Complete boot #2 (verbatim, exit code 3) and run-to-run stability
+### Q5.3 — Complete boot #2 (verbatim, exit code 3) and run-to-run exit-code variance
 
-A second independent boot produced the identical failure (also exit code 3). Its full, unedited
-output:
+A second independent boot produced the identical worker-level failure and also landed on the
+majority exit-code-`3` path. Its full, unedited output:
 
 ```
 [2026-07-13 18:00:38 +0000] [1252] [INFO] Starting gunicorn 20.0.4
@@ -1885,10 +1958,14 @@ Upload files to local dir
 [2026-07-13 18:00:39 +0000] [1252] [INFO] Reason: Worker failed to boot.
 ```
 
-**Stability (observed).** The two boots are **deterministic**. A line-by-line `diff` of the two
-281-line captures differs *only* in the wall-clock timestamps, the process IDs (master and the two
-workers), and the two ephemeral `GNUPGHOME` temp-directory names — every other line, including both
-complete tracebacks, the `Listening at: http://0.0.0.0:7777` line, the whole import chain, the
+**Stability (observed) — the worker failure is reproducible, but the master's exit code is not.**
+The *worker-level* failure is fully deterministic: in **every** one of the 24 boots the master binds
+`:7777`, both workers raise the identical `sqlalchemy.exc.OperationalError` (Connection refused), and
+both log `Worker failed to boot.`. The two 281-line captures shown in Q5.2 and Q5.3 are a
+representative pair from the **majority (`EXIT=3`) path**; a line-by-line `diff` of them differs
+*only* in the wall-clock timestamps, the process IDs (master and the two workers), and the two
+ephemeral `GNUPGHOME` temp-directory names — every other line, including both complete tracebacks,
+the `Listening at: http://0.0.0.0:7777` line, the whole import chain, the
 `sqlalchemy.exc.OperationalError`, and the `Shutting down: Master` / `Reason: Worker failed to boot.`
 lines, is byte-for-byte identical:
 
@@ -1935,8 +2012,80 @@ lines, is byte-for-byte identical:
 > [2026-07-13 18:00:39 +0000] [1252] [INFO] Reason: Worker failed to boot.
 ```
 
-(For completeness, an earlier pair of boots captured during setup showed the same signature and the
-same exit code 3 — four boots in total, all identical apart from PIDs/timestamps/temp-dirs.)
+**The master's final exit, however, is *not* deterministic.** Repeating the identical boot 24 times
+(§Q5.0) produced `EXIT=3` in 18 boots (~75%) and `EXIT=1` in 6 boots (~25%). The two outcomes are
+byte-identical for their first 279 lines (socket bind, both worker `OperationalError` tracebacks,
+both `Worker exiting`); they diverge **only** in how the master terminates:
+
+- **`EXIT=3` (18/24, clean).** The master reaps both boot-failed workers, logs two lines, and calls
+  `sys.exit(3)`:
+
+```
+[<ts>] [<master-pid>] [INFO] Shutting down: Master
+[<ts>] [<master-pid>] [INFO] Reason: Worker failed to boot.
+```
+
+- **`EXIT=1` (6/24, re-entrant `HaltServer` race).** In place of those two lines, the master prints a
+  **doubled, unhandled traceback** and the interpreter exits `1`. The following is the verbatim tail
+  of one such boot (`run_4` of the 24), which replaces the two `Shutting down: Master` lines above
+  (all 6 `EXIT=1` captures produced this same signature — exactly two `HaltServer` occurrences each):
+
+```
+Traceback (most recent call last):
+  File "/app/venv/lib/python3.10/site-packages/gunicorn/arbiter.py", line 209, in run
+    self.sleep()
+  File "/app/venv/lib/python3.10/site-packages/gunicorn/arbiter.py", line 357, in sleep
+    ready = select.select([self.PIPE[0]], [], [], 1.0)
+  File "/app/venv/lib/python3.10/site-packages/gunicorn/arbiter.py", line 242, in handle_chld
+    self.reap_workers()
+  File "/app/venv/lib/python3.10/site-packages/gunicorn/arbiter.py", line 525, in reap_workers
+    raise HaltServer(reason, self.WORKER_BOOT_ERROR)
+gunicorn.errors.HaltServer: <HaltServer 'Worker failed to boot.' 3>
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/app/venv/bin/gunicorn", line 8, in <module>
+    sys.exit(run())
+  File "/app/venv/lib/python3.10/site-packages/gunicorn/app/wsgiapp.py", line 58, in run
+    WSGIApplication("%(prog)s [OPTIONS] [APP_MODULE]").run()
+  File "/app/venv/lib/python3.10/site-packages/gunicorn/app/base.py", line 228, in run
+    super().run()
+  File "/app/venv/lib/python3.10/site-packages/gunicorn/app/base.py", line 72, in run
+    Arbiter(self).run()
+  File "/app/venv/lib/python3.10/site-packages/gunicorn/arbiter.py", line 229, in run
+    self.halt(reason=inst.reason, exit_status=inst.exit_status)
+  File "/app/venv/lib/python3.10/site-packages/gunicorn/arbiter.py", line 342, in halt
+    self.stop()
+  File "/app/venv/lib/python3.10/site-packages/gunicorn/arbiter.py", line 393, in stop
+    time.sleep(0.1)
+  File "/app/venv/lib/python3.10/site-packages/gunicorn/arbiter.py", line 242, in handle_chld
+    self.reap_workers()
+  File "/app/venv/lib/python3.10/site-packages/gunicorn/arbiter.py", line 525, in reap_workers
+    raise HaltServer(reason, self.WORKER_BOOT_ERROR)
+gunicorn.errors.HaltServer: <HaltServer 'Worker failed to boot.' 3>
+```
+
+**Why the exit code varies (inferred, source-grounded in the traceback above and Gunicorn 20.0.4).**
+Gunicorn installs a `SIGCHLD` handler, `handle_chld` [gunicorn/arbiter.py:242], which calls
+`reap_workers` [gunicorn/arbiter.py:525]; when a reaped child died via the worker-boot-error path,
+`reap_workers` raises `HaltServer(reason, self.WORKER_BOOT_ERROR)` — whose repr carries the intended
+status `3` (`<HaltServer 'Worker failed to boot.' 3>`). On the **clean** path a single `SIGCHLD`
+reaps both dead workers at once: the first `HaltServer` propagates out of the arbiter's main loop
+(`run()` → `self.sleep()` [arbiter.py:209], interrupted by the signal), is caught at
+[arbiter.py:229], and `halt()` [arbiter.py:342] runs `stop()` and then `sys.exit(3)` — hence
+`EXIT=3`. On the **racing** path a *second* `SIGCHLD` (the second worker's death) is delivered while
+the master is already inside `halt() → stop() → time.sleep(0.1)` [arbiter.py:342, 393]; that signal
+re-enters `handle_chld → reap_workers` [arbiter.py:242 → 525], which raises `HaltServer` **again** —
+now from within the shutdown path, where nothing catches it. It unwinds all the way to
+`sys.exit(run())` at the Gunicorn console-script entry (`/app/venv/bin/gunicorn`, line 8), so the
+interpreter terminates on an uncaught exception and the process exit code is Python's default **`1`**
+(the intended `3` inside the `HaltServer` never reaches a `sys.exit(3)`). This is a timing race in
+**Gunicorn's master**, not in SimpleLogin's code; SimpleLogin's only contribution is that the eager
+import-time `connection = engine.connect()` [app/db.py:12] guarantees *every* worker boot-fails,
+which is what reliably drives the master onto this reaping/shutdown path — occasionally with the two
+`SIGCHLD`s overlapping. The clean `EXIT=3` path remains the majority outcome (~75%), but the
+`EXIT=1` race reproduces reliably at roughly one boot in four.
 
 ### Q5.4 — Why the master binds the port but the workers die (Gunicorn worker-loading)
 
@@ -1981,7 +2130,7 @@ repository working tree at all times.
 ### Process teardown (no zombies, no orphaned workers)
 
 Each canonical Gunicorn boot was either torn down explicitly (SIGTERM to the master, then `wait`)
-or exited on its own (the Q5 failure boots exit `3`). Because PID 1 is a real init process, any
+or exited on its own (the Q5 failure boots exit `3` or, in the SIGCHLD-race minority, `1`). Because PID 1 is a real init process, any
 transient child is reaped — there are no defunct/zombie processes and no orphaned workers:
 
 ```console
