@@ -37,7 +37,7 @@ All values below were captured from the running instance inside the **mandated c
 | OS | Debian GNU/Linux 12 (bookworm) | `cat /etc/os-release` |
 | Repo path (runtime) | **`/app`** (the repository, bind-mounted from the working clone) | `pwd` inside container |
 | Working git branch | `blitzy-50c513ea-a8be-4059-9e27-0c097dfd57f3` | `git rev-parse --abbrev-ref HEAD` |
-| HEAD commit | `872849980eb530187250c876c894e8b567732426` | `git rev-parse HEAD` |
+| HEAD commit (capture-time; moving) | authoring capture `872849980eb530187250c876c894e8b567732426`; the working-branch `HEAD` is a **moving reference** that doc-only review commits have since advanced (live value at this writing `96ccbaa58d76dffc19b63d6f9bd8eaa869486589`), and the commit that finalizes this file advances it once more — so a fresh checkout reports a **descendant** of the value shown. The read-only invariant is anchored to the immutable **base commit** (next row), not to this hash. | `git rev-parse HEAD` (capture-time) |
 | Source/base commit | `2cd6ee777f8c2d3531559588bcfb18627ffb5d2c` — ancestor of HEAD; the deliverable is named after the source branch `app_2cd6ee777f8c` | `git merge-base --is-ancestor` |
 | Only tracked delta base→HEAD | `A blitzy/documentation/app_2cd6ee777f8c.md` (this file; **no source path is modified**) | `git diff --name-status` |
 | Python | **3.10.18** (image venv at `/app/venv`; all ~70 deps at exact `poetry.lock` pins) | `python --version` |
@@ -194,7 +194,7 @@ The investigation is fully non-invasive — **no source file was modified** to c
 - **Dev-server stdout** → `/tmp/blitzy_server.log` (the structured `LOG` object, `app/log.py`). (`/tmp` here is container scratch, **not** the repo bind-mount.)
 - **A `requests` (2.31.0) HTTP client**, run in the image venv, drove the live web entry point (login → form submission); `curl` drove the API contrast (§8).
 
-Note: the in-memory flask-limiter route budget (5 create-POST/min per §1.4 `ALIAS_LIMIT`; 10 GET/min on `/dashboard/`, `app/dashboard/views/index.py:61`) is ephemeral in-process state, so the dev server was restarted between capture batches to reset the counters.
+Note: the in-memory flask-limiter route budget (5 create-POST/min per §1.4 `ALIAS_LIMIT`; 10 GET/min on `/dashboard/`, `app/dashboard/views/index.py:62`) is ephemeral in-process state, so the dev server was restarted between capture batches to reset the counters.
 
 ---
 
@@ -557,7 +557,7 @@ Side-by-side (both success 302s; every header field shown):
 | `Vary` | `Cookie` | `Cookie` |
 | `Server` | `Werkzeug/1.0.1 Python/3.10.18` | `Werkzeug/1.0.1 Python/3.10.18` |
 
-The duplicate-custom **200** re-render instead carries `Content-Length: 551695` (a full HTML page), as shown in §4.1. `Set-Cookie` refreshes the session on every response.
+Both success `Content-Length` values are **alias-id-digit dependent** (OBSERVED): the Werkzeug 302 body embeds the redirect `Location` (which carries `highlight_alias_id=<id>`) **twice** — once as the `href` and once as the visible link text — so `Content-Length` grows by **2 bytes per additional digit in the alias id**. The `339`/`273` shown above were captured for a **2-digit** id (`highlight_alias_id=21`); re-running the same creates with a **3-digit** id yields `341` for random (`highlight_alias_id=176`) and `275` for custom (`highlight_alias_id=179`). The duplicate-custom **200** re-render instead carries `Content-Length: 551695` (a full HTML page), as shown in §4.1. `Set-Cookie` refreshes the session on every response.
 
 ### 4.3 Flash-message mechanism
 
@@ -1099,7 +1099,7 @@ The custom route validates in this **order** (`app/dashboard/views/custom_alias.
 | 1 | bad prefix `bad!x` (invalid char) | C | **302** | →`custom_alias` | `error` — `Only lowercase letters, numbers, dashes (-), dots (.) and underscores (_) are currently supported for alias prefix. Cannot be more than 40 letters` | +0 |
 | 2 | **missing `prefix` field** | NC | **500** | (500 page) | — (`AttributeError`, see below) | +0 |
 | 3 | empty prefix `""` | NC | **302** | →`custom_alias` | `error` — *(same charset message as #1)* | +0 |
-| 4 | long prefix (41 chars) | C | **302** | →`custom_alias` | `error` — *(same charset message as #1)* | +0 |
+| 4 | long prefix (41 chars, crafted — the `prefix` input's `maxlength="40"` truncates typed input in-browser) | NC | **302** | →`custom_alias` | `error` — *(same charset message as #1)* | +0 |
 | 5 | consecutive dots `a..b` | C | **302** | →`custom_alias` | `error` — `Your alias can't contain 2 consecutive dots (..)` | +0 |
 | 6 | **tampered suffix** (flip a sig char) | NC | **302** | →`custom_alias` | `warning` — `Alias creation time is expired, please retry` | +0 |
 | 7 | **missing suffix field** | NC | **302** | →`custom_alias` | `error` — `Unknown error, refresh the page` | +0 |
@@ -1445,7 +1445,7 @@ Every value, log line, HTTP response, SQL statement, and error string in this do
 
 - **Q1:** login → dashboard (302 → 200), then a single click creates an alias and lands back on the dashboard with a green toastr success flash.
 - **Q2:** the frontend sends `POST` with `Content-Type: application/x-www-form-urlencoded`; random body `csrf_token`, `form-name=create-random-email`, optional `generator_scheme`; custom body `csrf_token`, `prefix`, `signed-alias-suffix`, `mailboxes`, `note` (no `form-name`).
-- **Q3:** **HTTP 302** Post/Redirect/Get + toastr flash; `Location …highlight_alias_id=<id>` (random adds `&query=&sort=&filter=`); `Set-Cookie: slapp=…; HttpOnly; Path=/; SameSite=Lax`; `Content-Length` 339 (random) / 273 (custom).
+- **Q3:** **HTTP 302** Post/Redirect/Get + toastr flash; `Location …highlight_alias_id=<id>` (random adds `&query=&sort=&filter=`); `Set-Cookie: slapp=…; HttpOnly; Path=/; SameSite=Lax`; `Content-Length` 339 (random) / 273 (custom) for a 2-digit alias id, growing 2 bytes per additional id digit (e.g. 341 / 275 for a 3-digit id — see §4.2).
 - **Q4:** write-set = **3 tables** for random (`alias` INSERT, `daily_metric` UPDATE, `alias_audit_log` INSERT) and **4 tables** for a custom alias with a secondary mailbox (adds `alias_mailbox` INSERT); `daily_metric` is a **global per-day** counter; `alias_audit_log` is written **synchronously**; **0** `sync_event` rows and **0** `NOTIFY`s across the whole log.
 - **Q5:** the domain event is a **gated no-op** (one `INFO` log line); **no background workers** run (`event_listener.py`/`job_runner.py`/`cron.py` all absent from `ps`); the audit log is synchronous, not a job.
 - **Q6:** the B1 (quota), B2 (CSRF), B3 (route 429 HTML), B5 (custom-alias validations), and B6 (IntegrityError rollback) outputs; and the **B4 canonical default** finding that the Redis token bucket + Redlock are no-ops (`MEM_STORE_URI=None`).
@@ -1463,7 +1463,7 @@ Every value, log line, HTTP response, SQL statement, and error string in this do
 ### 9.4 NON-CANONICAL (non-default / crafted inputs, explicitly labelled)
 
 - **Adversarial direct `POST`s that bypass the browser** (finding S3): several §7 error branches (B2 CSRF, parts of B5 custom-alias validation, and the B6 race) were driven by scripted HTTP clients that skip the dashboard's client-side JavaScript guard (`templates/dashboard/custom_alias.html:112-127`). §7 reports the **browser behavior first** and labels each such direct post NON-CANONICAL; they exercise server-side validation that a normal browser session would not reach the same way.
-- **Non-numeric `generator_scheme`** (§7 B3′): a crafted `generator_scheme=abc` produces an uncaught `ValueError` → **HTTP 500** at `app/dashboard/views/index.py:99` (`int(...)`). The dashboard dropdown only ever submits `0`/`1`/`2`, so this input is crafted and non-canonical.
+- **Non-numeric `generator_scheme`** (§7 B3′): a crafted `generator_scheme=abc` produces an uncaught `ValueError` → **HTTP 500** at `app/dashboard/views/index.py:99` (`int(...)`). The dashboard dropdown only ever submits `1` (word) or `2` (uuid) — and the plain "Random Alias" button submits no `generator_scheme` at all (the server then applies the user's default) — so a non-numeric value is crafted and non-canonical.
 - The **Redis-backed token-bucket demos** in §7 B4:
   - **CASE A** — a live `RedisStorage("redis://localhost:6379")` with `max_hits=5` producing `TooManyRequests` on call #6 (`… -> 6/5`).
   - **CASE B** — a dead Redis on `:6399` producing `ERROR app/rate_limiter.py:42 - Cannot connect to redis` and then **failing open** (returning normally with no exception).
@@ -1534,8 +1534,8 @@ Every part of the six questions, and every mechanism / function / file / flag / 
 
 | Condition / variant | Section | Observed result |
 |---------------------|---------|-----------------|
-| Random alias — word scheme (`generator_scheme=0`) | §3 | 302, created |
-| Random alias — uuid scheme (`=1`) | §3 | 302, created |
+| Random alias — word scheme (`generator_scheme=1`) | §3 | 302, created |
+| Random alias — uuid scheme (`=2`) | §3 | 302, created |
 | Random alias — default (no `generator_scheme`) | §3 | 302, created |
 | Custom alias — single mailbox | §3, §5 | 302, 3-table write |
 | Custom alias — secondary mailbox | §5 | 302, 4-table (adds `alias_mailbox`) |
@@ -1707,11 +1707,11 @@ A	blitzy/documentation/app_2cd6ee777f8c.md
 
 Interpretation:
 
-- `git status --porcelain` lists **only** this deliverable (` M` = modified relative to `HEAD` `87284998`, which already carried an earlier draft of the same file; the session's edits are committed as the final step).
+- `git status --porcelain` lists **only** this deliverable (` M` = modified relative to the capture-time `HEAD` `87284998`, which already carried an earlier draft of the same file; the session's edits are committed as the final step, which advances `HEAD` by one — see the capture-timing note below).
 - `git status --ignored --porcelain` lists **only** this deliverable — after cleanup there are **no** remaining ignored artifacts (`.env`, `__pycache__/`, `*.pyc`, and `static/upload/` are all gone). The working tree is pristine except for the one intended file.
 - `git diff <base> --name-status` against the pre-existing source/base commit `2cd6ee77` (before this file existed) reports a single **`A`** (added) path — exactly one CREATE, with no source path modified or deleted.
 
-> **Capture timing (honest disclosure):** the commands above were run at the conclusion of Phase 8 cleanup. Authoring this Section 10 into the deliverable is the only change made *after* capture; it appends lines to the single, already-tracked deliverable and creates no additional file, so the tracked delta remains **exactly one file** — re-verified immediately before the final commit. Database rows created while exercising the flow live only in the PostgreSQL data directory (inside the container, outside the `/app` bind mount) and are never part of the repository working tree.
+> **Capture timing (honest disclosure):** the commands above were run at the conclusion of Phase 8 cleanup, when `HEAD` was `87284998`. Because this is a **self-documenting file**, the `HEAD` hash shown above is a capture-time value: the working-branch `HEAD` advances by one with **each doc-only review commit** (`87284998` → `1c10c966` → `b0b4dd6e` → `96ccbaa5` → the commit that finalizes these corrections), so a live `git rev-parse HEAD` on the delivered branch reports a **descendant** of the value above. The timeless read-only invariant does **not** depend on this moving hash — `git diff 2cd6ee777f8c2d3531559588bcfb18627ffb5d2c --name-status` reports the single added deliverable at **every** one of those HEADs, because it is measured against the immutable base commit `2cd6ee77` (verified an ancestor of `HEAD` via `git merge-base --is-ancestor`). Authoring this Section 10 into the deliverable is the only change made *after* capture; it appends lines to the single, already-tracked deliverable and creates no additional file, so the tracked delta remains **exactly one file** — re-verified immediately before the final commit. Database rows created while exercising the flow live only in the PostgreSQL data directory (inside the container, outside the `/app` bind mount) and are never part of the repository working tree.
 
 
 
