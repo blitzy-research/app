@@ -37,15 +37,15 @@ All values below were captured from the running instance inside the **mandated c
 | OS | Debian GNU/Linux 12 (bookworm) | `cat /etc/os-release` |
 | Repo path (runtime) | **`/app`** (the repository, bind-mounted from the working clone) | `pwd` inside container |
 | Working git branch | `blitzy-50c513ea-a8be-4059-9e27-0c097dfd57f3` | `git rev-parse --abbrev-ref HEAD` |
-| HEAD commit (capture-time; moving) | authoring capture `872849980eb530187250c876c894e8b567732426`; the working-branch `HEAD` is a **moving reference** that successive doc-only review commits have since advanced — most recently to `a4467a8a1fc6988a46691be0d4241290cf6ed551` — and the commit that finalizes these corrections advances it once more, so a fresh checkout reports a **descendant** of the capture hash. Every commit between the base and `HEAD` touches only this deliverable. The read-only invariant is anchored to the immutable **base commit** (next row), not to any moving hash. | `git rev-parse HEAD` (capture-time) |
+| HEAD commit (capture-time; moving) | authoring capture `872849980eb530187250c876c894e8b567732426`; the working-branch `HEAD` is a **moving reference** that successive doc-only review commits have since advanced — most recently to `ff16e389c15a0820924a4dec782842e5fa7fbb02` — and the commit that finalizes these corrections advances it once more, so a fresh checkout reports a **descendant** of the capture hash. Every commit between the base and `HEAD` touches only this deliverable. The read-only invariant is anchored to the immutable **base commit** (next row), not to any moving hash. | `git rev-parse HEAD` (capture-time) |
 | Source/base commit | `2cd6ee777f8c2d3531559588bcfb18627ffb5d2c` — ancestor of HEAD; the deliverable is named after the source branch `app_2cd6ee777f8c` | `git merge-base --is-ancestor` |
 | Only tracked delta base→HEAD | `A blitzy/documentation/app_2cd6ee777f8c.md` (this file; **no source path is modified**) | `git diff --name-status` |
-| Python | **3.10.18** (image venv at `/app/venv`; all ~70 deps at exact `poetry.lock` pins) | `python --version` |
+| Python | **3.10.18** (image venv at `/app/venv`; the alias-flow deps are present at their exact `poetry.lock` pins, with one image-level substitution *off* the flow — `pyre2`→`google-re2`, documented in §1.2) | `python --version` |
 | Dev web server | **Werkzeug/1.0.1**, port **7777** (`server.py:588` — `app.run(debug=True, port=7777)`); every response `Server:` header reads `Werkzeug/1.0.1 Python/3.10.18` | response header capture |
 | PostgreSQL | **15.13** (Debian 15.13-0+deb12u1) on `:5432` | `SELECT version()` |
 | Redis | **7.0.15** on `:6379` (present but *not* wired into rate limiting by default — see §7 B4) | `redis-cli INFO server` |
 
-The project targets Python `^3.10` (`pyproject.toml:61`, `CONTRIBUTING.md`). The mandated image satisfies this directly: it ships **Python 3.10.18** with a pre-built virtualenv at `/app/venv` holding every locked dependency at its exact `poetry.lock` version, so no interpreter substitution and no C-extension rebuild were necessary. Confirmed at runtime — the `Server:` header of the very first response is:
+The project targets Python `^3.10` (`pyproject.toml:61`, `CONTRIBUTING.md`). The mandated image satisfies this directly: it ships **Python 3.10.18** with a pre-built virtualenv at `/app/venv`. Every dependency exercised by the alias-creation flow (the twelve listed in §1.2) is present at its exact `poetry.lock` pin, so no interpreter substitution and no C-extension rebuild were necessary for the path under study. **One image-level dependency substitution does exist and is disclosed rather than glossed over (OBSERVED, off the alias-creation path):** `poetry.lock` pins `pyre2==0.3.6` but the venv ships `google-re2==1.1.20250805` in its place — the captured evidence and its (test-only) impact are in §1.2. Confirmed at runtime — the `Server:` header of the very first response is:
 
 ```
 $ curl -sD - -o /dev/null http://localhost:7777/ | grep -i '^Server:'
@@ -92,6 +92,26 @@ email-validator==1.1.3
 | arrow | 0.16.0 | timestamps on models |
 | email-validator | 1.1.3 | alias/email address validation (custom-alias prefix path) |
 
+**Dependency-pin discrepancy (OBSERVED — off the alias-creation path).** The twelve packages above were each verified present at their exact locked versions, but the venv is **not** a perfect mirror of `poetry.lock` for *every* one of its ~70 packages, so the blanket phrasing "all ~70 deps at exact `poetry.lock` pins" would be inaccurate. The lock pins `pyre2` (the Cython RE2 wrapper) at `0.3.6`, yet the image installs Google's own `google-re2` in its place and the locked `pyre2` is absent entirely. The substitute exposes a different API surface — it lacks the `re2.DOTALL` attribute the `pyre2` compatibility layer provides — so code written against the `pyre2` API raises `AttributeError` on that attribute. Captured live in the image venv:
+
+```
+$ grep -n -A1 '^name = "pyre2"' poetry.lock
+2473:name = "pyre2"
+2474-version = "0.3.6"
+$ /app/venv/bin/pip show pyre2 2>&1 | head -1
+WARNING: Package(s) not found: pyre2
+$ /app/venv/bin/pip show google-re2 | grep -E '^(Name|Version):'
+Name: google-re2
+Version: 1.1.20250805
+$ /app/venv/bin/python -c "import re2; print('re2 file =', re2.__file__); print('has DOTALL =', hasattr(re2, 'DOTALL'))"
+re2 file = /app/venv/lib/python3.10/site-packages/re2/__init__.py
+has DOTALL = False
+$ /app/venv/bin/python -c "import re2; re2.DOTALL"
+AttributeError: module 're2' has no attribute 'DOTALL'
+```
+
+**Impact on this investigation: none.** The only modules that `import re2` are `app/dashboard/views/referral.py`, `app/email_utils.py`, `app/spamassassin_utils.py`, and `app/regex_utils.py` (OBSERVED via `grep -rln 'import re2' app tests`) — none is on the alias-creation web path (`app/dashboard/views/index.py`, `app/dashboard/views/custom_alias.py`, `app/models.py`), which never imports `re2`. *(INFERRED, not re-run here: per the image's own dependency notes the substitution also breaks a small number of RE2-dependent tests — three `email_handler` modules at collection time plus one regex test — which is why the blanket "all ~70 deps at exact `poetry.lock` pins" phrasing is corrected to this precise statement.)*
+
 ### 1.3 Canonical bootstrap (default configuration)
 
 The application was brought up exactly as the contributor guide prescribes — `CONTRIBUTING.md` gives the one-liner `alembic upgrade head && flask dummy-data && python3 server.py` and the login instruction (open `http://localhost:7777`, log in with `john@wick.com / password`). For a reproducible, from-empty capture, the `simplelogin` database was dropped and recreated first, then each step below was run **inside the mandated container** and its exit code and key output captured. `.env` is byte-identical to `example.env` (`diff -q .env example.env` → identical), so no config was set: `EVENT_WEBHOOK`, `MEM_STORE_URI`, `REDIS_URL`, and `DISABLE_RATE_LIMIT` are all **absent** (§1.4).
@@ -100,9 +120,27 @@ The application was brought up exactly as the contributor guide prescribes — `
 
 ```
 $ pg_ctlcluster 15 main start        # -> exit 0
-$ pg_isready -h localhost            # -> /var/run/postgresql:5432 - accepting connections   (exit 0)
+$ pg_isready -h localhost            # -> localhost:5432 - accepting connections   (exit 0)
 $ redis-server --daemonize yes --dir /tmp ; redis-cli ping   # -> PONG
 ```
+
+**Step 0b — clean-slate database (drop/create + role/credential context).** `psql` connects over TCP as the image's pre-provisioned superuser `myuser`, which requires a password, so `PGPASSWORD` is exported for the shell session — a *bare* `psql` would instead try to connect as OS user `root` (`psql: error: … FATAL: role "root" does not exist`) and omitting the password yields `psql: error: … fe_sendauth: no password supplied`. With the dev server not yet started (Step 3) there are no open connections, so the `simplelogin` database is dropped and recreated directly, against the maintenance database `postgres`, giving the migrations an empty schema (OBSERVED):
+
+```
+$ export PGPASSWORD=mypassword
+$ psql -h localhost -U myuser -d postgres -tAc \
+    "select 'myuser superuser='||rolsuper from pg_roles where rolname='myuser'"
+myuser superuser=true
+$ psql -h localhost -U myuser -d postgres -tAc "DROP DATABASE IF EXISTS simplelogin"
+DROP DATABASE
+$ psql -h localhost -U myuser -d postgres -tAc "CREATE DATABASE simplelogin OWNER myuser"
+CREATE DATABASE
+$ psql -h localhost -U myuser -d simplelogin -tAc \
+    "select count(*) from information_schema.tables where table_schema='public'"   # -> 0 (empty)
+0
+```
+
+*(If the database is instead re-bootstrapped while the dev server is live, first close its pooled connections — `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='simplelogin' AND pid<>pg_backend_pid();` — otherwise `DROP DATABASE` reports `database "simplelogin" is being accessed by other users`.)*
 
 **Step 1 — schema (`alembic upgrade head`):** run as `cd /app && /app/venv/bin/alembic upgrade head` in the image venv. On startup the command prints the app banner (`>>> URL: http://localhost:7777`, then `MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value`) and then applies the project's **full Alembic migration chain** up to head `32f25cbf12f6`. The **contiguous tail** of that run — its final three `Running upgrade` lines and the captured exit code — is shown below (OBSERVED; `alembic upgrade` emits no further output after the last migration, so these are the genuine last lines):
 
@@ -116,8 +154,9 @@ alembic exit=0
 Verified afterward (OBSERVED): **77** tables in schema `public`; head revision **`32f25cbf12f6`**:
 
 ```
-$ psql -tAc "select count(*) from information_schema.tables where table_schema='public'"   # -> 77
-$ psql -tAc 'select version_num from alembic_version'                                       # -> 32f25cbf12f6
+$ psql -h localhost -U myuser -d simplelogin -tAc \
+    "select count(*) from information_schema.tables where table_schema='public'"   # -> 77
+$ psql -h localhost -U myuser -d simplelogin -tAc 'select version_num from alembic_version'   # -> 32f25cbf12f6
 ```
 
 **Step 2 — seed data (`flask dummy-data`):** the CLI command is defined at `server.py:490-497` and runs `fake_data()`, `add_sl_domains()`, and `add_proton_partner()`:
@@ -139,7 +178,7 @@ Run as `cd /app && FLASK_APP=server.py /app/venv/bin/flask dummy-data`; it compl
 2026-07-13 18:34:31,082 - SL - INFO - 3501 - "/app/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
 ```
 
-The same run also logs `Disable onboarding emails` (`app/models.py:647`) and `Add sl.local to SL domain` (`app/init_app.py:44`); the resulting seed state (2 users, 11 aliases) is verified immediately below.
+The same run also logs `Disable onboarding emails` (`app/models.py:647`) and `Add sl.local to SL domain` (`init_app.py:44` — a repo-root module, imported as `from init_app import …` at `server.py:492`; the `/app/…` prefix in the runtime log line is the container's bind-mount path, not a Python package path); the resulting seed state (2 users, 11 aliases) is verified immediately below.
 
 Verified afterward (OBSERVED): 2 users (`john@wick.com` id=1 admin, `winston@continental.com` id=2) and **11** seeded aliases (`select count(*),max(id) from alias` → `11|11`, so the next created alias will have **id=12**).
 
@@ -155,7 +194,15 @@ MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value
  * Running on http://127.0.0.1:7777/ (Press CTRL+C to quit)
 ```
 
-The server binds `127.0.0.1:7777` (container loopback); a `socat` bridge exposes it to the host so the observation client can drive it. All request/response captures in this document hit that real web entry point.
+The server binds `127.0.0.1:7777` (container loopback). To reach it from the host, a `socat` bridge is started **inside the container**, forwarding the container's published interface (`eth0` = `172.17.0.2`) to that loopback; a host `curl` then confirms the entry point answers with the unauthenticated redirect to the login page (OBSERVED):
+
+```
+$ socat TCP-LISTEN:7777,bind=172.17.0.2,fork,reuseaddr TCP:127.0.0.1:7777 &
+$ curl -s -o /dev/null -w '%{http_code}\n' http://localhost:7777/     # from the host
+302
+```
+
+All request/response captures in this document hit that real web entry point.
 
 ### 1.4 Default configuration keys (all from `example.env`, which the run used verbatim)
 
@@ -190,7 +237,7 @@ john@wick.com is_admin= True is_premium= True can_create_new_alias= True
 
 The investigation is fully non-invasive — **no source file was modified** to capture evidence; every tap is external to the application:
 
-- **PostgreSQL statement log:** `log_statement=all` + `log_min_duration_statement=0`, enabled per-database with `ALTER DATABASE simplelogin SET …` + `SELECT pg_reload_conf()` and **reset afterward** (§8 cleanup). This records every `BEGIN`/`INSERT`/`UPDATE`/`SELECT`/`COMMIT` the SQLAlchemy engine (`app/db.py`) emits. The exact log destination and the enable/reset commands are shown in **§5**.
+- **PostgreSQL statement log:** `log_statement=all` + `log_min_duration_statement=0`, enabled per-database with `ALTER DATABASE simplelogin SET …` + `SELECT pg_reload_conf()` and **reset afterward** (Appendix A). This records every `BEGIN`/`INSERT`/`UPDATE`/`SELECT`/`COMMIT` the SQLAlchemy engine (`app/db.py`) emits. The exact log destination and the enable/reset commands are shown in **§5**.
 - **Dev-server stdout** → `/tmp/blitzy_server.log` (the structured `LOG` object, `app/log.py`). (`/tmp` here is container scratch, **not** the repo bind-mount.)
 - **A `requests` (2.31.0) HTTP client**, run in the image venv, drove the live web entry point (login → form submission); `curl` drove the API contrast (§8).
 
@@ -602,17 +649,18 @@ CUSTOM followed-GET flash line(s):
 
 ## Section 5 — Q4: Database Changes (OBSERVED via PostgreSQL `log_statement=all` + psycopg2 before/after row snapshots; default config)
 
-**How captured (producing command).** With the server running in the canonical image, per-database statement logging was enabled temporarily (reset in the cleanup step, §9 / Section 8-cleanup) so PostgreSQL 15 would log every statement:
+**How captured (producing command).** With the server running in the canonical image, per-database statement logging was enabled temporarily (reset in the cleanup step, Appendix A) so PostgreSQL 15 would log every statement:
 
 ```bash
 # enable full statement logging on the simplelogin DB (temporary, reset afterwards)
+export PGPASSWORD=mypassword
 psql -h localhost -U myuser -d simplelogin -c "alter database simplelogin set log_statement='all'"
 psql -h localhost -U myuser -d simplelogin -c "alter database simplelogin set log_min_duration_statement=0"
 psql -h localhost -U myuser -d postgres    -tAc "select pg_reload_conf()"   # -> t
 # then restart the dev server so pooled connections pick up the setting
 ```
 
-PostgreSQL logs to `/var/log/postgresql/postgresql-15-main.log` (OBSERVED: `logging_collector => off`, so statements go to that file via stderr). A temporary harness (`obs_db_capture.py`, removed afterwards) logged in as `john@wick.com`, took a psycopg2 row snapshot **before** each create, issued the real form `POST`, took a snapshot **after**, and sliced the PostgreSQL log by line-count marks around the single request (backend PID isolates the request). Each variant was run **twice** to confirm stability.
+PostgreSQL logs to `/var/log/postgresql/postgresql-15-main.log` (OBSERVED: `logging_collector => off`, so statements go to that file via stderr). A temporary harness (`obs_db_capture.py`, removed afterwards) logged in as `john@wick.com`, took a psycopg2 row snapshot **before** each create, issued the real form `POST`, took a snapshot **after**, and sliced the PostgreSQL log by line-count marks around the single request (backend PID isolates the request). Each variant was run **twice** to confirm stability. This Section-5 statement-logging pass is a **dedicated capture session**, distinct from the Section 2/6 walkthrough; consequently its pooled backend PID (**36580**) and calendar date (**2026-07-14 UTC**) differ from the PIDs and date shown in those sections, and its alias ids (**25–28**) simply continue the sequence past the earlier runs — none of which affects the observed write set or deltas.
 
 ### 5.1 The single creation core: `Alias.create`
 
@@ -660,43 +708,97 @@ The `commit`/`flush` kwargs are both `False` by default here (the dashboard call
 
 **Producing command:** `POST /dashboard/` with body `csrf_token=<…>&form-name=create-random-email` (see §3.2), as `john@wick.com`.
 
-**Before/during/after snapshot** (psycopg2, two runs; OBSERVED). Run 1 created alias id=25 (`cuspid_fuller927@sl.local`); run 2 created id=26 (`drakes_proper206@sl.local`):
+**Before/during/after snapshot** (psycopg2, two runs; OBSERVED). Run 1 created alias id=25 (`misers_amnion824@sl.local`); run 2 created id=26 (`volley_tildes080@sl.local`):
 
 | Table | BEFORE (run 1) | AFTER (run 1) | Delta | Operation |
 |-------|----------------|---------------|-------|-----------|
 | `alias` | count=24, max_id=24 | count=25, max_id=25 | **+1 row** | INSERT |
 | `daily_metric` | id=1, nb_alias=**24** | id=1, nb_alias=**25** | **+0 rows / nb_alias +1** | UPDATE (today's row already existed) |
 | `alias_audit_log` | count=24, max_id=24 | count=25, max_id=25 | **+1 row** | INSERT |
-| `alias_mailbox` | count=2, max_id=2 | count=2, max_id=2 | 0 | — (not touched) |
+| `alias_mailbox` | count=1, max_id=1 | count=1, max_id=1 | 0 | — (not touched) |
 | `sync_event` | count=0 | count=0 | 0 | — (not touched; see §6) |
 
 **Two-run stability (OBSERVED):** both runs produced the identical delta — `alias +1, alias_audit_log +1, alias_mailbox +0, daily_metric.nb_alias +1`.
 
-The whole operation is ONE `BEGIN..COMMIT` on backend PID 4339. The complete, unedited 73-line log slice for run 1 is below (this is the entire single `POST /dashboard/` — the create transaction `BEGIN`→`COMMIT`, then a second read-only `BEGIN`→`ROLLBACK` that reloads the alias/user for the flash message at request teardown). The three write statements are shown **in full**:
+The whole operation is ONE `BEGIN..COMMIT` on backend PID 36580. The complete, unedited 73-line log slice for run 1 is below **in full** (this is the entire single `POST /dashboard/` — the create transaction `BEGIN`→`COMMIT`, then a second read-only `BEGIN`→`ROLLBACK` that reloads the alias/user for the flash message at request teardown). All 19 `statement:` lines are shown verbatim with their `duration:` lines and full column-projection lists; the three **write** statements are `INSERT alias`, `INSERT alias_audit_log`, and `UPDATE daily_metric`:
 
 ```
-2026-07-13 19:09:32.375 UTC [4339] myuser@simplelogin LOG:  statement: BEGIN
-2026-07-13 19:09:32.376 UTC [4339] myuser@simplelogin LOG:  statement: SELECT users.… FROM users WHERE users.alternative_id = '017b95a2-524e-4b49-a6b4-e8b8214a636e' LIMIT 1          -- current_user load (Flask-Login)
-2026-07-13 19:09:32.379 UTC [4339] myuser@simplelogin LOG:  statement: SELECT subscription.… FROM subscription WHERE subscription.user_id = 1 LIMIT 1                                 -- premium check #1
-2026-07-13 19:09:32.388 UTC [4339] myuser@simplelogin LOG:  statement: SELECT anon_1.… FROM (SELECT … FROM alias WHERE alias.email = 'cuspid_fuller927@sl.local' LIMIT 1) AS anon_1 LEFT OUTER JOIN … -- existing-alias/dup check
-2026-07-13 19:09:32.391 UTC [4339] myuser@simplelogin LOG:  statement: SELECT contact.… FROM contact WHERE contact.reply_email = 'cuspid_fuller927@sl.local' LIMIT 1                     -- reply-email collision check
-2026-07-13 19:09:32.392 UTC [4339] myuser@simplelogin LOG:  statement: SELECT deleted_alias.… FROM deleted_alias WHERE deleted_alias.email = 'cuspid_fuller927@sl.local' LIMIT 1          -- trash check (DeletedAlias)
-2026-07-13 19:09:32.393 UTC [4339] myuser@simplelogin LOG:  statement: SELECT subscription.… FROM subscription WHERE subscription.user_id = 1 LIMIT 1                                 -- premium check #2
-2026-07-13 19:09:32.394 UTC [4339] myuser@simplelogin LOG:  statement: SELECT deleted_alias.… FROM deleted_alias WHERE deleted_alias.email = 'cuspid_fuller927@sl.local' LIMIT 1          -- trash check (DeletedAlias) again
-2026-07-13 19:09:32.395 UTC [4339] myuser@simplelogin LOG:  statement: SELECT domain_deleted_alias.… FROM domain_deleted_alias WHERE domain_deleted_alias.email = 'cuspid_fuller927@sl.local' LIMIT 1  -- trash check (DomainDeletedAlias)
-2026-07-13 19:09:32.397 UTC [4339] myuser@simplelogin LOG:  statement: SELECT public_domain.… FROM public_domain WHERE public_domain.domain = 'sl.local' LIMIT 1                        -- domain lookup
-2026-07-13 19:09:32.398 UTC [4339] myuser@simplelogin LOG:  statement: INSERT INTO alias (created_at, updated_at, user_id, email, name, enabled, flags, custom_domain_id, automatic_creation, directory_id, note, mailbox_id, disable_pgp, cannot_be_disabled, disable_email_spoofing_check, batch_import_id, original_owner_id, pinned, transfer_token, transfer_token_expiration, hibp_last_check, last_email_log_id) VALUES ('2026-07-13T19:09:32.398658'::timestamp, NULL, 1, 'cuspid_fuller927@sl.local', NULL, true, 0, NULL, false, NULL, NULL, 1, false, false, false, NULL, NULL, false, NULL, '2026-07-13T19:09:32.398689'::timestamp, NULL, NULL) RETURNING alias.id
-2026-07-13 19:09:32.399 UTC [4339] myuser@simplelogin LOG:  statement: SELECT daily_metric.… FROM daily_metric WHERE daily_metric.date = '2026-07-13'::date LIMIT 1                      -- get_or_create_today_metric lookup
-2026-07-13 19:09:32.401 UTC [4339] myuser@simplelogin LOG:  statement: UPDATE daily_metric SET updated_at='2026-07-13T19:09:32.401239'::timestamp, nb_alias=25 WHERE daily_metric.id = 1
-2026-07-13 19:09:32.401 UTC [4339] myuser@simplelogin LOG:  statement: INSERT INTO alias_audit_log (created_at, updated_at, user_id, alias_id, alias_email, action, message) VALUES ('2026-07-13T19:09:32.401706'::timestamp, NULL, 1, 25, 'cuspid_fuller927@sl.local', 'create', 'New alias created') RETURNING alias_audit_log.id
-2026-07-13 19:09:32.402 UTC [4339] myuser@simplelogin LOG:  statement: COMMIT
-2026-07-13 19:09:32.404 UTC [4339] myuser@simplelogin LOG:  statement: BEGIN
-2026-07-13 19:09:32.404 UTC [4339] myuser@simplelogin LOG:  statement: SELECT alias.… FROM alias WHERE alias.id = 25                                                                  -- post-commit reload for flash message
-2026-07-13 19:09:32.406 UTC [4339] myuser@simplelogin LOG:  statement: SELECT users.… FROM users WHERE users.id = 1
-2026-07-13 19:09:32.408 UTC [4339] myuser@simplelogin LOG:  statement: ROLLBACK
+2026-07-14 13:01:36.399 UTC [36580] myuser@simplelogin LOG:  statement: BEGIN
+2026-07-14 13:01:36.399 UTC [36580] myuser@simplelogin LOG:  duration: 0.069 ms
+2026-07-14 13:01:36.399 UTC [36580] myuser@simplelogin LOG:  statement: SELECT users.directory_quota AS users_directory_quota, users.subdomain_quota AS users_subdomain_quota, users.password AS users_password, users.id AS users_id, users.created_at AS users_created_at, users.updated_at AS users_updated_at, users.email AS users_email, users.name AS users_name, users.is_admin AS users_is_admin, users.alias_generator AS users_alias_generator, users.notification AS users_notification, users.activated AS users_activated, users.disabled AS users_disabled, users.profile_picture_id AS users_profile_picture_id, users.otp_secret AS users_otp_secret, users.enable_otp AS users_enable_otp, users.last_otp AS users_last_otp, users.fido_uuid AS users_fido_uuid, users.default_alias_custom_domain_id AS users_default_alias_custom_domain_id, users.default_alias_public_domain_id AS users_default_alias_public_domain_id, users.lifetime AS users_lifetime, users.paid_lifetime AS users_paid_lifetime, users.lifetime_coupon_id AS users_lifetime_coupon_id, users.trial_end AS users_trial_end, users.default_mailbox_id AS users_default_mailbox_id, users.sender_format AS users_sender_format, users.sender_format_updated_at AS users_sender_format_updated_at, users.replace_reverse_alias AS users_replace_reverse_alias, users.referral_id AS users_referral_id, users.intro_shown AS users_intro_shown, users.max_spam_score AS users_max_spam_score, users.newsletter_alias_id AS users_newsletter_alias_id, users.include_sender_in_reverse_alias AS users_include_sender_in_reverse_alias, users.random_alias_suffix AS users_random_alias_suffix, users.expand_alias_info AS users_expand_alias_info, users.ignore_loop_email AS users_ignore_loop_email, users.alternative_id AS users_alternative_id, users.disable_automatic_alias_note AS users_disable_automatic_alias_note, users.one_click_unsubscribe_block_sender AS users_one_click_unsubscribe_block_sender, users.include_website_in_one_click_alias AS users_include_website_in_one_click_alias, users.disable_import AS users_disable_import, users.can_use_phone AS users_can_use_phone, users.phone_quota AS users_phone_quota, users.block_behaviour AS users_block_behaviour, users.include_header_email_header AS users_include_header_email_header, users.enable_data_breach_check AS users_enable_data_breach_check, users.flags AS users_flags, users.unsub_behaviour AS users_unsub_behaviour, users.delete_on AS users_delete_on
+	FROM users
+	WHERE users.alternative_id = '6aba9f6b-4be2-4a5a-880b-38fec0e8b328'
+	 LIMIT 1
+2026-07-14 13:01:36.399 UTC [36580] myuser@simplelogin LOG:  duration: 0.389 ms
+2026-07-14 13:01:36.403 UTC [36580] myuser@simplelogin LOG:  statement: SELECT subscription.id AS subscription_id_1, subscription.created_at AS subscription_created_at, subscription.updated_at AS subscription_updated_at, subscription.cancel_url AS subscription_cancel_url, subscription.update_url AS subscription_update_url, subscription.subscription_id AS subscription_subscription_id, subscription.event_time AS subscription_event_time, subscription.next_bill_date AS subscription_next_bill_date, subscription.cancelled AS subscription_cancelled, subscription.plan AS subscription_plan, subscription.user_id AS subscription_user_id
+	FROM subscription
+	WHERE subscription.user_id = 1
+	 LIMIT 1
+2026-07-14 13:01:36.403 UTC [36580] myuser@simplelogin LOG:  duration: 0.167 ms
+2026-07-14 13:01:36.411 UTC [36580] myuser@simplelogin LOG:  statement: SELECT anon_1.alias_id AS anon_1_alias_id, anon_1.alias_created_at AS anon_1_alias_created_at, anon_1.alias_updated_at AS anon_1_alias_updated_at, anon_1.alias_user_id AS anon_1_alias_user_id, anon_1.alias_email AS anon_1_alias_email, anon_1.alias_name AS anon_1_alias_name, anon_1.alias_enabled AS anon_1_alias_enabled, anon_1.alias_flags AS anon_1_alias_flags, anon_1.alias_custom_domain_id AS anon_1_alias_custom_domain_id, anon_1.alias_automatic_creation AS anon_1_alias_automatic_creation, anon_1.alias_directory_id AS anon_1_alias_directory_id, anon_1.alias_note AS anon_1_alias_note, anon_1.alias_mailbox_id AS anon_1_alias_mailbox_id, anon_1.alias_disable_pgp AS anon_1_alias_disable_pgp, anon_1.alias_cannot_be_disabled AS anon_1_alias_cannot_be_disabled, anon_1.alias_disable_email_spoofing_check AS anon_1_alias_disable_email_spoofing_check, anon_1.alias_batch_import_id AS anon_1_alias_batch_import_id, anon_1.alias_original_owner_id AS anon_1_alias_original_owner_id, anon_1.alias_pinned AS anon_1_alias_pinned, anon_1.alias_transfer_token AS anon_1_alias_transfer_token, anon_1.alias_transfer_token_expiration AS anon_1_alias_transfer_token_expiration, anon_1.alias_hibp_last_check AS anon_1_alias_hibp_last_check, anon_1.alias_ts_vector AS anon_1_alias_ts_vector, anon_1.alias_last_email_log_id AS anon_1_alias_last_email_log_id, mailbox_1.id AS mailbox_1_id, mailbox_1.created_at AS mailbox_1_created_at, mailbox_1.updated_at AS mailbox_1_updated_at, mailbox_1.user_id AS mailbox_1_user_id, mailbox_1.email AS mailbox_1_email, mailbox_1.verified AS mailbox_1_verified, mailbox_1.force_spf AS mailbox_1_force_spf, mailbox_1.new_email AS mailbox_1_new_email, mailbox_1.pgp_public_key AS mailbox_1_pgp_public_key, mailbox_1.pgp_finger_print AS mailbox_1_pgp_finger_print, mailbox_1.disable_pgp AS mailbox_1_disable_pgp, mailbox_1.nb_failed_checks AS mailbox_1_nb_failed_checks, mailbox_1.disabled AS mailbox_1_disabled, mailbox_1.generic_subject AS mailbox_1_generic_subject, mailbox_2.id AS mailbox_2_id, mailbox_2.created_at AS mailbox_2_created_at, mailbox_2.updated_at AS mailbox_2_updated_at, mailbox_2.user_id AS mailbox_2_user_id, mailbox_2.email AS mailbox_2_email, mailbox_2.verified AS mailbox_2_verified, mailbox_2.force_spf AS mailbox_2_force_spf, mailbox_2.new_email AS mailbox_2_new_email, mailbox_2.pgp_public_key AS mailbox_2_pgp_public_key, mailbox_2.pgp_finger_print AS mailbox_2_pgp_finger_print, mailbox_2.disable_pgp AS mailbox_2_disable_pgp, mailbox_2.nb_failed_checks AS mailbox_2_nb_failed_checks, mailbox_2.disabled AS mailbox_2_disabled, mailbox_2.generic_subject AS mailbox_2_generic_subject
+	FROM (SELECT alias.id AS alias_id, alias.created_at AS alias_created_at, alias.updated_at AS alias_updated_at, alias.user_id AS alias_user_id, alias.email AS alias_email, alias.name AS alias_name, alias.enabled AS alias_enabled, alias.flags AS alias_flags, alias.custom_domain_id AS alias_custom_domain_id, alias.automatic_creation AS alias_automatic_creation, alias.directory_id AS alias_directory_id, alias.note AS alias_note, alias.mailbox_id AS alias_mailbox_id, alias.disable_pgp AS alias_disable_pgp, alias.cannot_be_disabled AS alias_cannot_be_disabled, alias.disable_email_spoofing_check AS alias_disable_email_spoofing_check, alias.batch_import_id AS alias_batch_import_id, alias.original_owner_id AS alias_original_owner_id, alias.pinned AS alias_pinned, alias.transfer_token AS alias_transfer_token, alias.transfer_token_expiration AS alias_transfer_token_expiration, alias.hibp_last_check AS alias_hibp_last_check, alias.ts_vector AS alias_ts_vector, alias.last_email_log_id AS alias_last_email_log_id
+	FROM alias
+	WHERE alias.email = 'misers_amnion824@sl.local'
+	 LIMIT 1) AS anon_1 LEFT OUTER JOIN (alias_mailbox AS alias_mailbox_1 JOIN mailbox AS mailbox_1 ON mailbox_1.id = alias_mailbox_1.mailbox_id) ON anon_1.alias_id = alias_mailbox_1.alias_id LEFT OUTER JOIN mailbox AS mailbox_2 ON mailbox_2.id = anon_1.alias_mailbox_id
+2026-07-14 13:01:36.412 UTC [36580] myuser@simplelogin LOG:  duration: 0.668 ms
+2026-07-14 13:01:36.415 UTC [36580] myuser@simplelogin LOG:  statement: SELECT contact.id AS contact_id, contact.created_at AS contact_created_at, contact.updated_at AS contact_updated_at, contact.user_id AS contact_user_id, contact.alias_id AS contact_alias_id, contact.name AS contact_name, contact.website_email AS contact_website_email, contact.website_from AS contact_website_from, contact.reply_email AS contact_reply_email, contact.is_cc AS contact_is_cc, contact.pgp_public_key AS contact_pgp_public_key, contact.pgp_finger_print AS contact_pgp_finger_print, contact.mail_from AS contact_mail_from, contact.invalid_email AS contact_invalid_email, contact.block_forward AS contact_block_forward, contact.automatic_created AS contact_automatic_created, contact.flags AS contact_flags
+	FROM contact
+	WHERE contact.reply_email = 'misers_amnion824@sl.local'
+	 LIMIT 1
+2026-07-14 13:01:36.415 UTC [36580] myuser@simplelogin LOG:  duration: 0.160 ms
+2026-07-14 13:01:36.417 UTC [36580] myuser@simplelogin LOG:  statement: SELECT deleted_alias.id AS deleted_alias_id, deleted_alias.created_at AS deleted_alias_created_at, deleted_alias.updated_at AS deleted_alias_updated_at, deleted_alias.email AS deleted_alias_email, deleted_alias.reason AS deleted_alias_reason
+	FROM deleted_alias
+	WHERE deleted_alias.email = 'misers_amnion824@sl.local'
+	 LIMIT 1
+2026-07-14 13:01:36.417 UTC [36580] myuser@simplelogin LOG:  duration: 0.348 ms
+2026-07-14 13:01:36.419 UTC [36580] myuser@simplelogin LOG:  statement: SELECT subscription.id AS subscription_id_1, subscription.created_at AS subscription_created_at, subscription.updated_at AS subscription_updated_at, subscription.cancel_url AS subscription_cancel_url, subscription.update_url AS subscription_update_url, subscription.subscription_id AS subscription_subscription_id, subscription.event_time AS subscription_event_time, subscription.next_bill_date AS subscription_next_bill_date, subscription.cancelled AS subscription_cancelled, subscription.plan AS subscription_plan, subscription.user_id AS subscription_user_id
+	FROM subscription
+	WHERE subscription.user_id = 1
+	 LIMIT 1
+2026-07-14 13:01:36.419 UTC [36580] myuser@simplelogin LOG:  duration: 0.117 ms
+2026-07-14 13:01:36.420 UTC [36580] myuser@simplelogin LOG:  statement: SELECT deleted_alias.id AS deleted_alias_id, deleted_alias.created_at AS deleted_alias_created_at, deleted_alias.updated_at AS deleted_alias_updated_at, deleted_alias.email AS deleted_alias_email, deleted_alias.reason AS deleted_alias_reason
+	FROM deleted_alias
+	WHERE deleted_alias.email = 'misers_amnion824@sl.local'
+	 LIMIT 1
+2026-07-14 13:01:36.420 UTC [36580] myuser@simplelogin LOG:  duration: 0.101 ms
+2026-07-14 13:01:36.421 UTC [36580] myuser@simplelogin LOG:  statement: SELECT domain_deleted_alias.id AS domain_deleted_alias_id, domain_deleted_alias.created_at AS domain_deleted_alias_created_at, domain_deleted_alias.updated_at AS domain_deleted_alias_updated_at, domain_deleted_alias.email AS domain_deleted_alias_email, domain_deleted_alias.domain_id AS domain_deleted_alias_domain_id, domain_deleted_alias.user_id AS domain_deleted_alias_user_id, domain_deleted_alias.reason AS domain_deleted_alias_reason
+	FROM domain_deleted_alias
+	WHERE domain_deleted_alias.email = 'misers_amnion824@sl.local'
+	 LIMIT 1
+2026-07-14 13:01:36.422 UTC [36580] myuser@simplelogin LOG:  duration: 0.281 ms
+2026-07-14 13:01:36.427 UTC [36580] myuser@simplelogin LOG:  statement: SELECT public_domain.id AS public_domain_id, public_domain.created_at AS public_domain_created_at, public_domain.updated_at AS public_domain_updated_at, public_domain.domain AS public_domain_domain, public_domain.premium_only AS public_domain_premium_only, public_domain.can_use_subdomain AS public_domain_can_use_subdomain, public_domain.partner_id AS public_domain_partner_id, public_domain.hidden AS public_domain_hidden, public_domain."order" AS public_domain_order, public_domain.use_as_reverse_alias AS public_domain_use_as_reverse_alias
+	FROM public_domain
+	WHERE public_domain.domain = 'sl.local'
+	 LIMIT 1
+2026-07-14 13:01:36.427 UTC [36580] myuser@simplelogin LOG:  duration: 0.127 ms
+2026-07-14 13:01:36.431 UTC [36580] myuser@simplelogin LOG:  statement: INSERT INTO alias (created_at, updated_at, user_id, email, name, enabled, flags, custom_domain_id, automatic_creation, directory_id, note, mailbox_id, disable_pgp, cannot_be_disabled, disable_email_spoofing_check, batch_import_id, original_owner_id, pinned, transfer_token, transfer_token_expiration, hibp_last_check, last_email_log_id) VALUES ('2026-07-14T13:01:36.431098'::timestamp, NULL, 1, 'misers_amnion824@sl.local', NULL, true, 0, NULL, false, NULL, NULL, 1, false, false, false, NULL, NULL, false, NULL, '2026-07-14T13:01:36.431135'::timestamp, NULL, NULL) RETURNING alias.id
+2026-07-14 13:01:36.433 UTC [36580] myuser@simplelogin LOG:  duration: 1.759 ms
+2026-07-14 13:01:36.434 UTC [36580] myuser@simplelogin LOG:  statement: SELECT daily_metric.id AS daily_metric_id, daily_metric.created_at AS daily_metric_created_at, daily_metric.updated_at AS daily_metric_updated_at, daily_metric.date AS daily_metric_date, daily_metric.nb_new_web_non_proton_user AS daily_metric_nb_new_web_non_proton_user, daily_metric.nb_alias AS daily_metric_nb_alias
+	FROM daily_metric
+	WHERE daily_metric.date = '2026-07-14'::date
+	 LIMIT 1
+2026-07-14 13:01:36.435 UTC [36580] myuser@simplelogin LOG:  duration: 0.388 ms
+2026-07-14 13:01:36.437 UTC [36580] myuser@simplelogin LOG:  statement: INSERT INTO alias_audit_log (created_at, updated_at, user_id, alias_id, alias_email, action, message) VALUES ('2026-07-14T13:01:36.437413'::timestamp, NULL, 1, 25, 'misers_amnion824@sl.local', 'create', 'New alias created') RETURNING alias_audit_log.id
+2026-07-14 13:01:36.437 UTC [36580] myuser@simplelogin LOG:  duration: 0.373 ms
+2026-07-14 13:01:36.438 UTC [36580] myuser@simplelogin LOG:  statement: UPDATE daily_metric SET updated_at='2026-07-14T13:01:36.438722'::timestamp, nb_alias=25 WHERE daily_metric.id = 1
+2026-07-14 13:01:36.439 UTC [36580] myuser@simplelogin LOG:  duration: 0.145 ms
+2026-07-14 13:01:36.439 UTC [36580] myuser@simplelogin LOG:  statement: COMMIT
+2026-07-14 13:01:36.440 UTC [36580] myuser@simplelogin LOG:  duration: 0.987 ms
+2026-07-14 13:01:36.441 UTC [36580] myuser@simplelogin LOG:  statement: BEGIN
+2026-07-14 13:01:36.441 UTC [36580] myuser@simplelogin LOG:  duration: 0.019 ms
+2026-07-14 13:01:36.441 UTC [36580] myuser@simplelogin LOG:  statement: SELECT alias.id AS alias_id, alias.created_at AS alias_created_at, alias.updated_at AS alias_updated_at, alias.user_id AS alias_user_id, alias.email AS alias_email, alias.name AS alias_name, alias.enabled AS alias_enabled, alias.flags AS alias_flags, alias.custom_domain_id AS alias_custom_domain_id, alias.automatic_creation AS alias_automatic_creation, alias.directory_id AS alias_directory_id, alias.note AS alias_note, alias.mailbox_id AS alias_mailbox_id, alias.disable_pgp AS alias_disable_pgp, alias.cannot_be_disabled AS alias_cannot_be_disabled, alias.disable_email_spoofing_check AS alias_disable_email_spoofing_check, alias.batch_import_id AS alias_batch_import_id, alias.original_owner_id AS alias_original_owner_id, alias.pinned AS alias_pinned, alias.transfer_token AS alias_transfer_token, alias.transfer_token_expiration AS alias_transfer_token_expiration, alias.hibp_last_check AS alias_hibp_last_check, alias.ts_vector AS alias_ts_vector, alias.last_email_log_id AS alias_last_email_log_id
+	FROM alias
+	WHERE alias.id = 25
+2026-07-14 13:01:36.442 UTC [36580] myuser@simplelogin LOG:  duration: 0.132 ms
+2026-07-14 13:01:36.444 UTC [36580] myuser@simplelogin LOG:  statement: SELECT users.directory_quota AS users_directory_quota, users.subdomain_quota AS users_subdomain_quota, users.password AS users_password, users.id AS users_id, users.created_at AS users_created_at, users.updated_at AS users_updated_at, users.email AS users_email, users.name AS users_name, users.is_admin AS users_is_admin, users.alias_generator AS users_alias_generator, users.notification AS users_notification, users.activated AS users_activated, users.disabled AS users_disabled, users.profile_picture_id AS users_profile_picture_id, users.otp_secret AS users_otp_secret, users.enable_otp AS users_enable_otp, users.last_otp AS users_last_otp, users.fido_uuid AS users_fido_uuid, users.default_alias_custom_domain_id AS users_default_alias_custom_domain_id, users.default_alias_public_domain_id AS users_default_alias_public_domain_id, users.lifetime AS users_lifetime, users.paid_lifetime AS users_paid_lifetime, users.lifetime_coupon_id AS users_lifetime_coupon_id, users.trial_end AS users_trial_end, users.default_mailbox_id AS users_default_mailbox_id, users.sender_format AS users_sender_format, users.sender_format_updated_at AS users_sender_format_updated_at, users.replace_reverse_alias AS users_replace_reverse_alias, users.referral_id AS users_referral_id, users.intro_shown AS users_intro_shown, users.max_spam_score AS users_max_spam_score, users.newsletter_alias_id AS users_newsletter_alias_id, users.include_sender_in_reverse_alias AS users_include_sender_in_reverse_alias, users.random_alias_suffix AS users_random_alias_suffix, users.expand_alias_info AS users_expand_alias_info, users.ignore_loop_email AS users_ignore_loop_email, users.alternative_id AS users_alternative_id, users.disable_automatic_alias_note AS users_disable_automatic_alias_note, users.one_click_unsubscribe_block_sender AS users_one_click_unsubscribe_block_sender, users.include_website_in_one_click_alias AS users_include_website_in_one_click_alias, users.disable_import AS users_disable_import, users.can_use_phone AS users_can_use_phone, users.phone_quota AS users_phone_quota, users.block_behaviour AS users_block_behaviour, users.include_header_email_header AS users_include_header_email_header, users.enable_data_breach_check AS users_enable_data_breach_check, users.flags AS users_flags, users.unsub_behaviour AS users_unsub_behaviour, users.delete_on AS users_delete_on
+	FROM users
+	WHERE users.id = 1
+2026-07-14 13:01:36.444 UTC [36580] myuser@simplelogin LOG:  duration: 0.184 ms
+2026-07-14 13:01:36.446 UTC [36580] myuser@simplelogin LOG:  statement: ROLLBACK
+2026-07-14 13:01:36.446 UTC [36580] myuser@simplelogin LOG:  duration: 0.031 ms
 ```
 
-> The `SELECT` column-projection lists (each ~40 columns) are shown as `…` for width; the three **write** statements (`INSERT alias`, `UPDATE daily_metric`, `INSERT alias_audit_log`) and every `FROM … WHERE …` clause are **verbatim and unedited**. The complete raw slice (with full column lists and per-statement `duration:` lines) was captured to a temporary file; PostgreSQL also logged a `duration:` line after each statement (omitted here). **Note:** there is **no `SELECT count(*) FROM alias`** (quota) statement — `john` is a premium user, so `User.can_create_new_alias` (`app/models.py:867`) short-circuits without counting; the two `subscription` SELECTs are the premium checks.
+> The slice above is the complete PostgreSQL `log_statement=all` output for run 1, verbatim — all 19 `statement:` lines, all 19 `duration:` lines, and the full ~40-column `SELECT` projection lists are included with **no elision**. The **only** normalization applied is stripping end-of-line whitespace from the tab-indented `FROM`/`WHERE` continuation lines that SQLAlchemy emits (a purely cosmetic trailing-space removal that changes no SQL token). **Note:** there is **no `SELECT count(*) FROM alias`** (quota) statement — `john` is a premium user, so `User.can_create_new_alias` (`app/models.py:867`) short-circuits without counting; the two `subscription` SELECTs are the premium checks.
 
 ### 5.3 CUSTOM alias with 2 mailboxes — 4 tables
 
@@ -709,7 +811,7 @@ The whole operation is ONE `BEGIN..COMMIT` on backend PID 4339. The complete, un
 | `alias` | count=26, max_id=26 | count=27, max_id=27 | **+1 row** | INSERT (`custom_domain_id=2`, `note=''`) |
 | `daily_metric` | id=1, nb_alias=**26** | id=1, nb_alias=**27** | **+0 rows / nb_alias +1** | UPDATE |
 | `alias_audit_log` | count=26, max_id=26 | count=27, max_id=27 | **+1 row** | INSERT |
-| `alias_mailbox` | count=2, max_id=2 | count=3, max_id=3 | **+1 row** | INSERT (secondary mailbox only) |
+| `alias_mailbox` | count=1, max_id=1 | count=2, max_id=2 | **+1 row** | INSERT (secondary mailbox only) |
 | `sync_event` | count=0 | count=0 | 0 | — (not touched; see §6) |
 
 **Two-run stability (OBSERVED):** both runs produced the identical delta — `alias +1, alias_audit_log +1, alias_mailbox +1, daily_metric.nb_alias +1`.
@@ -743,18 +845,156 @@ The whole operation is ONE `BEGIN..COMMIT` on backend PID 4339. The complete, un
                 return redirect(url_for("dashboard.index", highlight_alias_id=alias.id))
 ```
 
-The four write statements, **verbatim and unedited** (run 1, single `BEGIN..COMMIT` on backend PID 4339; 142-line full slice captured to a temporary file):
+The complete, unedited 142-line log slice for run 1 is below **in full** (the create transaction `BEGIN`→`COMMIT` on backend PID 36580, then the read-only `BEGIN`→`ROLLBACK` reload). All 35 `statement:` lines are shown verbatim with their `duration:` lines and full column-projection lists; the **four write** statements are `INSERT alias`, `UPDATE daily_metric`, `INSERT alias_audit_log`, and `INSERT alias_mailbox` (same end-of-line-whitespace normalization as §5.2, no SQL token changed):
 
 ```
-2026-07-13 19:09:33.672 UTC [4339] myuser@simplelogin LOG:  statement: INSERT INTO alias (created_at, updated_at, user_id, email, name, enabled, flags, custom_domain_id, automatic_creation, directory_id, note, mailbox_id, disable_pgp, cannot_be_disabled, disable_email_spoofing_check, batch_import_id, original_owner_id, pinned, transfer_token, transfer_token_expiration, hibp_last_check, last_email_log_id) VALUES ('2026-07-13T19:09:33.672072'::timestamp, NULL, 1, 'obscap169773@old.com', NULL, true, 0, 2, false, NULL, '', 1, false, false, false, NULL, NULL, false, NULL, '2026-07-13T19:09:33.672102'::timestamp, NULL, NULL) RETURNING alias.id
-2026-07-13 19:09:33.674 UTC [4339] myuser@simplelogin LOG:  statement: UPDATE daily_metric SET updated_at='2026-07-13T19:09:33.674606'::timestamp, nb_alias=27 WHERE daily_metric.id = 1
-2026-07-13 19:09:33.675 UTC [4339] myuser@simplelogin LOG:  statement: INSERT INTO alias_audit_log (created_at, updated_at, user_id, alias_id, alias_email, action, message) VALUES ('2026-07-13T19:09:33.675077'::timestamp, NULL, 1, 27, 'obscap169773@old.com', 'create', 'New alias created') RETURNING alias_audit_log.id
-2026-07-13 19:09:33.676 UTC [4339] myuser@simplelogin LOG:  statement: INSERT INTO alias_mailbox (created_at, updated_at, alias_id, mailbox_id) VALUES ('2026-07-13T19:09:33.676510'::timestamp, NULL, 27, 2) RETURNING alias_mailbox.id
+2026-07-14 13:03:27.322 UTC [36580] myuser@simplelogin LOG:  statement: BEGIN
+2026-07-14 13:03:27.322 UTC [36580] myuser@simplelogin LOG:  duration: 0.059 ms
+2026-07-14 13:03:27.322 UTC [36580] myuser@simplelogin LOG:  statement: SELECT users.directory_quota AS users_directory_quota, users.subdomain_quota AS users_subdomain_quota, users.password AS users_password, users.id AS users_id, users.created_at AS users_created_at, users.updated_at AS users_updated_at, users.email AS users_email, users.name AS users_name, users.is_admin AS users_is_admin, users.alias_generator AS users_alias_generator, users.notification AS users_notification, users.activated AS users_activated, users.disabled AS users_disabled, users.profile_picture_id AS users_profile_picture_id, users.otp_secret AS users_otp_secret, users.enable_otp AS users_enable_otp, users.last_otp AS users_last_otp, users.fido_uuid AS users_fido_uuid, users.default_alias_custom_domain_id AS users_default_alias_custom_domain_id, users.default_alias_public_domain_id AS users_default_alias_public_domain_id, users.lifetime AS users_lifetime, users.paid_lifetime AS users_paid_lifetime, users.lifetime_coupon_id AS users_lifetime_coupon_id, users.trial_end AS users_trial_end, users.default_mailbox_id AS users_default_mailbox_id, users.sender_format AS users_sender_format, users.sender_format_updated_at AS users_sender_format_updated_at, users.replace_reverse_alias AS users_replace_reverse_alias, users.referral_id AS users_referral_id, users.intro_shown AS users_intro_shown, users.max_spam_score AS users_max_spam_score, users.newsletter_alias_id AS users_newsletter_alias_id, users.include_sender_in_reverse_alias AS users_include_sender_in_reverse_alias, users.random_alias_suffix AS users_random_alias_suffix, users.expand_alias_info AS users_expand_alias_info, users.ignore_loop_email AS users_ignore_loop_email, users.alternative_id AS users_alternative_id, users.disable_automatic_alias_note AS users_disable_automatic_alias_note, users.one_click_unsubscribe_block_sender AS users_one_click_unsubscribe_block_sender, users.include_website_in_one_click_alias AS users_include_website_in_one_click_alias, users.disable_import AS users_disable_import, users.can_use_phone AS users_can_use_phone, users.phone_quota AS users_phone_quota, users.block_behaviour AS users_block_behaviour, users.include_header_email_header AS users_include_header_email_header, users.enable_data_breach_check AS users_enable_data_breach_check, users.flags AS users_flags, users.unsub_behaviour AS users_unsub_behaviour, users.delete_on AS users_delete_on
+	FROM users
+	WHERE users.alternative_id = '6aba9f6b-4be2-4a5a-880b-38fec0e8b328'
+	 LIMIT 1
+2026-07-14 13:03:27.322 UTC [36580] myuser@simplelogin LOG:  duration: 0.305 ms
+2026-07-14 13:03:27.325 UTC [36580] myuser@simplelogin LOG:  statement: SELECT subscription.id AS subscription_id_1, subscription.created_at AS subscription_created_at, subscription.updated_at AS subscription_updated_at, subscription.cancel_url AS subscription_cancel_url, subscription.update_url AS subscription_update_url, subscription.subscription_id AS subscription_subscription_id, subscription.event_time AS subscription_event_time, subscription.next_bill_date AS subscription_next_bill_date, subscription.cancelled AS subscription_cancelled, subscription.plan AS subscription_plan, subscription.user_id AS subscription_user_id
+	FROM subscription
+	WHERE subscription.user_id = 1
+	 LIMIT 1
+2026-07-14 13:03:27.325 UTC [36580] myuser@simplelogin LOG:  duration: 0.113 ms
+2026-07-14 13:03:27.330 UTC [36580] myuser@simplelogin LOG:  statement: SELECT custom_domain.id AS custom_domain_id, custom_domain.created_at AS custom_domain_created_at, custom_domain.updated_at AS custom_domain_updated_at, custom_domain.user_id AS custom_domain_user_id, custom_domain.domain AS custom_domain_domain, custom_domain.name AS custom_domain_name, custom_domain.verified AS custom_domain_verified, custom_domain.dkim_verified AS custom_domain_dkim_verified, custom_domain.spf_verified AS custom_domain_spf_verified, custom_domain.dmarc_verified AS custom_domain_dmarc_verified, custom_domain.catch_all AS custom_domain_catch_all, custom_domain.random_prefix_generation AS custom_domain_random_prefix_generation, custom_domain.nb_failed_checks AS custom_domain_nb_failed_checks, custom_domain.ownership_verified AS custom_domain_ownership_verified, custom_domain.ownership_txt_token AS custom_domain_ownership_txt_token, custom_domain.is_sl_subdomain AS custom_domain_is_sl_subdomain, custom_domain.partner_id AS custom_domain_partner_id, custom_domain.pending_deletion AS custom_domain_pending_deletion, mailbox_1.id AS mailbox_1_id, mailbox_1.created_at AS mailbox_1_created_at, mailbox_1.updated_at AS mailbox_1_updated_at, mailbox_1.user_id AS mailbox_1_user_id, mailbox_1.email AS mailbox_1_email, mailbox_1.verified AS mailbox_1_verified, mailbox_1.force_spf AS mailbox_1_force_spf, mailbox_1.new_email AS mailbox_1_new_email, mailbox_1.pgp_public_key AS mailbox_1_pgp_public_key, mailbox_1.pgp_finger_print AS mailbox_1_pgp_finger_print, mailbox_1.disable_pgp AS mailbox_1_disable_pgp, mailbox_1.nb_failed_checks AS mailbox_1_nb_failed_checks, mailbox_1.disabled AS mailbox_1_disabled, mailbox_1.generic_subject AS mailbox_1_generic_subject
+	FROM custom_domain LEFT OUTER JOIN (domain_mailbox AS domain_mailbox_1 JOIN mailbox AS mailbox_1 ON mailbox_1.id = domain_mailbox_1.mailbox_id) ON custom_domain.id = domain_mailbox_1.domain_id
+	WHERE custom_domain.user_id = 1 AND custom_domain.ownership_verified = true ORDER BY custom_domain.domain ASC
+2026-07-14 13:03:27.330 UTC [36580] myuser@simplelogin LOG:  duration: 0.440 ms
+2026-07-14 13:03:27.334 UTC [36580] myuser@simplelogin LOG:  statement: SELECT custom_domain.id AS custom_domain_id, custom_domain.created_at AS custom_domain_created_at, custom_domain.updated_at AS custom_domain_updated_at, custom_domain.user_id AS custom_domain_user_id, custom_domain.domain AS custom_domain_domain, custom_domain.name AS custom_domain_name, custom_domain.verified AS custom_domain_verified, custom_domain.dkim_verified AS custom_domain_dkim_verified, custom_domain.spf_verified AS custom_domain_spf_verified, custom_domain.dmarc_verified AS custom_domain_dmarc_verified, custom_domain.catch_all AS custom_domain_catch_all, custom_domain.random_prefix_generation AS custom_domain_random_prefix_generation, custom_domain.nb_failed_checks AS custom_domain_nb_failed_checks, custom_domain.ownership_verified AS custom_domain_ownership_verified, custom_domain.ownership_txt_token AS custom_domain_ownership_txt_token, custom_domain.is_sl_subdomain AS custom_domain_is_sl_subdomain, custom_domain.partner_id AS custom_domain_partner_id, custom_domain.pending_deletion AS custom_domain_pending_deletion, mailbox_1.id AS mailbox_1_id, mailbox_1.created_at AS mailbox_1_created_at, mailbox_1.updated_at AS mailbox_1_updated_at, mailbox_1.user_id AS mailbox_1_user_id, mailbox_1.email AS mailbox_1_email, mailbox_1.verified AS mailbox_1_verified, mailbox_1.force_spf AS mailbox_1_force_spf, mailbox_1.new_email AS mailbox_1_new_email, mailbox_1.pgp_public_key AS mailbox_1_pgp_public_key, mailbox_1.pgp_finger_print AS mailbox_1_pgp_finger_print, mailbox_1.disable_pgp AS mailbox_1_disable_pgp, mailbox_1.nb_failed_checks AS mailbox_1_nb_failed_checks, mailbox_1.disabled AS mailbox_1_disabled, mailbox_1.generic_subject AS mailbox_1_generic_subject
+	FROM custom_domain LEFT OUTER JOIN (domain_mailbox AS domain_mailbox_1 JOIN mailbox AS mailbox_1 ON mailbox_1.id = domain_mailbox_1.mailbox_id) ON custom_domain.id = domain_mailbox_1.domain_id
+	WHERE custom_domain.user_id = 1 AND custom_domain.ownership_verified = true ORDER BY custom_domain.domain ASC
+2026-07-14 13:03:27.334 UTC [36580] myuser@simplelogin LOG:  duration: 0.314 ms
+2026-07-14 13:03:27.335 UTC [36580] myuser@simplelogin LOG:  statement: SELECT subscription.id AS subscription_id_1, subscription.created_at AS subscription_created_at, subscription.updated_at AS subscription_updated_at, subscription.cancel_url AS subscription_cancel_url, subscription.update_url AS subscription_update_url, subscription.subscription_id AS subscription_subscription_id, subscription.event_time AS subscription_event_time, subscription.next_bill_date AS subscription_next_bill_date, subscription.cancelled AS subscription_cancelled, subscription.plan AS subscription_plan, subscription.user_id AS subscription_user_id
+	FROM subscription
+	WHERE subscription.user_id = 1
+	 LIMIT 1
+2026-07-14 13:03:27.335 UTC [36580] myuser@simplelogin LOG:  duration: 0.098 ms
+2026-07-14 13:03:27.337 UTC [36580] myuser@simplelogin LOG:  statement: SELECT public_domain.id AS public_domain_id, public_domain.created_at AS public_domain_created_at, public_domain.updated_at AS public_domain_updated_at, public_domain.domain AS public_domain_domain, public_domain.premium_only AS public_domain_premium_only, public_domain.can_use_subdomain AS public_domain_can_use_subdomain, public_domain.partner_id AS public_domain_partner_id, public_domain.hidden AS public_domain_hidden, public_domain."order" AS public_domain_order, public_domain.use_as_reverse_alias AS public_domain_use_as_reverse_alias
+	FROM public_domain
+	WHERE public_domain.hidden = false AND (public_domain.partner_id IS NULL) ORDER BY public_domain."order"
+2026-07-14 13:03:27.337 UTC [36580] myuser@simplelogin LOG:  duration: 0.104 ms
+2026-07-14 13:03:27.338 UTC [36580] myuser@simplelogin LOG:  statement: SELECT subscription.id AS subscription_id_1, subscription.created_at AS subscription_created_at, subscription.updated_at AS subscription_updated_at, subscription.cancel_url AS subscription_cancel_url, subscription.update_url AS subscription_update_url, subscription.subscription_id AS subscription_subscription_id, subscription.event_time AS subscription_event_time, subscription.next_bill_date AS subscription_next_bill_date, subscription.cancelled AS subscription_cancelled, subscription.plan AS subscription_plan, subscription.user_id AS subscription_user_id
+	FROM subscription
+	WHERE subscription.user_id = 1
+	 LIMIT 1
+2026-07-14 13:03:27.338 UTC [36580] myuser@simplelogin LOG:  duration: 0.077 ms
+2026-07-14 13:03:27.339 UTC [36580] myuser@simplelogin LOG:  statement: SELECT public_domain.id AS public_domain_id, public_domain.created_at AS public_domain_created_at, public_domain.updated_at AS public_domain_updated_at, public_domain.domain AS public_domain_domain, public_domain.premium_only AS public_domain_premium_only, public_domain.can_use_subdomain AS public_domain_can_use_subdomain, public_domain.partner_id AS public_domain_partner_id, public_domain.hidden AS public_domain_hidden, public_domain."order" AS public_domain_order, public_domain.use_as_reverse_alias AS public_domain_use_as_reverse_alias
+	FROM public_domain
+	WHERE public_domain.id IS NULL AND public_domain.hidden = false
+	 LIMIT 1
+2026-07-14 13:03:27.339 UTC [36580] myuser@simplelogin LOG:  duration: 0.073 ms
+2026-07-14 13:03:27.341 UTC [36580] myuser@simplelogin LOG:  statement: SELECT mailbox.id AS mailbox_id, mailbox.created_at AS mailbox_created_at, mailbox.updated_at AS mailbox_updated_at, mailbox.user_id AS mailbox_user_id, mailbox.email AS mailbox_email, mailbox.verified AS mailbox_verified, mailbox.force_spf AS mailbox_force_spf, mailbox.new_email AS mailbox_new_email, mailbox.pgp_public_key AS mailbox_pgp_public_key, mailbox.pgp_finger_print AS mailbox_pgp_finger_print, mailbox.disable_pgp AS mailbox_disable_pgp, mailbox.nb_failed_checks AS mailbox_nb_failed_checks, mailbox.disabled AS mailbox_disabled, mailbox.generic_subject AS mailbox_generic_subject
+	FROM mailbox
+	WHERE mailbox.user_id = 1 AND mailbox.verified = true
+2026-07-14 13:03:27.341 UTC [36580] myuser@simplelogin LOG:  duration: 0.100 ms
+2026-07-14 13:03:27.343 UTC [36580] myuser@simplelogin LOG:  statement: SELECT mailbox.id AS mailbox_id, mailbox.created_at AS mailbox_created_at, mailbox.updated_at AS mailbox_updated_at, mailbox.user_id AS mailbox_user_id, mailbox.email AS mailbox_email, mailbox.verified AS mailbox_verified, mailbox.force_spf AS mailbox_force_spf, mailbox.new_email AS mailbox_new_email, mailbox.pgp_public_key AS mailbox_pgp_public_key, mailbox.pgp_finger_print AS mailbox_pgp_finger_print, mailbox.disable_pgp AS mailbox_disable_pgp, mailbox.nb_failed_checks AS mailbox_nb_failed_checks, mailbox.disabled AS mailbox_disabled, mailbox.generic_subject AS mailbox_generic_subject
+	FROM mailbox
+	WHERE mailbox.id = '1'
+2026-07-14 13:03:27.343 UTC [36580] myuser@simplelogin LOG:  duration: 0.077 ms
+2026-07-14 13:03:27.344 UTC [36580] myuser@simplelogin LOG:  statement: SELECT mailbox.id AS mailbox_id, mailbox.created_at AS mailbox_created_at, mailbox.updated_at AS mailbox_updated_at, mailbox.user_id AS mailbox_user_id, mailbox.email AS mailbox_email, mailbox.verified AS mailbox_verified, mailbox.force_spf AS mailbox_force_spf, mailbox.new_email AS mailbox_new_email, mailbox.pgp_public_key AS mailbox_pgp_public_key, mailbox.pgp_finger_print AS mailbox_pgp_finger_print, mailbox.disable_pgp AS mailbox_disable_pgp, mailbox.nb_failed_checks AS mailbox_nb_failed_checks, mailbox.disabled AS mailbox_disabled, mailbox.generic_subject AS mailbox_generic_subject
+	FROM mailbox
+	WHERE mailbox.id = '2'
+2026-07-14 13:03:27.344 UTC [36580] myuser@simplelogin LOG:  duration: 0.076 ms
+2026-07-14 13:03:27.347 UTC [36580] myuser@simplelogin LOG:  statement: SELECT custom_domain.id AS custom_domain_id, custom_domain.created_at AS custom_domain_created_at, custom_domain.updated_at AS custom_domain_updated_at, custom_domain.user_id AS custom_domain_user_id, custom_domain.domain AS custom_domain_domain, custom_domain.name AS custom_domain_name, custom_domain.verified AS custom_domain_verified, custom_domain.dkim_verified AS custom_domain_dkim_verified, custom_domain.spf_verified AS custom_domain_spf_verified, custom_domain.dmarc_verified AS custom_domain_dmarc_verified, custom_domain.catch_all AS custom_domain_catch_all, custom_domain.random_prefix_generation AS custom_domain_random_prefix_generation, custom_domain.nb_failed_checks AS custom_domain_nb_failed_checks, custom_domain.ownership_verified AS custom_domain_ownership_verified, custom_domain.ownership_txt_token AS custom_domain_ownership_txt_token, custom_domain.is_sl_subdomain AS custom_domain_is_sl_subdomain, custom_domain.partner_id AS custom_domain_partner_id, custom_domain.pending_deletion AS custom_domain_pending_deletion, mailbox_1.id AS mailbox_1_id, mailbox_1.created_at AS mailbox_1_created_at, mailbox_1.updated_at AS mailbox_1_updated_at, mailbox_1.user_id AS mailbox_1_user_id, mailbox_1.email AS mailbox_1_email, mailbox_1.verified AS mailbox_1_verified, mailbox_1.force_spf AS mailbox_1_force_spf, mailbox_1.new_email AS mailbox_1_new_email, mailbox_1.pgp_public_key AS mailbox_1_pgp_public_key, mailbox_1.pgp_finger_print AS mailbox_1_pgp_finger_print, mailbox_1.disable_pgp AS mailbox_1_disable_pgp, mailbox_1.nb_failed_checks AS mailbox_1_nb_failed_checks, mailbox_1.disabled AS mailbox_1_disabled, mailbox_1.generic_subject AS mailbox_1_generic_subject
+	FROM custom_domain LEFT OUTER JOIN (domain_mailbox AS domain_mailbox_1 JOIN mailbox AS mailbox_1 ON mailbox_1.id = domain_mailbox_1.mailbox_id) ON custom_domain.id = domain_mailbox_1.domain_id
+	WHERE custom_domain.user_id = 1 AND custom_domain.ownership_verified = true ORDER BY custom_domain.domain ASC
+2026-07-14 13:03:27.347 UTC [36580] myuser@simplelogin LOG:  duration: 0.265 ms
+2026-07-14 13:03:27.349 UTC [36580] myuser@simplelogin LOG:  statement: SELECT subscription.id AS subscription_id_1, subscription.created_at AS subscription_created_at, subscription.updated_at AS subscription_updated_at, subscription.cancel_url AS subscription_cancel_url, subscription.update_url AS subscription_update_url, subscription.subscription_id AS subscription_subscription_id, subscription.event_time AS subscription_event_time, subscription.next_bill_date AS subscription_next_bill_date, subscription.cancelled AS subscription_cancelled, subscription.plan AS subscription_plan, subscription.user_id AS subscription_user_id
+	FROM subscription
+	WHERE subscription.user_id = 1
+	 LIMIT 1
+2026-07-14 13:03:27.349 UTC [36580] myuser@simplelogin LOG:  duration: 0.093 ms
+2026-07-14 13:03:27.350 UTC [36580] myuser@simplelogin LOG:  statement: SELECT public_domain.id AS public_domain_id, public_domain.created_at AS public_domain_created_at, public_domain.updated_at AS public_domain_updated_at, public_domain.domain AS public_domain_domain, public_domain.premium_only AS public_domain_premium_only, public_domain.can_use_subdomain AS public_domain_can_use_subdomain, public_domain.partner_id AS public_domain_partner_id, public_domain.hidden AS public_domain_hidden, public_domain."order" AS public_domain_order, public_domain.use_as_reverse_alias AS public_domain_use_as_reverse_alias
+	FROM public_domain
+	WHERE public_domain.hidden = false AND (public_domain.partner_id IS NULL) ORDER BY public_domain."order"
+2026-07-14 13:03:27.350 UTC [36580] myuser@simplelogin LOG:  duration: 0.089 ms
+2026-07-14 13:03:27.353 UTC [36580] myuser@simplelogin LOG:  statement: SELECT custom_domain.id AS custom_domain_id, custom_domain.created_at AS custom_domain_created_at, custom_domain.updated_at AS custom_domain_updated_at, custom_domain.user_id AS custom_domain_user_id, custom_domain.domain AS custom_domain_domain, custom_domain.name AS custom_domain_name, custom_domain.verified AS custom_domain_verified, custom_domain.dkim_verified AS custom_domain_dkim_verified, custom_domain.spf_verified AS custom_domain_spf_verified, custom_domain.dmarc_verified AS custom_domain_dmarc_verified, custom_domain.catch_all AS custom_domain_catch_all, custom_domain.random_prefix_generation AS custom_domain_random_prefix_generation, custom_domain.nb_failed_checks AS custom_domain_nb_failed_checks, custom_domain.ownership_verified AS custom_domain_ownership_verified, custom_domain.ownership_txt_token AS custom_domain_ownership_txt_token, custom_domain.is_sl_subdomain AS custom_domain_is_sl_subdomain, custom_domain.partner_id AS custom_domain_partner_id, custom_domain.pending_deletion AS custom_domain_pending_deletion, mailbox_1.id AS mailbox_1_id, mailbox_1.created_at AS mailbox_1_created_at, mailbox_1.updated_at AS mailbox_1_updated_at, mailbox_1.user_id AS mailbox_1_user_id, mailbox_1.email AS mailbox_1_email, mailbox_1.verified AS mailbox_1_verified, mailbox_1.force_spf AS mailbox_1_force_spf, mailbox_1.new_email AS mailbox_1_new_email, mailbox_1.pgp_public_key AS mailbox_1_pgp_public_key, mailbox_1.pgp_finger_print AS mailbox_1_pgp_finger_print, mailbox_1.disable_pgp AS mailbox_1_disable_pgp, mailbox_1.nb_failed_checks AS mailbox_1_nb_failed_checks, mailbox_1.disabled AS mailbox_1_disabled, mailbox_1.generic_subject AS mailbox_1_generic_subject
+	FROM custom_domain LEFT OUTER JOIN (domain_mailbox AS domain_mailbox_1 JOIN mailbox AS mailbox_1 ON mailbox_1.id = domain_mailbox_1.mailbox_id) ON custom_domain.id = domain_mailbox_1.domain_id
+	WHERE custom_domain.user_id = 1 AND custom_domain.ownership_verified = true ORDER BY custom_domain.domain ASC
+2026-07-14 13:03:27.353 UTC [36580] myuser@simplelogin LOG:  duration: 0.256 ms
+2026-07-14 13:03:27.354 UTC [36580] myuser@simplelogin LOG:  statement: SELECT subscription.id AS subscription_id_1, subscription.created_at AS subscription_created_at, subscription.updated_at AS subscription_updated_at, subscription.cancel_url AS subscription_cancel_url, subscription.update_url AS subscription_update_url, subscription.subscription_id AS subscription_subscription_id, subscription.event_time AS subscription_event_time, subscription.next_bill_date AS subscription_next_bill_date, subscription.cancelled AS subscription_cancelled, subscription.plan AS subscription_plan, subscription.user_id AS subscription_user_id
+	FROM subscription
+	WHERE subscription.user_id = 1
+	 LIMIT 1
+2026-07-14 13:03:27.355 UTC [36580] myuser@simplelogin LOG:  duration: 0.082 ms
+2026-07-14 13:03:27.356 UTC [36580] myuser@simplelogin LOG:  statement: SELECT public_domain.id AS public_domain_id, public_domain.created_at AS public_domain_created_at, public_domain.updated_at AS public_domain_updated_at, public_domain.domain AS public_domain_domain, public_domain.premium_only AS public_domain_premium_only, public_domain.can_use_subdomain AS public_domain_can_use_subdomain, public_domain.partner_id AS public_domain_partner_id, public_domain.hidden AS public_domain_hidden, public_domain."order" AS public_domain_order, public_domain.use_as_reverse_alias AS public_domain_use_as_reverse_alias
+	FROM public_domain
+	WHERE public_domain.hidden = false AND (public_domain.partner_id IS NULL) ORDER BY public_domain."order"
+2026-07-14 13:03:27.356 UTC [36580] myuser@simplelogin LOG:  duration: 0.077 ms
+2026-07-14 13:03:27.364 UTC [36580] myuser@simplelogin LOG:  statement: SELECT anon_1.alias_id AS anon_1_alias_id, anon_1.alias_created_at AS anon_1_alias_created_at, anon_1.alias_updated_at AS anon_1_alias_updated_at, anon_1.alias_user_id AS anon_1_alias_user_id, anon_1.alias_email AS anon_1_alias_email, anon_1.alias_name AS anon_1_alias_name, anon_1.alias_enabled AS anon_1_alias_enabled, anon_1.alias_flags AS anon_1_alias_flags, anon_1.alias_custom_domain_id AS anon_1_alias_custom_domain_id, anon_1.alias_automatic_creation AS anon_1_alias_automatic_creation, anon_1.alias_directory_id AS anon_1_alias_directory_id, anon_1.alias_note AS anon_1_alias_note, anon_1.alias_mailbox_id AS anon_1_alias_mailbox_id, anon_1.alias_disable_pgp AS anon_1_alias_disable_pgp, anon_1.alias_cannot_be_disabled AS anon_1_alias_cannot_be_disabled, anon_1.alias_disable_email_spoofing_check AS anon_1_alias_disable_email_spoofing_check, anon_1.alias_batch_import_id AS anon_1_alias_batch_import_id, anon_1.alias_original_owner_id AS anon_1_alias_original_owner_id, anon_1.alias_pinned AS anon_1_alias_pinned, anon_1.alias_transfer_token AS anon_1_alias_transfer_token, anon_1.alias_transfer_token_expiration AS anon_1_alias_transfer_token_expiration, anon_1.alias_hibp_last_check AS anon_1_alias_hibp_last_check, anon_1.alias_ts_vector AS anon_1_alias_ts_vector, anon_1.alias_last_email_log_id AS anon_1_alias_last_email_log_id, mailbox_1.id AS mailbox_1_id, mailbox_1.created_at AS mailbox_1_created_at, mailbox_1.updated_at AS mailbox_1_updated_at, mailbox_1.user_id AS mailbox_1_user_id, mailbox_1.email AS mailbox_1_email, mailbox_1.verified AS mailbox_1_verified, mailbox_1.force_spf AS mailbox_1_force_spf, mailbox_1.new_email AS mailbox_1_new_email, mailbox_1.pgp_public_key AS mailbox_1_pgp_public_key, mailbox_1.pgp_finger_print AS mailbox_1_pgp_finger_print, mailbox_1.disable_pgp AS mailbox_1_disable_pgp, mailbox_1.nb_failed_checks AS mailbox_1_nb_failed_checks, mailbox_1.disabled AS mailbox_1_disabled, mailbox_1.generic_subject AS mailbox_1_generic_subject, mailbox_2.id AS mailbox_2_id, mailbox_2.created_at AS mailbox_2_created_at, mailbox_2.updated_at AS mailbox_2_updated_at, mailbox_2.user_id AS mailbox_2_user_id, mailbox_2.email AS mailbox_2_email, mailbox_2.verified AS mailbox_2_verified, mailbox_2.force_spf AS mailbox_2_force_spf, mailbox_2.new_email AS mailbox_2_new_email, mailbox_2.pgp_public_key AS mailbox_2_pgp_public_key, mailbox_2.pgp_finger_print AS mailbox_2_pgp_finger_print, mailbox_2.disable_pgp AS mailbox_2_disable_pgp, mailbox_2.nb_failed_checks AS mailbox_2_nb_failed_checks, mailbox_2.disabled AS mailbox_2_disabled, mailbox_2.generic_subject AS mailbox_2_generic_subject
+	FROM (SELECT alias.id AS alias_id, alias.created_at AS alias_created_at, alias.updated_at AS alias_updated_at, alias.user_id AS alias_user_id, alias.email AS alias_email, alias.name AS alias_name, alias.enabled AS alias_enabled, alias.flags AS alias_flags, alias.custom_domain_id AS alias_custom_domain_id, alias.automatic_creation AS alias_automatic_creation, alias.directory_id AS alias_directory_id, alias.note AS alias_note, alias.mailbox_id AS alias_mailbox_id, alias.disable_pgp AS alias_disable_pgp, alias.cannot_be_disabled AS alias_cannot_be_disabled, alias.disable_email_spoofing_check AS alias_disable_email_spoofing_check, alias.batch_import_id AS alias_batch_import_id, alias.original_owner_id AS alias_original_owner_id, alias.pinned AS alias_pinned, alias.transfer_token AS alias_transfer_token, alias.transfer_token_expiration AS alias_transfer_token_expiration, alias.hibp_last_check AS alias_hibp_last_check, alias.ts_vector AS alias_ts_vector, alias.last_email_log_id AS alias_last_email_log_id
+	FROM alias
+	WHERE alias.email = 'obscap169773@old.com'
+	 LIMIT 1) AS anon_1 LEFT OUTER JOIN (alias_mailbox AS alias_mailbox_1 JOIN mailbox AS mailbox_1 ON mailbox_1.id = alias_mailbox_1.mailbox_id) ON anon_1.alias_id = alias_mailbox_1.alias_id LEFT OUTER JOIN mailbox AS mailbox_2 ON mailbox_2.id = anon_1.alias_mailbox_id
+2026-07-14 13:03:27.364 UTC [36580] myuser@simplelogin LOG:  duration: 0.561 ms
+2026-07-14 13:03:27.367 UTC [36580] myuser@simplelogin LOG:  statement: SELECT domain_deleted_alias.id AS domain_deleted_alias_id, domain_deleted_alias.created_at AS domain_deleted_alias_created_at, domain_deleted_alias.updated_at AS domain_deleted_alias_updated_at, domain_deleted_alias.email AS domain_deleted_alias_email, domain_deleted_alias.domain_id AS domain_deleted_alias_domain_id, domain_deleted_alias.user_id AS domain_deleted_alias_user_id, domain_deleted_alias.reason AS domain_deleted_alias_reason
+	FROM domain_deleted_alias
+	WHERE domain_deleted_alias.email = 'obscap169773@old.com'
+	 LIMIT 1
+2026-07-14 13:03:27.367 UTC [36580] myuser@simplelogin LOG:  duration: 0.122 ms
+2026-07-14 13:03:27.368 UTC [36580] myuser@simplelogin LOG:  statement: SELECT deleted_alias.id AS deleted_alias_id, deleted_alias.created_at AS deleted_alias_created_at, deleted_alias.updated_at AS deleted_alias_updated_at, deleted_alias.email AS deleted_alias_email, deleted_alias.reason AS deleted_alias_reason
+	FROM deleted_alias
+	WHERE deleted_alias.email = 'obscap169773@old.com'
+	 LIMIT 1
+2026-07-14 13:03:27.368 UTC [36580] myuser@simplelogin LOG:  duration: 0.096 ms
+2026-07-14 13:03:27.369 UTC [36580] myuser@simplelogin LOG:  statement: SELECT subscription.id AS subscription_id_1, subscription.created_at AS subscription_created_at, subscription.updated_at AS subscription_updated_at, subscription.cancel_url AS subscription_cancel_url, subscription.update_url AS subscription_update_url, subscription.subscription_id AS subscription_subscription_id, subscription.event_time AS subscription_event_time, subscription.next_bill_date AS subscription_next_bill_date, subscription.cancelled AS subscription_cancelled, subscription.plan AS subscription_plan, subscription.user_id AS subscription_user_id
+	FROM subscription
+	WHERE subscription.user_id = 1
+	 LIMIT 1
+2026-07-14 13:03:27.369 UTC [36580] myuser@simplelogin LOG:  duration: 0.109 ms
+2026-07-14 13:03:27.370 UTC [36580] myuser@simplelogin LOG:  statement: SELECT deleted_alias.id AS deleted_alias_id, deleted_alias.created_at AS deleted_alias_created_at, deleted_alias.updated_at AS deleted_alias_updated_at, deleted_alias.email AS deleted_alias_email, deleted_alias.reason AS deleted_alias_reason
+	FROM deleted_alias
+	WHERE deleted_alias.email = 'obscap169773@old.com'
+	 LIMIT 1
+2026-07-14 13:03:27.370 UTC [36580] myuser@simplelogin LOG:  duration: 0.090 ms
+2026-07-14 13:03:27.371 UTC [36580] myuser@simplelogin LOG:  statement: SELECT domain_deleted_alias.id AS domain_deleted_alias_id, domain_deleted_alias.created_at AS domain_deleted_alias_created_at, domain_deleted_alias.updated_at AS domain_deleted_alias_updated_at, domain_deleted_alias.email AS domain_deleted_alias_email, domain_deleted_alias.domain_id AS domain_deleted_alias_domain_id, domain_deleted_alias.user_id AS domain_deleted_alias_user_id, domain_deleted_alias.reason AS domain_deleted_alias_reason
+	FROM domain_deleted_alias
+	WHERE domain_deleted_alias.email = 'obscap169773@old.com'
+	 LIMIT 1
+2026-07-14 13:03:27.371 UTC [36580] myuser@simplelogin LOG:  duration: 0.093 ms
+2026-07-14 13:03:27.372 UTC [36580] myuser@simplelogin LOG:  statement: SELECT public_domain.id AS public_domain_id, public_domain.created_at AS public_domain_created_at, public_domain.updated_at AS public_domain_updated_at, public_domain.domain AS public_domain_domain, public_domain.premium_only AS public_domain_premium_only, public_domain.can_use_subdomain AS public_domain_can_use_subdomain, public_domain.partner_id AS public_domain_partner_id, public_domain.hidden AS public_domain_hidden, public_domain."order" AS public_domain_order, public_domain.use_as_reverse_alias AS public_domain_use_as_reverse_alias
+	FROM public_domain
+	WHERE public_domain.domain = 'old.com'
+	 LIMIT 1
+2026-07-14 13:03:27.372 UTC [36580] myuser@simplelogin LOG:  duration: 0.100 ms
+2026-07-14 13:03:27.377 UTC [36580] myuser@simplelogin LOG:  statement: SELECT anon_1.custom_domain_id AS anon_1_custom_domain_id, anon_1.custom_domain_created_at AS anon_1_custom_domain_created_at, anon_1.custom_domain_updated_at AS anon_1_custom_domain_updated_at, anon_1.custom_domain_user_id AS anon_1_custom_domain_user_id, anon_1.custom_domain_domain AS anon_1_custom_domain_domain, anon_1.custom_domain_name AS anon_1_custom_domain_name, anon_1.custom_domain_verified AS anon_1_custom_domain_verified, anon_1.custom_domain_dkim_verified AS anon_1_custom_domain_dkim_verified, anon_1.custom_domain_spf_verified AS anon_1_custom_domain_spf_verified, anon_1.custom_domain_dmarc_verified AS anon_1_custom_domain_dmarc_verified, anon_1.custom_domain_catch_all AS anon_1_custom_domain_catch_all, anon_1.custom_domain_random_prefix_generation AS anon_1_custom_domain_random_prefix_generation, anon_1.custom_domain_nb_failed_checks AS anon_1_custom_domain_nb_failed_checks, anon_1.custom_domain_ownership_verified AS anon_1_custom_domain_ownership_verified, anon_1.custom_domain_ownership_txt_token AS anon_1_custom_domain_ownership_txt_token, anon_1.custom_domain_is_sl_subdomain AS anon_1_custom_domain_is_sl_subdomain, anon_1.custom_domain_partner_id AS anon_1_custom_domain_partner_id, anon_1.custom_domain_pending_deletion AS anon_1_custom_domain_pending_deletion, mailbox_1.id AS mailbox_1_id, mailbox_1.created_at AS mailbox_1_created_at, mailbox_1.updated_at AS mailbox_1_updated_at, mailbox_1.user_id AS mailbox_1_user_id, mailbox_1.email AS mailbox_1_email, mailbox_1.verified AS mailbox_1_verified, mailbox_1.force_spf AS mailbox_1_force_spf, mailbox_1.new_email AS mailbox_1_new_email, mailbox_1.pgp_public_key AS mailbox_1_pgp_public_key, mailbox_1.pgp_finger_print AS mailbox_1_pgp_finger_print, mailbox_1.disable_pgp AS mailbox_1_disable_pgp, mailbox_1.nb_failed_checks AS mailbox_1_nb_failed_checks, mailbox_1.disabled AS mailbox_1_disabled, mailbox_1.generic_subject AS mailbox_1_generic_subject
+	FROM (SELECT custom_domain.id AS custom_domain_id, custom_domain.created_at AS custom_domain_created_at, custom_domain.updated_at AS custom_domain_updated_at, custom_domain.user_id AS custom_domain_user_id, custom_domain.domain AS custom_domain_domain, custom_domain.name AS custom_domain_name, custom_domain.verified AS custom_domain_verified, custom_domain.dkim_verified AS custom_domain_dkim_verified, custom_domain.spf_verified AS custom_domain_spf_verified, custom_domain.dmarc_verified AS custom_domain_dmarc_verified, custom_domain.catch_all AS custom_domain_catch_all, custom_domain.random_prefix_generation AS custom_domain_random_prefix_generation, custom_domain.nb_failed_checks AS custom_domain_nb_failed_checks, custom_domain.ownership_verified AS custom_domain_ownership_verified, custom_domain.ownership_txt_token AS custom_domain_ownership_txt_token, custom_domain.is_sl_subdomain AS custom_domain_is_sl_subdomain, custom_domain.partner_id AS custom_domain_partner_id, custom_domain.pending_deletion AS custom_domain_pending_deletion
+	FROM custom_domain
+	WHERE custom_domain.domain = 'old.com'
+	 LIMIT 1) AS anon_1 LEFT OUTER JOIN (domain_mailbox AS domain_mailbox_1 JOIN mailbox AS mailbox_1 ON mailbox_1.id = domain_mailbox_1.mailbox_id) ON anon_1.custom_domain_id = domain_mailbox_1.domain_id
+2026-07-14 13:03:27.378 UTC [36580] myuser@simplelogin LOG:  duration: 0.369 ms
+2026-07-14 13:03:27.380 UTC [36580] myuser@simplelogin LOG:  statement: INSERT INTO alias (created_at, updated_at, user_id, email, name, enabled, flags, custom_domain_id, automatic_creation, directory_id, note, mailbox_id, disable_pgp, cannot_be_disabled, disable_email_spoofing_check, batch_import_id, original_owner_id, pinned, transfer_token, transfer_token_expiration, hibp_last_check, last_email_log_id) VALUES ('2026-07-14T13:03:27.380647'::timestamp, NULL, 1, 'obscap169773@old.com', NULL, true, 0, 2, false, NULL, '', 1, false, false, false, NULL, NULL, false, NULL, '2026-07-14T13:03:27.380677'::timestamp, NULL, NULL) RETURNING alias.id
+2026-07-14 13:03:27.381 UTC [36580] myuser@simplelogin LOG:  duration: 0.653 ms
+2026-07-14 13:03:27.382 UTC [36580] myuser@simplelogin LOG:  statement: SELECT daily_metric.id AS daily_metric_id, daily_metric.created_at AS daily_metric_created_at, daily_metric.updated_at AS daily_metric_updated_at, daily_metric.date AS daily_metric_date, daily_metric.nb_new_web_non_proton_user AS daily_metric_nb_new_web_non_proton_user, daily_metric.nb_alias AS daily_metric_nb_alias
+	FROM daily_metric
+	WHERE daily_metric.date = '2026-07-14'::date
+	 LIMIT 1
+2026-07-14 13:03:27.382 UTC [36580] myuser@simplelogin LOG:  duration: 0.127 ms
+2026-07-14 13:03:27.383 UTC [36580] myuser@simplelogin LOG:  statement: UPDATE daily_metric SET updated_at='2026-07-14T13:03:27.383359'::timestamp, nb_alias=27 WHERE daily_metric.id = 1
+2026-07-14 13:03:27.383 UTC [36580] myuser@simplelogin LOG:  duration: 0.108 ms
+2026-07-14 13:03:27.384 UTC [36580] myuser@simplelogin LOG:  statement: INSERT INTO alias_audit_log (created_at, updated_at, user_id, alias_id, alias_email, action, message) VALUES ('2026-07-14T13:03:27.383879'::timestamp, NULL, 1, 27, 'obscap169773@old.com', 'create', 'New alias created') RETURNING alias_audit_log.id
+2026-07-14 13:03:27.384 UTC [36580] myuser@simplelogin LOG:  duration: 0.128 ms
+2026-07-14 13:03:27.385 UTC [36580] myuser@simplelogin LOG:  statement: INSERT INTO alias_mailbox (created_at, updated_at, alias_id, mailbox_id) VALUES ('2026-07-14T13:03:27.385295'::timestamp, NULL, 27, 2) RETURNING alias_mailbox.id
+2026-07-14 13:03:27.385 UTC [36580] myuser@simplelogin LOG:  duration: 0.417 ms
+2026-07-14 13:03:27.386 UTC [36580] myuser@simplelogin LOG:  statement: COMMIT
+2026-07-14 13:03:27.387 UTC [36580] myuser@simplelogin LOG:  duration: 1.003 ms
+2026-07-14 13:03:27.388 UTC [36580] myuser@simplelogin LOG:  statement: BEGIN
+2026-07-14 13:03:27.388 UTC [36580] myuser@simplelogin LOG:  duration: 0.024 ms
+2026-07-14 13:03:27.388 UTC [36580] myuser@simplelogin LOG:  statement: SELECT alias.id AS alias_id, alias.created_at AS alias_created_at, alias.updated_at AS alias_updated_at, alias.user_id AS alias_user_id, alias.email AS alias_email, alias.name AS alias_name, alias.enabled AS alias_enabled, alias.flags AS alias_flags, alias.custom_domain_id AS alias_custom_domain_id, alias.automatic_creation AS alias_automatic_creation, alias.directory_id AS alias_directory_id, alias.note AS alias_note, alias.mailbox_id AS alias_mailbox_id, alias.disable_pgp AS alias_disable_pgp, alias.cannot_be_disabled AS alias_cannot_be_disabled, alias.disable_email_spoofing_check AS alias_disable_email_spoofing_check, alias.batch_import_id AS alias_batch_import_id, alias.original_owner_id AS alias_original_owner_id, alias.pinned AS alias_pinned, alias.transfer_token AS alias_transfer_token, alias.transfer_token_expiration AS alias_transfer_token_expiration, alias.hibp_last_check AS alias_hibp_last_check, alias.ts_vector AS alias_ts_vector, alias.last_email_log_id AS alias_last_email_log_id
+	FROM alias
+	WHERE alias.id = 27
+2026-07-14 13:03:27.388 UTC [36580] myuser@simplelogin LOG:  duration: 0.165 ms
+2026-07-14 13:03:27.390 UTC [36580] myuser@simplelogin LOG:  statement: ROLLBACK
+2026-07-14 13:03:27.390 UTC [36580] myuser@simplelogin LOG:  duration: 0.032 ms
 ```
 
 Note the two OBSERVED differences from a random alias in the `INSERT INTO alias` values: `custom_domain_id=2` (because `@old.com` is one of `john`'s custom domains — random aliases have `custom_domain_id=NULL`) and `note=''` (empty string from the submitted `note=` field — a random alias has `note=NULL`).
 
-**OBSERVED ordering nuance (not a stability concern).** The write **set** (which tables, which rows) is identical and stable across runs. The intra-transaction *ordering* of the `UPDATE daily_metric` vs the `INSERT alias_audit_log` varies run to run: random run 1 emitted `UPDATE daily_metric` then `INSERT alias_audit_log`; random run 2 emitted them in the opposite order (custom run 1 above emitted `UPDATE daily_metric` first). **INFERRED** cause: SQLAlchemy 1.3.24 unit-of-work flush ordering. This is an implementation detail; the canonical, stable fact is the set of tables/rows written in one transaction.
+**OBSERVED ordering nuance (not a stability concern).** The write **set** (which tables, which rows) is identical and stable across runs. The intra-transaction *ordering* of the `UPDATE daily_metric` vs the `INSERT alias_audit_log` varies run to run: across the four captured transactions, random run 1 (spliced above) emitted `INSERT alias_audit_log` then `UPDATE daily_metric`, whereas random run 2 emitted them in the opposite order (`UPDATE daily_metric` first); custom run 1 (spliced above) emitted `UPDATE daily_metric` first, and custom run 2 emitted `INSERT alias_audit_log` first. **INFERRED** cause: SQLAlchemy 1.3.24 unit-of-work flush ordering. This is an implementation detail; the canonical, stable fact is the set of tables/rows written in one transaction.
 
 ### 5.4 Key facts (cited)
 
@@ -902,9 +1142,9 @@ $ grep -c 'create new random alias' /tmp/blitzy_server.log
 
 ## Section 7 — Q6: Error / Edge-Path Catalog (OBSERVED live unless labelled; default config)
 
-**How these were captured.** Every branch below was exercised against the canonical running server (PID varied across captures — `5030`/`5247`/`5356`/`5433` — on the mandated image, host-reachable via the in-container `socat` bridge on `127.0.0.1:7777`). For each condition the producing command is a scripted `requests` client; the response status/`Location`/flash was read by following the 302 to its target (or from the 200 body); `alias`-row deltas were measured with `psycopg2` `SELECT count(*)` before/after; log evidence was sliced from `/tmp/blitzy_server.log`. Each failing branch performs **NO database write unless explicitly stated** — the success write-set (§5) never occurs on a rejected request (every "delta +0" below is a direct measurement).
+**How these were captured.** Every branch below was exercised against the canonical running server (PID varied across captures — `5030`/`5356`/`5433` for most branches, with the B3 route-429 evidence re-captured in a separate session under app PID `36792` — on the mandated image, host-reachable via the in-container `socat` bridge on `127.0.0.1:7777`). For each condition the producing command is a scripted `requests` client; the response status/`Location`/flash was read by following the 302 to its target (or from the 200 body); `alias`-row deltas were measured with `psycopg2` `SELECT count(*)` before/after; log evidence was sliced from `/tmp/blitzy_server.log`. Each failing branch performs **NO database write unless explicitly stated** — the success write-set (§5) never occurs on a rejected request (every "delta +0" below is a direct measurement).
 
-**Canonical vs. adversarial (labelling policy).** The two browser forms validate some inputs client-side before submitting: `templates/dashboard/custom_alias.html` runs a click handler (`:112`) that requires a prefix and at least one mailbox and blocks the submit otherwise, and the random form only ever submits `form-name`/`csrf_token`/`generator_scheme`. Conditions that a real browser cannot produce (a tampered/expired/missing signed suffix, a non-existent `mailboxes` id, a non-numeric `generator_scheme`, a suffix for an unavailable domain) are therefore reached only by POSTing crafted fields **directly**, bypassing that client-side validation; those inputs are labelled **NON-CANONICAL** and the browser's own behaviour is stated first. In every such case the **route response itself is a real, canonical observation** — only the crafted *input* is non-canonical.
+**Canonical vs. adversarial (labelling policy).** The two browser forms validate some inputs client-side before submitting: `templates/dashboard/custom_alias.html` runs a click handler (`:112`) that requires a prefix and at least one mailbox and blocks the submit otherwise, and the random form only ever submits `form-name`/`csrf_token`/`generator_scheme`. Conditions that a real browser cannot produce (an **invalid-charset or over-length prefix** — the prefix input's Parsley `data-parsley-pattern="[0-9a-z-_.]{1,}"` and `maxlength=40` block these client-side, OBSERVED in §7 B5 — a tampered/expired/missing signed suffix, a non-existent `mailboxes` id, a non-numeric `generator_scheme`, a suffix for an unavailable domain) are therefore reached only by POSTing crafted fields **directly**, bypassing that client-side validation; those inputs are labelled **NON-CANONICAL** and the browser's own behaviour is stated first. In every such case the **route response itself is a real, canonical observation** — only the crafted *input* is non-canonical.
 
 ### B1 — Quota exceeded (OBSERVED)
 
@@ -974,14 +1214,16 @@ OBSERVED, fresh in-memory counter, firing rapid POSTs as `john`:
 
 | Route | POST #1–5 | POST #6 | 429 `Content-Type` / `Content-Length` |
 |---|---|---|---|
-| `POST /dashboard/` (random) | **302** created ids 37,38,39,40,41 (CL 339 each) | **429** | `text/html; charset=utf-8` / **6067** bytes |
-| `POST /dashboard/custom_alias` | **302** created ids 42,43,44,45,46 (CL 273 each) | **429** | `text/html; charset=utf-8` / **6054** bytes |
+| `POST /dashboard/` (random) | **302** created ids 29,30,31,32,33 (CL 339 each) | **429** | `text/html; charset=utf-8` / **6067** bytes |
+| `POST /dashboard/custom_alias` | **302** created ids 34,35,36,37,38 (CL 273 each) | **429** | `text/html; charset=utf-8` / **6039** bytes |
+
+> **Byte-count nuance (OBSERVED).** The random 429 body is a **stable 6067 bytes** across runs because the word-generator localpart is a fixed shape (`word_word###@sl.local`, 5 queued flashes). The **custom** 429 body size **varies with the user-chosen prefix lengths** (a non-canonical, input-dependent value): the **6039 bytes** here were produced with prefixes `c429test1`–`c429test6`. So only the random count is canonical and reproducible; the custom count depends on the crafted prefixes.
 
 `LOG.w` at `server.py:364` (both routes), verbatim:
 
 ```
-2026-07-13 19:43:23,306 - SL - WARNING - 5247 - "/app/server.py:364" - rate_limited() -  - Client hit rate limit on path /dashboard/, user:<User 1 John Wick john@wick.com>
-2026-07-13 19:43:23,806 - SL - WARNING - 5247 - "/app/server.py:364" - rate_limited() -  - Client hit rate limit on path /dashboard/custom_alias, user:<User 1 John Wick john@wick.com>
+2026-07-14 13:06:30,751 - SL - WARNING - 36792 - "/app/server.py:364" - rate_limited() -  - Client hit rate limit on path /dashboard/, user:<User 1 John Wick john@wick.com>
+2026-07-14 13:07:32,044 - SL - WARNING - 36792 - "/app/server.py:364" - rate_limited() -  - Client hit rate limit on path /dashboard/custom_alias, user:<User 1 John Wick john@wick.com>
 ```
 
 The 429 handler (`server.py:362-372`) branches HTML vs. JSON by path prefix — the web routes render `templates/error/429.html` (which `{% extends "error.html" %}`); the API path (§8) returns JSON:
@@ -1000,10 +1242,106 @@ The 429 handler (`server.py:362-372`) branches HTML vs. JSON by path prefix — 
             return render_template("error/429.html"), 429
 ```
 
-The full 6067-byte random-route 429 response is a complete dashboard-chrome HTML page (identical `<head>` to the dashboard capture in §2); its **meaningful body**, verbatim, shows the queued success flashes from POST #1–5 (Flask carries pending flashes to the next rendered page) followed by the `error/429.html` block:
+The **complete 6067-byte** random-route 429 response body — verbatim and unedited (only end-of-line whitespace stripped from 13 wrapped lines; no markup changed) — is reproduced **in full** below. It is a complete dashboard-chrome HTML page (the same `<head>` rendered in §2); its `<body>` carries the five queued `toastr.success` flashes from POST #1–5 (Flask carries pending flashes to the next rendered page) on one line, then the `error/429.html` block (`{% extends "error.html" %}`: the large **429**, *"Whoa, slow down there, pardner!"*, and the **Home Page** button → `/`), then the standard footer scripts:
 
 ```html
-            <script>toastr.success("Alias horsed_tonsil715@sl.local has been created");</script><script>toastr.success("Alias niches_indite486@sl.local has been created");</script><script>toastr.success("Alias egoist_planes740@sl.local has been created");</script><script>toastr.success("Alias menial_twists513@sl.local has been created");</script><script>toastr.success("Alias yanked_livens704@sl.local has been created");</script>
+
+<!DOCTYPE html>
+<html lang="en"
+      dir="ltr"
+      data-theme="">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport"
+          content="width=device-width, user-scalable=no, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0" />
+    <meta http-equiv="X-UA-Compatible" content="ie=edge" />
+    <meta http-equiv="Content-Language" content="en" />
+    <meta name="msapplication-TileColor" content="#2d89ef" />
+    <meta name="theme-color" content="#4188c9" />
+    <meta name="apple-mobile-web-app-status-bar-style"
+          content="black-translucent" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="HandheldFriendly" content="True" />
+    <meta name="MobileOptimized" content="320" />
+    <meta name="referrer" content="no-referrer" />
+    <!-- Bing -->
+    <meta name="msvalidate.01" content="2A313A69CBFD1A378C3B91734DC221A8" />
+    <!-- Yandex -->
+    <meta name="yandex-verification" content="c9e5d4d68bc983a1" />
+    <meta name="description"
+          content="Protect your email address with email ALIAS. Create a different email alias for each website. No more phishing, or spam." />
+    <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
+    <link rel="shortcut icon" type="image/x-icon" href="/static/favicon.ico" />
+    <link rel="canonical" href="http://localhost:7777/dashboard/" />
+    <title>
+
+      | SimpleLogin
+    </title>
+    <link rel="stylesheet"
+          href="/static/node_modules/font-awesome/css/font-awesome.css" />
+    <!-- Dashboard Core -->
+    <link href="/static/assets/css/dashboard.css" rel="stylesheet" />
+    <!-- Tabler JS -->
+    <script src="/static/assets/js/vendors/jquery-3.2.1.min.js"></script>
+    <script src="/static/assets/js/vendors/bootstrap.bundle.min.js"></script>
+    <script src="/static/assets/js/vendors/jquery.sparkline.min.js"></script>
+    <script src="/static/assets/js/vendors/selectize.min.js"></script>
+    <script src="/static/assets/js/vendors/jquery.tablesorter.min.js"></script>
+    <script src="/static/assets/js/vendors/jquery-jvectormap-2.0.3.min.js"></script>
+    <script src="/static/assets/js/vendors/jquery-jvectormap-de-merc.js"></script>
+    <script src="/static/assets/js/vendors/jquery-jvectormap-world-mill.js"></script>
+    <script src="/static/assets/js/vendors/circle-progress.min.js"></script>
+    <script src="/static/assets/js/core.js"></script>
+    <!-- ClipboardJS -->
+    <script src="/static/vendor/clipboard.min.js"></script>
+    <!-- IntroJS -->
+    <link rel="stylesheet"
+          type="text/css"
+          href="/static/node_modules/intro.js/minified/introjs.min.css" />
+    <script src="/static/node_modules/intro.js/minified/intro.min.js"></script>
+    <!-- Sentry -->
+    <script src="/static/node_modules/%40sentry/browser/build/bundle.min.js"></script>
+    <link rel="stylesheet" href="/static/vendor/bootstrap-social.min.css" />
+    <!-- Toastr library -->
+    <link rel="stylesheet"
+          href="/static/node_modules/toastr/build/toastr.min.css" />
+    <script src="/static/node_modules/toastr/build/toastr.min.js"></script>
+    <script src="/static/node_modules/bootbox/dist/bootbox.min.js"></script>
+    <!-- Multiple-select library -->
+    <link rel="stylesheet"
+          href="/static/node_modules/multiple-select/dist/multiple-select.min.css" />
+    <script src="/static/node_modules/multiple-select/dist/multiple-select.min.js"></script>
+    <!-- Parseley library -->
+    <script src="/static/node_modules/parsleyjs/dist/parsley.min.js"></script>
+    <script src="/static/node_modules/parsleyjs/dist/i18n/en.js"></script>
+    <script src="/static/node_modules/htmx.org/dist/htmx.min.js"></script>
+
+    <link rel="stylesheet"
+          href="/static/darkmode.css?v=dev" />
+    <link rel="stylesheet"
+          type="text/css"
+          href="/static/style.css?v=dev" />
+    <script src="/static/js/theme.js"></script>
+    <script>toastr.options.closeButton = true;</script>
+    <!-- For additional head -->
+
+  </head>
+  <body>
+    <div class="page">
+
+
+      <div class="container">
+        <!-- For flash messages -->
+
+          <!-- Categories: success (green), info (blue), warning (yellow), danger (red) -->
+
+
+            <script>toastr.success("Alias squirm_bunkum571@sl.local has been created");</script><script>toastr.success("Alias lasing_slowly638@sl.local has been created");</script><script>toastr.success("Alias header_blowup482@sl.local has been created");</script><script>toastr.success("Alias waxing_boxing456@sl.local has been created");</script><script>toastr.success("Alias yuccas_loveys294@sl.local has been created");</script>
+
+
+      </div>
+
 
   <div class="page-content">
     <div class="container text-center">
@@ -1022,6 +1360,45 @@ The full 6067-byte random-route 429 response is a complete dashboard-chrome HTML
 
     </div>
   </div>
+
+    </div>
+    <script>
+
+
+  // default options for bootbox
+  bootbox.setDefaults({
+    closeButton: false,
+    backdrop: true
+  })
+
+  var clipboard = new ClipboardJS('.clipboard');
+
+  clipboard.on('success', function (e) {
+    toastr.success("Copied to clipboard");
+    e.clearSelection();
+  });
+
+  // Handle back or close button
+  $('.back-or-close').on("click", function () {
+    // the window is actually a popup, in this case just close it
+    if (history.length == 1) {
+      window.close();
+    } else {
+      history.back();
+    }
+  });
+
+  document.body.addEventListener('htmx:responseError', function(evt) {
+    toastr.error("Sorry for the inconvenience! Could you refresh the page & retry please?", "Unknown Error");
+  });
+
+    </script>
+    <script src="/static/local-storage-polyfill.js"></script>
+    <script src="/static/js/an.js?v=2"></script>
+    <!-- For additional script -->
+
+  </body>
+</html>
 ```
 
 ### B3′ — Non-numeric `generator_scheme` (NON-CANONICAL input) → HTTP 500 (OBSERVED)
@@ -1092,11 +1469,11 @@ Thresholds (parsed, runtime-confirmed; used only when the bucket is armed): `ALI
 
 The custom route validates in this **order** (`app/dashboard/views/custom_alias.py:55-172`): (1) CSRF → (2) read `prefix` (`.strip()…` at `:59`) → (3) `check_alias_prefix` → (4) **mailbox loop** (`:73-83`) → (5) "no mailboxes" (`:85`) → (6) suffix signature (`:88-98`) → (7) `verify_prefix_suffix` (`:100`) → (8) `".."` (`:103`) → (9) `validate_email` (`:107`) → (10) duplicate/trash checks (`:117-135`) → (11) create + `Session.flush()` (`:138-145`) → success (`:158-161`). Note the mailbox loop runs **before** the suffix check.
 
-**Browser client-side gate first (M8):** `templates/dashboard/custom_alias.html:112-129` runs a `#create` click handler that blocks the submit (with a `toastr.error`, `return`) when the mailbox list is empty (`"You must select at least a mailbox"`) or the prefix is empty (`"Alias cannot be empty"`); the fields are also HTML5 `required` (`:39`, `:74`). It does **not** check prefix charset/length, consecutive dots, the signed suffix, or mailbox-id validity — those come from `<select>`s of valid options. Rows below marked **(NC)** are only reachable by POSTing crafted fields that bypass this gate; rows marked **(C)** a real browser can produce. In all rows the **route response is a genuine observation**; alias delta is **+0** except the baseline create.
+**Browser client-side gate first (M8; OBSERVED in Chrome).** The prefix `<input>` carries a **Parsley** validator `data-parsley-pattern="[0-9a-z-_.]{1,}"` together with `maxlength="40"` and HTML5 `required` (`templates/dashboard/custom_alias.html:33-39`), and the `#create` click handler (`:112-129`) additionally blocks the submit (with a `toastr.error`, `return`) when the mailbox list is empty (`"You must select at least a mailbox"`) or the prefix is empty (`"Alias cannot be empty"`) (the mailbox `<select>` is also `required`, `:74`). So the browser **does** validate the prefix **charset** (the Parsley pattern), **length** (`maxlength=40`), and **presence** (`required` + the empty-prefix handler) before any request leaves the page — directly OBSERVED via Chrome DevTools below. What the client gate does **not** catch is **consecutive dots** (the pattern permits `.`, so `a..b` passes Parsley), the **signed suffix**, or **mailbox-id** validity — the latter two are supplied from `<select>`s of valid options. Rows below marked **(NC)** are only reachable by POSTing crafted fields that bypass this gate; rows marked **(C)** a real browser can produce. In all rows the **route response is a genuine observation**; alias delta is **+0** except the baseline create.
 
 | # | Condition | | HTTP | Target | Flash (category, message) | Δ |
 |---|---|---|---|---|---|---|
-| 1 | bad prefix `bad!x` (invalid char) | C | **302** | →`custom_alias` | `error` — `Only lowercase letters, numbers, dashes (-), dots (.) and underscores (_) are currently supported for alias prefix. Cannot be more than 40 letters` | +0 |
+| 1 | bad prefix `bad!x` (invalid char — **crafted**; the browser's Parsley gate blocks it, OBSERVED below) | NC | **302** | →`custom_alias` | `error` — `Only lowercase letters, numbers, dashes (-), dots (.) and underscores (_) are currently supported for alias prefix. Cannot be more than 40 letters` | +0 |
 | 2 | **missing `prefix` field** | NC | **500** | (500 page) | — (`AttributeError`, see below) | +0 |
 | 3 | empty prefix `""` | NC | **302** | →`custom_alias` | `error` — *(same charset message as #1)* | +0 |
 | 4 | long prefix (41 chars, crafted — the `prefix` input's `maxlength="40"` truncates typed input in-browser) | NC | **302** | →`custom_alias` | `error` — *(same charset message as #1)* | +0 |
@@ -1110,6 +1487,8 @@ The custom route validates in this **order** (`app/dashboard/views/custom_alias.
 | 12 | verify_prefix_suffix=False (suffix domain not available) | NC | **200** | (re-render) | `warning` — `something went wrong` | +0 |
 | 13a | baseline create `dupobs71594` | C | **302** | →`dashboard.index?highlight_alias_id=36` | `success` — `Alias dupobs71594@old.com has been created` | **+1** |
 | 13b | duplicate (own) — re-POST same prefix | C | **200** | (re-render) | `error` — `You already have this alias dupobs71594@old.com` | +0 |
+
+**Browser validation of `bad!x` — OBSERVED in Chrome DevTools (canonical entry point).** Logged in as `john@wick.com`, navigating to `/dashboard/custom_alias`, typing `bad!x` into the prefix field and clicking **Create** issues **no request at all**: Parsley rejects the `!` against `data-parsley-pattern="[0-9a-z-_.]{1,}"` and renders the inline error **`Only lowercase letters, dots, numbers, dashes (-) and underscores (_) are currently supported.`** (the field's `data-parsley-error-message`), the input gains class `parsley-error`, and the URL stays on `/dashboard/custom_alias`. `list_network_requests` for the interaction shows **no `POST /dashboard/custom_alias`** — only the page-load `GET /dashboard/custom_alias` (200) and the background `GET /api/notifications?page=0` (200) — and the database is unchanged (`SELECT count(*) FROM alias` = 39, `max(id)` = 39, identical to the pre-click baseline). A control prefix `validprefix123` flips the input to class `parsley-success` with the error list empty. Screenshot: `blitzy/screenshots/docfix_doc2_custom_bad_prefix_parsley_blocked.png`. **Therefore row 1's `302` is a NON-CANONICAL observation** — reachable only by a crafted `POST` (e.g. `curl`) that skips the browser; the server-side `check_alias_prefix` (message at `custom_alias.py:65`) then returns the longer server message shown in the table. The client (Parsley) and server messages differ verbatim: Parsley ends *"…dashes (-) and underscores (_) are currently supported."*, whereas the server adds *"…for alias prefix. Cannot be more than 40 letters"*.
 
 **Counter-intuitive finding (empirically confirmed).** The flash text does *not* map to a naive "tampered vs. expired" model. `check_suffix_signature` (`app/alias_suffix.py:37-42`) catches `itsdangerous.BadSignature` — which subsumes **both** a bad signature **and** `SignatureExpired` — and returns `None`, so the route's `:89` branch fires ("…expired") for a **tampered string** (row 6), an **empty** string (row 8) *and* a genuinely **expired** suffix (row 9). The route's `:95 except` "tampered" branch (`"Unknown error, refresh the page"`) is reached **only when `check_suffix_signature` raises** a non-`BadSignature` — e.g. a **missing** suffix field, where `signer.unsign(None)` raises inside the library (row 7). The accompanying `LOG.w` lines (verbatim) prove which branch each hit:
 
@@ -1179,46 +1558,138 @@ This differs from the **application-level** duplicate check in B5 (which catches
 
 **Why a real race is reachable in default config.** `app.run(debug=True, port=7777)` runs the Werkzeug dev server **threaded** (Flask forces `options.setdefault("threaded", True)`, `flask/app.py:983`), and `@parallel_limiter.lock` is a **no-op** by default (B4), so nothing serializes concurrent `create-custom` requests. Crucially, `app/db.py` opens **one** module-level connection — `connection = engine.connect()` (`:12`) — and binds the scoped session to it — `Session = scoped_session(sessionmaker(bind=connection))` (`:14`). So all concurrent request threads share **one** PostgreSQL connection/transaction.
 
-**REAL CANONICAL RACE (OBSERVED).** Firing K=5 simultaneous POSTs (a `threading.Barrier`) with an identical brand-new prefix, on 3 separate attempts, the `IntegrityError` branch was reached every time — `LOG.w "Alias … already exists"` at `custom_alias.py:147` fired on all 3. Attempt 0 verbatim:
+**REAL CANONICAL RACE (OBSERVED).** Firing K=5 simultaneous POSTs (a `threading.Barrier`) with an identical brand-new prefix, on 3 separate attempts (re-captured fresh on **2026-07-14**, app PID **38143**, to supply the complete unedited failure output below), the `IntegrityError` branch was reached every time — `LOG.w "Alias … already exists"` at `custom_alias.py:147` fired on all 3. Attempt 0 verbatim:
 
 ```
-attempt 0: prefix=race1783972083x0  DB rows for race1783972083x0@old.com = 1
-   thread0: HTTP 500  Loc=-  flash=[]
-   thread1: HTTP 302  Loc=http://127.0.0.1:7777/dashboard/custom_alias  flash=[]
-   thread2: HTTP 500  Loc=-  flash=[]
-   thread3: HTTP 500  Loc=-  flash=[]
-   thread4: HTTP 500  Loc=-  flash=[]
+ATTEMPT 0 prefix=b6race1784038383_0
+   thread0: HTTP 302 Loc=http://127.0.0.1:7777/dashboard/custom_alias
+   thread1: HTTP 500 Loc=-
+   thread2: HTTP 500 Loc=-
+   thread3: HTTP 500 Loc=-
+   thread4: HTTP 500 Loc=-
+   #302=1 #500=4 #429=0
 ```
 
-The HTTP split across the K=5 threads is **timing-dependent, not fixed**. Re-running the identical race, the number of threads that return a **302** varies run-to-run: the attempt-0 capture above shows **1 of 5**, and three independent re-runs produced **2, 2, and 1 of 5** respectively (the re-verified distribution is tabulated below). A returned 302 is either the `IntegrityError` branch's `redirect(url_for("dashboard.custom_alias"))` at `:150` (`Location: …/dashboard/custom_alias`) or an apparent-success redirect (`Location: …/dashboard/?highlight_alias_id=<id>`); the remaining threads return **HTTP 500** because the duplicate INSERT aborts the **shared** transaction, so their subsequent statements fail. The invariant that holds on *every* run is the database one: the `gen_email_email_key` UNIQUE constraint (`alias.email`, `app/models.py:1477`) permits **at most one** surviving row. The two 500-side failure modes follow — verbatim except for the marked `…` elisions, disclosed immediately after the block:
+The HTTP split across the K=5 threads is **timing-dependent, not fixed**. The number of threads that return a **302** varies run to run: the three attempts produced **1, 1, and 2 of 5** returning 302 respectively (tabulated below). A returned 302 here is the `IntegrityError` branch's `redirect(url_for("dashboard.custom_alias"))` at `:150` (every observed 302 carried `Location: …/dashboard/custom_alias`); the remaining threads return **HTTP 500** because the duplicate INSERT aborts the **shared** transaction, so their subsequent statements fail. The invariant that holds on *every* run is the database one: the `gen_email_email_key` UNIQUE constraint (`alias.email`, `app/models.py:1477`) permits **at most one** surviving row. The two 500-side failure modes follow, each **complete and unedited** (only end-of-line whitespace stripped from the wrapped `[SQL: …]` continuation lines; no token changed). The first is a **reader** thread: its `DeletedAlias.get_by(...)` duplicate-check read at `custom_alias.py:134` runs a `SELECT deleted_alias …` on the already-aborted shared transaction and raises `InFailedSqlTransaction`:
 
 ```
+2026-07-14 14:13:05,487 - SL - ERROR - 38143 - "/app/server.py:390" - error_handler() -  - (psycopg2.errors.InFailedSqlTransaction) current transaction is aborted, commands ignored until end of transaction block
+
+[SQL: SELECT deleted_alias.id AS deleted_alias_id, deleted_alias.created_at AS deleted_alias_created_at, deleted_alias.updated_at AS deleted_alias_updated_at, deleted_alias.email AS deleted_alias_email, deleted_alias.reason AS deleted_alias_reason
+FROM deleted_alias
+WHERE deleted_alias.email = %(email_1)s
+ LIMIT %(param_1)s]
+[parameters: {'email_1': 'b6race1784038383_0@old.com', 'param_1': 1}]
+(Background on this error at: http://sqlalche.me/e/13/2j85)
+Traceback (most recent call last):
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/base.py", line 1276, in _execute_context
+    self.dialect.do_execute(
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/default.py", line 608, in do_execute
+    cursor.execute(statement, parameters)
+psycopg2.errors.InFailedSqlTransaction: current transaction is aborted, commands ignored until end of transaction block
+
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/app/venv/lib/python3.10/site-packages/flask/app.py", line 1950, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "/app/venv/lib/python3.10/site-packages/flask_debugtoolbar/__init__.py", line 125, in dispatch_request
+    return view_func(**req.view_args)
+  File "/usr/local/lib/python3.10/cProfile.py", line 110, in runcall
+    return func(*args, **kw)
+  File "/app/venv/lib/python3.10/site-packages/flask_limiter/extension.py", line 702, in __inner
+    return obj(*a, **k)
+  File "/app/venv/lib/python3.10/site-packages/flask_login/utils.py", line 272, in decorated_view
+    return func(*args, **kwargs)
+  File "/app/app/parallel_limiter.py", line 52, in decorated
+    return f(*args, **kwargs)
+  File "/app/app/dashboard/views/custom_alias.py", line 134, in custom_alias
+    elif DeletedAlias.get_by(email=full_alias):
+  File "/app/app/models.py", line 84, in get_by
+    return Session.query(cls).filter_by(**kw).first()
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/orm/query.py", line 3429, in first
+    ret = list(self[0:1])
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/orm/query.py", line 3203, in __getitem__
+    return list(res)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/orm/query.py", line 3535, in __iter__
+    return self._execute_and_instances(context)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/orm/query.py", line 3560, in _execute_and_instances
+    result = conn.execute(querycontext.statement, self._params)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/base.py", line 1011, in execute
+    return meth(self, multiparams, params)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/sql/elements.py", line 298, in _execute_on_connection
+    return connection._execute_clauseelement(self, multiparams, params)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/base.py", line 1124, in _execute_clauseelement
+    ret = self._execute_context(
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/base.py", line 1316, in _execute_context
+    self._handle_dbapi_exception(
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/base.py", line 1510, in _handle_dbapi_exception
+    util.raise_(
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/util/compat.py", line 182, in raise_
+    raise exception
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/base.py", line 1276, in _execute_context
+    self.dialect.do_execute(
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/default.py", line 608, in do_execute
+    cursor.execute(statement, parameters)
 sqlalchemy.exc.InternalError: (psycopg2.errors.InFailedSqlTransaction) current transaction is aborted, commands ignored until end of transaction block
-[SQL: SELECT deleted_alias.id … FROM deleted_alias WHERE deleted_alias.email = %(email_1)s  LIMIT %(param_1)s]
-[parameters: {'email_1': 'race1783972083x0@old.com', 'param_1': 1}]
+
+[SQL: SELECT deleted_alias.id AS deleted_alias_id, deleted_alias.created_at AS deleted_alias_created_at, deleted_alias.updated_at AS deleted_alias_updated_at, deleted_alias.email AS deleted_alias_email, deleted_alias.reason AS deleted_alias_reason
+FROM deleted_alias
+WHERE deleted_alias.email = %(email_1)s
+ LIMIT %(param_1)s]
+[parameters: {'email_1': 'b6race1784038383_0@old.com', 'param_1': 1}]
+(Background on this error at: http://sqlalche.me/e/13/2j85)
 ```
+
+The other 500-side mode is a **committer** thread: it reached `Session.commit()` at `custom_alias.py:158`, but the shared transaction had already been rolled back beneath it, so `commit()` raised `InvalidRequestError`:
+
 ```
-2026-07-13 19:48:03,869 - SL - WARNING - 5433 - "/app/app/dashboard/views/custom_alias.py:147" - custom_alias() -  - Alias race1783972083x0@old.com already exists
-2026-07-13 19:48:03,877 - SL - ERROR - 5433 - "/app/server.py:390" - error_handler() -  - This transaction is inactive
-…
+2026-07-14 14:13:05,494 - SL - ERROR - 38143 - "/app/server.py:390" - error_handler() -  - This transaction is inactive
+Traceback (most recent call last):
+  File "/app/venv/lib/python3.10/site-packages/flask/app.py", line 1950, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "/app/venv/lib/python3.10/site-packages/flask_debugtoolbar/__init__.py", line 125, in dispatch_request
+    return view_func(**req.view_args)
+  File "/usr/local/lib/python3.10/cProfile.py", line 110, in runcall
+    return func(*args, **kw)
+  File "/app/venv/lib/python3.10/site-packages/flask_limiter/extension.py", line 702, in __inner
+    return obj(*a, **k)
+  File "/app/venv/lib/python3.10/site-packages/flask_login/utils.py", line 272, in decorated_view
+    return func(*args, **kwargs)
+  File "/app/app/parallel_limiter.py", line 52, in decorated
+    return f(*args, **kwargs)
   File "/app/app/dashboard/views/custom_alias.py", line 158, in custom_alias
     Session.commit()
-…
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/orm/scoping.py", line 163, in do
+    return getattr(self.registry(), name)(*args, **kwargs)
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/orm/session.py", line 1046, in commit
+    self.transaction.commit()
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/orm/session.py", line 508, in commit
+    t[1].commit()
+  File "/app/venv/lib/python3.10/site-packages/sqlalchemy/engine/base.py", line 1761, in commit
+    raise exc.InvalidRequestError("This transaction is inactive")
 sqlalchemy.exc.InvalidRequestError: This transaction is inactive
 ```
 
-> **Elision disclosure** (mirroring §5.2): the `…` markers inside the two blocks above denote **three elisions only** — the single `…` in the first block replaces the ~40-column `SELECT deleted_alias.id … FROM deleted_alias` projection list, and the two `…` in the traceback block replace the intervening stack frames on either side of the shown `custom_alias.py:158` `Session.commit()` frame. Everything diagnostically material is verbatim and unedited: the `psycopg2.errors.InFailedSqlTransaction` "current transaction is aborted" message, the `LOG.w` line at `custom_alias.py:147`, the failing `Session.commit()` at `custom_alias.py:158`, and the terminal `sqlalchemy.exc.InvalidRequestError: This transaction is inactive`. The complete raw server-log slice was captured to a temporary file during the run and is not reproduced here in full.
-
-after_request recorded the mix (`… 500, takes 0.389s` alongside `… 302, takes 0.383s`). Surviving DB rows for the raced email are **0 or 1 — never more** — and, importantly, **not even a returned success-302 guarantees a surviving row**: because all threads share one connection, a losing thread's `Session.rollback()` can undo the winner's already-flushed INSERT. The original attempt-0 capture retained **1** row (a commit landed before the abort cascade) and attempts 1–2 retained **0**; a fresh re-verification — the identical K=5 race repeated on the running server, spaced >60s apart to clear the `5/minute` route budget — retained **0** on every run, including a run whose thread returned `Location: …/dashboard/?highlight_alias_id=68` yet left no row behind:
+The single **302** thread is the one that caught its *own* `IntegrityError` at `Session.flush()` and took the `:146-150` branch; its `LOG.w` line at `custom_alias.py:147`, verbatim:
 
 ```
-run | #302 | #500 | #429 | surviving_rows
-  0 |   2  |   2  |   1  |     0
-  1 |   2  |   3  |   0  |     0
-  2 |   1  |   4  |   0  |     0
+2026-07-14 14:13:05,489 - SL - WARNING - 38143 - "/app/app/dashboard/views/custom_alias.py:147" - custom_alias() -  - Alias b6race1784038383_0@old.com already exists
 ```
 
-A sequential, non-raced control creation run immediately before these races returned `HTTP 302 → /dashboard/?highlight_alias_id=63` and persisted exactly **1** row — so the 0-survivor outcomes are a property of the *concurrent* shared-connection path, not a broken route. (Run 0's single `429` is the `ALIAS_LIMIT` `5/minute` cap of B7: the control POST plus the five race POSTs made six writes inside one minute.) This is the true, directly-observed canonical behavior: under concurrent identical submissions the single shared connection turns most losers into **HTTP 500**, a run-varying **1–2 of 5** into a 302, and — because the shared transaction is rolled back — frequently persists **0** rows; the `gen_email_email_key` UNIQUE constraint guarantees the surviving count is **never more than one**.
+> **Completeness note** (mirroring §5.2 and §7 B3): the three blocks above are the **complete, unedited** server-log records for the two 500-side threads and the 302 thread — the full five-column `SELECT deleted_alias.id … deleted_alias.reason FROM deleted_alias` projection and both entire tracebacks are reproduced end to end; the only normalization is end-of-line whitespace stripped from the wrapped `[SQL: …]` continuation lines (no token changed). **Nothing is elided.** The `psycopg2.errors.InFailedSqlTransaction` "current transaction is aborted" message, the `LOG.w` line at `custom_alias.py:147`, the failing `Session.commit()` at `custom_alias.py:158`, and the terminal `sqlalchemy.exc.InvalidRequestError: This transaction is inactive` are all present verbatim above.
+
+`after_request` logged the mix (the three 500 threads recorded, e.g., `… POST /dashboard/custom_alias … 500, takes 0.347` / `0.354` / `0.360`, alongside the 302 thread). The number of **surviving DB rows** for the raced email was **exactly 1 on all three attempts** in this session (a commit landed before the abort cascade each time). The invariant that holds on *every* run is the UNIQUE constraint — **never more than one** row survives; a **0**-survivor outcome is also possible under different interleaving (**INFERRED** — because all threads share one connection, a losing thread's `Session.rollback()` can undo the winner's already-flushed INSERT). The per-attempt distribution, spaced >60s apart to clear the `5/minute` route budget:
+
+```
+attempt | #302 | #500 | #429 | surviving_rows
+   0    |   1  |   4  |   0  |       1
+   1    |   1  |   4  |   0  |       1
+   2    |   2  |   3  |   0  |       1
+```
+
+This is the true, directly-observed canonical behavior: under concurrent identical submissions the single shared connection turns most losers into **HTTP 500** (a run-varying **3–4 of 5**), a run-varying **1–2 of 5** into a 302 via the `IntegrityError` branch, and persists **at most one** row — the `gen_email_email_key` UNIQUE constraint (`app/models.py:1477`) guarantees the surviving count is **never more than one** (it was exactly **1** on each of the three fresh attempts above).
 
 **DETERMINISTIC COMPONENT REPRO (OBSERVED; NON-CANONICAL input).** To isolate the `:146-150` branch cleanly (bypassing the `get_by` guard by inserting the same email twice on one session), verbatim:
 
@@ -1230,7 +1701,7 @@ route branch: LOG.w('Alias %s already exists'); Session.rollback(); flash('Unkno
 rows for compdup1783972315@sl.local after rollback of the 2nd = 1 (UNIQUE constraint held; exactly one persisted)
 ```
 
-**HEALTH CHECK (OBSERVED).** Immediately after the race, a normal random create via the route returned `HTTP 302 … highlight_alias_id=56` — the shared connection recovers per-request (the request teardown calls `Session.remove()`), so the messy race leaves the server healthy.
+**HEALTH CHECK (OBSERVED).** Immediately after the race, a normal random create via the route returned `HTTP 302 … highlight_alias_id=27` — the shared connection recovers per-request (the request teardown calls `Session.remove()`), so the messy race leaves the server healthy.
 
 ### Remaining sub-branches NOT reproduced at runtime (labelled INFERRED)
 
@@ -1328,7 +1799,7 @@ To observe this, PostgreSQL statement logging (`log_statement='all'`, §5) was a
 Producing command (filter of the request's slice of `/var/log/postgresql/postgresql-15-main.log`):
 
 ```
-sed -n '<delta>' $PGLOG | grep -aoE 'statement: (BEGIN|COMMIT|ROLLBACK|INSERT INTO [a-z_]+|UPDATE [a-z_]+)'
+sed -n '12026,12119p' $PGLOG | grep -aoE 'statement: (BEGIN|COMMIT|ROLLBACK|INSERT INTO [a-z_]+|UPDATE [a-z_]+)'
 ```
 
 Complete output of that command (three transactions):
@@ -1442,7 +1913,25 @@ ApiKey.get_by(code=<redacted ...rofh>) -> None
 ApiKey.get_by(code=<redacted ...wwnl>) -> None
 ```
 
-The third key used for the §8.2 exhibit (`id=5`, `blitzy-obs-temp-m6`) was likewise deleted (`deleted id=5; remaining m6 keys = 0`). After deletion, the exact lookup `authorize_request` performs — `ApiKey.get_by(code=...)` (`app/api/base.py:18`) — returns `None`, so any reuse of a disposed key would now fall through to `return jsonify(error="Wrong api key"), 401` (`app/api/base.py:27`). (Aside: `times=6` on john's key = 1 happy-path call + 5 successful rate-limit-flood calls; the two throttled `429` requests did **not** increment `times`, because `@limiter.limit` (`app/api/views/new_random_alias.py:22`) runs *before* `@require_api_auth` (`:23`), so `authorize_request` never executed for them.)
+The third key used for the §8.2 exhibit (`id=5`, `blitzy-obs-temp-m6`) was likewise deleted (`deleted id=5; remaining m6 keys = 0`). After deletion, the exact lookup `authorize_request` performs — `ApiKey.get_by(code=...)` (`app/api/base.py:18`) — returns `None`, so reuse of a disposed key **falls through to** `return jsonify(error="Wrong api key"), 401` (`app/api/base.py:27`). This 401 path was **exercised directly and is OBSERVED, not inferred**. An unknown API code — behaviorally identical to reusing a disposed key, since `ApiKey.get_by(code=...)` (`app/api/base.py:18`) returns `None` in both cases — produces a `401`:
+
+```
+curl -sS -i -X POST http://127.0.0.1:7777/api/alias/random/new -H 'Authentication: blitzy-nonexistent-deleted-code-xyz' -H 'Content-Type: application/json' -d '{}'
+```
+
+Response (status line, content headers, and body reproduced verbatim; the volatile `Set-Cookie`/`Date` headers are not shown):
+
+```
+HTTP/1.0 401 UNAUTHORIZED
+Content-Type: application/json
+Content-Length: 31
+
+{
+  "error": "Wrong api key"
+}
+```
+
+Omitting the `Authentication` header entirely produces the **byte-identical** `401` (`HTTP/1.0 401 UNAUTHORIZED`, `Content-Length: 31`, `{"error": "Wrong api key"}`), because the `if not api_key:` guard (`app/api/base.py:20`) is reached whether `api_code` is `None` (header absent) or an unknown code. (Aside: `times=6` on john's key = 1 happy-path call + 5 successful rate-limit-flood calls; the two throttled `429` requests did **not** increment `times`, because `@limiter.limit` (`app/api/views/new_random_alias.py:22`) runs *before* `@require_api_auth` (`:23`), so `authorize_request` never executed for them.)
 
 ---
 
@@ -1450,7 +1939,7 @@ The third key used for the §8.2 exhibit (`id=5`, `blitzy-obs-temp-m6`) was like
 
 ### 9.1 Evidence provenance (fresh canonical run — explicit disclosure)
 
-Every value, log line, HTTP response, SQL statement, and error string in this document was **captured fresh, by this investigation, inside the mandated canonical Docker image** — `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_simple-login_app_1.0` (image id `sha256:ea242796bbce…`), running the repository bind-mounted at `/app` on **Python 3.10.18, PostgreSQL 15.13, Redis 7.0.15** (§1). Each capture is shown with its exact producing command and, where relevant, the live process/backend PID (for example dev-server PIDs 5817/5943 and PostgreSQL backend PIDs 5823/5949). No evidence was borrowed from a supplied capture package. Any earlier-draft values that reflected a **non-canonical environment** (for example a `Server: Werkzeug/1.0.1 Python/3.10.20` banner or a PostgreSQL 16 datastore) were **discarded and are not relied upon**; apart from this one sentence, which names them solely to document their exclusion, no such non-canonical value is used as evidence anywhere in this document.
+Every value, log line, HTTP response, SQL statement, and error string in this document was **captured fresh, by this investigation, inside the mandated canonical Docker image** — `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_simple-login_app_1.0` (image id `sha256:ea242796bbce…`), running the repository bind-mounted at `/app` on **Python 3.10.18, PostgreSQL 15.13, Redis 7.0.15** (§1). Each capture is shown with its exact producing command and, where relevant, the live process/backend PID (for example PostgreSQL backend PID `36580` in §5's SQL slices, the dev-server/app PID `36792` in §7 B3 and `38143` in §7 B6, and the §8 API session's dev-server PID `5943` (§8.3) with PostgreSQL backend `5949` (§8.2)). Because the investigation spanned several canonical runs — with the database re-bootstrapped (`alembic upgrade head` + `flask dummy-data`) between some of them — per-section timestamps, process PIDs, and alias-id ranges differ (for example §5's `alias` ids 25-28 and §6's `<Alias 29>` come from different runs, each with its own reset id sequence); every value shown is the real, unedited output of the run that produced it. No evidence was borrowed from a supplied capture package. Any earlier-draft values that reflected a **non-canonical environment** (for example a `Server: Werkzeug/1.0.1 Python/3.10.20` banner or a PostgreSQL 16 datastore) were **discarded and are not relied upon**; apart from this one sentence, which names them solely to document their exclusion, no such non-canonical value is used as evidence anywhere in this document.
 
 ### 9.2 OBSERVED (default / canonical) — captured at runtime
 
@@ -1460,7 +1949,7 @@ Every value, log line, HTTP response, SQL statement, and error string in this do
 - **Q4:** write-set = **3 tables** for random (`alias` INSERT, `daily_metric` UPDATE, `alias_audit_log` INSERT) and **4 tables** for a custom alias with a secondary mailbox (adds `alias_mailbox` INSERT); `daily_metric` is a **global per-day** counter; `alias_audit_log` is written **synchronously**; **0** `sync_event` rows and **0** `NOTIFY`s across the whole log.
 - **Q5:** the domain event is a **gated no-op** (one `INFO` log line); **no background workers** run (`event_listener.py`/`job_runner.py`/`cron.py` all absent from `ps`); the audit log is synchronous, not a job.
 - **Q6:** the B1 (quota), B2 (CSRF), B3 (route 429 HTML), B5 (custom-alias validations), and B6 (IntegrityError rollback) outputs; and the **B4 canonical default** finding that the Redis token bucket + Redlock are no-ops (`MEM_STORE_URI=None`).
-- **§8:** the API happy path returning **HTTP 201** JSON with the request's `note` **echoed** in the body; the API-only **`api_key` UPDATE + commit** performed by `authorize_request` (making the API success write-set **4 tables** vs. the web's 3); and the API rate-limit / quota responses as **JSON** (`429 {"error": "Rate limit exceeded"}` / `400` with the real value `5`).
+- **§8:** the API happy path returning **HTTP 201** JSON with the request's `note` **echoed** in the body; the API-only **`api_key` UPDATE + commit** performed by `authorize_request` (making the API success write-set **4 tables** vs. the web's 3); and the API rate-limit / quota responses as **JSON** (`429 {"error": "Rate limit exceeded"}` / `400` with the real value `5`); and the API **401** `{"error": "Wrong api key"}` returned by `authorize_request` (`app/api/base.py:20,27`) for an invalid or missing `Authentication` key (§8.4, exercised directly).
 
 ### 9.3 INFERRED (code-derived, not observed) — each grounded in `file:line`
 
@@ -1469,7 +1958,7 @@ Every value, log line, HTTP response, SQL statement, and error string in this do
 - The `validate_email` → `EmailNotValidError` → `flash(str(e), "error")` branch (`app/dashboard/views/custom_alias.py:109-114`) — requires a prefix+suffix pair that passes `verify_prefix_suffix` yet fails RFC email validation, which the canonical signed suffixes do not produce.
 - The **SL-public-domain** (global `DeletedAlias`) recreation branch — the symmetric counterpart of the **observed** custom-domain `DomainDeletedAlias` recreation (§7 B5); the public-domain variant routes through `Alias.create`'s `DeletedAlias` lookup rather than the domain-scoped `domain_deleted_alias` table.
 
-(Two items that earlier drafts listed as INFERRED are now **OBSERVED** and have moved to §9.2: the `verify_prefix_suffix`→`False` "hacked" branch returning **HTTP 200** — `app/dashboard/views/custom_alias.py:162-166`, captured in §7 B5 — and the exact **API quota 400 JSON body** with the real value `5`, captured in §8.3.)
+(Three items that earlier drafts listed as INFERRED are now **OBSERVED** and have moved to §9.2: the `verify_prefix_suffix`→`False` "hacked" branch returning **HTTP 200** — `app/dashboard/views/custom_alias.py:162-166`, captured in §7 B5; the exact **API quota 400 JSON body** with the real value `5`, captured in §8.3; and the **API 401 `{"error": "Wrong api key"}`** path for an invalid or missing `Authentication` key — the §8.4 prose earlier described only what the code "would" return, but this path is now **exercised directly** and captured verbatim (§8.4).)
 
 ### 9.4 NON-CANONICAL (non-default / crafted inputs, explicitly labelled)
 
@@ -1489,8 +1978,8 @@ Every part of the six questions, and every mechanism / function / file / flag / 
 
 | Question sub-part | Answered in | Primary `file:line` |
 |-------------------|-------------|---------------------|
-| Q1 — bring up the app (standard dev setup) | §1 | `server.py:588`; `CONTRIBUTING.md` |
-| Q1 — log in the test user `john@wick.com` | §2 | `app/auth/views/login.py`; creds per `CONTRIBUTING.md` |
+| Q1 — bring up the app (standard dev setup) | §1 | `server.py:588`; `CONTRIBUTING.md:106` |
+| Q1 — log in the test user `john@wick.com` | §2 | `app/auth/views/login.py:21-25`; creds per `CONTRIBUTING.md:109` |
 | Q1 — create a new alias & watch the flow | §2 | `app/dashboard/views/index.py:55` |
 | Q2 — HTTP method (`POST`) | §3 | `app/dashboard/views/index.py:55` |
 | Q2 — URL / path (`/dashboard/`, `/dashboard/custom_alias`) | §3 | `app/dashboard/views/index.py:55`; `app/dashboard/views/custom_alias.py:30` |
@@ -1538,8 +2027,8 @@ Every part of the six questions, and every mechanism / function / file / flag / 
 | `ALIAS_CREATE_RATE_LIMIT_FREE` / `_PAID` | §7 B4 | `app/config.py:554-558` |
 | `EVENT_WEBHOOK` (unset) / `EVENT_WEBHOOK_DISABLE` | §6 | `app/config.py:612`; `app/events/event_dispatcher.py:57-64` |
 | `MEM_STORE_URI` (unset → bucket & Redlock no-op) | §7 B4 | `server.py:163-165`; `app/rate_limiter.py:28-29` |
-| `DISABLE_RATE_LIMIT` (`False`) | §7 B3/B4 | `app/extensions.py` |
-| `MAX_NB_EMAIL_FREE_PLAN` (`5`) | §7 B1, §8.3 | `app/config.py` |
+| `DISABLE_RATE_LIMIT` (`False`) | §7 B3/B4 | `app/config.py:602`; `app/extensions.py:23,28` |
+| `MAX_NB_EMAIL_FREE_PLAN` (`5`) | §7 B1, §8.3 | `app/config.py:121-124` |
 
 **9.5.4 — Conditions / variants exercised**
 
@@ -1556,9 +2045,11 @@ Every part of the six questions, and every mechanism / function / file / flag / 
 | CSRF wrong / missing — random & custom (cross-product) | §7 B2 | 302 "Invalid request" |
 | Route 429 — web random & custom | §7 B3 | 429 HTML (`error/429.html`) |
 | Route 429 — API | §8.3 | 429 JSON |
+| API — invalid / missing `Authentication` key | §8.4 | **401 JSON** `{"error":"Wrong api key"}` (OBSERVED) |
 | Redis token bucket + Redlock — default | §7 B4 | no-op (canonical) |
 | Redis bucket — live / dead store (crafted) | §7 B4, §9.4 | enforce / fail-open (NON-CANONICAL) |
-| Custom prefix — bad / empty / long / consecutive-dots | §7 B5 | 302 error |
+| Custom prefix — bad-charset (`bad!x`) via browser | §7 B5 | Parsley `pattern` blocks client-side, **no POST** (OBSERVED) |
+| Custom prefix — bad / empty / long / consecutive-dots (crafted direct POST) | §7 B5 | 302 error (NON-CANONICAL — bypasses the browser gate) |
 | Custom prefix — missing field | §7 B5 | 500 (`NoneType.strip`) |
 | Custom suffix — tampered / empty / expired | §7 B5 | 302 "…expired" warning |
 | Custom suffix — missing field | §7 B5 | 302 "Unknown error" |
@@ -1577,10 +2068,10 @@ Every part of the six questions, and every mechanism / function / file / flag / 
 | ID | Severity | Category | Status | Resolution evidence |
 |----|----------|----------|--------|---------------------|
 | C1 | CRITICAL | Runtime/Infra (wrong env) | ✅ RESOLVED | §1 re-run in canonical image `ea242796` (Py 3.10.18 / PG 15.13 / Redis 7.0.15); §9.1 provenance; whole-doc wrong-env markers = 0 |
-| C2 / S1 | CRITICAL / Security | Repo integrity (cleanup) | ✅ RESOLVED | §10 — repository final-state proof (`git status --porcelain` / `--ignored`, `.env` & `__pycache__`/`.pyc` removed, PG logging reset) |
+| C2 / S1 | CRITICAL / Security | Repo integrity (cleanup) | ✅ RESOLVED | Appendix A — repository final-state proof (`git status --porcelain` / `--ignored`, `.env` & `__pycache__`/`.pyc` removed, PG logging reset) |
 | M1 | MAJOR | Evidence provenance | ✅ RESOLVED | §9.1 explicit fresh-canonical-run disclosure |
-| M2 | MAJOR | Evidence (cmd + output) | ✅ RESOLVED | producing command + complete output beside every condition (§2–§8) |
-| M3 | MAJOR | Evidence (elisions) | ✅ RESOLVED | full untruncated SQL / JSON / logs (§5, §8); no placeholders in verbatim blocks |
+| M2 | MAJOR | Evidence (cmd + output) | ✅ RESOLVED | every behavioral claim carries its exact producing command **and** its complete, unedited output beside it (§2–§8); §8.2's DB-log slice now uses a real, verified line range (`sed -n '12026,12119p'`), replacing the earlier non-executable placeholder command |
+| M3 | MAJOR | Evidence (elisions) | ✅ RESOLVED | verbatim blocks are complete with **zero `…` elisions** — the full random/custom SQL slices (§5.2/§5.3), the complete 6067-byte web-429 body (§7 B3), the full `IntegrityError` tracebacks (§7 B6), and the untruncated API JSON (§8); the only angle-bracket tokens remaining are **deliberate secret redactions** (`<APIKEY>`, `<FREE_APIKEY>`, `<REDACTED>`) masking credentials in command/header lines — not incomplete-work placeholders |
 | M4 | MAJOR | Perf (before/after, 2-run) | ✅ RESOLVED | §5 before/after row values + two-run stability |
 | M5 | MAJOR | Infra (bootstrap) | ✅ RESOLVED | §1 full sequence with exit codes (image, PG/Redis, role/DB, alembic, dummy-data, socat, health/login) |
 | M6 | MAJOR | API / DB (write-set) | ✅ RESOLVED | §8.2 `api_key` UPDATE/commit exhibit; §8 contrast table (4 vs 3 tables) |
@@ -1603,24 +2094,24 @@ Every part of the six questions, and every mechanism / function / file / flag / 
 
 ---
 
-## Section 10 — Repository Final State (Cleanup Proof) (OBSERVED)
+## Appendix A — Repository Final State (Cleanup Proof) (OBSERVED)
 
-This section closes findings **C2 / S1** (repository integrity). The investigation is read-only: the sole intended change to the repository is the one new deliverable, `blitzy/documentation/app_2cd6ee777f8c.md`. Below is the captured proof that (a) the single non-default runtime setting enabled for observation was restored, (b) every temporary observation process, script, and artifact was removed, and (c) the working tree contains exactly one change — this file — and nothing else. Every block shows the producing command and its complete, unedited output (M2/M3).
+This section closes findings **C2 / S1** (repository integrity). The investigation is read-only: the sole intended change to the repository is the one new deliverable, `blitzy/documentation/app_2cd6ee777f8c.md`. Below is the captured proof that (a) the single non-default runtime setting enabled for observation was restored, (b) every temporary observation process, script, and artifact was removed, and (c) the only **tracked** change is this one file — `git diff <base> --name-status` reports a single added path — while the untracked `blitzy/screenshots/` and `blitzy/screen_recordings/` observation captures retained for the reader, and the gitignored dependency/runtime directories, are never committed (§A.4). Every block shows the producing command and its complete, unedited output (M2/M3).
 
-> **Read-only invariant (OBSERVED):** `git status --porcelain` and `git diff <base> --name-status` each report exactly one path — this deliverable. No source, template, migration, test, configuration, or dependency file is added, modified, or deleted (§10.4).
+> **Read-only invariant (OBSERVED):** `git diff <base> --name-status` reports exactly one path — this deliverable (an added file) — so no source, template, migration, test, configuration, or dependency file is added, modified, or deleted. `git status --porcelain` shows this file plus two **untracked** observation-artifact directories (`blitzy/screenshots/`, `blitzy/screen_recordings/`) that are retained for the reader and never `git add`-ed; they never enter a commit and never affect the one-path tracked delta (§A.4).
 
-### 10.1 Temporary runtime setting restored — PostgreSQL statement logging
+### A.1 Temporary runtime setting restored — PostgreSQL statement logging
 
 The only non-default runtime setting enabled during the investigation was per-database SQL statement logging on `simplelogin` (used in §5 to capture the exact `INSERT`/`UPDATE` statements). It is reset to the built-in cluster defaults:
 
 ```
-$ docker exec sl-app psql -h localhost -U myuser -d simplelogin \
+$ docker exec -e PGPASSWORD=mypassword sl-app psql -h localhost -U myuser -d simplelogin \
     -c "ALTER DATABASE simplelogin RESET log_statement;" \
     -c "ALTER DATABASE simplelogin RESET log_min_duration_statement;" \
     -c "SELECT pg_reload_conf();"
 ALTER DATABASE
 ALTER DATABASE
- pg_reload_conf 
+ pg_reload_conf
 ----------------
  t
 (1 row)
@@ -1629,16 +2120,16 @@ ALTER DATABASE
 Verified on a fresh connection — both settings are back to the defaults (`log_statement=none`, `log_min_duration_statement=-1`) and no per-database override row remains:
 
 ```
-$ docker exec sl-app psql -h localhost -U myuser -d simplelogin -tAc \
+$ docker exec -e PGPASSWORD=mypassword sl-app psql -h localhost -U myuser -d simplelogin -tAc \
     "SELECT name||'='||setting FROM pg_settings WHERE name IN ('log_statement','log_min_duration_statement') ORDER BY name;"
 log_min_duration_statement=-1
 log_statement=none
-$ docker exec sl-app psql -h localhost -U myuser -d simplelogin -tAc \
+$ docker exec -e PGPASSWORD=mypassword sl-app psql -h localhost -U myuser -d simplelogin -tAc \
     "SELECT count(*) FROM pg_db_role_setting s JOIN pg_database d ON d.oid=s.setdatabase WHERE d.datname='simplelogin';"
 0
 ```
 
-### 10.2 Observation processes stopped
+### A.2 Observation processes stopped
 
 The dev server (`server.py`) and the `socat` host bridge started for observation are stopped by killing their specific container PIDs (never a host-wide `pkill`):
 
@@ -1653,7 +2144,7 @@ http_code=000
 
 `server.py` is fully gone and the `socat` listener is closed — port 7777 is no longer served (`curl` receives a connection reset, `http_code=000`). The residual `socat` entry is a harmless zombie (`Z <defunct>`) reparented to the container's PID 1 (`sleep infinity`); it holds no port, socket, or memory and is container-local, not a repository artifact. *(INFERRED: PID 1 `sleep` does not `wait()`-reap children, so the process-table entry lingers until the container stops; it has no effect on the repository or the deliverable.)*
 
-### 10.3 Temporary observation artifacts removed
+### A.3 Temporary observation artifacts removed
 
 **Host scratch** — observation scripts and captured evidence written outside the repository under `/tmp` (the shared workspace root `/tmp/blitzy` is never touched):
 
@@ -1698,31 +2189,36 @@ The shared Python virtualenv is intentionally **retained**: it is the image-prov
 
 ```
 $ docker exec sl-app bash -c "find /app/venv -type f -name '*.pyc' | wc -l"
-2706
+2711
 $ docker exec sl-app /app/venv/bin/python -c "import flask; print('flask', flask.__version__)"
 flask 1.1.2
 ```
 
-### 10.4 Final working-tree proof
+### A.4 Final working-tree proof
 
 ```
 $ git rev-parse HEAD
-872849980eb530187250c876c894e8b567732426
+ff16e389c15a0820924a4dec782842e5fa7fbb02
 $ git status --porcelain
  M blitzy/documentation/app_2cd6ee777f8c.md
+?? blitzy/screen_recordings/
+?? blitzy/screenshots/
 $ git status --ignored --porcelain
  M blitzy/documentation/app_2cd6ee777f8c.md
+?? blitzy/screen_recordings/
+?? blitzy/screenshots/
+!! static/node_modules/
 $ git diff 2cd6ee777f8c2d3531559588bcfb18627ffb5d2c --name-status
 A	blitzy/documentation/app_2cd6ee777f8c.md
 ```
 
 Interpretation:
 
-- `git status --porcelain` lists **only** this deliverable (` M` = modified relative to the capture-time `HEAD` `87284998`, which already carried an earlier draft of the same file; the session's edits are committed as the final step, which advances `HEAD` by one — see the capture-timing note below).
-- `git status --ignored --porcelain` lists **only** this deliverable — after cleanup there are **no** remaining ignored artifacts (`.env`, `__pycache__/`, `*.pyc`, and `static/upload/` are all gone). The working tree is pristine except for the one intended file.
-- `git diff <base> --name-status` against the pre-existing source/base commit `2cd6ee77` (before this file existed) reports a single **`A`** (added) path — exactly one CREATE, with no source path modified or deleted.
+- `git diff <base> --name-status` against the immutable pre-existing base commit `2cd6ee77` (before this file existed) reports a single **`A`** (added) path — this deliverable — with **no source path modified or deleted**. This is the timeless read-only invariant, and it holds independently of any untracked or gitignored local file (`2cd6ee77` verified an ancestor of `HEAD` via `git merge-base --is-ancestor`).
+- `git status --porcelain` lists this deliverable (` M` = modified relative to the current `HEAD` `ff16e389`, which already carries an earlier draft of the same file; the session's edits are committed as the final step, advancing `HEAD` by one — see the capture-timing note) **plus two untracked observation-artifact directories**, `blitzy/screen_recordings/` and `blitzy/screenshots/`. These hold the runtime and visual-verification captures referenced throughout this document and the QA review (for example the Parsley-blocked custom-prefix screenshot cited in §7 B5, `blitzy/screenshots/docfix_doc2_custom_bad_prefix_parsley_blocked.png`); they are produced during the investigation, retained for the reader as evidence, and **deliberately never `git add`-ed**, so they never enter a commit.
+- `git status --ignored --porcelain` additionally lists `static/node_modules/` — the gitignored npm dependency directory (`.gitignore:9`), retained like the `venv/` runtime mount (`.gitignore:12`, which git does not enumerate). Every temporary scratch and build artifact flagged by the finding (`.env` `.gitignore:4`, `__pycache__/`, `*.pyc` `.gitignore:2`, `static/upload/` `.gitignore:11`) was removed in §A.3 and is confirmed **absent**; the only artifacts remaining are the intended deliverable, the reader-facing observation captures, and the gitignored dependencies — none of which is ever committed.
 
-> **Capture timing (honest disclosure):** the commands above were run at the conclusion of Phase 8 cleanup, when `HEAD` was `87284998`. Because this is a **self-documenting file**, the `HEAD` hash shown above is a capture-time value: the working-branch `HEAD` advances by one with **each doc-only review commit** (`87284998` → `1c10c966` → `b0b4dd6e` → `96ccbaa5` → `a4467a8a` → the commit that finalizes these corrections), so a live `git rev-parse HEAD` on the delivered branch reports a **descendant** of the value above. The timeless read-only invariant does **not** depend on this moving hash — `git diff 2cd6ee777f8c2d3531559588bcfb18627ffb5d2c --name-status` reports the single added deliverable at **every** one of those HEADs, because it is measured against the immutable base commit `2cd6ee77` (verified an ancestor of `HEAD` via `git merge-base --is-ancestor`). Authoring this Section 10 into the deliverable is the only change made *after* capture; it appends lines to the single, already-tracked deliverable and creates no additional file, so the tracked delta remains **exactly one file** — re-verified immediately before the final commit. Database rows created while exercising the flow live only in the PostgreSQL data directory (inside the container, outside the `/app` bind mount) and are never part of the repository working tree.
+> **Capture timing (honest disclosure):** because this is a **self-documenting file**, the `HEAD` hash shown above (`ff16e389`) is a point-in-time value: the working-branch `HEAD` advances by one with **each doc-only review commit** (`87284998` → `1c10c966` → `b0b4dd6e` → `96ccbaa5` → `a4467a8a` → `ff16e389` → the commit that finalizes these corrections), so after the final commit a live `git rev-parse HEAD` on the delivered branch reports a **descendant** of `ff16e389`. The timeless read-only invariant does **not** depend on this moving hash — `git diff 2cd6ee777f8c2d3531559588bcfb18627ffb5d2c --name-status` reports the single added deliverable at **every** one of those HEADs, because it is measured against the immutable base commit `2cd6ee77` (verified an ancestor of `HEAD` via `git merge-base --is-ancestor`). Likewise, the untracked `blitzy/screenshots/` and `blitzy/screen_recordings/` capture directories and the gitignored `static/node_modules/`, the regenerable `.env`, and the `venv/` mount are **never tracked**, so they never alter that one-file tracked delta. Appending this Appendix A to the deliverable is the only change made *after* the git state was captured; it adds lines to the single, already-tracked file and creates no new path — re-verified immediately before the final commit. Database rows created while exercising the flow live only in the PostgreSQL data directory (inside the container, outside the `/app` bind mount) and are never part of the repository working tree.
 
 
 
