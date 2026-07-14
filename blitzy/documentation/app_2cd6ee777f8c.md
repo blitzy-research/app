@@ -6163,8 +6163,8 @@ invocation in §2.3; source is in §11.
 | 17 | Quota gate is `User.can_create_new_alias()` (`models.py:867-884`) + `max_alias_for_free_account()` (`858-865`) | Q4 | `probe_functional.py` (COND13) | §6 (`functional.out`) |
 | 18 | **No** quota value is logged on the 201 path; the only quota log is the failure `LOG.d` (`new_custom_alias.py:49`/`:138`) | Q4 | `probe_functional.py` | §6 |
 | 19 | Quota check precedes the signature check, so a quota-exhausted user gets the 400 quota message regardless of suffix validity | Q4/Q5 | `probe_functional.py` (COND13c) | §6.4 |
-| 20 | Decorator order `@limiter.limit` -> `@require_api_auth` -> `@parallel_limiter.lock` (v2 L28-30 / v3 L115-117) | Q5 | source | §7.1 |
-| 21 | Parallel lock -> **HTTP 429** (werkzeug `TooManyRequests`) on contention; **no-op** when Redis absent (`parallel_limiter.py:55-58`) | Q5 | `probe_lock.py` | §7.7 (`lock.out`) |
+| 20 | Decorator order `@limiter.limit` -> `@require_api_auth` -> `@parallel_limiter.lock` (v2 L29-31 / v3 L116-118) | Q5 | source | §7.1 |
+| 21 | Parallel lock -> **HTTP 429** (werkzeug `TooManyRequests`) on contention; **no-op** when Redis absent (`parallel_limiter.py:51-52`) | Q5 | `probe_lock.py` | §7.7 (`lock.out`) |
 | 22 | The 412 collapse is **domain-independent** (verified custom domain: valid 201, tampered 412) | Q1/root | `probe_customdomain.py` | §9.5 (`customdomain.out`) |
 | 23 | Repository unchanged; DB/Redis net-zero; probes removed | scope | `run_all.sh`, `git status` | §2.5 (`run_all.out`) |
 | 24 | `signed_suffix` producers: **v4** returns `[suffix, signed_suffix]` **pairs**, **v5** returns `{suffix, signed_suffix, is_custom, is_premium}` **objects** (both `200`) | Q5/mint | `blitzy_probe_options.py` | §2.4.1 |
