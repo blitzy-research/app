@@ -2507,7 +2507,7 @@ of the application behaving on its own).
 
 | # | Behavior | Basis (file:line) | Why not exercised |
 |---|----------|-------------------|-------------------|
-| 1 | Event **success** path — guards #1 (`EVENT_WEBHOOK_DISABLE`) and #3 (`not partner_user`) passing → `PostgresDispatcher.send()` → `SyncEvent.create` + `NOTIFY simplelogin_sync_events` + `Sent event to the dispatcher` | `app/events/event_dispatcher.py:L57,L66-69,L23-25,L84` | Default config has `EVENT_WEBHOOK=None`, so dispatch stops at guard #2 (§5.4) — the success path is never reached |
+| 1 | Event **success** path — guards #1 (`EVENT_WEBHOOK_DISABLE`) and #3 (`not partner_user`) passing → `PostgresDispatcher.send()` → `SyncEvent.create` + `NOTIFY simplelogin_sync_events` + `Sent event to the dispatcher` | `app/events/event_dispatcher.py:L57,L66-69,L23-26,L84` | Default config has `EVENT_WEBHOOK=None`, so dispatch stops at guard #2 (§5.4) — the success path is never reached |
 | 2 | MFA branches in `after_login()` — FIDO and OTP redirects | `app/auth/views/login_utils.py:L19-27,L28-33` | Test/seed users have neither `fido_enabled()` nor `enable_otp`, so the non-MFA branch is taken |
 | 3 | Analytics recording backend — `LoginEvent.send()` / `RegisterEvent.send()` call `newrelic.agent.record_custom_event` | `app/events/auth_event.py:L21-24` | No New Relic agent is configured locally, so the call records nowhere observable (functional no-op) |
 | 4 | Onboarding jobs at registration | `app/models.py:L647-664` | `DISABLE_ONBOARDING=true` — `User.create()` logs `Disable onboarding emails` and skips scheduling |
