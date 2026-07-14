@@ -572,21 +572,21 @@ verified AFTER = True | activation count AFTER = 0
 - **Limit + counter + progression [OBSERVED].** `MAX_ACTIVATION_TRIES = 3`;
   `tries` advances **0 → 1 → 2 → 3** across submissions 1–3, each raising
   `CannotVerifyError(msg='Invalid activation code')`. The logger marker
-  `mailbox_utils.py:206` confirms the "code does not match" branch; the
+  `app/mailbox_utils.py:206` confirms the "code does not match" branch; the
   increment/commit/raise are at `app/mailbox_utils.py:209-211`.
 - **Lockout condition [OBSERVED].** Submission 4 (with `tries` already `3`) hits
-  the top-of-function guard (`mailbox_utils.py:196`, "more than 3 times") and
+  the top-of-function guard (`app/mailbox_utils.py:196`, "more than 3 times") and
   raises `CannotVerifyError('Invalid activation code. Please request another
   code.')`; the activation row is then gone (`None`, count `0`), proving
   `clear_activation_codes_for_mailbox` [`app/mailbox_utils.py:197`] deleted it.
 - **Post-lockout secondary path [OBSERVED].** Submission 5 raises
   `MailboxError('Invalid code')` via the no-activation branch
-  (`mailbox_utils.py:191`, raise at `:194`).
+  (`app/mailbox_utils.py:191`, raise at `:194`).
 - **15-minute expiry edge branch [OBSERVED].** With `created_at` back-dated 16
-  minutes, even the correct code is rejected (`mailbox_utils.py:200`, "code is
+  minutes, even the correct code is rejected (`app/mailbox_utils.py:200`, "code is
   too old"), codes cleared (count `0`).
 - **Success control path [OBSERVED].** A correct code flips `verified`
-  `False → True` and clears the activation rows (count `0`) — `mailbox_utils.py:212`.
+  `False → True` and clears the activation rows (count `0`) — `app/mailbox_utils.py:212`.
 - **Net-zero cleanup [OBSERVED].** Both runs report
   `before=(172, 264, 42) after=(172, 264, 42) net-zero=True`.
 
@@ -6530,7 +6530,7 @@ config.EMAIL_DOMAIN          = 'sl.local'
 
 #### E.2 — Modern-VERP extra-recipient bypass, both directions (F9) `[OBSERVED]` + `[SOURCE-VERIFIED]`
 
-`[SOURCE-VERIFIED]` The forward-VERP guard [`app/email_handler.py:2057-2061`] and the reply-VERP guard [`app/email_handler.py:2077-2081`] are disjunctions in which the `len(rcpt_tos) == 1` term binds **only** to the legacy `BOUNCE_PREFIX`/`BOUNCE_PREFIX_FOR_REPLY_PHASE` sub-expression (Python `and` binds tighter than `or`). The modern-VERP disjunct — `(verp_info and verp_info[0] == VerpType.bounce_forward)` / `... bounce_reply` — carries **no** recipient-count guard, and `verp_info` is decoded from `rcpt_tos[0]` at `app/email_handler.py:2035`. So a bounce whose **first** recipient is a valid modern VERP is still routed to `handle_bounce` even when additional recipients are present.
+`[SOURCE-VERIFIED]` The forward-VERP guard [`email_handler.py:2057-2061`] and the reply-VERP guard [`email_handler.py:2077-2081`] are disjunctions in which the `len(rcpt_tos) == 1` term binds **only** to the legacy `BOUNCE_PREFIX`/`BOUNCE_PREFIX_FOR_REPLY_PHASE` sub-expression (Python `and` binds tighter than `or`). The modern-VERP disjunct — `(verp_info and verp_info[0] == VerpType.bounce_forward)` / `... bounce_reply` — carries **no** recipient-count guard, and `verp_info` is decoded from `rcpt_tos[0]` at `email_handler.py:2035`. So a bounce whose **first** recipient is a valid modern VERP is still routed to `handle_bounce` even when additional recipients are present.
 
 `[OBSERVED]` Driven through the canonical `email_handler.handle()` with the committed `multipart/report` fixture `local_data/email_tests/bounce.eml` and `envelope.mail_from = "<>"`. A single-recipient control confirms the normal path; two-recipient cases show the bypass; a legacy two-recipient contrast shows the guard is respected for the legacy form.
 
@@ -6962,7 +6962,7 @@ BASELINE counts: {'Bounce': 11, 'RefusedEmail': 0, 'Notification': 0, 'EmailLog'
 
 #### E.3 — iCloud `MAIL FROM` branch decodes `mail_from[0]` (first character), so modern VERP is missed (F10) `[OBSERVED]` + `[SOURCE-VERIFIED]`
 
-`[SOURCE-VERIFIED]` The iCloud bounce branch computes `verp_info = get_verp_info_from_email(mail_from[0])` at `app/email_handler.py:2101`. `mail_from` is a **string**, so `mail_from[0]` is its **first character**, never a full address; the modern-VERP disjunct at `app/email_handler.py:2106` is therefore dead. Only the legacy string test `mail_from.startswith(BOUNCE_PREFIX)` / `.endswith(BOUNCE_SUFFIX)` [`app/email_handler.py:2104-2105`] can match a `MAIL FROM` bounce.
+`[SOURCE-VERIFIED]` The iCloud bounce branch computes `verp_info = get_verp_info_from_email(mail_from[0])` at `email_handler.py:2101`. `mail_from` is a **string**, so `mail_from[0]` is its **first character**, never a full address; the modern-VERP disjunct at `email_handler.py:2106` is therefore dead. Only the legacy string test `mail_from.startswith(BOUNCE_PREFIX)` / `.endswith(BOUNCE_SUFFIX)` [`email_handler.py:2104-2105`] can match a `MAIL FROM` bounce.
 
 `[OBSERVED]` Driven through canonical `email_handler.handle()` with `rcpt_tos=[alias.email]` (so the earlier `rcpt_tos[0]`-based branches fall through and control reaches the iCloud branch). Case (a) presents a modern signed VERP as `MAIL FROM`; case (b) presents the legacy `bounce+{id}+@` form.
 
@@ -7268,7 +7268,7 @@ F10 -- iCloud MAIL-FROM branch uses mail_from[0] (first CHAR) at L2101
 (Ephemeral clone DB is dropped by the wrapper -> canonical test DB net-zero.)
 ```
 
-**Observed (F10):** `get_verp_info_from_email(<full modern VERP>)` decodes to `(VerpType.bounce_forward, 955)`, but `get_verp_info_from_email(mail_from[0])` (first char `'s'`) returns `None`. Case (a) modern VERP `MAIL FROM` -> `250 Message accepted for delivery` (ordinary forward; a new `Contact`/`EmailLog` is created) with `email_log.bounced=False` (**not** recognized as a bounce); case (b) legacy `bounce+{id}+@` `MAIL FROM` -> `WARNING ... iCloud bounces` at `app/email_handler.py:2110` -> `250 SL E211 Bounce Forward phase handled` with `email_log.bounced=True` (recognized). `[OBSERVED]`
+**Observed (F10):** `get_verp_info_from_email(<full modern VERP>)` decodes to `(VerpType.bounce_forward, 955)`, but `get_verp_info_from_email(mail_from[0])` (first char `'s'`) returns `None`. Case (a) modern VERP `MAIL FROM` -> `250 Message accepted for delivery` (ordinary forward; a new `Contact`/`EmailLog` is created) with `email_log.bounced=False` (**not** recognized as a bounce); case (b) legacy `bounce+{id}+@` `MAIL FROM` -> `WARNING ... iCloud bounces` at `email_handler.py:2110` -> `250 SL E211 Bounce Forward phase handled` with `email_log.bounced=True` (recognized). `[OBSERVED]`
 
 #### E.4 — Decoder validation limits on a correctly-signed malformed payload (F11) `[OBSERVED]` + `[NON-CANONICAL INPUT CONSTRUCTION]`
 
@@ -7577,7 +7577,7 @@ now_min = 2383537  (well below future bound; time check passes)
 
 #### E.5 — No lower time bound and no consumed-token tracking => replayable VERP with duplicate side effects (F12) `[OBSERVED]` + `[NON-CANONICAL INPUT CONSTRUCTION]`
 
-`[SOURCE-VERIFIED]` The only time check is `if data[2] > (time.time() + config.VERP_MESSAGE_LIFETIME - VERP_TIME_START) / 60: return None` [`app/email_utils.py:1496`] — a **future** clock-sanity guard (`VERP_MESSAGE_LIFETIME = 432000 s = 5 days`). There is **no lower bound** and **no consumed-token tracking**, and `handle_bounce_forward_phase` [`app/email_handler.py:1432`] unconditionally creates a `Bounce` [`:1449-1454`] and a `RefusedEmail` with no `email_log.bounced` guard.
+`[SOURCE-VERIFIED]` The only time check is `if data[2] > (time.time() + config.VERP_MESSAGE_LIFETIME - VERP_TIME_START) / 60: return None` [`app/email_utils.py:1496`] — a **future** clock-sanity guard (`VERP_MESSAGE_LIFETIME = 432000 s = 5 days`). There is **no lower bound** and **no consumed-token tracking**, and `handle_bounce_forward_phase` [`email_handler.py:1432`] unconditionally creates a `Bounce` [`:1449-1454`] and a `RefusedEmail` with no `email_log.bounced` guard.
 
 `[OBSERVED]` Part A routes a **real** `generate_verp_email` token twice through canonical `handle()`. Part B builds an **old** token (embedded minute 100 days in the past) with the signer mirror `[NON-CANONICAL INPUT CONSTRUCTION]` (only the timestamp is crafted; decode + handler are canonical) and routes it twice. Part C is a decode-only boundary confirmation.
 
@@ -8704,7 +8704,7 @@ Provenance uses the four labels defined in the introduction: **OBSERVED**,
 | 8 | NULL-payload handler crash leaves the job at `taken(1)` (same failure state as any exception) | PASS | Q2 Evidence E | OBSERVED |
 | 9 | Concurrent duplicate execution — two drainers can take the same job (no row lock) | PASS | Q2 Evidence E | OBSERVED + SOURCE-VERIFIED |
 | 10 | Committed intermediate `taken(1)` state is visible to a live external poller mid-run | PASS | Q2 Evidence E (live poller) | OBSERVED |
-| 11 | Runtime prerequisite — the daemon needs valid `local_data/` DKIM keys to import; fresh image fails at `email_utils.py:465` | PASS | Q2 prerequisite disclosure (F23) | OBSERVED + SOURCE-VERIFIED |
+| 11 | Runtime prerequisite — the daemon needs valid `local_data/` DKIM keys to import; fresh image fails at `app/email_utils.py:465` | PASS | Q2 prerequisite disclosure (F23) | OBSERVED + SOURCE-VERIFIED |
 | 12 | Canonical entry point — the real `job_runner.py` drain loop; scheduled `cron.py`/`crontab.yml` for cleanup | PASS | Q2 Evidence A/B/C/E; cron path | OBSERVED + SOURCE-VERIFIED (cron path) |
 
 ### Q3 — VERP bounce-address format and direction-dependent handling
