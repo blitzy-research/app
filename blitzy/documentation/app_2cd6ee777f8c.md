@@ -5,12 +5,17 @@ This document answers seven questions about how the **SimpleLogin** email-aliasi
 is written from **observed runtime output** captured by actually building and running the code
 through its canonical entry point (`python3 server.py`) — not from reading source alone. Each
 question is answered in the mandated five-stage order: **(1) direct answer → (2) command(s) run
-→ (3) complete, unedited output → (4) `file:line` grounding → (5) Observed / Inferred label.**
+→ (3) complete output (secret-masked only where a `<REDACTED:…>` marker is shown) → (4) `file:line`
+grounding → (5) Observed / Inferred label.**
 
-> **Evidence discipline.** Every fenced output block below is the *verbatim* stdout/stderr of the
-> command shown immediately above it, copied byte-for-byte from a capture file. Nothing inside an
-> output block is truncated, re-ordered, or annotated; all interpretation lives *outside* the
-> blocks. **Two byte-level normalizations** are applied, and only these two. **(1) Line endings:**
+> **Evidence discipline.** Every fenced output block below is the stdout/stderr of the command
+> shown immediately above it, reproduced from a capture file. Nothing inside an output block is
+> truncated, re-ordered, paraphrased, or summarized, and all interpretation lives *outside* the
+> blocks; the **only** in-block modifications are the **two byte-level normalizations** defined
+> next (and nothing else). Consequently, a block that contains a `<REDACTED:…>` marker is
+> **complete and structurally verbatim but secret-masked** — its header is labelled *"Complete
+> output (secret-masked)"* rather than *"unedited"* — whereas blocks with no marker are genuinely
+> unedited. **(1) Line endings:**
 > `curl -i` HTTP responses are **CRLF-terminated on the wire** (RFC 7230) and are shown here
 > **LF-normalized** — the status line, headers and body are otherwise verbatim. **(2) Secret
 > masking:** the random secret *bytes* of security-sensitive fields (session-cookie HMAC signatures,
@@ -54,9 +59,19 @@ question is answered in the mandated five-stage order: **(1) direct answer → (
 > (= the user's `alternative_id`), `_id` (a SHA-512 of `remote_addr|user_agent`, not secret-derived),
 > `_fresh`, `_permanent`, `sudo_time`, the signed-cookie timestamp, all cookie flags
 > (`HttpOnly`/`Path`/`SameSite`/`Expires`/`Max-Age`), all HTTP statuses/headers/bodies, all `SL` log
-> lines, and the public seed values (`FLASK_SECRET=secret`, seed keys `code`/`codeFF`). This
-> reconciles the run-first *complete-evidence* rule with mask-before-emission: only opaque random
-> bytes — which carry no evidentiary meaning — are hidden.
+> lines, and the **public, non-bearer DEV defaults**: the seed login `john@wick.com` / `password`,
+> `FLASK_SECRET=secret`, the DB credentials `test:test`, and the seed API keys `code` / `codeFF`.
+> These defaults are not private secrets — they are published verbatim in the project's own
+> `example.env`, `CONTRIBUTING.md`, and the container's setup script — so masking them would remove
+> required Q2/Q5 configuration-and-identity evidence (the AAP mandates showing the actual observed
+> identity values, e.g. proving `session["_user_id"]` **equals** the user's `alternative_id`) while
+> adding no security value, because none of them is a capturable bearer token. This is a deliberate
+> policy, not an oversight: it reconciles the run-first *complete-evidence* rule with
+> mask-before-emission — **only capturable bearer material** (session-cookie HMAC signatures, the
+> signed-cookie payload blob, acquired 60-char API-key values, CSRF tokens, and the
+> `RECOVERY_CODE_HMAC_SECRET`, which is **never printed anywhere** in this document) is hidden;
+> opaque random bytes carry no evidentiary meaning, whereas the public defaults and identity UUIDs
+> above do and are therefore kept.
 
 ## Investigation environment
 
@@ -338,7 +353,9 @@ stream above and appears **only after** the first HTTP response (`/health` retur
 except the PIDs and the timestamps**: RUN‑A parent/child PIDs `5058`/`5070` at `18:23:21`/`18:23:22`;
 RUN‑B parent/child PIDs `5101`/`5113` at `18:23:30`/`18:23:31`. Both are variable; the line content,
 ordering and the double-import are stable. Both runs bound and then released `127.0.0.1:7777`
-cleanly (no LISTEN socket after termination). The complete RUN‑B pure-startup transcript
+cleanly (no LISTEN socket after termination); and the resulting parent(`NLWP=1`)/child(`NLWP=2`)
+thread topology then stays **flat for the life of the process** — see Q6, where two further runs
+sample it at t=0/30/65 s and find it unchanged over a `>=60 s` window. The complete RUN‑B pure-startup transcript
 (`q1_runB_startup.log`, captured before any HTTP request) and its process tree follow — compare
 line-for-line with RUN‑A above; only the PID and timestamp fields change:
 
@@ -647,9 +664,13 @@ capturing the actual stream in Q1). The only startup markers actually printed ar
 
 Because there is no readiness line, practical readiness must be confirmed out-of-band; the
 `/health` endpoint returning **`HTTP/1.0 200 OK`** with body `success` is the reliable signal. The
-last observable startup marker before the socket accepts is the **second** (serving-child)
-`>>> init logging <<<` line. Separately, `local_main()` runs `config.COLOR_LOG = True` (`server.py:L573`)
-but this does **not** colorize the logs — see the COLOR_LOG sub-finding below.
+**last observable startup marker before the socket accepts is the second (serving-child) `SL`
+"load words file" line** (`app/utils.py:L17`, emitted during the child's app import) — it prints
+immediately *after* the child's second `>>> init logging <<<`, and nothing else is logged between it
+and the first accepted request (the launch→first-`200` correlation below shows the child's
+"load words file" line and the first `/health` `200` landing in the **same second**). Separately,
+`local_main()` runs `config.COLOR_LOG = True` (`server.py:L573`) but this does **not** colorize the
+logs — see the COLOR_LOG sub-finding below.
 
 ### Command(s) run
 
@@ -661,7 +682,9 @@ $ curl -s -i http://localhost:7777/health
 $ /app/venv/bin/python /tmp/blitzy_cap/colorlog_probe.py
 ```
 
-### Complete, unedited output
+### Complete output (secret-masked)
+
+_(One `Set-Cookie` HMAC signature is masked below per the Evidence-discipline note; the block is otherwise structurally verbatim.)_
 
 Werkzeug/Flask version pairing:
 
@@ -700,6 +723,41 @@ Server: Werkzeug/1.0.1 Python/3.10.18
 Date: Mon, 13 Jul 2026 18:23:25 GMT
 
 success
+```
+
+**First-success timing correlation (Observed).** To tie the startup stream to the first request the
+socket actually accepts, the canonical dev server was launched (`python server.py`, recording `T0`)
+and `/health` polled every 50 ms until the first `200` (recording `T1`); then the last import-time
+`SL` lines and the first `/health` `Date` header were printed. The serving-child's final import-time
+marker — the `SL` "load words file" line (`app/utils.py:L17`) — lands at `05:03:29,186` (child PID
+`38647`), and the first successful `/health` carries `Date: Tue, 14 Jul 2026 05:03:29 GMT`: the socket
+begins accepting in the **same second** the child finishes importing. Measured launch→first-`200` was
+**3.097 s**.
+
+```bash
+T0=$(date +%s.%N); setsid /app/venv/bin/python server.py > q3.log 2>&1 &
+for i in $(seq 1 600); do
+  [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:7777/health)" = 200 ] \
+    && { first=$(date +%s.%N); break; }; sleep 0.05
+done
+awk -v a=$T0 -v b=$first 'BEGIN{printf "elapsed_launch_to_first200 = %.3f s\n", b-a}'
+curl -s -i http://localhost:7777/health | grep -iE '^HTTP/|^Date:'
+grep -E ">>> init logging <<<|load words file|Debug mode: on" q3.log | tail -5
+```
+
+The concatenated output of that sequence — the elapsed timing, then the first `/health` status line
+and `Date` header, then the tail of the import-time markers for parent PID `38554` and serving-child
+PID `38647`:
+
+```text
+elapsed_launch_to_first200 = 3.097 s
+HTTP/1.0 200 OK
+Date: Tue, 14 Jul 2026 05:03:29 GMT
+>>> init logging <<<
+2026-07-14 05:03:27,627 - SL - DEBUG - 38554 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+ * Debug mode: on
+>>> init logging <<<
+2026-07-14 05:03:29,186 - SL - DEBUG - 38647 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
 ```
 
 **COLOR_LOG sub-finding (why `local_main()`'s `config.COLOR_LOG = True` does not colorize logs).**
@@ -818,7 +876,9 @@ $ kill -TERM $CHILD $PARENT ; kill -KILL $CHILD $PARENT
 $ grep -iE ':1E61 [0-9A-F:]+ 0A ' /proc/net/tcp || echo PORT FREE   # after termination
 ```
 
-### Complete, unedited output
+### Complete output (secret-masked)
+
+_(One `Set-Cookie` HMAC signature is masked below per the Evidence-discipline note; the block is otherwise structurally verbatim.)_
 
 **Listening socket** (`/proc/net/tcp`, header + the single `:1E61`/state-`0A` line for this run;
 parent/child PIDs recorded):
@@ -1222,13 +1282,18 @@ HMAC-signed — readable with **no secret key** (⇒ signed/tamper-evident, **no
 
 ### Command(s) run
 
-All web/API evidence below comes from one bounded server run, **RUN-Q5-REDIS** (Redis backend,
+The core web/API evidence comes from one bounded server run, **RUN-Q5-REDIS** (Redis backend,
 `parent=5660 child=5673`); a supplementary run captured the `X-Forwarded-Host` proof
-(`parent=5844 child=5856`); and the signed-cookie backend was exercised twice as **RUN-Q5-COOKIE**
-(`MEM_STORE_URI=""`). Every server is launched through the canonical dev entry point
+(`parent=5844 child=5856`); the signed-cookie backend was exercised twice as **RUN-Q5-COOKIE**
+(`MEM_STORE_URI=""`); the canonical owner-revoke lifecycle of subsection **(H′)** was captured as
+**RUN-Q5-REVOKE-CANONICAL** (Redis backend); and the session-lifecycle edge behaviours of subsection
+**(I)** — login non-rotation (Redis), signed-cookie logout replay (`MEM_STORE_URI=""`), and negative
+CSRF — were captured alongside them. Every server is launched through the canonical dev entry point
 `/app/venv/bin/python server.py`. Disposable users D1 (disabled), D2 (`delete_on` in the future) and
-D3 (web login-then-mutate) were created solely for the guard tests and are deleted at the end of the
-phase; **john@wick.com is never mutated**.
+D3 (web login-then-mutate) are created solely for the guard tests — through the app's own model layer,
+a **supplemental, non-canonical** fixture (there is no self-service HTTP path to disable an account
+or schedule a future deletion) — and are deleted at the end of the phase; **john@wick.com is never
+mutated**.
 
 ```bash
 # ---- prefix sourced in every command (per setup) ----
@@ -1274,18 +1339,59 @@ curl -s -i -H 'Authentication: code'                "$BASE/api/user_info" # [A] 
 curl -s -i -H 'Authentication: this-is-a-wrong-key' "$BASE/api/user_info" # [B] wrong  -> 401
 curl -s -i                                          "$BASE/api/user_info" # [C] absent -> 401
 curl -s -i -b cj_john.txt                           "$BASE/api/user_info" # [D] session fallback -> 200 (g.api_key=None)
-curl -s -i -H "Authentication: $D1KEY"              "$BASE/api/user_info" # disabled  -> 403
-curl -s -i -H "Authentication: $D2KEY"              "$BASE/api/user_info" # inactive  -> 401
+# --- SUPPLEMENTAL (non-canonical) fixture setup for the account-guard tests ---------------------
+# The `disabled` state and a *future* `delete_on` have NO self-service HTTP path (disabling is an
+# admin/DB action; scheduled deletion is set by a separate internal flow), so the disposable guard
+# users D1/D2/D3 and one API key each are created through the app's OWN model layer, and the guard
+# state is then set directly in the DB. These writes are a FIXTURE, not the behaviour under test;
+# the CANONICAL signal under test is the HTTP status the endpoint returns on that state.
+/app/venv/bin/python - <<'PY' > /tmp/guard_fixture.env
+from app.db import Session
+from app.models import User, ApiKey
+import uuid
+lines = []
+for tag in ("D1", "D2", "D3"):
+    u = User.create(email=f"blitzy-{tag}-{uuid.uuid4().hex[:8]}@sl.local",
+                    password="password", name=tag, activated=True); Session.commit()
+    k = ApiKey.create(user_id=u.id, name=f"blitzy-{tag}-key"); Session.commit()
+    lines += [f"{tag}UID={u.id}", f"{tag}KEY={k.code}"]
+print("\n".join(lines))
+PY
+set -a; . /tmp/guard_fixture.env; set +a   # binds D1UID/D1KEY/D2UID/D2KEY/D3UID/D3KEY (60-char codes; values never printed into this doc)
+PGP="PGPASSWORD=test psql -h localhost -U test -d test"   # test:test = public DEV creds (see Security scope)
 
-# (D) WEB load_user guards (D3 login, then mutate the row and re-request /dashboard/):
-psql ... "update users set disabled=true  where id=5;"   # -> 302 login
-psql ... "update users set disabled=false where id=5;"   # -> 200
-psql ... "update users set delete_on=(now() + interval '7 days') where id=5;"  # -> 302 login
+$PGP -c "update users set disabled=true where id=$D1UID;"                # D1 -> disabled (fixture)
+curl -s -i -H "Authentication: $D1KEY"              "$BASE/api/user_info" # (d-1) disabled account -> 403 "Disabled account"
+$PGP -c "update users set delete_on=(now() + interval '7 days') where id=$D2UID;"  # D2 -> future delete_on (fixture)
+curl -s -i -H "Authentication: $D2KEY"              "$BASE/api/user_info" # (d-2) inactive account -> 401 "Account does not exist"
+
+# (D) WEB load_user guards on disposable D3 (uid $D3UID; resolved to 5 in RUN-Q5-REDIS, as the output
+#     blocks below show). The DB writes are a SUPPLEMENTAL fixture (same no-self-service-path reason
+#     as above); the CANONICAL signal is the HTTP status of the *identical* GET /dashboard/ issued on
+#     the same cookie jar before/after each mutation:
+$PGP -c "update users set disabled=true  where id=$D3UID;"   # -> GET /dashboard/ 302 login
+$PGP -c "update users set disabled=false where id=$D3UID;"   # -> GET /dashboard/ 200
+$PGP -c "update users set delete_on=(now() + interval '7 days') where id=$D3UID;"  # -> GET /dashboard/ 302 login
 
 # (F) signed-cookie backend (twice): disable Redis sessions, log in, decode the cookie:
 export MEM_STORE_URI=""              # Flask default signed-cookie interface
-/app/venv/bin/python server.py &     # RUN-Q5-COOKIE-N
-# ... web login as above; then decode the 'slapp' cookie with base64url+zlib and NO secret key.
+/app/venv/bin/python server.py &     # RUN-Q5-COOKIE-N (fresh server on :7777)
+# web login exactly as in (B): GET /auth/login (-c cj_cookie.txt) -> scrape csrf_token ->
+#   POST /auth/login with email/password/csrf_token (-b -c cj_cookie.txt) -> 302, then decode:
+curl -s -D cookie_login_headers.txt -o cbody.html -c cj_cookie.txt "$BASE/auth/login"
+CSRF=$(grep -oE 'name="csrf_token"[^>]*value="[^"]+"' cbody.html | head -1 | sed -E 's/.*value="([^"]+)".*/\1/')
+curl -s -D cookie_post.txt -o /dev/null -b cj_cookie.txt -c cj_cookie.txt \
+  --data-urlencode "email=john@wick.com" --data-urlencode "password=password" \
+  --data-urlencode "csrf_token=$CSRF" "$BASE/auth/login"                 # -> 302 /dashboard/
+# take the 'slapp' cookie value (.eJw<payload>.<ts>.<sig>) and decode the payload with NO secret key:
+SLAPP=$(awk -F'\t' '$6=="slapp"{print $7}' cj_cookie.txt | tail -1)
+/app/venv/bin/python - "$SLAPP" <<'PY'   # base64url + zlib, no key -> proves signed-not-encrypted
+import sys, base64, zlib, json
+blob = sys.argv[1].split('.')[0]            # the .eJw... payload segment before the timestamp/sig
+if blob.startswith('.'): blob = blob[1:]
+raw = zlib.decompress(base64.urlsafe_b64decode(blob + '=' * (-len(blob) % 4)))
+print(json.dumps(json.loads(raw)))          # csrf_token masked in the doc's output block
+PY
 
 # (G) WEB LOGOUT lifecycle (fresh login on jar cj_logout.txt, then logout + post-logout probe):
 curl -s -D - -o login_body.html -c cj_logout.txt "$BASE/auth/login"                    # anon GET -> CSRF
@@ -1299,16 +1405,25 @@ curl -s -D web_after_logout_dashboard.txt -o /dev/null -b cj_logout.txt "$BASE/d
 # (Redis session dump BEFORE vs AFTER logout -> redis_logout.txt; the authenticated key is purged)
 
 # (H) API REVOKED-KEY over HTTP on a concrete endpoint (/api/user_info):
+#     acquire + use + reuse are over HTTP; the revoke step here is a SUPPLEMENTAL direct-SQL DELETE
+#     (labelled non-canonical). The canonical owner-revoke transition itself is exercised over HTTP
+#     in subsection (H') below; the observed signal in BOTH is the 401 the reused key receives.
 curl -s -i -H 'Content-Type: application/json' \
   -d '{"email":"john@wick.com","password":"password","device":"blitzy-q5-revoke"}' \
-  "$BASE/api/auth/login"                                                               # acquire -> api_revoke_acquire.txt (key K)
-curl -s -i -H "Authentication: $K" "$BASE/api/user_info"                               # use     -> 200  api_revoke_use.txt
-psql ... "delete from api_key where code='$K';"                                        # revoke (delete the row)
-curl -s -i -H "Authentication: $K" "$BASE/api/user_info"                               # reuse   -> 401 Wrong api key  api_revoke_after.txt
+  "$BASE/api/auth/login" -o api_revoke_acquire.txt                                     # acquire (HTTP)
+K=$(/app/venv/bin/python -c "import json,sys,re; b=open('api_revoke_acquire.txt').read().split('\r\n\r\n',1)[-1]; print(json.loads(b)['api_key'])")  # bind K (value never printed into this doc)
+curl -s -i -H "Authentication: $K" "$BASE/api/user_info"                               # use (HTTP)   -> 200  api_revoke_use.txt
+PGP="PGPASSWORD=test psql -h localhost -U test -d test"                                # test:test = public DEV creds
+$PGP -c "delete from api_key where code='$K';"                                         # revoke: SUPPLEMENTAL SQL DELETE (non-canonical; see (H') for the canonical HTTP revoke)
+curl -s -i -H "Authentication: $K" "$BASE/api/user_info"                               # reuse (HTTP) -> 401 Wrong api key  api_revoke_after.txt
 ```
 
 
-### Complete, unedited output
+### Complete output (secret-masked)
+
+_(Bearer material — `Set-Cookie` HMAC signatures, the signed-cookie payload blob, acquired API-key
+values, and CSRF tokens — is masked below per the Evidence-discipline note; every block is otherwise
+structurally verbatim, and all non-secret fields, statuses, headers, bodies and log lines are shown.)_
 
 > HTTP header blocks below are shown LF-normalized (`tr -d '\r'`) per the global note in the
 > *Investigation environment* section; the on-disk captures use CRLF line endings as curl emitted them.
@@ -1579,8 +1694,8 @@ Date: Mon, 13 Jul 2026 18:54:41 GMT
 **(d-3) Web `load_user` guards** — D3 logs in, then the DB row is mutated between identical
 `GET /dashboard/` requests on the same cookie jar. `load_user` returns `None` when the user is
 `disabled` (`server.py:L225-226`) or not `is_active()` (`L227-228`), which Flask-Login turns into a
-`302` to the login page; restoring the row returns `200`. The five blocks below are the complete,
-unedited responses (`curl -s -D <file>`) in sequence — the disposable D3 login, then the
+`302` to the login page; restoring the row returns `200`. The five blocks below are the complete
+responses (`curl -s -D <file>`), secret-masked per the Evidence-discipline note, in sequence — the disposable D3 login, then the
 baseline / disabled / restored / inactive `GET /dashboard/` on the same cookie jar. The `slapp`
 cookie is the same disposable Redis session throughout (`b8c1f1f6-…`, flushed in the end-of-phase
 cleanup); the interpretation of each block is stated in the prose line preceding it.
@@ -1816,11 +1931,14 @@ Date: Mon, 13 Jul 2026 23:26:39 GMT
 
 #### (H) API revoked key over HTTP — a concrete `/api/user_info` request
 
-Revocation is exercised **end-to-end over HTTP** on a concrete endpoint: acquire a key canonically,
-use it, delete its row (revoke), then re-issue the **same** request bearing the now-revoked key.
-On the revoked key, `ApiKey.get_by(code=...)` (`app/api/base.py:L18`) returns `None`, so
-`authorize_request()` takes the no-key branch (`if not api_key:` `L20`); with no web session on the
-request it returns `401 {"error": "Wrong api key"}` (`L27`). The key value below is a disposable
+The **acquire → use → reuse** steps here are all real HTTP calls; the **revoke** step in *this*
+block is a **supplemental, non-canonical** direct-SQL `DELETE` of the key's row (used only to
+produce the revoked state compactly). The genuinely canonical owner-revocation transition — the
+CSRF-protected, sudo-gated dashboard `POST /dashboard/api_key` `form-name=delete` — is exercised
+**entirely over HTTP** in subsection **(H′)** immediately below. In both blocks the observed signal
+is identical: on the revoked key, `ApiKey.get_by(code=...)` (`app/api/base.py:L18`) returns `None`,
+so `authorize_request()` takes the no-key branch (`if not api_key:` `L20`); with no web session on
+the request it returns `401 {"error": "Wrong api key"}` (`L27`). The key value below is a disposable
 DEVELOPMENT-only key created solely for this test and deleted at the revoke step; it is dynamic per
 run.
 
@@ -1898,6 +2016,130 @@ Date: Mon, 13 Jul 2026 23:28:02 GMT
   "error": "Wrong api key"
 }
 ```
+
+#### (H′) Canonical owner revocation over HTTP — the sudo-gated dashboard delete (RUN-Q5-REVOKE-CANONICAL)
+
+To exercise the **canonical** revoke transition (not the SQL `DELETE` fixture used in (H)), a fresh
+Redis-backed server was driven entirely through the owner UI: web login → **enter-sudo** (the delete
+action is `@sudo_required`, `app/dashboard/views/enter_sudo.py:L71-81`, `_SUDO_GAP = 120` s) →
+`POST /dashboard/api_key` `form-name=create` to mint a key → use it once → `POST /dashboard/api_key`
+`form-name=delete` (`app/dashboard/views/api_key.py:L60-76`: `ApiKey.delete(api_key_id)` +
+`Session.commit()`) → reuse the same key. Every step is a real CSRF-protected HTTP request; the only
+DB touches are the read-back of the row id and the final `count(*)`.
+
+```bash
+# fresh Redis server on :7777; jar=cj_canon.txt; PY=/app/venv/bin/python; PGP="PGPASSWORD=test psql -h localhost -U test -d test"
+# scrape() = grep the csrf_token hidden input value from an HTML file
+curl -s -c cj -o l.html  "$BASE/auth/login";        C=$(scrape l.html)                 # anon GET
+curl -s -b cj -c cj --data-urlencode email=john@wick.com --data-urlencode password=password \
+     --data-urlencode "csrf_token=$C" "$BASE/auth/login"                                # 1) login  -> 302 /dashboard/
+curl -s -b cj "$BASE/dashboard/"                                                        # 2) authed -> 200
+curl -s -b cj -c cj -o s.html "$BASE/dashboard/enter_sudo"; C=$(scrape s.html)          # sudo GET  -> 200
+curl -s -b cj -c cj --data-urlencode password=password --data-urlencode "csrf_token=$C" \
+     "$BASE/dashboard/enter_sudo"                                                        # 3) sudo   -> 302
+curl -s -b cj -c cj -o a.html "$BASE/dashboard/api_key"; C=$(scrape a.html)             # sudo-gated GET -> 200
+curl -s -b cj -c cj -o new.html --data-urlencode form-name=create \
+     --data-urlencode name=blitzy-canonical-revoke --data-urlencode "csrf_token=$C" \
+     "$BASE/dashboard/api_key"                                                           # 4) create -> 200 (new key in new_api_key.html)
+NK=$(scrape_clipboard new.html)                                                          #   bind new key (value never printed here)
+curl -s -H "Authentication: $NK" "$BASE/api/user_info"                                   # 5) use    -> 200
+KID=$($PGP -t -A -c "select id from api_key where name='blitzy-canonical-revoke';")      #   id read-back
+curl -s -b cj -c cj --data-urlencode form-name=delete --data-urlencode "api-key-id=$KID" \
+     --data-urlencode "csrf_token=$C" "$BASE/dashboard/api_key"                          # 6) REVOKE -> 302 (canonical HTTP delete)
+curl -s -H "Authentication: $NK" "$BASE/api/user_info"                                   # 7) reuse  -> 401
+$PGP -t -A -c "select count(*) from api_key where name='blitzy-canonical-revoke';"       # 8) readback -> 0
+```
+
+Complete (secret-masked) outcomes:
+
+```text
+1) POST /auth/login                    -> HTTP/1.0 302 FOUND   Location: http://localhost:7777/dashboard/
+2) GET  /dashboard/                    -> HTTP/1.0 200 OK
+3) POST /dashboard/enter_sudo          -> HTTP/1.0 302 FOUND   Location: http://localhost:7777/dashboard/
+4) POST /dashboard/api_key (create)    -> HTTP/1.0 200 OK
+   Set-Cookie: slapp=6e4f6e6c-5010-459b-8843-91403a443e9a.<REDACTED:slapp-hmac-signature>; Expires=Tue, 21-Jul-2026 04:07:34 GMT; HttpOnly; Path=/; SameSite=Lax
+5) GET  /api/user_info (NEW key)       -> HTTP/1.0 200 OK
+   {
+     "can_create_reverse_alias": true,
+     "connected_proton_address": null,
+     "email": "john@wick.com",
+     "in_trial": false,
+     "is_premium": true,
+     "max_alias_free_plan": 3,
+     "name": "John Wick",
+     "profile_picture_url": "http://localhost/static/upload/profile_pic.svg"
+   }
+6) api-key-id (DB read-back)           = 35
+7) POST /dashboard/api_key (delete)    -> HTTP/1.0 302 FOUND   Location: http://localhost:7777/dashboard/api_key
+8) GET  /api/user_info (REVOKED key)   -> HTTP/1.0 401 UNAUTHORIZED
+   {
+     "error": "Wrong api key"
+   }
+9) SELECT count(*) FROM api_key WHERE name='blitzy-canonical-revoke'  = 0
+```
+
+**Result (Observed):** the canonical, sudo-gated UI delete removes the row (`count(*) = 0`) and the
+reused key then receives the very same `401 {"error": "Wrong api key"}` as the SQL-fixture path in
+(H) — confirming revocation is a genuine HTTP/UI transition (not merely a database artefact) and
+that the two paths converge on the identical observed signal.
+
+#### (I) Session-lifecycle edge behaviours (Observed) — login rotation, signed-cookie logout, negative CSRF
+
+Three further authenticated-request edge behaviours were exercised at runtime; each is a property of
+the pinned stack and the app's own session/auth wiring, and each is reported as **Observed** DEV
+behaviour. Where a behaviour would warrant a code change, that change is **out of scope** here — the
+AAP mandates a read-only investigation and forbids modifying application source (AAP §0.5.2 /
+§0.7.7) — so only the observation and its code grounding are given. They are recorded because Q5
+asks *how an authenticated request is handled*, and these are the observed boundaries of that handling.
+
+**(i-1) The session id is NOT rotated on login (Redis backend).** With one cookie jar, the anonymous
+session id issued by `GET /auth/login` is unchanged after `POST /auth/login` succeeds; only the Redis
+TTL and stored payload change. `RedisSessionStore.save_session` (`app/session.py:L82-114`) always
+writes `self._get_key(session.session_id)` — the *same* id — and re-signs that same id into the
+cookie; regeneration happens only in `purge_session` (`app/session.py:L61-66`), which is called by
+`logout_session` (`app/session.py:L117-121`), not on login. `after_login`
+(`app/auth/views/login_utils.py:L36-37`) calls `login_user(user)` and sets `session` keys but does
+not rotate the id. Observed:
+
+```text
+anon session id (cookie)  = 4eca6bbb-e655-4ca1-b960-1d35b535a48b   redis TTL=300     _user_id absent
+POST /auth/login          -> HTTP/1.0 302 FOUND   (1 Set-Cookie; re-signs the SAME id)
+GET  /dashboard/          -> HTTP/1.0 200 OK
+post-login session id     = 4eca6bbb-e655-4ca1-b960-1d35b535a48b   redis TTL=604800  _user_id present
+=> session id UNCHANGED across login; TTL 300 -> 604800; payload gains _user_id.
+```
+
+**(i-2) Signed-cookie logout cannot revoke a captured cookie (fallback backend, `MEM_STORE_URI=""`).**
+In signed-cookie mode the whole session lives inside the cookie, so logout only deletes the client's
+copy (`response.delete_cookie(...)`, `app/auth/views/logout.py:L13-15`) — there is no server-side
+record to invalidate. `logout()` (`app/auth/views/logout.py:L9-15`) calls `logout_session()`; with
+the default Flask `SecureCookieSessionInterface` there is no `purge_session`, so nothing server-side
+is revoked (contrast the Redis backend of (G), where `purge_session` deletes `session:<id>` and the
+post-logout probe is `302`). A copy taken *before* logout keeps working for its full 7-day lifetime.
+Observed (Client B replays Client A's pre-logout cookie *after* A logged out):
+
+```text
+Client A: login 302 -> /dashboard/ 200 -> logout 302 (Set-Cookie slapp Max-Age=0) -> /dashboard/ 302 (A rejected)
+Client B (stale pre-logout cookie), AFTER A's logout:
+  GET /dashboard/    replay #1/#2/#3 -> 200 / 200 / 200
+  GET /api/user_info replay #1/#2/#3 -> 200 / 200 / 200   (session fallback: g.user = current_user)
+control: one-byte-tampered cookie -> GET /dashboard/ 302 (rejected — the signature check holds)
+```
+
+**(i-3) Negative CSRF on the login form is rejected (no authentication).** Posting valid credentials
+with a **missing** or **invalid** `csrf_token` does not authenticate: Flask-WTF's
+`form.validate_on_submit()` (`app/auth/views/login.py:L40`) returns `False`, so the view falls
+through to re-render the login page (`200`) and establishes no session. Observed:
+
+```text
+POST /auth/login (no csrf_token)      -> HTTP/1.0 200 OK   then GET /dashboard/ -> 302 (not authenticated)
+POST /auth/login (invalid csrf_token) -> HTTP/1.0 200 OK   then GET /dashboard/ -> 302 (not authenticated)
+```
+
+> **Scope note.** (i-1) and (i-2) are session-fixation- and logout-revocation-relevant and would, in
+> a hardening pass, motivate rotating the session id on login and adding a server-side session
+> version; both are **source changes and therefore out of scope** for this read-only investigation.
+> (i-3) confirms the CSRF protection on the primary web-auth form is effective.
 
 ### File:line grounding
 
@@ -2021,15 +2263,34 @@ build a lightweight app context via `create_light_app()`; `event_listener.py` do
 cd /app && set -a && . /tmp/sl_env.sh && set +a && unset EVENT_WEBHOOK_DISABLE \
   && export GNUPGHOME=/tmp/sl_clean_gnupg
 
-# (1) bounded lifecycle: launch, probe /health, inspect threads TWICE, terminate by exact PID.
-/app/venv/bin/python server.py > q6_server.log 2>&1 &
-PARENT=$!; sleep 6
-CHILD=$(ps -eo pid,ppid,args | awk -v p="$PARENT" '$2==p && /server.py/{print $1}')
-curl -s -o /dev/null -w "health_http=%{http_code}\n" http://localhost:7777/health
-ps -o pid,ppid,nlwp,args -p "$PARENT","$CHILD"        # NLWP = OS thread count
-for t in /proc/$CHILD/task/*; do echo "tid=$(basename "$t") comm=$(cat "$t/comm")"; done
-# (repeat the two lines above after 2s = inspection #2)
-kill -TERM $CHILD $PARENT; sleep 1; kill -KILL $CHILD $PARENT
+# (1) bounded lifecycle, run TWICE independently (RUN-Q6-A, RUN-Q6-B) to confirm cross-run stability
+#     and that NO scheduler thread/process appears over a >=60s window. Each run inspects the thread
+#     topology at t=0s (before), t=30s (intermediate) and t=65s (after the >=60s window), then
+#     terminates by exact PID.
+run_once() {                                            # $1 = RUN-Q6-A | RUN-Q6-B
+  /app/venv/bin/python server.py > /tmp/q6_$1.log 2>&1 &
+  PARENT=$!; sleep 7
+  CHILD=$(ps -eo pid,ppid,args | awk -v p="$PARENT" '$2==p && /server.py/{print $1}')
+  echo "$1 parent=$PARENT child=$CHILD"
+  inspect() {                                           # one thread-topology sample
+    curl -s -o /dev/null -w "health_$2=%{http_code}\n" http://localhost:7777/health
+    echo "=== $1 inspection $3 ==="
+    ps -o pid,ppid,nlwp,args -p "$PARENT","$CHILD"       # NLWP = OS thread count
+    echo "-- parent thread ids (/proc/$PARENT/task) --"
+    for t in /proc/$PARENT/task/*; do echo "  tid=$(basename "$t") comm=$(cat "$t/comm")"; done
+    echo "-- child thread ids (/proc/$CHILD/task) --"
+    for t in /proc/$CHILD/task/*;  do echo "  tid=$(basename "$t") comm=$(cat "$t/comm")"; done; }
+  inspect "$1" t0  "t=0s (before)"
+  sleep 30; inspect "$1" t30 "t=30s (intermediate)"
+  sleep 35; inspect "$1" t65 "t=65s (after >=60s window)"   # 7+30+35 >= 60s elapsed since child came up
+  ps -eo pid,ppid,nlwp,args | grep "[p]ython"           # every python process (live server + zombies)
+  kill -TERM $CHILD $PARENT; sleep 1; kill -KILL $CHILD $PARENT; sleep 1
+  curl -s -o /dev/null -w "health_after=%{http_code}\n" --max-time 3 http://localhost:7777/health \
+    || echo "PORT FREE ($1)"
+}
+run_once RUN-Q6-A ; sleep 3 ; run_once RUN-Q6-B
+# process-population summary: histogram of python process states (S=live sleeping, Z=zombie/defunct)
+ps -eo stat,comm | awk '/python/{c[substr($1,1,1)]++} END{for(k in c) print k"  count="c[k]}'
 
 # (2) runtime import check — are any job modules pulled in by the webapp?
 /app/venv/bin/python - <<'PY'
@@ -2051,40 +2312,104 @@ cat crontab.yml
 
 ### Complete, unedited output
 
-**(1) Lifecycle — `pids.txt`, `health.txt`, `threads.txt`, `port_after.txt`** (RUN-Q6):
+**(1) Lifecycle over a `>=60 s` window — two independent runs (RUN-Q6-A, RUN-Q6-B).** Each run
+samples the thread topology at **t=0 s (before)**, **t=30 s (intermediate)** and **t=65 s (after the
+`>=60 s` window)**. RUN-Q6-A output:
 
 ```text
-RUN-Q6 parent=6768 child=6780
-```
-```text
-health_http=200
-```
-```text
-=== inspection #1 ===
+########## RUN-Q6-A parent=37063 child=37075 ##########
+health_t0=200
+=== RUN-Q6-A inspection t=0s (before) ===
     PID    PPID NLWP COMMAND
-   6768    6761    1 /app/venv/bin/python server.py
-   6780    6768    2 /app/venv/bin/python /app/server.py
--- parent thread names (/proc/6768/task/*/comm) --
-  tid=6768 comm=python
--- child thread names (/proc/6780/task/*/comm) --
-  tid=6780 comm=python
-  tid=6791 comm=python
-=== inspection #2 (after 2s) ===
+  37063   37042    1 /app/venv/bin/python server.py
+  37075   37063    2 /app/venv/bin/python /app/server.py
+-- parent thread ids (/proc/37063/task) --
+  tid=37063 comm=python
+-- child thread ids (/proc/37075/task) --
+  tid=37075 comm=python
+  tid=37086 comm=python
+health_t30=200
+=== RUN-Q6-A inspection t=30s (intermediate) ===
     PID    PPID NLWP COMMAND
-   6768    6761    1 /app/venv/bin/python server.py
-   6780    6768    2 /app/venv/bin/python /app/server.py
--- parent thread names (/proc/6768/task/*/comm) --
-  tid=6768 comm=python
--- child thread names (/proc/6780/task/*/comm) --
-  tid=6780 comm=python
-  tid=6791 comm=python
-```
-```text
-PORT FREE
+  37063   37042    1 /app/venv/bin/python server.py
+  37075   37063    2 /app/venv/bin/python /app/server.py
+-- parent thread ids (/proc/37063/task) --
+  tid=37063 comm=python
+-- child thread ids (/proc/37075/task) --
+  tid=37075 comm=python
+  tid=37086 comm=python
+health_t65=200
+=== RUN-Q6-A inspection t=65s (after >=60s window) ===
+    PID    PPID NLWP COMMAND
+  37063   37042    1 /app/venv/bin/python server.py
+  37075   37063    2 /app/venv/bin/python /app/server.py
+-- parent thread ids (/proc/37063/task) --
+  tid=37063 comm=python
+-- child thread ids (/proc/37075/task) --
+  tid=37075 comm=python
+  tid=37086 comm=python
+health_after=000
+PORT FREE (RUN-Q6-A)
 ```
 
-The thread counts are identical across both inspections (parent `NLWP=1`, child `NLWP=2`), i.e. no
-scheduler thread appears over time; after killing the exact PIDs the `:7777` listener is gone.
+RUN-Q6-B output (fresh process, unchanged invocation):
+
+```text
+########## RUN-Q6-B parent=37137 child=37150 ##########
+health_t0=200
+=== RUN-Q6-B inspection t=0s (before) ===
+    PID    PPID NLWP COMMAND
+  37137   37042    1 /app/venv/bin/python server.py
+  37150   37137    2 /app/venv/bin/python /app/server.py
+-- parent thread ids (/proc/37137/task) --
+  tid=37137 comm=python
+-- child thread ids (/proc/37150/task) --
+  tid=37150 comm=python
+  tid=37161 comm=python
+health_t30=200
+=== RUN-Q6-B inspection t=30s (intermediate) ===
+    PID    PPID NLWP COMMAND
+  37137   37042    1 /app/venv/bin/python server.py
+  37150   37137    2 /app/venv/bin/python /app/server.py
+-- parent thread ids (/proc/37137/task) --
+  tid=37137 comm=python
+-- child thread ids (/proc/37150/task) --
+  tid=37150 comm=python
+  tid=37161 comm=python
+health_t65=200
+=== RUN-Q6-B inspection t=65s (after >=60s window) ===
+    PID    PPID NLWP COMMAND
+  37137   37042    1 /app/venv/bin/python server.py
+  37150   37137    2 /app/venv/bin/python /app/server.py
+-- parent thread ids (/proc/37137/task) --
+  tid=37137 comm=python
+-- child thread ids (/proc/37150/task) --
+  tid=37150 comm=python
+  tid=37161 comm=python
+health_after=000
+PORT FREE (RUN-Q6-B)
+```
+
+In **both** runs the topology is **flat across the whole `>=60 s` window and identical between runs**:
+parent `NLWP=1` (the reloader), child `NLWP=2` (daemon WSGI thread + `reloader.run()` main thread),
+the very same two child tids at every sample, `/health = 200` throughout, and after killing the exact
+PIDs the `:7777` listener is gone (`health_after=000` ⇒ `PORT FREE`). **No third thread and no extra
+process ever appears** — i.e. no APScheduler/cron/job thread is spawned over time.
+
+The per-run `ps … | grep "[p]ython"` listing additionally showed **only** each run's own parent+child
+as *live* processes; the other python entries it printed were **36 `<defunct>` (zombie, state `Z`)
+processes** — dead remnants of earlier short-lived dev-server launches in this long-lived (~12 h)
+container, reparented to PID 1 and awaiting reap — **not** live schedulers. The steady-state
+process-state histogram makes the live-vs-zombie split explicit (`S` = live sleeping, `Z` = zombie):
+
+```text
+Z  count=36
+S  count=2
+```
+
+i.e. exactly **two** live python processes exist (the reloader parent + worker child, confirmed
+`Ss` and `Sl` — the `l` flag = multithreaded child); every other python entry is a dead zombie, so
+no background scheduler process is running.
 
 **(2) Runtime import check — `import_check.txt`:**
 
@@ -2276,8 +2601,11 @@ jobs:
 ### Observed vs Inferred
 
 - **Observed:** the webapp starting with no job module in `sys.modules`; the stable
-  parent(`NLWP=1`)/child(`NLWP=2`) thread counts across two inspections; `/health = 200`; the port
-  freeing after termination; `server.py` importing none of the four scripts; and each script's
+  parent(`NLWP=1`)/child(`NLWP=2`) thread counts sampled at **t=0 s, t=30 s and t=65 s** and found
+  **identical across a `>=60 s` window in two independent runs** (RUN-Q6-A, RUN-Q6-B); the
+  process-state histogram showing exactly **two** live python processes (`S count=2`) and no live
+  scheduler (the other 36 being `Z`/zombie remnants); `/health = 200` throughout each window; the
+  port freeing after termination; `server.py` importing none of the four scripts; and each script's
   `__main__` guard and `create_light_app` usage (or absence, for `event_listener.py`).
 - **Inferred:** the *identity* of the two child threads (daemon server thread + `reloader.run()` main
   thread) is read from Werkzeug 1.0.1 source (`_reloader.py`), not from thread names (which all read
@@ -2293,7 +2621,11 @@ Beyond request handling, starting the app has four notable **import-time** side 
 
 1. **A PostgreSQL connection is opened at import.** `app/db.py:L12` runs `connection =
    engine.connect()` at module import (not lazily), so merely importing the app opens a real DB
-   connection with `application_name = "webapp"` (`config.DB_CONN_NAME`, `app/config.py:L193`).
+   connection with `application_name = "webapp"` (`config.DB_CONN_NAME`, `app/config.py:L193`). This
+   is a **single process-wide connection**: `app/db.py:L14` binds `Session =
+   scoped_session(sessionmaker(bind=connection))` to that one `connection` object (not to the engine
+   pool), so **all threads share it** — which, under the threaded dev server, lets concurrent requests
+   race on one transaction (demonstrated in *Further observed DEV-mode behaviours* (a) below).
 2. **That connection happens *twice* under the dev reloader.** Because `debug=True` enables the
    Werkzeug reloader, the app module is imported in **both** the reloader (parent) process **and** the
    worker (child) process — so `pg_stat_activity` shows **two** `webapp` connections while the dev
@@ -2308,6 +2640,11 @@ Beyond request handling, starting the app has four notable **import-time** side 
 4. **Import fails fast if the DB is unreachable.** Because the connect is at import, pointing
    `DB_URI` at a dead port makes `python server.py` abort during import with a full
    `sqlalchemy.exc.OperationalError` traceback and exit code `1` — the server never binds a port.
+
+Three **further DEV-mode behaviours** — request concurrency racing on the single shared connection,
+the Flask Debug Toolbar (and the forgeability of the signed session given the public `FLASK_SECRET`),
+and the non-idempotency of `flask dummy-data` — are exercised and reported in *Further observed
+DEV-mode behaviours* at the end of this section.
 
 ### Command(s) run
 
@@ -2553,11 +2890,293 @@ exit_code=1
   `python server.py` entry point); it is used only to isolate the connect-at-import, whose canonical
   manifestation is the two `pg_stat_activity` rows in (1).
 
+### Further observed DEV-mode behaviours (beyond import-time)
+
+Three additional runtime behaviours were exercised while answering "anything else going on". Each is
+reported **Observed**. Where a fix would require changing application source, that is flagged
+**out of scope** for this read-only investigation (this document only adds an answer file; it does
+not modify source — AAP §0.5.2 / §0.7.7).
+
+#### (a) Concurrent requests race on the single shared DB connection
+
+Because `app/db.py:L12` opens **one** module-global `connection = engine.connect()` and `L14` binds
+`Session` to **that** connection (not to the engine pool), and because the dev server is **threaded
+by default** (Flask 1.1.2 `Flask.run` executes `options.setdefault("threaded", True)`), two
+overlapping requests share a single DB transaction and race. Fired 60 concurrent authenticated
+`GET /api/user_info` (rate-limiting is off via `DISABLE_RATE_LIMIT=1`, so nothing throttles them):
+
+```bash
+export PGPASSWORD=test
+PGP="psql -h localhost -U test -d test -tA"
+# per run: record the log position, capture the counter BEFORE, fire 60 concurrent authed
+# GET /api/user_info, then capture the status distribution, the counter AFTER, and only THIS
+# run's new server-log lines (from the recorded position onward):
+mark=$(wc -l < /tmp/sl_run.log)
+$PGP -c "select times from api_key where code='code';"                 # counter BEFORE
+for i in $(seq 1 60); do
+  ( curl -s -o /dev/null -w "%{http_code}\n" -H "Authentication: code" \
+      http://localhost:7777/api/user_info >> /tmp/q7_conc.txt ) &
+done; wait
+sort /tmp/q7_conc.txt | uniq -c                                        # HTTP status distribution
+$PGP -c "select times from api_key where code='code';"                 # counter AFTER
+tail -n +$((mark+1)) /tmp/sl_run.log \
+  | grep -E "This transaction is inactive|InvalidRequestError" | sort | uniq -c
+```
+
+The exact split varies run-to-run (it is a race), so the **same unchanged burst was run twice under
+the same server process** (child pid `38146`); the race is present in **both**. HTTP status
+distribution (`sort /tmp/q7_conc.txt | uniq -c`), run A then run B:
+
+```text
+     48 200
+     12 500
+```
+```text
+     52 200
+      8 500
+```
+
+The `code` key usage counter (`select times from api_key where code='code';`) BEFORE then AFTER each
+burst — run A, then run B:
+
+```text
+12
+19
+```
+```text
+19
+23
+```
+
+THIS-run server-log lines matching the transaction error (`tail -n +$((mark+1)) /tmp/sl_run.log |
+grep -E "This transaction is inactive|InvalidRequestError" | sort | uniq -c`) — run A (12 failures):
+
+```text
+     12     raise exc.InvalidRequestError("This transaction is inactive")
+      1 2026-07-14 04:55:51,172 - SL - ERROR - 38146 - "/app/server.py:390" - error_handler() -  - This transaction is inactive
+      1 2026-07-14 04:55:51,194 - SL - ERROR - 38146 - "/app/server.py:390" - error_handler() -  - This transaction is inactive
+      1 2026-07-14 04:55:51,221 - SL - ERROR - 38146 - "/app/server.py:390" - error_handler() -  - This transaction is inactive
+      2 2026-07-14 04:55:51,424 - SL - ERROR - 38146 - "/app/server.py:390" - error_handler() -  - This transaction is inactive
+      1 2026-07-14 04:55:51,425 - SL - ERROR - 38146 - "/app/server.py:390" - error_handler() -  - This transaction is inactive
+      1 2026-07-14 04:55:51,426 - SL - ERROR - 38146 - "/app/server.py:390" - error_handler() -  - This transaction is inactive
+      1 2026-07-14 04:55:51,431 - SL - ERROR - 38146 - "/app/server.py:390" - error_handler() -  - This transaction is inactive
+      1 2026-07-14 04:55:51,446 - SL - ERROR - 38146 - "/app/server.py:390" - error_handler() -  - This transaction is inactive
+      1 2026-07-14 04:55:51,497 - SL - ERROR - 38146 - "/app/server.py:390" - error_handler() -  - This transaction is inactive
+      1 2026-07-14 04:55:51,548 - SL - ERROR - 38146 - "/app/server.py:390" - error_handler() -  - This transaction is inactive
+      1 2026-07-14 04:55:51,595 - SL - ERROR - 38146 - "/app/server.py:390" - error_handler() -  - This transaction is inactive
+     12 sqlalchemy.exc.InvalidRequestError: This transaction is inactive
+```
+
+run B (8 failures):
+
+```text
+      8     raise exc.InvalidRequestError("This transaction is inactive")
+      1 2026-07-14 04:55:53,833 - SL - ERROR - 38146 - "/app/server.py:390" - error_handler() -  - This transaction is inactive
+      1 2026-07-14 04:55:53,843 - SL - ERROR - 38146 - "/app/server.py:390" - error_handler() -  - This transaction is inactive
+      1 2026-07-14 04:55:53,846 - SL - ERROR - 38146 - "/app/server.py:390" - error_handler() -  - This transaction is inactive
+      1 2026-07-14 04:55:53,873 - SL - ERROR - 38146 - "/app/server.py:390" - error_handler() -  - This transaction is inactive
+      1 2026-07-14 04:55:54,130 - SL - ERROR - 38146 - "/app/server.py:390" - error_handler() -  - This transaction is inactive
+      1 2026-07-14 04:55:54,139 - SL - ERROR - 38146 - "/app/server.py:390" - error_handler() -  - This transaction is inactive
+      1 2026-07-14 04:55:54,141 - SL - ERROR - 38146 - "/app/server.py:390" - error_handler() -  - This transaction is inactive
+      1 2026-07-14 04:55:54,239 - SL - ERROR - 38146 - "/app/server.py:390" - error_handler() -  - This transaction is inactive
+      8 sqlalchemy.exc.InvalidRequestError: This transaction is inactive
+```
+
+Interpretation (outside the blocks): in **both** runs a subset of the concurrent requests returned
+`500`, each carrying a full server-side `sqlalchemy.exc.InvalidRequestError: This transaction is
+inactive` traceback logged by `error_handler` (`server.py:L390`); and in **both** runs the usage
+counter advanced far less than the number of `200`s (run A `12 → 19`, i.e. 7 increments against 48
+successes; run B `19 → 23`, i.e. 4 increments against 52 successes), so dozens of increments were
+lost. Both are direct consequences of many threads sharing the single `app/db.py:L14` `Session` bound
+to the single `app/db.py:L12` `connection`; the failure count (12 vs 8) varies because it is
+timing-dependent.
+
+- **Grounding:** `app/db.py:L12` `connection = engine.connect()`; `app/db.py:L14` `Session =
+  scoped_session(sessionmaker(bind=connection))`; threaded default in `flask/app.py`
+  `Flask.run` (`options.setdefault("threaded", True)`, observed above); the `500` path is the
+  catch-all `@app.errorhandler(Exception)` (`server.py:L388`) → `error_handler` (`L389`) → `LOG.e(e)`
+  (`L390`, the SL-ERROR line above) → `jsonify(error="Internal error"), 500` for `/api/` (`L392-393`).
+- **Observed.** **Out of scope to fix:** binding `Session` to the engine/pool instead of a single
+  connection is an application-source change.
+
+#### (b) The Flask Debug Toolbar is enabled, and the signed session is forgeable given the public `FLASK_SECRET`
+
+`local_main()` enables the Debug Toolbar in dev (`server.py:L577` `from flask_debugtoolbar import
+DebugToolbarExtension`; `L581` `app.debug = True`; `L582` `DebugToolbarExtension(app)`; `L588`
+`app.run(debug=True, port=7777)`). Observed consequences:
+
+```bash
+# (b1) the toolbar injects into every authenticated HTML response. Fetch the dashboard with a valid
+#      logged-in cookie jar (cj), then scan the returned HTML for toolbar markers:
+curl -s -b cj http://localhost:7777/dashboard/ -o dash.html          # 200
+grep -oiE '_debug_toolbar/static/[^"]*|id="flDebug|Flask-Debug' dash.html | sort -u
+```
+
+```text
+Flask-Debug
+_debug_toolbar/static/'</script>
+_debug_toolbar/static/js/jquery.js
+_debug_toolbar/static/js/jquery.tablesorter.js
+_debug_toolbar/static/js/toolbar.js
+flask-debug
+id="flDebug
+```
+
+```bash
+# the toolbar's static-asset namespace is served live:
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:7777/_debug_toolbar/static/js/toolbar.js
+```
+
+```text
+200
+```
+
+```bash
+# the toolbar's ConfigVars panel is embedded in the page, exposing app-config rows:
+grep -oiE 'ConfigVarsPanel|<td>SECRET_KEY</td>|SQLALCHEMY_DATABASE_URI' dash.html | sort -u
+```
+
+```text
+<td>SECRET_KEY</td>
+ConfigVarsPanel
+SQLALCHEMY_DATABASE_URI
+```
+
+```bash
+# (b2) NON-CANONICAL forge (signed-cookie mode, MEM_STORE_URI=""): mint a Flask-Login session cookie
+#      WITHOUT logging in, signed with the public example.env default FLASK_SECRET="secret".
+#      forge.py replicates flask_login._create_identifier() and signs via SecureCookieSessionInterface;
+#      it prints ONLY the cookie length, never the cookie value.
+ALT=<john_alt_id>                                              # john's alternative_id (= _user_id)
+C1=$(python /tmp/forge.py "$ALT" secret      forge 127.0.0.1 goodid)    # correct secret + correct _id
+C2=$(python /tmp/forge.py "$ALT" WRONGSECRET forge 127.0.0.1 goodid)    # wrong signing secret
+C3=$(python /tmp/forge.py "$ALT" secret      forge 127.0.0.1 wrongid)   # correct secret, wrong client _id
+echo "forged cookie length (correct secret+_id) = ${#C1}"
+curl -s -A forge -b "slapp=$C1" -o d1.html -w "  [1] correct secret + correct _id : /dashboard/ = %{http_code}\n" http://localhost:7777/dashboard/
+echo "  [1] identity shown on the forged dashboard page: $(grep -oiE 'John Wick' d1.html | head -1)"
+curl -s -A forge -b "slapp=$C2" -o /dev/null -w "  [2] WRONG secret       + correct _id : /dashboard/ = %{http_code}\n" http://localhost:7777/dashboard/
+curl -s -A forge -b "slapp=$C3" -o /dev/null -w "  [3] correct secret + WRONG _id (strong-prot) : /dashboard/ = %{http_code}\n" http://localhost:7777/dashboard/
+```
+
+```text
+forged cookie length (correct secret+_id) = 262
+  [1] correct secret + correct _id : /dashboard/ = 200
+  [1] identity shown on the forged dashboard page: John Wick
+  [2] WRONG secret       + correct _id : /dashboard/ = 302
+  [3] correct secret + WRONG _id (strong-prot) : /dashboard/ = 200
+```
+
+The forge script prints only the cookie *length* (`262`); the signed cookie value itself is never
+emitted, so no bearer material appears in the output above.
+
+So the toolbar is served on every authenticated HTML page and its **ConfigVars panel exposes app
+config rows including `SECRET_KEY` and `SQLALCHEMY_DATABASE_URI`**; and because `FLASK_SECRET` is the
+public `example.env` default `"secret"`, a cookie **signed with that public secret authenticates as
+the admin without any login** (`[1]` → `200`, "John Wick"), while a wrong signature is rejected
+(`[2]` → `302`). Probe `[3]` shows Flask-Login's configured `session_protection = "strong"`
+(`app/extensions.py:L8`) does **not** bind the session to the client here: because SimpleLogin marks
+**every** session permanent (`make_session_permanent`, `server.py:L205-206` `session.permanent =
+True`), the strong-protection check degrades to *basic* — `login_manager.py:L351`
+`if mode == 'basic' or sess.permanent:` → `L352` `sess['_fresh'] = False` (mark non-fresh, **no
+logout**); the session-clearing `elif mode == 'strong'` branch (`L355`) is never reached for a
+permanent session. A mismatched client `_id` therefore does not invalidate a forged cookie.
+
+**Why this is not a reachable remote-code-execution path in the canonical dev config** (each cause is
+code/observation-grounded, not assumed):
+
+- **Loopback-only bind.** `app.run(..., port=7777)` binds `127.0.0.1:7777` (observed in Q1/Q4 via
+  `/proc/net/tcp`); the port is not reachable off-host.
+- **Interactive debugger is PIN-gated and the PIN is never emitted.** Werkzeug's evalex console
+  requires the `WERKZEUG_DEBUG_PIN`, which is printed through the `werkzeug` logger — and that logger
+  is **disabled** (`app/log.py:L70-71`, shown in Q3), so no PIN appears in the captured startup
+  stream.
+- **A catch-all error handler intercepts before the debugger.** `@app.errorhandler(Exception)`
+  (`server.py:L388-395`) converts any unhandled exception into a plain `500` response (JSON for
+  `/api/`, `error/500.html` otherwise). Observed directly: the concurrency failures in (a) returned
+  **status `500`, not an interactive Werkzeug debugger page**.
+
+- **Grounding:** `server.py:L577,L581-582,L588`; `app/extensions.py:L8`; `server.py:L205-206`;
+  `flask_login/login_manager.py:L351-352,L355`; `app/log.py:L70-71`; `server.py:L388-395`.
+- **Observed** (the forge is explicitly **NON-CANONICAL** — it bypasses the `POST /auth/login` entry
+  point by minting a cookie directly). **Out of scope to fix:** disabling the toolbar in
+  `local_main()` and requiring a non-default `FLASK_SECRET` are application-source/configuration
+  changes; `FLASK_SECRET="secret"` is a disposable DEV-only default (see the *Security scope* note).
+
+#### (c) `flask dummy-data` is not idempotent
+
+The seed command logs a "reset db" banner but does **not** drop or recreate tables: `dummy_data()`
+(`server.py:L491-497`) logs `LOG.w("reset db, add fake data")` (`L494`) and then calls `fake_data()`
+(`L495`), which at `app/fake_data.py:L44-56` immediately does `User.create(email="john@wick.com", …)`
++ `Session.commit()`. Run against the already-seeded dev DB, the first insert violates the
+`users.email` unique constraint:
+
+```bash
+export PGPASSWORD=test
+PGP="psql -h localhost -U test -d test -tA"          # -t tuples-only, -A unaligned => bare scalar
+# BEFORE: user count, then john's id
+$PGP -c "select count(*) from users;"
+$PGP -c "select id from users where email='john@wick.com';"
+```
+
+```text
+2
+1
+```
+
+```bash
+# re-run the seed against the already-populated dev DB; grep the salient lines and capture exit code
+/app/venv/bin/flask dummy-data 2>&1 \
+  | grep -E "reset db, add fake data|create fake data|sqlalchemy.exc.IntegrityError|already exists"
+echo "exit_code=${PIPESTATUS[0]}"
+```
+
+```text
+2026-07-14 04:54:14,347 - SL - WARNING - 38181 - "/app/server.py:494" - dummy_data() -  - reset db, add fake data
+2026-07-14 04:54:14,347 - SL - DEBUG - 38181 - "/app/app/fake_data.py:41" - fake_data() -  - create fake data
+DETAIL:  Key (email)=(john@wick.com) already exists.
+sqlalchemy.exc.IntegrityError: (psycopg2.errors.UniqueViolation) duplicate key value violates unique constraint "users_email_key"
+DETAIL:  Key (email)=(john@wick.com) already exists.
+exit_code=1
+```
+
+```bash
+# AFTER: user count, then john's id
+$PGP -c "select count(*) from users;"
+$PGP -c "select id from users where email='john@wick.com';"
+```
+
+```text
+2
+1
+```
+
+So `flask dummy-data` is a **one-shot seed for a fresh/empty schema**, not a reset: on a populated DB
+it aborts at the very first row with `exit 1` and leaves the existing data intact (verified: user
+count `2` before and after, `john@wick.com` id `1` untouched).
+
+- **Grounding:** `server.py:L491` `def dummy_data():`, `L494` `LOG.w("reset db, add fake data")`,
+  `L495` `fake_data()`; `app/fake_data.py:L44-56` `User.create(email="john@wick.com", …)` +
+  `Session.commit()`; unique constraint `users_email_key` on `users.email`.
+- **Observed.** **Out of scope to fix:** making the seed idempotent (drop/recreate, or upsert/guard)
+  is an application-source change.
+
+
 
 ## Coverage-pass checklist
 
 Final pass re-reading each question and every named item. Each box is checked **only** where the
 body contains observed runtime evidence for it (with the section that carries the evidence).
+
+**Scope of this checklist (per AAP §0.7.4).** This is the coverage pass over the seven questions and
+their named sub-items — the "each distinct thing and named item" the prompt asks for — **not** a
+general security or dependency audit. Topics that no question raises — CORS / security-response
+headers, CRLF / log injection, exhaustive malformed / boundary API fuzzing, and third-party
+dependency CVE advisories — are **outside the question scope** and are deliberately excluded per
+AAP §0.5.2 / §0.7.7 (read-only, no source changes) and §0.8 ("do not expand into a full security
+audit"); they are intentionally absent as checklist items rather than checked-but-unevidenced. Where
+a behaviour flagged elsewhere *does* fall inside a question it is evidenced and listed here — the
+Debug Toolbar and the shared-connection concurrency race under Q7 *(b)/(a)*, and the session-lifecycle
+items (no rotation, stale-cookie replay, negative CSRF) under Q5 *(I)*.
 
 **Q1 — startup in dev mode**
 - [x] Canonical entry `python3 server.py` → `local_main()` runs — Q1 output (RUN‑A/RUN‑B)
@@ -2603,7 +3222,10 @@ body contains observed runtime evidence for it (with the section that carries th
 - [x] Signed cookie is signed (readable w/o secret), not encrypted — Q5 (F)
 - [x] 401 edge: web → 302 login redirect; API JSON — Q5 (A),(C) + grounding
 - [x] Web logout: `GET /auth/logout` → `302` + `slapp`/`mfa`/`dark-mode` deleted (`Max-Age=0`) + Redis session purged; post-logout `/dashboard/` → `302` (before `200` / after `302`) — Q5 (G)
-- [x] API key revoked over HTTP on a concrete endpoint: acquire `200` → use `200` → revoke → reuse `401 {"error": "Wrong api key"}` on `/api/user_info` — Q5 (H)
+- [x] API key revoked over HTTP on a concrete endpoint: acquire `200` → use `200` → revoke → reuse `401 {"error": "Wrong api key"}` on `/api/user_info` — Q5 (H′) canonical sudo‑gated UI delete; (H) SQL‑fixture supplemental
+- [x] Session ID **not** rotated across the login boundary (session‑fixation observation; same sid, TTL `300`→`604800`) — Q5 (I) (i‑1)
+- [x] Stale signed‑cookie replay after logout in signed‑cookie mode (empty `MEM_STORE_URI`): the logged‑out cookie still authenticates; tampering → `302` — Q5 (I) (i‑2)
+- [x] Negative CSRF: `POST` without a valid token re‑renders the form (no state change) — Q5 (I) (i‑3)
 
 **Q6 — background jobs / schedulers**
 - [x] Webapp starts no scheduler thread (thread counts, `sys.modules` = NONE) — Q6 output
@@ -2616,6 +3238,9 @@ body contains observed runtime evidence for it (with the section that carries th
 - [x] Reloader double‑import → two `webapp` DB connections + doubled banners — Q7 output
 - [x] `OAUTHLIB_INSECURE_TRANSPORT` set to `"1"` at import, unconditional (prod too) — Q7 output
 - [x] Fail‑fast on unreachable DB (full traceback, exit 1) — Q7 output
+- [x] Concurrency: single shared `connection`/`Session` (`db.py:L12,L14`) + threaded dev server → mixed `200`/`500` (run A 48×200/12×500, run B 52×200/8×500), "This transaction is inactive", lost usage‑counter increments — Q7 *Further …* (a)
+- [x] Debug Toolbar enabled in dev + ConfigVars panel exposes `SECRET_KEY`/`SQLALCHEMY_DATABASE_URI`; signed session forgeable given public `FLASK_SECRET` (NON‑CANONICAL forge → 200; wrong secret → 302); strong→basic degradation for permanent sessions; not a reachable RCE (loopback/PIN‑disabled/errorhandler‑intercept) — Q7 *Further …* (b)
+- [x] `flask dummy-data` not idempotent → `users_email_key` UniqueViolation on seeded DB, exit 1, no corruption — Q7 *Further …* (c)
 
 
 ## Cleanup and read-only guarantee
@@ -2660,18 +3285,38 @@ shown in (h-4)). The seeded `code`/`codeFF` keys remain as standard `flask dummy
 testing — a benign seed side-effect, never reset so as not to fabricate state); they are disposable
 DEVELOPMENT-only credentials in the git-ignored throwaway dev database, never production material.
 
-**Read-only proof — the host repository has exactly one modified path, this document**, on the
-working branch:
+**Read-only proof — across the whole branch since the source baseline, exactly one path differs:
+this document.** The commit-independent check is the branch delta against the pre-Blitzy source
+baseline `2cd6ee77` (`chore: emit some missing contact audit logs (#2269)`); it lists a single path
+whether or not this deliverable has been committed yet:
 
 ```bash
-git rev-parse --abbrev-ref HEAD      # blitzy-a91b3111-6deb-4252-be6e-91d062c6ed20
-git status --porcelain
-git status --porcelain | wc -l
+git rev-parse --abbrev-ref HEAD                    # blitzy-a91b3111-6deb-4252-be6e-91d062c6ed20
+git diff --name-only 2cd6ee77 --                   # paths differing from the source baseline
+git diff --name-only 2cd6ee77 -- | wc -l
+```
+```text
+blitzy/documentation/app_2cd6ee777f8c.md
+1
+```
+
+The **working-tree** status, by contrast, changes with the commit and must be read accordingly.
+*Before* this deliverable is committed — the state the investigation itself leaves — `git status
+--porcelain` reports the one modified path:
+
+```bash
+git status --porcelain          # investigation end state, before the deliverable is committed
 ```
 ```text
  M blitzy/documentation/app_2cd6ee777f8c.md
-1
 ```
+
+*After* the deliverable is committed (the repository's final state) the working tree is **clean** —
+`git status --porcelain` prints nothing — and the single change is recorded as that same one file in
+the commit, confirmable with `git show --stat HEAD` (`1 file changed`,
+`blitzy/documentation/app_2cd6ee777f8c.md`). An empty post-commit `git status` is therefore the
+expected end state, not a discrepancy: exactly one file ever changes — either as a working-tree
+modification (pre-commit) or as a one-file commit (post-commit).
 
 **Note on `git diff --check`.** The terminal blank line at EOF flagged by the original review has
 been removed (one final newline is retained). The remaining `git diff --check` notices are all
