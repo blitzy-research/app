@@ -59,6 +59,19 @@ observed and **must be changed before any production/self-host exposure**:
 - **Flask **debug** development server** — `app.run(debug=True, port=7777)` [`server.py:L588`] prints
   `WARNING: This is a development server. Do not use it in a production deployment.` (observed in
   §3.1). Production uses `gunicorn wsgi:app` [`Dockerfile` CMD].
+- **The Debug Toolbar leaks `app.config` to unauthenticated clients — compounding the two items above
+  into an account-takeover path.** The canonical `python server.py` run calls `local_main()`, which
+  sets `app.debug = True` and enables `DebugToolbarExtension(app)` [`server.py:L577-L582`]; the Flask
+  Debug Toolbar then renders its ConfigVars panel on **every** page, including the unauthenticated
+  login page. An unauthenticated `GET /auth/login` (HTTP 200) returns that panel with `app.config` in
+  clear text — observed to include `SECRET_KEY = 'secret'` and
+  `SQLALCHEMY_DATABASE_URI = 'postgresql://myuser:mypassword@localhost:15432/simplelogin'`. Because the
+  disclosed `SECRET_KEY` is exactly the guessable value noted above, an attacker can forge a signed
+  Flask session cookie and authenticate as any user (account takeover), and the same panel additionally
+  leaks the database credentials. This toolbar exists **only** in the `python server.py` dev mode:
+  production `gunicorn wsgi:app` imports `create_app()` directly [`wsgi.py:L1-L3`] and never calls
+  `local_main()`, so the toolbar is never enabled — but the default local mode must never be exposed on
+  a reachable network.
 - **Demo/seed credentials** — `john@wick.com` / `password` [`app/fake_data.py:L45-L47`] and
   `winston@continental.com` [`app/fake_data.py:L236-L237`] are seeded by `flask dummy-data`; these
   must never exist in production.
@@ -1736,7 +1749,57 @@ app through the canonical HTTP entry points (seed user `john@wick.com`), confirm
 `400 "You are already logged in"` response is emitted **only** by `activate` [`activate.py:L18-22`],
 whereas `register` [`register.py:L33-36`] and `login` [`login.py:L28-34`] return a `302` redirect to
 `/dashboard/` because their `current_user.is_authenticated` guard runs *before* form/CSRF handling.
-Complete unedited capture:
+
+The exact producer script that generated the capture below (published here in full; temporary,
+written to `/tmp/obs`, never committed) — `/tmp/obs/obj2_authenticated.py`:
+
+```python
+#!/usr/bin/env python3
+# Objective-2 edge re-verification: already-authenticated behavior of the
+# register / login / activate routes, driven through the REAL HTTP entry points
+# on :7777 with a genuine authenticated session (seed user john@wick.com).
+import re
+import requests
+
+BASE = "http://localhost:7777"
+s = requests.Session()
+
+# STEP 1 (setup): fetch the login form and extract its CSRF token.
+login_page = s.get(f"{BASE}/auth/login")
+csrf = re.search(r'name="csrf_token"[^>]*value="([^"]+)"', login_page.text).group(1)
+
+# STEP 2: authenticate (this is the ONLY canonical state-change; it establishes the session).
+r = s.post(f"{BASE}/auth/login",
+           data={"csrf_token": csrf, "email": "john@wick.com", "password": "password"},
+           allow_redirects=False)
+print(f"STEP 2  POST /auth/login  (john@wick.com / password)       -> HTTP {r.status_code} ; "
+      f"Location: {r.headers.get('Location')}   [session now authenticated]")
+
+# STEP 3-5: already-authenticated register/login short-circuit to a 302 BEFORE any form/CSRF work.
+r = s.get(f"{BASE}/auth/register", allow_redirects=False)
+print(f"STEP 3  GET  /auth/register      (authenticated session)   -> HTTP {r.status_code} ; "
+      f"Location: {r.headers.get('Location')}")
+r = s.post(f"{BASE}/auth/register", allow_redirects=False)
+print(f"STEP 4  POST /auth/register      (authenticated session)   -> HTTP {r.status_code} ; "
+      f"Location: {r.headers.get('Location')}   [redirect precedes form processing]")
+r = s.get(f"{BASE}/auth/login", allow_redirects=False)
+print(f"STEP 5  GET  /auth/login         (authenticated session)   -> HTTP {r.status_code} ; "
+      f"Location: {r.headers.get('Location')}")
+
+# STEP 6: only /auth/activate returns 400 with the guard message for an authenticated session.
+r = s.get(f"{BASE}/auth/activate?code=anything", allow_redirects=False)
+has = "You are already logged in" in r.text
+print(f"STEP 6  GET  /auth/activate?code=anything (authenticated)  -> HTTP {r.status_code} ; "
+      f'body contains "You are already logged in": {"YES" if has else "NO"}')
+
+# STEP 7: follow the register 302 to the dashboard so the warning flash renders.
+r = s.get(f"{BASE}/auth/register", allow_redirects=True)
+has = "You are already logged in" in r.text
+print(f"STEP 7  follow register 302 to /dashboard/                 -> "
+      f'warning flash "You are already logged in" present: {"YES" if has else "NO"}')
+```
+
+Run with `python3 /tmp/obs/obj2_authenticated.py`; complete captured output:
 
 ```text
 STEP 2  POST /auth/login  (john@wick.com / password)       -> HTTP 302 ; Location: http://localhost:7777/dashboard/   [session now authenticated]
@@ -1748,19 +1811,29 @@ STEP 7  follow register 302 to /dashboard/                 -> warning flash "You
 ```
 
 Read-only proof that the authenticated `POST /auth/register` (STEP 4) created **no** row — the
-guard returns before `RegisterForm` is ever processed, so the demonstration leaves the DB pristine:
+guard returns before `RegisterForm` is ever processed, so the demonstration leaves the DB pristine.
+The database is published to the host on `127.0.0.1:15432` (§2.3), so the connection flags
+`-h localhost -p 15432` and `PGPASSWORD` are required for the commands to reach it:
 
 ```text
-$ psql -U myuser -d simplelogin -c "SELECT COUNT(*) FROM users WHERE email='should-not-be-created@example.com';"
+$ export PGPASSWORD=mypassword
+$ psql -h localhost -p 15432 -U myuser -d simplelogin -c "SELECT COUNT(*) FROM users WHERE email='should-not-be-created@example.com';"
  count
 -------
      0
-$ psql -U myuser -d simplelogin -c "SELECT id,email,activated FROM users ORDER BY id;"
+(1 row)
+
+$ psql -h localhost -p 15432 -U myuser -d simplelogin -c "SELECT id,email,activated FROM users ORDER BY id;"
  id |          email          | activated
 ----+-------------------------+-----------
   1 | john@wick.com           | t
   2 | winston@continental.com | t
+(2 rows)
 ```
+
+(psql right-pads header cells with spaces for column alignment; that trailing padding is trimmed
+here only to satisfy the repository's no-trailing-whitespace rule — no row, value, or count is
+altered.)
 
 **Inferred vs observed.** Every row in §4.5, §4.8, and §4.9 is **Observed** — a captured HTTP status
 plus a body/flash string, a DB row-state read, and (where applicable) a `sl-web` log line. The only
@@ -2016,9 +2089,15 @@ swaks --to e1@sl.local --from probe-sender@example.com --server 127.0.0.1:20381 
       --body "Objective 3: exercising handle() -> handle_forward() through the aiosmtpd controller."
 ```
 
-Complete, unedited `swaks` client transcript (swaks prefixes each line it sends with `->`; only
-display-artifact trailing whitespace on otherwise-empty lines has been trimmed so the committed
-document passes `git diff --check` — no content byte, timestamp, ID, or field is altered):
+Complete `swaks` client transcript. swaks itself prefixes each line it sends with ` -> ` and each
+server reply with `<- `. Two byte-level normalizations are applied to the block below so the
+committed document satisfies the repository's no-trailing-whitespace convention (`git diff --check`):
+the CRLF (`\r\n`) line-endings swaks writes are rendered as plain newlines, and the single trailing
+space swaks emits on each otherwise-empty ` ->` header/body continuation line is trimmed. No SMTP
+verb, status code, header, or body byte is otherwise altered. The `Date` and `Message-Id` header
+values are generated fresh by swaks on every invocation, so they differ run-to-run; the values below
+are from the captured run shown here — re-running the command above reproduces the identical dialog
+with only those two per-run fields changed:
 
 ```text
 === Trying 127.0.0.1:20381...
@@ -2036,11 +2115,11 @@ document passes `git diff --check` — no content byte, timestamp, ID, or field 
 <-  250 OK
  -> DATA
 <-  354 End data with <CR><LF>.<CR><LF>
- -> Date: Mon, 13 Jul 2026 19:07:52 +0000
+ -> Date: Tue, 14 Jul 2026 10:40:53 +0000
  -> To: e1@sl.local
  -> From: probe-sender@example.com
  -> Subject: Obj3 forwarding pipeline probe
- -> Message-Id: <20260713190752.119109@reverse-code-generator-71c836b7-xjgzz>
+ -> Message-Id: <20260714104053.745039@reverse-code-generator-71c836b7-xjgzz>
  -> X-Mailer: swaks v20240103.0 jetmore.org/john/code/swaks/
  ->
  -> Objective 3: exercising handle() -> handle_forward() through the aiosmtpd controller.
@@ -2053,28 +2132,39 @@ document passes `git diff --check` — no content byte, timestamp, ID, or field 
 === Connection closed with remote host.
 ```
 
-Complete, unedited `sl-email` handler log for that message (`docker logs sl-email --since <send>`):
+Complete `sl-email` handler log for that message. A UTC timestamp is captured immediately before the
+swaks send and handed to `docker logs --since`, so only this message's lines are shown; the `SL -`
+filter keeps the application logger's lines and drops aiosmtpd's own connection-framing lines. Exact
+commands (the same trailing-whitespace trim as above is applied so the block passes `git diff
+--check`; the `message_id`, timestamps, and reverse-alias suffix are per-run values):
+
+```bash
+SINCE=$(date -u +%Y-%m-%dT%H:%M:%S)          # captured immediately before the swaks send above
+docker logs sl-email --since "$SINCE" 2>&1 | grep -E "SL -"
+```
+
+Output:
 
 ```text
-2026-07-13 19:07:52,111 - SL - DEBUG - 1 - "/workspace/app/log.py:24" - set_message_id() -  - set message_id 0e94bf3b-c88c-4d66-83ea-a9cc8161a842
-2026-07-13 19:07:52,111 - SL - DEBUG - 1 - "/workspace/email_handler.py:2342" - _handle() - 0e94bf3b-c88c-4d66-83ea-a9cc8161a842 - ====>=====>====>====>====>====>====>====>
-2026-07-13 19:07:52,111 - SL - INFO - 1 - "/workspace/email_handler.py:2343" - _handle() - 0e94bf3b-c88c-4d66-83ea-a9cc8161a842 - New message, mail from probe-sender@example.com, rctp tos ['e1@sl.local']
-2026-07-13 19:07:52,112 - SL - INFO - 1 - "/workspace/email_handler.py:1956" - handle() - 0e94bf3b-c88c-4d66-83ea-a9cc8161a842 - Set CONTENT_TRANSFER_ENCODING
-2026-07-13 19:07:52,112 - SL - DEBUG - 1 - "/workspace/email_handler.py:1963" - handle() - 0e94bf3b-c88c-4d66-83ea-a9cc8161a842 - Cannot parse Postfix queue ID from None None
-2026-07-13 19:07:52,276 - SL - DEBUG - 1 - "/workspace/email_handler.py:1980" - handle() - 0e94bf3b-c88c-4d66-83ea-a9cc8161a842 - ==>> Handle mail_from:probe-sender@example.com, rcpt_tos:['e1@sl.local'], header_from:probe-sender@example.com, header_to:e1@sl.local, cc:None, reply-to:None, message_id:<20260713190752.119109@reverse-code-generator-71c836b7-xjgzz>, client_ip:None, headers:[('Date', 'Mon, 13 Jul 2026 19:07:52 +0000'), ('To', 'e1@sl.local'), ('From', 'probe-sender@example.com'), ('Subject', 'Obj3 forwarding pipeline probe'), ('Message-Id', '<20260713190752.119109@reverse-code-generator-71c836b7-xjgzz>'), ('X-Mailer', 'swaks v20240103.0 jetmore.org/john/code/swaks/'), ('Content-Transfer-Encoding', '7bit')], mail_options:[], rcpt_options:[]
-2026-07-13 19:07:52,282 - SL - DEBUG - 1 - "/workspace/email_handler.py:2202" - handle() - 0e94bf3b-c88c-4d66-83ea-a9cc8161a842 - Forward phase probe-sender@example.com(probe-sender@example.com) -> e1@sl.local
-2026-07-13 19:07:52,299 - SL - DEBUG - 1 - "/workspace/email_handler.py:580" - handle_forward() - 0e94bf3b-c88c-4d66-83ea-a9cc8161a842 - Create or get contact for from_header:probe-sender@example.com
-2026-07-13 19:07:52,326 - SL - DEBUG - 1 - "/workspace/app/contact_utils.py:110" - create_contact() - 0e94bf3b-c88c-4d66-83ea-a9cc8161a842 - Created contact <Contact 2 probe-sender@example.com 5> for alias <Alias 5 e1@sl.local> with email probe-sender@example.com invalid_email=False
-2026-07-13 19:07:52,327 - SL - INFO - 1 - "/workspace/app/handler/dmarc.py:33" - apply_dmarc_policy_for_forward_phase() - 0e94bf3b-c88c-4d66-83ea-a9cc8161a842 - DMARC check disabled
-2026-07-13 19:07:52,335 - SL - DEBUG - 1 - "/workspace/email_handler.py:688" - forward_email_to_mailbox() - 0e94bf3b-c88c-4d66-83ea-a9cc8161a842 - Forward <Contact 2 probe-sender@example.com 5> -> <Alias 5 e1@sl.local> -> <Mailbox 1 john@wick.com>
-2026-07-13 19:07:52,339 - SL - DEBUG - 1 - "/workspace/email_handler.py:740" - forward_email_to_mailbox() - 0e94bf3b-c88c-4d66-83ea-a9cc8161a842 - Create <EmailLog 2> for <Contact 2 probe-sender@example.com 5>, <User 1 John Wick john@wick.com>, <Mailbox 1 john@wick.com>
-2026-07-13 19:07:52,344 - SL - DEBUG - 1 - "/workspace/email_handler.py:867" - forward_email_to_mailbox() - 0e94bf3b-c88c-4d66-83ea-a9cc8161a842 - From header, new:"probe-sender at example.com" <probe-sender_at_example_com_vvceytezmb@sl.local>, old:probe-sender@example.com
-2026-07-13 19:07:52,344 - SL - DEBUG - 1 - "/workspace/email_handler.py:316" - replace_header_when_forward() - 0e94bf3b-c88c-4d66-83ea-a9cc8161a842 - Delete Cc header, old value None
-2026-07-13 19:07:52,345 - SL - DEBUG - 1 - "/workspace/email_handler.py:313" - replace_header_when_forward() - 0e94bf3b-c88c-4d66-83ea-a9cc8161a842 - Replace To header, old: e1@sl.local, new: e1@sl.local
-2026-07-13 19:07:52,345 - SL - INFO - 1 - "/workspace/app/handler/unsubscribe_generator.py:36" - _generate_header_with_original_behaviour() - 0e94bf3b-c88c-4d66-83ea-a9cc8161a842 - Email has no unsubscribe header
-2026-07-13 19:07:52,345 - SL - DEBUG - 1 - "/workspace/email_handler.py:893" - forward_email_to_mailbox() - 0e94bf3b-c88c-4d66-83ea-a9cc8161a842 - Forward mail from probe-sender@example.com to john@wick.com, mail_options:[], rcpt_options:[]
-2026-07-13 19:07:52,345 - SL - DEBUG - 1 - "/workspace/app/mail_sender.py:131" - send() - 0e94bf3b-c88c-4d66-83ea-a9cc8161a842 - send email with subject 'Obj3 forwarding pipeline probe', from '"probe-sender at example.com" <probe-sender_at_example_com_vvceytezmb@sl.local>' to 'e1@sl.local'
-2026-07-13 19:07:52,345 - SL - INFO - 1 - "/workspace/email_handler.py:2367" - _handle() - 0e94bf3b-c88c-4d66-83ea-a9cc8161a842 - Finish mail_from probe-sender@example.com, rcpt_tos ['e1@sl.local'], takes 0.23475217819213867 seconds with return code '250 Message accepted for delivery'<<===
+2026-07-14 10:40:53,891 - SL - DEBUG - 1 - "/workspace/app/log.py:24" - set_message_id() -  - set message_id bcf2352e-1819-4b8f-b11b-2927f06082ac
+2026-07-14 10:40:53,891 - SL - DEBUG - 1 - "/workspace/email_handler.py:2342" - _handle() - bcf2352e-1819-4b8f-b11b-2927f06082ac - ====>=====>====>====>====>====>====>====>
+2026-07-14 10:40:53,891 - SL - INFO - 1 - "/workspace/email_handler.py:2343" - _handle() - bcf2352e-1819-4b8f-b11b-2927f06082ac - New message, mail from probe-sender@example.com, rctp tos ['e1@sl.local']
+2026-07-14 10:40:53,893 - SL - INFO - 1 - "/workspace/email_handler.py:1956" - handle() - bcf2352e-1819-4b8f-b11b-2927f06082ac - Set CONTENT_TRANSFER_ENCODING
+2026-07-14 10:40:53,893 - SL - DEBUG - 1 - "/workspace/email_handler.py:1963" - handle() - bcf2352e-1819-4b8f-b11b-2927f06082ac - Cannot parse Postfix queue ID from None None
+2026-07-14 10:40:53,964 - SL - DEBUG - 1 - "/workspace/email_handler.py:1980" - handle() - bcf2352e-1819-4b8f-b11b-2927f06082ac - ==>> Handle mail_from:probe-sender@example.com, rcpt_tos:['e1@sl.local'], header_from:probe-sender@example.com, header_to:e1@sl.local, cc:None, reply-to:None, message_id:<20260714104053.745039@reverse-code-generator-71c836b7-xjgzz>, client_ip:None, headers:[('Date', 'Tue, 14 Jul 2026 10:40:53 +0000'), ('To', 'e1@sl.local'), ('From', 'probe-sender@example.com'), ('Subject', 'Obj3 forwarding pipeline probe'), ('Message-Id', '<20260714104053.745039@reverse-code-generator-71c836b7-xjgzz>'), ('X-Mailer', 'swaks v20240103.0 jetmore.org/john/code/swaks/'), ('Content-Transfer-Encoding', '7bit')], mail_options:[], rcpt_options:[]
+2026-07-14 10:40:53,969 - SL - DEBUG - 1 - "/workspace/email_handler.py:2202" - handle() - bcf2352e-1819-4b8f-b11b-2927f06082ac - Forward phase probe-sender@example.com(probe-sender@example.com) -> e1@sl.local
+2026-07-14 10:40:53,984 - SL - DEBUG - 1 - "/workspace/email_handler.py:580" - handle_forward() - bcf2352e-1819-4b8f-b11b-2927f06082ac - Create or get contact for from_header:probe-sender@example.com
+2026-07-14 10:40:54,062 - SL - DEBUG - 1 - "/workspace/app/contact_utils.py:110" - create_contact() - bcf2352e-1819-4b8f-b11b-2927f06082ac - Created contact <Contact 2 probe-sender@example.com 5> for alias <Alias 5 e1@sl.local> with email probe-sender@example.com invalid_email=False
+2026-07-14 10:40:54,062 - SL - INFO - 1 - "/workspace/app/handler/dmarc.py:33" - apply_dmarc_policy_for_forward_phase() - bcf2352e-1819-4b8f-b11b-2927f06082ac - DMARC check disabled
+2026-07-14 10:40:54,071 - SL - DEBUG - 1 - "/workspace/email_handler.py:688" - forward_email_to_mailbox() - bcf2352e-1819-4b8f-b11b-2927f06082ac - Forward <Contact 2 probe-sender@example.com 5> -> <Alias 5 e1@sl.local> -> <Mailbox 1 john@wick.com>
+2026-07-14 10:40:54,074 - SL - DEBUG - 1 - "/workspace/email_handler.py:740" - forward_email_to_mailbox() - bcf2352e-1819-4b8f-b11b-2927f06082ac - Create <EmailLog 2> for <Contact 2 probe-sender@example.com 5>, <User 1 John Wick john@wick.com>, <Mailbox 1 john@wick.com>
+2026-07-14 10:40:54,080 - SL - DEBUG - 1 - "/workspace/email_handler.py:867" - forward_email_to_mailbox() - bcf2352e-1819-4b8f-b11b-2927f06082ac - From header, new:"probe-sender at example.com" <probe-sender_at_example_com_ikqfpsb@sl.local>, old:probe-sender@example.com
+2026-07-14 10:40:54,080 - SL - DEBUG - 1 - "/workspace/email_handler.py:316" - replace_header_when_forward() - bcf2352e-1819-4b8f-b11b-2927f06082ac - Delete Cc header, old value None
+2026-07-14 10:40:54,080 - SL - DEBUG - 1 - "/workspace/email_handler.py:313" - replace_header_when_forward() - bcf2352e-1819-4b8f-b11b-2927f06082ac - Replace To header, old: e1@sl.local, new: e1@sl.local
+2026-07-14 10:40:54,080 - SL - INFO - 1 - "/workspace/app/handler/unsubscribe_generator.py:36" - _generate_header_with_original_behaviour() - bcf2352e-1819-4b8f-b11b-2927f06082ac - Email has no unsubscribe header
+2026-07-14 10:40:54,080 - SL - DEBUG - 1 - "/workspace/email_handler.py:893" - forward_email_to_mailbox() - bcf2352e-1819-4b8f-b11b-2927f06082ac - Forward mail from probe-sender@example.com to john@wick.com, mail_options:[], rcpt_options:[]
+2026-07-14 10:40:54,081 - SL - DEBUG - 1 - "/workspace/app/mail_sender.py:131" - send() - bcf2352e-1819-4b8f-b11b-2927f06082ac - send email with subject 'Obj3 forwarding pipeline probe', from '"probe-sender at example.com" <probe-sender_at_example_com_ikqfpsb@sl.local>' to 'e1@sl.local'
+2026-07-14 10:40:54,081 - SL - INFO - 1 - "/workspace/email_handler.py:2367" - _handle() - bcf2352e-1819-4b8f-b11b-2927f06082ac - Finish mail_from probe-sender@example.com, rcpt_tos ['e1@sl.local'], takes 0.1899263858795166 seconds with return code '250 Message accepted for delivery'<<===
 ```
 
 **Correct paths (M4-01).** The DMARC check runs from `app/handler/dmarc.py:33`
@@ -2087,8 +2177,8 @@ at [`email_handler.py:L688`], creates the reverse-alias `Contact` via `create_co
 [`email_handler.py:L732`], logged `Create <EmailLog 2>` at [`email_handler.py:L740`]). Observed DB
 side effects: `email_log` 1 → 2 and `contact` 1 → 2. The pipeline finished in `_handle()`
 [`email_handler.py:L2367`], whose final log line (reproduced verbatim in the block above) ends with
-`return code '250 Message accepted for delivery'` and reports the elapsed
-`takes 0.23475217819213867 seconds`.
+`return code '250 Message accepted for delivery'` and reports the elapsed time — a per-run timing
+value, `0.1899263858795166` seconds in the captured run.
 
 ### 5.4 Event system under the default self-host — dispatch stops at guard #2 (M4-12)
 
@@ -2599,44 +2689,69 @@ irreversible sequences. Before/after SQL is published below.
 
 ### 8.1 Before — accumulated test residue (complete SQL)
 
-Command:
+The test residue below was created exclusively through canonical entry points: two temporary user
+registrations via `POST /auth/register` on :7777 (each creating a `users` row plus its
+`simplelogin-newsletter` alias, verified `mailbox`, and pending `activation_code`), one authenticated
+`POST /dashboard/account_setting` with `form-name=send-full-user-report` as seed `john@wick.com`
+(enqueuing the GDPR-export `job` handled in `app/dashboard/views/account_setting.py:131`), and one
+inbound message via `swaks --to e1@sl.local --from blitzy-ext@example.com --server 127.0.0.1:20381`
+(creating a `contact` + `email_log`).
+
+Command — every displayed output line is produced by a shown command: the `date -u` header line, and
+the `\echo` labels interleaved with their queries inside a single `psql` session:
 
 ```bash
 export PGPASSWORD=mypassword
-psql -h localhost -p 15432 -U myuser -d simplelogin -tA -c "SELECT 'users', count(*) FROM users
-  UNION ALL SELECT 'alias', count(*) FROM alias
-  UNION ALL SELECT 'mailbox', count(*) FROM mailbox
-  UNION ALL SELECT 'contact', count(*) FROM contact
-  UNION ALL SELECT 'email_log', count(*) FROM email_log
-  UNION ALL SELECT 'job', count(*) FROM job
-  UNION ALL SELECT 'sync_event', count(*) FROM sync_event
-  UNION ALL SELECT 'activation_code', count(*) FROM activation_code
-  UNION ALL SELECT 'alias_audit_log', count(*) FROM alias_audit_log
-  UNION ALL SELECT 'user_audit_log', count(*) FROM user_audit_log
-  UNION ALL SELECT 'daily_metric', count(*) FROM daily_metric ORDER BY 1;"
+date -u +'-- BEFORE cleanup (test residue present): %Y-%m-%dT%H:%M:%SZ'
+psql -h localhost -p 15432 -U myuser -d simplelogin -tA <<'SQL'
+\echo -- table row counts (table|count):
+SELECT 'activation_code', count(*) FROM activation_code
+UNION ALL SELECT 'alias', count(*) FROM alias
+UNION ALL SELECT 'alias_audit_log', count(*) FROM alias_audit_log
+UNION ALL SELECT 'contact', count(*) FROM contact
+UNION ALL SELECT 'daily_metric', count(*) FROM daily_metric
+UNION ALL SELECT 'email_log', count(*) FROM email_log
+UNION ALL SELECT 'job', count(*) FROM job
+UNION ALL SELECT 'mailbox', count(*) FROM mailbox
+UNION ALL SELECT 'sync_event', count(*) FROM sync_event
+UNION ALL SELECT 'user_audit_log', count(*) FROM user_audit_log
+UNION ALL SELECT 'users', count(*) FROM users
+ORDER BY 1;
+\echo -- users list (id|email|activated):
+SELECT id,email,activated FROM users ORDER BY id;
+\echo -- daily_metric detail (id|date|nb_new_web_non_proton_user|nb_alias):
+SELECT id,date,nb_new_web_non_proton_user,nb_alias FROM daily_metric ORDER BY id;
+SQL
 ```
 
 Complete, unedited output:
 
 ```text
--- BEFORE cleanup (2026-07-13T19:24:28Z)
-activation_code|11
-alias|28
-alias_audit_log|28
+-- BEFORE cleanup (test residue present): 2026-07-14T11:12:29Z
+-- table row counts (table|count):
+activation_code|2
+alias|13
+alias_audit_log|13
 contact|2
 daily_metric|1
 email_log|2
-job|2
-mailbox|21
+job|1
+mailbox|6
 sync_event|0
 user_audit_log|1
-users|19
--- daily_metric detail:
-1|2026-07-13|17|28
+users|4
+-- users list (id|email|activated):
+1|john@wick.com|t
+2|winston@continental.com|t
+3|blitzy-qa-res1@example.com|f
+4|blitzy-qa-res2@example.com|f
+-- daily_metric detail (id|date|nb_new_web_non_proton_user|nb_alias):
+1|2026-07-14|2|13
 ```
 
-The residue (19 users vs the baseline 2, 28 aliases vs 11, 2 jobs, 11 activation codes, a
-`daily_metric` of `17/28` vs `0/11`, etc.) confirms the environment was genuinely dirty — matching
+The residue (4 users vs the baseline 2, 13 aliases vs 11, 1 job, 2 activation codes, a
+`daily_metric` of `2/13` vs `0/11`, the two `blitzy-qa-res*` accounts still unactivated, plus one
+extra `contact`/`email_log` from the forward) confirms the environment was genuinely dirty — matching
 what M4-13 flagged. `sync_event` stayed `0` throughout, corroborating the default event no-op (§5.4).
 
 ### 8.2 Canonical reset — stop app containers, drop schema, migrate, seed
@@ -2758,7 +2873,10 @@ GRANT
 
 Step 3 — re-run the canonical migrate + seed (`ALEMBIC_EXIT=0`, `SEED_EXIT=0`). This is the identical
 flow whose complete transcript is embedded verbatim in §2.6; the full migration log is reproduced
-again below for this second (cleanup) run:
+again below for this second (cleanup) run. The 264-line migration chain is deterministic and
+byte-identical on every run (it always ends at head `32f25cbf12f6`); the only values that vary
+run-to-run are the per-run `GNUPGHOME` temp-directory names, the log timestamps, and the randomly
+generated seed identifiers — the demo alias email and the two `demo*` OAuth client IDs:
 
 ```bash
 REPO=/tmp/blitzy/app/blitzy-d7c2d64b-4eea-4bae-9c05-a7e6d6e3887f_243015
@@ -2774,10 +2892,10 @@ Complete, unedited `alembic upgrade head` output:
 >>> URL: http://localhost:7777
 MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value
 Paddle param not set
-WARNING: Use a temp directory for GNUPGHOME /tmp/ohxvtrhuvxgdfdqgmsgt
+WARNING: Use a temp directory for GNUPGHOME /tmp/xrijhsvyvyfuwipcowjc
 Upload files to local dir
 >>> init logging <<<
-2026-07-13 19:24:56,346 - SL - DEBUG - 1 - "/workspace/app/utils.py:17" - <module>() -  - load words file: /workspace/local_data/test_words.txt
+2026-07-14 11:12:52,027 - SL - DEBUG - 1 - "/workspace/app/utils.py:17" - <module>() -  - load words file: /workspace/local_data/test_words.txt
 INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
 INFO  [alembic.runtime.migration] Will assume transactional DDL.
 INFO  [alembic.runtime.migration] Running upgrade  -> 5e549314e1e2, empty message
@@ -3043,38 +3161,70 @@ Complete, unedited `flask dummy-data` output:
 >>> URL: http://localhost:7777
 MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value
 Paddle param not set
-WARNING: Use a temp directory for GNUPGHOME /tmp/uvyycwuezfmfqefykqen
+WARNING: Use a temp directory for GNUPGHOME /tmp/nppfbfrerpflmxhfneze
 Upload files to local dir
 >>> init logging <<<
-2026-07-13 19:24:58,802 - SL - DEBUG - 1 - "/workspace/app/utils.py:17" - <module>() -  - load words file: /workspace/local_data/test_words.txt
-2026-07-13 19:25:00,747 - SL - WARNING - 1 - "/workspace/server.py:494" - dummy_data() -  - reset db, add fake data
-2026-07-13 19:25:00,747 - SL - DEBUG - 1 - "/workspace/app/fake_data.py:41" - fake_data() -  - create fake data
-2026-07-13 19:25:01,134 - SL - INFO - 1 - "/workspace/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
-2026-07-13 19:25:01,138 - SL - DEBUG - 1 - "/workspace/app/models.py:647" - create() -  - Disable onboarding emails
-2026-07-13 19:25:01,158 - SL - DEBUG - 1 - "/workspace/app/models.py:1459" - generate_random_alias_email() -  - generate email tautly_fungal677@sl.local
-2026-07-13 19:25:01,169 - SL - INFO - 1 - "/workspace/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
-2026-07-13 19:25:01,240 - SL - INFO - 1 - "/workspace/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
-2026-07-13 19:25:01,249 - SL - INFO - 1 - "/workspace/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
-2026-07-13 19:25:01,268 - SL - INFO - 1 - "/workspace/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
-2026-07-13 19:25:01,280 - SL - INFO - 1 - "/workspace/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
-2026-07-13 19:25:01,295 - SL - INFO - 1 - "/workspace/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
-2026-07-13 19:25:01,303 - SL - INFO - 1 - "/workspace/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
-2026-07-13 19:25:01,314 - SL - DEBUG - 1 - "/workspace/app/models.py:1255" - generate_oauth_client_id() -  - generate oauth_client_id demo-hzgudzjrik
-2026-07-13 19:25:01,322 - SL - DEBUG - 1 - "/workspace/app/models.py:1255" - generate_oauth_client_id() -  - generate oauth_client_id demo2-izabrlzjyj
-2026-07-13 19:25:01,595 - SL - INFO - 1 - "/workspace/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
-2026-07-13 19:25:01,597 - SL - DEBUG - 1 - "/workspace/app/models.py:647" - create() -  - Disable onboarding emails
-2026-07-13 19:25:01,620 - SL - INFO - 1 - "/workspace/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
-2026-07-13 19:25:01,632 - SL - INFO - 1 - "/workspace/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
-2026-07-13 19:25:01,642 - SL - INFO - 1 - "/workspace/init_app.py:44" - add_sl_domains() -  - Add sl.local to SL domain
+2026-07-14 11:12:54,426 - SL - DEBUG - 1 - "/workspace/app/utils.py:17" - <module>() -  - load words file: /workspace/local_data/test_words.txt
+2026-07-14 11:12:56,358 - SL - WARNING - 1 - "/workspace/server.py:494" - dummy_data() -  - reset db, add fake data
+2026-07-14 11:12:56,358 - SL - DEBUG - 1 - "/workspace/app/fake_data.py:41" - fake_data() -  - create fake data
+2026-07-14 11:12:56,742 - SL - INFO - 1 - "/workspace/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-14 11:12:56,746 - SL - DEBUG - 1 - "/workspace/app/models.py:647" - create() -  - Disable onboarding emails
+2026-07-14 11:12:56,765 - SL - DEBUG - 1 - "/workspace/app/models.py:1459" - generate_random_alias_email() -  - generate email dashes_shafts127@sl.local
+2026-07-14 11:12:56,776 - SL - INFO - 1 - "/workspace/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-14 11:12:56,829 - SL - INFO - 1 - "/workspace/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-14 11:12:56,838 - SL - INFO - 1 - "/workspace/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-14 11:12:56,855 - SL - INFO - 1 - "/workspace/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-14 11:12:56,867 - SL - INFO - 1 - "/workspace/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-14 11:12:56,882 - SL - INFO - 1 - "/workspace/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-14 11:12:56,891 - SL - INFO - 1 - "/workspace/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-14 11:12:56,901 - SL - DEBUG - 1 - "/workspace/app/models.py:1255" - generate_oauth_client_id() -  - generate oauth_client_id demo-pkiodymuej
+2026-07-14 11:12:56,909 - SL - DEBUG - 1 - "/workspace/app/models.py:1255" - generate_oauth_client_id() -  - generate oauth_client_id demo2-bslnwmhvro
+2026-07-14 11:12:57,181 - SL - INFO - 1 - "/workspace/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-14 11:12:57,183 - SL - DEBUG - 1 - "/workspace/app/models.py:647" - create() -  - Disable onboarding emails
+2026-07-14 11:12:57,205 - SL - INFO - 1 - "/workspace/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-14 11:12:57,218 - SL - INFO - 1 - "/workspace/app/events/event_dispatcher.py:62" - send_event() -  - Not sending events because webhook is not configured and allowed to be empty
+2026-07-14 11:12:57,228 - SL - INFO - 1 - "/workspace/init_app.py:44" - add_sl_domains() -  - Add sl.local to SL domain
 ```
 
 ### 8.3 After — pristine baseline restored (complete SQL)
 
-The same count query as §8.1 was re-run:
+The same self-documenting query block as §8.1 was re-run — every displayed line is produced by a shown
+command (the `date -u` header line, the `\echo` labels, and their queries inside one `psql` session),
+with the alembic head selected first to prove the schema is still at head:
+
+```bash
+export PGPASSWORD=mypassword
+date -u +'-- AFTER cleanup (seed baseline restored): %Y-%m-%dT%H:%M:%SZ'
+psql -h localhost -p 15432 -U myuser -d simplelogin -tA <<'SQL'
+\echo -- alembic head (version_num):
+SELECT version_num FROM alembic_version;
+\echo -- table row counts (table|count):
+SELECT 'activation_code', count(*) FROM activation_code
+UNION ALL SELECT 'alias', count(*) FROM alias
+UNION ALL SELECT 'alias_audit_log', count(*) FROM alias_audit_log
+UNION ALL SELECT 'contact', count(*) FROM contact
+UNION ALL SELECT 'daily_metric', count(*) FROM daily_metric
+UNION ALL SELECT 'email_log', count(*) FROM email_log
+UNION ALL SELECT 'job', count(*) FROM job
+UNION ALL SELECT 'mailbox', count(*) FROM mailbox
+UNION ALL SELECT 'sync_event', count(*) FROM sync_event
+UNION ALL SELECT 'user_audit_log', count(*) FROM user_audit_log
+UNION ALL SELECT 'users', count(*) FROM users
+ORDER BY 1;
+\echo -- users list (id|email|activated):
+SELECT id,email,activated FROM users ORDER BY id;
+\echo -- daily_metric detail (id|date|nb_new_web_non_proton_user|nb_alias):
+SELECT id,date,nb_new_web_non_proton_user,nb_alias FROM daily_metric ORDER BY id;
+SQL
+```
+
+Complete, unedited output:
 
 ```text
--- AFTER cleanup (2026-07-13T19:25:14Z) — schema head + counts
+-- AFTER cleanup (seed baseline restored): 2026-07-14T11:13:28Z
+-- alembic head (version_num):
 32f25cbf12f6
+-- table row counts (table|count):
 activation_code|0
 alias|11
 alias_audit_log|11
@@ -3086,61 +3236,98 @@ mailbox|4
 sync_event|0
 user_audit_log|0
 users|2
--- users list:
+-- users list (id|email|activated):
 1|john@wick.com|t
 2|winston@continental.com|t
--- daily_metric detail:
-1|2026-07-13|0|11
+-- daily_metric detail (id|date|nb_new_web_non_proton_user|nb_alias):
+1|2026-07-14|0|11
 ```
 
 **This matches the §2.7 pristine baseline exactly** — `users=2` (only `john@wick.com` and
 `winston@continental.com`), `alias=11`, `mailbox=4`, `contact=1`, `email_log=1`, `job=0`,
 `sync_event=0`, `activation_code=0`, `alias_audit_log=11`, `user_audit_log=0`, `daily_metric=1` with
-row `1|2026-07-13|0|11`, at alembic head `32f25cbf12f6`. All temporary rows are gone.
+row `1|2026-07-14|0|11`, at alembic head `32f25cbf12f6`. All temporary rows are gone.
 
-### 8.4 Read-only guarantee — git proof
+### 8.4 Read-only guarantee — git proof and cleanup
 
-The application containers were restarted so the environment is left live:
+The application containers are restarted so the environment is left live. Because `docker ps`
+lists only running containers, printing their names is itself the liveness proof; the volatile
+`Up …` uptime column is intentionally omitted with `--format '{{.Names}}'` for a stable capture.
+The first three lines are echoed by `docker start` (in argument order); the last five are the sorted
+`docker ps` listing:
 
 ```bash
 docker start sl-web sl-email sl-jobs
-docker ps --format '{{.Names}}\t{{.Status}}' | grep sl- | sort
+docker ps --filter name=sl- --format '{{.Names}}' | sort
 ```
 
 ```text
 sl-web
 sl-email
 sl-jobs
-sl-email	Up About a minute
-sl-jobs	Up About a minute
-sl-postgres	Up 3 hours
-sl-redis	Up 3 hours
-sl-web	Up About a minute
+sl-email
+sl-jobs
+sl-postgres
+sl-redis
+sl-web
 ```
 
-The source tree is unchanged apart from this single documentation file:
+The source tree is unchanged apart from this single documentation file. Each `---` separator line
+below is produced by an `echo` in the command block (git emits none of its own), so the text block
+is exactly what the commands print. The exact insertion/deletion counts of `git diff --stat` are
+deliberately not shown: they are self-referential (editing this very section changes them), so the
+dispositive, stable proof used here is the `git status --porcelain` line — a single modified file:
 
 ```bash
-git status --porcelain
-git diff --stat
-git ls-files --others --exclude-standard   # untracked, excluding .gitignore
+echo '--- tracked changes (git status --porcelain -uno) ---'
+git -c core.fsmonitor=false status --porcelain -uno
+echo '--- untracked paths, grouped by top-level directory (count path) ---'
+git -c core.fsmonitor=false ls-files --others --exclude-standard | cut -d/ -f1-2 | sort | uniq -c
 ```
 
 ```text
---- git status --porcelain ---
+--- tracked changes (git status --porcelain -uno) ---
  M blitzy/documentation/app_2cd6ee777f8c.md
---- git diff --stat ---
- blitzy/documentation/app_2cd6ee777f8c.md | 3660 +++++++++++++++++++++++-------
- 1 file changed, 2857 insertions(+), 803 deletions(-)
---- untracked (excluding ignored) ---
-(none)
+--- untracked paths, grouped by top-level directory (count path) ---
+     45 blitzy/lighthouse
+      4 blitzy/screen_recordings
+    205 blitzy/screenshots
 ```
 
-Exactly one tracked file is modified — `blitzy/documentation/app_2cd6ee777f8c.md` — and there are no
-untracked files in the repository. (The `git diff --stat` insertion/deletion counts above are a
-point-in-time snapshot captured while this section was being written; the file grew slightly as §8
-was appended. The dispositive, stable fact is the `git status --porcelain` line — a single modified
-file.) No SimpleLogin source, test, configuration, `pyproject.toml`, or `poetry.lock` file was
-changed. The `.env` used for the run is git-ignored (§2.4). All temporary
-observation scripts live under `/tmp/obs` (outside the repository) and are removed at the end of the
-investigation. The read-only requirement of rule `SWE-AtlasQnA-Repo` is satisfied.
+`git status --porcelain -uno` shows exactly one tracked modification — the deliverable
+`blitzy/documentation/app_2cd6ee777f8c.md`. The only untracked paths are automated QA/tooling
+outputs under `blitzy/` (Lighthouse reports, screenshots, and screen recordings emitted by the
+test harness); they are not SimpleLogin source, are not part of this deliverable, and are not
+committed. No SimpleLogin source, test, configuration, `pyproject.toml`, or `poetry.lock` file was
+changed, and the `.env` used for the run is git-ignored (§2.4).
+
+Redis holds no residual keys from the run — the default local configuration leaves `MEM_STORE_URI`
+unset, so flask-limiter uses its in-memory fallback and the application never writes to Redis; the
+sidecar is nonetheless live (`DBSIZE` = `0`, `PING` = `PONG`):
+
+```bash
+redis-cli -p 6379 DBSIZE
+redis-cli -p 6379 PING
+```
+
+```text
+0
+PONG
+```
+
+Finally, the temporary observation scripts — all under `/tmp/obs`, outside the repository — are
+removed, and their absence is verified:
+
+```bash
+rm -rf /tmp/obs
+ls -d /tmp/obs 2>&1 || true
+```
+
+```text
+ls: cannot access '/tmp/obs': No such file or directory
+```
+
+The read-only requirement of rule `SWE-AtlasQnA-Repo` is satisfied: the repository's only tracked
+change is this one documentation file; all temporary DB rows created for the walkthroughs were
+removed by the §8.2 canonical reset (§8.3 confirms the pristine baseline); and all temporary
+observation scripts are deleted.
