@@ -848,7 +848,7 @@ http_code=400
 Activation code cannot be found
 ```
 
-- **Expired code** → *"Activation code was expired"* at [app/auth/views/activate.py:L38-L46] (the `elif activation_code.is_expired():` branch, where `is_expired()` compares `self.expired < arrow.now()` at [app/models.py:L1214]). To exercise this branch we inserted a temporary `ActivationCode` whose `expired` timestamp is in the past (this row is removed in §Q4):
+- **Expired code** → *"Activation code was expired"* at [app/auth/views/activate.py:L38-L46] (the `if activation_code.is_expired():` branch — a plain `if` that functions as an effective else-if because the preceding not-found block at [app/auth/views/activate.py:L28-L36] `return`s first — where `is_expired()` compares `self.expired < arrow.now()` at [app/models.py:L1214]). To exercise this branch we inserted a temporary `ActivationCode` whose `expired` timestamp is in the past (this row is removed in §Q4):
 
 ```bash
 docker exec sl-canonical bash -c 'cd /app && source /app/venv/bin/activate && CONFIG=/root/sl.env python3 - <<PY 2>/dev/null
@@ -1489,8 +1489,8 @@ Rule 4 asks for a closing coverage pass. The tables below map every item named i
 
 | Named item | Answered in | Observed signal |
 |------------|-------------|-----------------|
-| Flask dev-server startup banner | Q1.1 | `* Running on http://127.0.0.1:7777/` (Werkzeug/1.0.1) |
-| `>>> init logging <<<` (SL logger init) | Q1.1 | emitted once during app import via `app/log.py` |
+| Flask dev-server startup banner | Q1.1 | `* Serving Flask app "server" (lazy loading)` / `* Environment: production` / `* Debug mode: on` (the classic `* Running on …` line is suppressed because the Werkzeug logger is disabled at [app/log.py:L70-L71]; Werkzeug/1.0.1 confirmed via the `Server:` header — see §Q1.1) |
+| `>>> init logging <<<` (SL logger init) | Q1.1 | emitted once per app import via `app/log.py` (twice total under the debug reloader — see §Q1.1) |
 | Unauthenticated `GET /` redirect | Q1.2 | `302` → `Location: /auth/login`, then `200` on the login page |
 | `/git` health endpoint | Q1.3 | `200` returning build `SHA1` (`dev`) |
 | `/live` health endpoint | Q1.3 | `200` returning `live` |
