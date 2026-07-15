@@ -14,14 +14,17 @@
 
 > **Evidence discipline (read this before the captures).** Every behavioral claim below is
 > immediately preceded by the **exact command** that produced it and followed by the
-> **complete captured output**. The captures are reproduced **verbatim** with a single,
-> disclosed, mechanical normalization: **non-semantic trailing whitespace is trimmed** on each
-> line so the Markdown stays `git diff --check`-clean (this is a byte-level hygiene step only;
-> **no content is elided, summarized, annotated, or truncated** — every SQL column, every
-> stack frame, every log line, and every SMTP reply is present in full). Nothing is redacted:
-> the one session cookie shown in §2.3 is a throwaway development cookie signed with the
-> **public** `example.env` value `FLASK_SECRET=secret` inside a disposable container, so it is
-> non-sensitive and is printed raw. Values that are **not** a real-path capture are explicitly
+> **complete captured output**. The captures are reproduced **verbatim** except for two
+> disclosed transformations: (1) **non-semantic trailing whitespace is trimmed** on each line
+> so the Markdown stays `git diff --check`-clean (a byte-level hygiene step only); and (2)
+> **exactly one value is redacted** — the signed `slapp` session-cookie token in §2.3(d) is
+> shown as `<redacted>` (its non-sensitive attributes are kept, and its decoded payload —
+> session flags plus a CSRF token, **no PII** — is disclosed in prose there). Apart from that
+> single redaction, **no content is elided, summarized, or truncated** — every SQL column,
+> every stack frame, every log line, and every SMTP reply is present in full. The redacted
+> cookie is a throwaway development token signed with the **public** `example.env` value
+> `FLASK_SECRET=secret` inside a disposable container, so the redaction is a repo-hygiene
+> measure, not a secrecy requirement. Values that are **not** a real-path capture are explicitly
 > labeled `DB-layer stand-in` or `INFERRED (from code)`.
 
 ## Direct answers at a glance
@@ -126,10 +129,13 @@ Runtime configuration is environment-driven through python-dotenv; the loader re
 named by `CONFIG` (else `./.env`) [app/config.py:65-71]. Five variables are read with bare
 `os.environ[...]` subscripts, so a missing value raises `KeyError` at import time; all five
 are present in `example.env`. The observation config `/tmp/obs.env` is a **byte-for-byte copy**
-of `example.env` (identical SHA-256), created **outside** the repository and never committed:
+of `example.env` (identical SHA-256), created **outside** the repository with restrictive `0600`
+permissions (never world-readable) and never committed:
 
 ```text
-$ cp /app/example.env /tmp/obs.env
+$ install -m 600 /app/example.env /tmp/obs.env
+$ stat -c '%a' /tmp/obs.env
+600
 $ cmp /app/example.env /tmp/obs.env && echo IDENTICAL
 IDENTICAL
 $ sha256sum /app/example.env /tmp/obs.env
@@ -480,11 +486,20 @@ HTTP/1.0 200 OK
 Content-Type: text/html; charset=utf-8
 Content-Length: 350142
 Vary: Cookie
-Set-Cookie: slapp=eyJfZnJlc2giOmZhbHNlLCJfcGVybWFuZW50Ijp0cnVlLCJjc3JmX3Rva2VuIjoiNmMyYzI5ZGY4YzEwYTkyMjZhODkwODkyZTM4MmMzN2RkNDZkYjllYiJ9.alaobw.U542RdGncuEpQsMspyUlM3Xj18E; Expires=Tue, 21-Jul-2026 21:21:51 GMT; HttpOnly; Path=/; SameSite=Lax
+Set-Cookie: slapp=<redacted>; Expires=Tue, 21-Jul-2026 21:21:51 GMT; HttpOnly; Path=/; SameSite=Lax
 Server: Werkzeug/1.0.1 Python/3.10.18
 Date: Tue, 14 Jul 2026 21:21:51 GMT
 client-UTC-after:  2026-07-14T21:21:51Z
 ```
+
+> **Cookie value redacted (the single redaction in this document).** The `slapp` value on the
+> `Set-Cookie` line above is shown as `<redacted>`. It was a signed Flask session cookie whose
+> decoded payload contained only session flags plus a CSRF token
+> (`{"_fresh": false, "_permanent": true, "csrf_token": "<40-hex>"}`) — **no user identity or
+> PII**. It was signed with the **public** `example.env` value `FLASK_SECRET=secret` inside a
+> disposable container, so it grants nothing; the raw signed token is redacted purely as a
+> repo-hygiene measure. Its non-sensitive attributes (`Expires`, `HttpOnly`, `Path`,
+> `SameSite=Lax`) are shown verbatim.
 
 ```text
 2026-07-14 21:21:51,346 - SL - DEBUG - 399 - "/app/server.py:284" - after_request() -  - 127.0.0.1 GET /auth/login ImmutableMultiDict([]) 200, takes 0.1103360652923584
@@ -1232,7 +1247,6 @@ the web + email PIDs 681, 703, 731):
 ```text
 $ fuser 7777/tcp 20381/tcp   # owners; must NOT include job pid 769
    681   703   731
-$ ls -1 /proc/769/fd | wc -l  (job has fds but no listening socket on 7777/20381)
 ```
 
 ### 3.8 Production web alternative — gunicorn (real banner, OBSERVED)
@@ -1242,7 +1256,7 @@ Beyond the dev server, the Dockerfile CMD is `gunicorn wsgi:app -b 0.0.0.0:7777 
 live in the canonical image), not inferred:
 
 ```text
-$ gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15   (from Dockerfile:47)
+$ /app/venv/bin/gunicorn wsgi:app -b 0.0.0.0:7777 -w 2 --timeout 15
 [2026-07-14 21:26:42 +0000] [860] [INFO] Starting gunicorn 20.0.4
 [2026-07-14 21:26:42 +0000] [860] [INFO] Listening at: http://0.0.0.0:7777 (860)
 [2026-07-14 21:26:42 +0000] [860] [INFO] Using worker: sync
@@ -1324,16 +1338,17 @@ CONFIG=/tmp/obs.env nohup /app/venv/bin/python email_handler.py > /tmp/req3_emai
 ```
 
 The sender script is reproduced in full (it lives under `/tmp`, outside the repo, and is removed
-on completion — §5). It targets the **real** aiosmtpd listener on `127.0.0.1:20381` and uses
-`set_debuglevel(1)` so smtplib echoes the exact server replies verbatim:
+on completion — §5). It targets the **real** aiosmtpd listener on `127.0.0.1:20381` and calls
+`set_debuglevel(1)` **before** `connect()` so smtplib echoes the server's opening `220`
+greeting through the closing `QUIT` — the complete SMTP dialogue verbatim:
 
 **`/tmp/req3_send.py`**:
 
 ```python
 """REQ-3: send an inbound message to x@sl.local through the REAL aiosmtpd entry point
 on 127.0.0.1:20381, from a NORMAL (non-ignore-bounce) sender, and print the full SMTP
-transcript. set_debuglevel(1) makes smtplib echo every command/reply to stderr, so the
-exact 550 reply after DATA is captured verbatim.
+transcript. Debugging is enabled with set_debuglevel(1) BEFORE connect() so smtplib
+echoes the server's opening 220 greeting through the closing QUIT — the complete dialogue.
 """
 import smtplib
 from email.message import EmailMessage
@@ -1344,8 +1359,9 @@ msg["To"] = "x@sl.local"
 msg["Subject"] = "test"
 msg.set_content("hi")
 
-s = smtplib.SMTP("127.0.0.1", 20381, timeout=15)
-s.set_debuglevel(1)  # echo full SMTP dialogue
+s = smtplib.SMTP()          # do NOT connect yet
+s.set_debuglevel(1)         # enable debug FIRST so the 220 greeting is echoed
+s.connect("127.0.0.1", 20381)
 try:
     s.sendmail("someone@example.com", ["x@sl.local"], msg.as_bytes())
     print("RESULT: sendmail returned without exception (unexpected)")
@@ -1369,7 +1385,272 @@ $ DB_URI=postgresql://myuser:mypassword@localhost:5432/simplelogin /tmp/reset_db
 RESET DONE: fresh empty simplelogin
 reset_exit=0
 $ CONFIG=/tmp/obs.env /app/venv/bin/alembic upgrade head ; echo alembic_exit=$?
-alembic_exit=0   # (255 "Running upgrade" lines — full log identical in form to §3.2)
+load config file /tmp/obs.env
+>>> URL: http://localhost:7777
+MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value
+Paddle param not set
+WARNING: Use a temp directory for GNUPGHOME /tmp/gpswmlorvqgeuvtgnuwu
+Upload files to local dir
+>>> init logging <<<
+2026-07-15 02:30:52,915 - SL - DEBUG - 327 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+INFO  [alembic.runtime.migration] Running upgrade  -> 5e549314e1e2, empty message
+INFO  [alembic.runtime.migration] Running upgrade 5e549314e1e2 -> 3cd10cfce8c3, empty message
+INFO  [alembic.runtime.migration] Running upgrade 3cd10cfce8c3 -> 0256244cd7c8, empty message
+INFO  [alembic.runtime.migration] Running upgrade 0256244cd7c8 -> 213fcca48483, empty message
+INFO  [alembic.runtime.migration] Running upgrade 213fcca48483 -> f234688f5ebd, empty message
+INFO  [alembic.runtime.migration] Running upgrade f234688f5ebd -> d03e433dc248, empty message
+INFO  [alembic.runtime.migration] Running upgrade d03e433dc248 -> 2fe19381f386, empty message
+INFO  [alembic.runtime.migration] Running upgrade 2fe19381f386 -> b20ee72fd9a4, empty message
+INFO  [alembic.runtime.migration] Running upgrade b20ee72fd9a4 -> 590d89f981c0, empty message
+INFO  [alembic.runtime.migration] Running upgrade 590d89f981c0 -> 551c4e6d4a8b, empty message
+INFO  [alembic.runtime.migration] Running upgrade 551c4e6d4a8b -> c6e7fc37ad42, empty message
+INFO  [alembic.runtime.migration] Running upgrade c6e7fc37ad42 -> 1b7d161d1012, empty message
+INFO  [alembic.runtime.migration] Running upgrade 1b7d161d1012 -> 507afb2632cc, empty message
+INFO  [alembic.runtime.migration] Running upgrade 507afb2632cc -> 4fac8c8a704c, empty message
+INFO  [alembic.runtime.migration] Running upgrade 4fac8c8a704c -> c79c702a1f23, empty message
+INFO  [alembic.runtime.migration] Running upgrade c79c702a1f23 -> 5fa68bafae72, empty message
+INFO  [alembic.runtime.migration] Running upgrade 5fa68bafae72 -> 4a640c170d02, empty message
+INFO  [alembic.runtime.migration] Running upgrade 4a640c170d02 -> 2e2b53afd819, empty message
+INFO  [alembic.runtime.migration] Running upgrade 2e2b53afd819 -> 6bbda4685999, empty message
+INFO  [alembic.runtime.migration] Running upgrade 6bbda4685999 -> d68a2d971b70, empty message
+INFO  [alembic.runtime.migration] Running upgrade d68a2d971b70 -> 0a89c670fc7a, empty message
+INFO  [alembic.runtime.migration] Running upgrade 0a89c670fc7a -> 3ebfbaeb76c0, empty message
+INFO  [alembic.runtime.migration] Running upgrade 3ebfbaeb76c0 -> 83f4dbe125c4, empty message
+INFO  [alembic.runtime.migration] Running upgrade 83f4dbe125c4 -> e505cb517589, empty message
+INFO  [alembic.runtime.migration] Running upgrade e505cb517589 -> e83298198ca5, empty message
+INFO  [alembic.runtime.migration] Running upgrade e83298198ca5 -> 3a87573bf8a8, empty message
+INFO  [alembic.runtime.migration] Running upgrade 3a87573bf8a8 -> a8d8aa307b8b, empty message
+INFO  [alembic.runtime.migration] Running upgrade a8d8aa307b8b -> 0b28518684ae, empty message
+INFO  [alembic.runtime.migration] Running upgrade 0b28518684ae -> 5e868298fee7, empty message
+INFO  [alembic.runtime.migration] Running upgrade 5e868298fee7 -> 2d2fc3e826af, empty message
+INFO  [alembic.runtime.migration] Running upgrade 2d2fc3e826af -> 0c7f1a48aac9, empty message
+INFO  [alembic.runtime.migration] Running upgrade 0c7f1a48aac9 -> 18e934d58f55, empty message
+INFO  [alembic.runtime.migration] Running upgrade 18e934d58f55 -> 9e1b06b9df13, empty message
+INFO  [alembic.runtime.migration] Running upgrade 9e1b06b9df13 -> d4e4488a0032, empty message
+INFO  [alembic.runtime.migration] Running upgrade d4e4488a0032 -> e409f6214b2b, empty message
+INFO  [alembic.runtime.migration] Running upgrade e409f6214b2b -> 696e17c13b8b, empty message
+INFO  [alembic.runtime.migration] Running upgrade 696e17c13b8b -> a8b996f0be40, empty message
+INFO  [alembic.runtime.migration] Running upgrade a8b996f0be40 -> 10ad2dbaeccf, empty message
+INFO  [alembic.runtime.migration] Running upgrade 10ad2dbaeccf -> 01f808f15b2e, empty message
+INFO  [alembic.runtime.migration] Running upgrade 01f808f15b2e -> d29cca963221, empty message
+INFO  [alembic.runtime.migration] Running upgrade d29cca963221 -> ba6f13ccbabb, empty message
+INFO  [alembic.runtime.migration] Running upgrade ba6f13ccbabb -> 7c39ba4ec38d, empty message
+INFO  [alembic.runtime.migration] Running upgrade 7c39ba4ec38d -> 9c976df9b9c4, empty message
+INFO  [alembic.runtime.migration] Running upgrade 9c976df9b9c4 -> b9f849432543, empty message
+INFO  [alembic.runtime.migration] Running upgrade b9f849432543 -> 6664d75ce3d4, empty message
+INFO  [alembic.runtime.migration] Running upgrade 6664d75ce3d4 -> 3c9542fc54e9, empty message
+INFO  [alembic.runtime.migration] Running upgrade 3c9542fc54e9 -> 3fa3a648c8e7, empty message
+INFO  [alembic.runtime.migration] Running upgrade 3fa3a648c8e7 -> 903ec5f566e8, empty message
+INFO  [alembic.runtime.migration] Running upgrade 903ec5f566e8 -> f580030d9beb, empty message
+INFO  [alembic.runtime.migration] Running upgrade f580030d9beb -> e3cb44b953f2, empty message
+INFO  [alembic.runtime.migration] Running upgrade e3cb44b953f2 -> 75093e7ded27, empty message
+INFO  [alembic.runtime.migration] Running upgrade 75093e7ded27 -> 5f191273d067, empty message
+INFO  [alembic.runtime.migration] Running upgrade 5f191273d067 -> 7eef64ffb398, empty message
+INFO  [alembic.runtime.migration] Running upgrade 7eef64ffb398 -> 235355381f53, empty message
+INFO  [alembic.runtime.migration] Running upgrade 235355381f53 -> 628a5438295c, empty message
+INFO  [alembic.runtime.migration] Running upgrade 628a5438295c -> 11a35b448f83, empty message
+INFO  [alembic.runtime.migration] Running upgrade 11a35b448f83 -> 9081f1a90939, empty message
+INFO  [alembic.runtime.migration] Running upgrade 9081f1a90939 -> 91b69dfad2f1, empty message
+INFO  [alembic.runtime.migration] Running upgrade 91b69dfad2f1 -> 7744c5c16159, empty message
+INFO  [alembic.runtime.migration] Running upgrade 7744c5c16159 -> 14167121af69, empty message
+INFO  [alembic.runtime.migration] Running upgrade 14167121af69 -> 6e061eb84167, empty message
+INFO  [alembic.runtime.migration] Running upgrade 6e061eb84167 -> e9395fe234a4, empty message
+INFO  [alembic.runtime.migration] Running upgrade e9395fe234a4 -> 0809266d08ca, empty message
+INFO  [alembic.runtime.migration] Running upgrade 0809266d08ca -> f4b8232fa17e, empty message
+INFO  [alembic.runtime.migration] Running upgrade f4b8232fa17e -> dbd80d290f04, empty message
+INFO  [alembic.runtime.migration] Running upgrade dbd80d290f04 -> 4e4a759ac4b5, empty message
+INFO  [alembic.runtime.migration] Running upgrade 4e4a759ac4b5 -> 30c13ca016e4, empty message
+INFO  [alembic.runtime.migration] Running upgrade 30c13ca016e4 -> 541ce53ab6e9, empty message
+INFO  [alembic.runtime.migration] Running upgrade 541ce53ab6e9 -> 67c61eead8d2, empty message
+INFO  [alembic.runtime.migration] Running upgrade 67c61eead8d2 -> 224fd8963462, empty message
+INFO  [alembic.runtime.migration] Running upgrade 224fd8963462 -> 92baf66b268b, empty message
+INFO  [alembic.runtime.migration] Running upgrade 92baf66b268b -> 497cfd2a02e2, empty message
+INFO  [alembic.runtime.migration] Running upgrade 497cfd2a02e2 -> ea30c0b5b2e3, empty message
+INFO  [alembic.runtime.migration] Running upgrade ea30c0b5b2e3 -> bfd7b2302903, empty message
+INFO  [alembic.runtime.migration] Running upgrade bfd7b2302903 -> 57ef03f3ac34, empty message
+INFO  [alembic.runtime.migration] Running upgrade 57ef03f3ac34 -> dd911f880b75, empty message
+INFO  [alembic.runtime.migration] Running upgrade dd911f880b75 -> bd05eac83f5f, empty message
+INFO  [alembic.runtime.migration] Running upgrade bd05eac83f5f -> b4146f7d5277, empty message
+INFO  [alembic.runtime.migration] Running upgrade b4146f7d5277 -> f939d67374e4, empty message
+INFO  [alembic.runtime.migration] Running upgrade f939d67374e4 -> de1b457472e0, empty message
+INFO  [alembic.runtime.migration] Running upgrade de1b457472e0 -> ae94fe5c4e9f, empty message
+INFO  [alembic.runtime.migration] Running upgrade ae94fe5c4e9f -> 026e7a782ed6, empty message
+INFO  [alembic.runtime.migration] Running upgrade 026e7a782ed6 -> 925b93d92809, empty message
+INFO  [alembic.runtime.migration] Running upgrade 925b93d92809 -> bdf76f4b65a2, empty message
+INFO  [alembic.runtime.migration] Running upgrade bdf76f4b65a2 -> a3a7c518ea70, empty message
+INFO  [alembic.runtime.migration] Running upgrade a3a7c518ea70 -> a5e3c6693dc6, empty message
+INFO  [alembic.runtime.migration] Running upgrade a5e3c6693dc6 -> bf11ab2f0a7a, empty message
+INFO  [alembic.runtime.migration] Running upgrade bf11ab2f0a7a -> 1759f73274ee, empty message
+INFO  [alembic.runtime.migration] Running upgrade 1759f73274ee -> 552d735a2f1f, empty message
+INFO  [alembic.runtime.migration] Running upgrade 552d735a2f1f -> 5cad8fa84386, empty message
+INFO  [alembic.runtime.migration] Running upgrade 5cad8fa84386 -> c31cdf879ee3, empty message
+INFO  [alembic.runtime.migration] Running upgrade c31cdf879ee3 -> 659d979b64ce, empty message
+INFO  [alembic.runtime.migration] Running upgrade 659d979b64ce -> ce15cf3467b4, empty message
+INFO  [alembic.runtime.migration] Running upgrade ce15cf3467b4 -> 0e08145f0499, empty message
+INFO  [alembic.runtime.migration] Running upgrade 0e08145f0499 -> 00532ac6d4bc, empty message
+INFO  [alembic.runtime.migration] Running upgrade 00532ac6d4bc -> f680032cc361, empty message
+INFO  [alembic.runtime.migration] Running upgrade f680032cc361 -> 10a7947fda6b, empty message
+INFO  [alembic.runtime.migration] Running upgrade 10a7947fda6b -> 4a7d35941602, empty message
+INFO  [alembic.runtime.migration] Running upgrade 4a7d35941602 -> cfc013b6461a, empty message
+INFO  [alembic.runtime.migration] Running upgrade cfc013b6461a -> b2d51e4d94c8, empty message
+INFO  [alembic.runtime.migration] Running upgrade b2d51e4d94c8 -> 749c2b85d20f, empty message
+INFO  [alembic.runtime.migration] Running upgrade 749c2b85d20f -> a5b4dc311a89, empty message
+INFO  [alembic.runtime.migration] Running upgrade a5b4dc311a89 -> a3c9a43e41f4, empty message
+INFO  [alembic.runtime.migration] Running upgrade a3c9a43e41f4 -> 7128f87af701, empty message
+INFO  [alembic.runtime.migration] Running upgrade 7128f87af701 -> 270d598c51e3, empty message
+INFO  [alembic.runtime.migration] Running upgrade 270d598c51e3 -> b77ab8c47cc7, empty message
+INFO  [alembic.runtime.migration] Running upgrade b77ab8c47cc7 -> a2b95b04d1f7, empty message
+INFO  [alembic.runtime.migration] Running upgrade a2b95b04d1f7 -> 63fd3b240583, empty message
+INFO  [alembic.runtime.migration] Running upgrade 63fd3b240583 -> 95938a93ea14, empty message
+INFO  [alembic.runtime.migration] Running upgrade 95938a93ea14 -> b82bcad9accf, empty message
+INFO  [alembic.runtime.migration] Running upgrade b82bcad9accf -> 84471852b610, empty message
+INFO  [alembic.runtime.migration] Running upgrade 84471852b610 -> b0e9a389939a, empty message
+INFO  [alembic.runtime.migration] Running upgrade b0e9a389939a -> 198c3aca9d8d, empty message
+INFO  [alembic.runtime.migration] Running upgrade 198c3aca9d8d -> 58ad4df8583e, empty message
+INFO  [alembic.runtime.migration] Running upgrade 58ad4df8583e -> 1abfc9e14d7e, empty message
+INFO  [alembic.runtime.migration] Running upgrade 1abfc9e14d7e -> 32b00d06d892, empty message
+INFO  [alembic.runtime.migration] Running upgrade 32b00d06d892 -> b17afc77ba83, empty message
+INFO  [alembic.runtime.migration] Running upgrade b17afc77ba83 -> 54ca2dbf89c0, empty message
+INFO  [alembic.runtime.migration] Running upgrade 54ca2dbf89c0 -> eef0c404b531, empty message
+INFO  [alembic.runtime.migration] Running upgrade eef0c404b531 -> 84dec6c29c48, empty message
+INFO  [alembic.runtime.migration] Running upgrade 84dec6c29c48 -> d0f197979bd9, empty message
+INFO  [alembic.runtime.migration] Running upgrade d0f197979bd9 -> 9dc16e591f88, empty message
+INFO  [alembic.runtime.migration] Running upgrade 9dc16e591f88 -> ac41029fb329, empty message
+INFO  [alembic.runtime.migration] Running upgrade ac41029fb329 -> d1edb3cadec8, empty message
+INFO  [alembic.runtime.migration] Running upgrade d1edb3cadec8 -> 623662ea0e7e, empty message
+INFO  [alembic.runtime.migration] Running upgrade 623662ea0e7e -> 56c790ec8ab4, empty message
+INFO  [alembic.runtime.migration] Running upgrade 56c790ec8ab4 -> c0d91ff18f77, empty message
+INFO  [alembic.runtime.migration] Running upgrade c0d91ff18f77 -> 780a8344914b, empty message
+INFO  [alembic.runtime.migration] Running upgrade 780a8344914b -> a20aeb9b0eac, empty message
+INFO  [alembic.runtime.migration] Running upgrade a20aeb9b0eac -> 0af2c2e286a7, empty message
+INFO  [alembic.runtime.migration] Running upgrade 0af2c2e286a7 -> 1919f1859215, empty message
+INFO  [alembic.runtime.migration] Running upgrade 1919f1859215 -> f66ca777f409, empty message
+INFO  [alembic.runtime.migration] Running upgrade f66ca777f409 -> 7c0dbd378cdb, empty message
+INFO  [alembic.runtime.migration] Running upgrade 7c0dbd378cdb -> e99989e6ad56, empty message
+INFO  [alembic.runtime.migration] Running upgrade e99989e6ad56 -> 1b54995bc086, empty message
+INFO  [alembic.runtime.migration] Running upgrade 1b54995bc086 -> 2779eb90c6c4, empty message
+INFO  [alembic.runtime.migration] Running upgrade 2779eb90c6c4 -> 74906d31d994, empty message
+INFO  [alembic.runtime.migration] Running upgrade 74906d31d994 -> 85d0655d42c0, empty message
+INFO  [alembic.runtime.migration] Running upgrade 85d0655d42c0 -> de7aa5280210, empty message
+INFO  [alembic.runtime.migration] Running upgrade de7aa5280210 -> e831a883153a, empty message
+INFO  [alembic.runtime.migration] Running upgrade e831a883153a -> d1236c4dff71, empty message
+INFO  [alembic.runtime.migration] Running upgrade d1236c4dff71 -> 94f14eb0fe5b, empty message
+INFO  [alembic.runtime.migration] Running upgrade 94f14eb0fe5b -> 9d6adad83936, empty message
+INFO  [alembic.runtime.migration] Running upgrade 9d6adad83936 -> f398b261d9c6, empty message
+INFO  [alembic.runtime.migration] Running upgrade f398b261d9c6 -> 517b79c56088, empty message
+INFO  [alembic.runtime.migration] Running upgrade 517b79c56088 -> 48b991e9de06, empty message
+INFO  [alembic.runtime.migration] Running upgrade 48b991e9de06 -> e11c3dd48a6f, empty message
+INFO  [alembic.runtime.migration] Running upgrade e11c3dd48a6f -> 4912f3bd5ba2, empty message
+INFO  [alembic.runtime.migration] Running upgrade 4912f3bd5ba2 -> f5133dc851ee, empty message
+INFO  [alembic.runtime.migration] Running upgrade f5133dc851ee -> 5c77d685df87, empty message
+INFO  [alembic.runtime.migration] Running upgrade 5c77d685df87 -> 6cc7f073b358, empty message
+INFO  [alembic.runtime.migration] Running upgrade 6cc7f073b358 -> 68e2f38e33f4, empty message
+INFO  [alembic.runtime.migration] Running upgrade 68e2f38e33f4 -> fc2eb1d7e4fc, empty message
+INFO  [alembic.runtime.migration] Running upgrade fc2eb1d7e4fc -> a5e643d562c9, empty message
+INFO  [alembic.runtime.migration] Running upgrade a5e643d562c9 -> 29ea13ed76f9, empty message
+INFO  [alembic.runtime.migration] Running upgrade 29ea13ed76f9 -> 8e70205a5308, empty message
+INFO  [alembic.runtime.migration] Running upgrade 8e70205a5308 -> f3f19998b755, empty message
+INFO  [alembic.runtime.migration] Running upgrade f3f19998b755 -> c31a081eab74, empty message
+INFO  [alembic.runtime.migration] Running upgrade c31a081eab74 -> 78403c7b8089, empty message
+INFO  [alembic.runtime.migration] Running upgrade 78403c7b8089 -> 5662122eac21, empty message
+INFO  [alembic.runtime.migration] Running upgrade 5662122eac21 -> 20c738810b1b, empty message
+INFO  [alembic.runtime.migration] Running upgrade 20c738810b1b -> dfee471558bd, empty message
+INFO  [alembic.runtime.migration] Running upgrade dfee471558bd -> 05e3af59929a, empty message
+INFO  [alembic.runtime.migration] Running upgrade 05e3af59929a -> c3470e2d3224, empty message
+INFO  [alembic.runtime.migration] Running upgrade c3470e2d3224 -> ffa75d04e6ef, empty message
+INFO  [alembic.runtime.migration] Running upgrade ffa75d04e6ef -> 9014cca7097c, empty message
+INFO  [alembic.runtime.migration] Running upgrade 9014cca7097c -> d4392342465f, empty message
+INFO  [alembic.runtime.migration] Running upgrade d4392342465f -> 424808e1fe49, empty message
+INFO  [alembic.runtime.migration] Running upgrade 424808e1fe49 -> 916a5257d18c, empty message
+INFO  [alembic.runtime.migration] Running upgrade 916a5257d18c -> 4d3f91ddf3e9, empty message
+INFO  [alembic.runtime.migration] Running upgrade 4d3f91ddf3e9 -> d8c55e79da54, empty message
+INFO  [alembic.runtime.migration] Running upgrade d8c55e79da54 -> cf1e8c1bc737, empty message
+INFO  [alembic.runtime.migration] Running upgrade cf1e8c1bc737 -> 7a105bfc0cd0, empty message
+INFO  [alembic.runtime.migration] Running upgrade 7a105bfc0cd0 -> bc75acacc98e, empty message
+INFO  [alembic.runtime.migration] Running upgrade bc75acacc98e -> b8b4f9598240, empty message
+INFO  [alembic.runtime.migration] Running upgrade b8b4f9598240 -> 5ee767807344, empty message
+INFO  [alembic.runtime.migration] Running upgrade 5ee767807344 -> 4913cb3f5a05, empty message
+INFO  [alembic.runtime.migration] Running upgrade 4913cb3f5a05 -> 0b1c9ea11aef, empty message
+INFO  [alembic.runtime.migration] Running upgrade 0b1c9ea11aef -> 2fbcad5527d7, empty message
+INFO  [alembic.runtime.migration] Running upgrade 2fbcad5527d7 -> d750d578b068, empty message
+INFO  [alembic.runtime.migration] Running upgrade d750d578b068 -> 2f1b3c759773, empty message
+INFO  [alembic.runtime.migration] Running upgrade 2f1b3c759773 -> 99d9e329b27f, empty message
+INFO  [alembic.runtime.migration] Running upgrade 99d9e329b27f -> a06066e3fbeb, empty message
+INFO  [alembic.runtime.migration] Running upgrade a06066e3fbeb -> d67eab226ecd, empty message
+INFO  [alembic.runtime.migration] Running upgrade d67eab226ecd -> bbedc353f90c, empty message
+INFO  [alembic.runtime.migration] Running upgrade bbedc353f90c -> 0b9150eb309d, Increase message_id length manually
+INFO  [alembic.runtime.migration] Running upgrade 0b9150eb309d -> 6204e57b4bc4, empty message
+INFO  [alembic.runtime.migration] Running upgrade 6204e57b4bc4 -> 37feaba7c45d, empty message
+INFO  [alembic.runtime.migration] Running upgrade 37feaba7c45d -> ff6c04869029, empty message
+INFO  [alembic.runtime.migration] Running upgrade ff6c04869029 -> fdb02bd105a8, empty message
+INFO  [alembic.runtime.migration] Running upgrade fdb02bd105a8 -> dd278f96ca83, empty message
+INFO  [alembic.runtime.migration] Running upgrade dd278f96ca83 -> 1076b5795b08, empty message
+INFO  [alembic.runtime.migration] Running upgrade 1076b5795b08 -> 5639ad89ee50, empty message
+INFO  [alembic.runtime.migration] Running upgrade 5639ad89ee50 -> 11ba83e2dd71, empty message
+INFO  [alembic.runtime.migration] Running upgrade 11ba83e2dd71 -> ccbfb61eda0d, empty message
+INFO  [alembic.runtime.migration] Running upgrade ccbfb61eda0d -> a5013ff0a00a, empty message
+INFO  [alembic.runtime.migration] Running upgrade a5013ff0a00a -> e6e8e12f5a13, empty message
+INFO  [alembic.runtime.migration] Running upgrade e6e8e12f5a13 -> 9031c9e28510, empty message
+INFO  [alembic.runtime.migration] Running upgrade 9031c9e28510 -> b8fd175c084a, empty message
+INFO  [alembic.runtime.migration] Running upgrade b8fd175c084a -> e7d7ebcea26c, empty message
+INFO  [alembic.runtime.migration] Running upgrade e7d7ebcea26c -> d0ccd9d7ac0c, empty message
+INFO  [alembic.runtime.migration] Running upgrade d0ccd9d7ac0c -> 4b483a762fed, empty message
+INFO  [alembic.runtime.migration] Running upgrade 4b483a762fed -> ad467baf7ec8, empty message
+INFO  [alembic.runtime.migration] Running upgrade ad467baf7ec8 -> d8a3dfe674f2, empty message
+INFO  [alembic.runtime.migration] Running upgrade d8a3dfe674f2 -> 3d05479d0d11, empty message
+INFO  [alembic.runtime.migration] Running upgrade 3d05479d0d11 -> 753d2ed92d41, empty message
+INFO  [alembic.runtime.migration] Running upgrade 753d2ed92d41 -> 698424c429e9, empty message
+INFO  [alembic.runtime.migration] Running upgrade 698424c429e9 -> 07b870d7cc86, empty message
+INFO  [alembic.runtime.migration] Running upgrade 07b870d7cc86 -> 9282e982bc05, Add block_behaviour setting for user
+INFO  [alembic.runtime.migration] Running upgrade 9282e982bc05 -> 5047fcbd57c7, empty message
+INFO  [alembic.runtime.migration] Running upgrade 5047fcbd57c7 -> 4729b7096d12, empty message
+INFO  [alembic.runtime.migration] Running upgrade 4729b7096d12 -> b500363567e3, Create admin audit log
+INFO  [alembic.runtime.migration] Running upgrade b500363567e3 -> 28b9b14c9664, store provider complaints
+INFO  [alembic.runtime.migration] Running upgrade 28b9b14c9664 -> 0aaad1740797, store provider complaints
+INFO  [alembic.runtime.migration] Running upgrade 0aaad1740797 -> e866ad0e78e1, Add partner tables
+INFO  [alembic.runtime.migration] Running upgrade e866ad0e78e1 -> 088f23324464, add flags to the user model
+INFO  [alembic.runtime.migration] Running upgrade 088f23324464 -> 2b1d3cd93e4b, update partner_api_token token length
+INFO  [alembic.runtime.migration] Running upgrade 2b1d3cd93e4b -> 82d3c7109ffb, partner_user and partner_subscription
+INFO  [alembic.runtime.migration] Running upgrade 82d3c7109ffb -> 36646e5dc6d9, make external_user_id non nullable
+INFO  [alembic.runtime.migration] Running upgrade 36646e5dc6d9 -> a7bcb872c12a, Add alias transfer token expiration
+INFO  [alembic.runtime.migration] Running upgrade a7bcb872c12a -> 673a074e4215, empty message
+INFO  [alembic.runtime.migration] Running upgrade 673a074e4215 -> d1fb679f7eec, Add sudo expiration for ApiKeys
+INFO  [alembic.runtime.migration] Running upgrade d1fb679f7eec -> bfebc2d5c719, Add state to job
+INFO  [alembic.runtime.migration] Running upgrade bfebc2d5c719 -> 516c21ea7d87, empty message
+INFO  [alembic.runtime.migration] Running upgrade 516c21ea7d87 -> bd7d032087b2, empty message
+INFO  [alembic.runtime.migration] Running upgrade bd7d032087b2 -> b0101a66bb77, Add unsubscribe behaviour
+INFO  [alembic.runtime.migration] Running upgrade b0101a66bb77 -> 89081a00fc7d, default_unsub_behaviour
+INFO  [alembic.runtime.migration] Running upgrade 89081a00fc7d -> c66f2c5b6cb1, empty message
+INFO  [alembic.runtime.migration] Running upgrade c66f2c5b6cb1 -> 9cc0f0712b29, Add api to cookie token
+INFO  [alembic.runtime.migration] Running upgrade 9cc0f0712b29 -> bd95b2b4217f, Updated recovery code string length
+INFO  [alembic.runtime.migration] Running upgrade bd95b2b4217f -> 2c2093c82bc0, empty message
+INFO  [alembic.runtime.migration] Running upgrade 2c2093c82bc0 -> 5f4a5625da66, empty message
+INFO  [alembic.runtime.migration] Running upgrade 5f4a5625da66 -> 893c0d18475f, empty message
+INFO  [alembic.runtime.migration] Running upgrade 893c0d18475f -> bc496c0a0279, empty message
+INFO  [alembic.runtime.migration] Running upgrade bc496c0a0279 -> 2d89315ac650, empty message
+INFO  [alembic.runtime.migration] Running upgrade 893c0d18475f -> 01e2997e90d3, empty message
+INFO  [alembic.runtime.migration] Running upgrade 01e2997e90d3, 2d89315ac650 -> 2634b41f54db, empty message
+INFO  [alembic.runtime.migration] Running upgrade 2634b41f54db -> 01827104004b, empty message
+INFO  [alembic.runtime.migration] Running upgrade 01827104004b -> 0a5701a4f5e4, empty message
+INFO  [alembic.runtime.migration] Running upgrade 0a5701a4f5e4 -> ec7fdde8da9f, empty message
+INFO  [alembic.runtime.migration] Running upgrade ec7fdde8da9f -> 46ecb648a47e, empty message
+INFO  [alembic.runtime.migration] Running upgrade 46ecb648a47e -> 4bc54632d9aa, empty message
+INFO  [alembic.runtime.migration] Running upgrade 4bc54632d9aa -> 818b0a956205, empty message
+INFO  [alembic.runtime.migration] Running upgrade 818b0a956205 -> 52510a633d6f, empty message
+INFO  [alembic.runtime.migration] Running upgrade 52510a633d6f -> fa2f19bb4e5a, empty message
+INFO  [alembic.runtime.migration] Running upgrade fa2f19bb4e5a -> 06a9a7133445, Create sync_event table
+INFO  [alembic.runtime.migration] Running upgrade 06a9a7133445 -> d608b8e48082, empty message
+INFO  [alembic.runtime.migration] Running upgrade d608b8e48082 -> 56d08955fcab, add retry count to sync event
+INFO  [alembic.runtime.migration] Running upgrade 56d08955fcab -> 1c14339aae90, empty message
+INFO  [alembic.runtime.migration] Running upgrade 1c14339aae90 -> 2441b7ff5da9, Custom Domain partner id
+INFO  [alembic.runtime.migration] Running upgrade 2441b7ff5da9 -> 88dd7a0abf54, contact.flags and custom_domain.pending_deletion
+INFO  [alembic.runtime.migration] Running upgrade 88dd7a0abf54 -> 62afa3a10010, custom domain indices
+INFO  [alembic.runtime.migration] Running upgrade 62afa3a10010 -> 91ed7f46dc81, alias_audit_log
+INFO  [alembic.runtime.migration] Running upgrade 91ed7f46dc81 -> 7d7b84779837, user_audit_log
+INFO  [alembic.runtime.migration] Running upgrade 7d7b84779837 -> 32f25cbf12f6, alias_audit_log_index_created_at
+alembic_exit=0
 $ PGPASSWORD=mypassword psql -h 127.0.0.1 -U myuser -d simplelogin -tAc "SELECT count(*) FROM public_domain" ; echo exit=$?
 0
 exit=0
@@ -1378,34 +1659,39 @@ $ PGPASSWORD=mypassword psql -h 127.0.0.1 -U myuser -d simplelogin -tAc "SELECT 
 exit=0
 ```
 
-**(b) Email handler startup** (`:20381`, PID 133) — same readiness lines as §3.6:
+**(b) Email handler startup** (`:20381`, PID 339) — same readiness lines as §3.6:
 
 ```text
 load config file /tmp/obs.env
 >>> URL: http://localhost:7777
 MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value
 Paddle param not set
-WARNING: Use a temp directory for GNUPGHOME /tmp/srzrvzjqsplyjsoxiywp
+WARNING: Use a temp directory for GNUPGHOME /tmp/xsltwhkedcabshdtxvoc
 Upload files to local dir
 >>> init logging <<<
-2026-07-14 23:56:17,052 - SL - DEBUG - 133 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
-2026-07-14 23:56:18,320 - SL - INFO - 133 - "/app/email_handler.py:2403" - <module>() -  - Listen for port 20381
-2026-07-14 23:56:18,322 - SL - DEBUG - 133 - "/app/email_handler.py:2386" - main() -  - Start mail controller 0.0.0.0 20381
+2026-07-15 02:30:55,087 - SL - DEBUG - 339 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+2026-07-15 02:30:55,570 - SL - INFO - 339 - "/app/email_handler.py:2403" - <module>() -  - Listen for port 20381
+2026-07-15 02:30:55,572 - SL - DEBUG - 339 - "/app/email_handler.py:2386" - main() -  - Start mail controller 0.0.0.0 20381
 ```
 
-**(c) Complete, unedited SMTP transcript** (from `req3_send.py` with `set_debuglevel(1)`). The
-session is accepted through DATA (`250`/`354`); the `550 SL E515 Email not exist` reply is
+**(c) Complete, unedited SMTP transcript** (from `req3_send.py`, which enables `set_debuglevel(1)`
+**before** `connect()`). The transcript opens with the server's `220 … Python SMTP 1.4.2` greeting; the
+session is then accepted through DATA (`250`/`354`); the `550 SL E515 Email not exist` reply is
 returned **after** the message body, and smtplib raises `SMTPDataError code=550`:
 
 ```text
 $ /app/venv/bin/python /tmp/req3_send.py
+connect: to ('127.0.0.1', 20381) None
+reply: b'220 82de72c0703d Python SMTP 1.4.2\r\n'
+reply: retcode (220); Msg: b'82de72c0703d Python SMTP 1.4.2'
+connect: b'82de72c0703d Python SMTP 1.4.2'
 send: 'ehlo [172.17.0.3]\r\n'
-reply: b'250-9a85502bb1b6\r\n'
+reply: b'250-82de72c0703d\r\n'
 reply: b'250-SIZE 33554432\r\n'
 reply: b'250-8BITMIME\r\n'
 reply: b'250-SMTPUTF8\r\n'
 reply: b'250 HELP\r\n'
-reply: retcode (250); Msg: b'9a85502bb1b6\nSIZE 33554432\n8BITMIME\nSMTPUTF8\nHELP'
+reply: retcode (250); Msg: b'82de72c0703d\nSIZE 33554432\n8BITMIME\nSMTPUTF8\nHELP'
 send: 'mail FROM:<someone@example.com> size=151\r\n'
 reply: b'250 OK\r\n'
 reply: retcode (250); Msg: b'OK'
@@ -1430,7 +1716,7 @@ RESULT: SMTPDataError -> code= 550 msg= b'SL E515 Email not exist'
 ```
 
 **(d) Complete, unedited handler logs for this message** — **every** line the handler writes to
-stdout for message-id `f167e4d1-a2d7-4884-bebe-45471d5f2782`, in emission order, from the **very
+stdout for message-id `fa8b67fd-33f0-4713-a25f-4fb7aba76724`, in emission order, from the **very
 first** line emitted for it (`set_message_id`) through the closing `Finish` line, with **no
 annotations added** and nothing elided (each `_handle()` call deterministically emits exactly
 these 11 lines — reconfirmed across repeated sends). The following spans are **source-emitted**,
@@ -1443,17 +1729,17 @@ the `<<===` suffix [email_handler.py:2367, string literal `:2368`]. Every line a
 one carries the message-id.
 
 ```text
-2026-07-14 23:56:25,727 - SL - DEBUG - 133 - "/app/app/log.py:24" - set_message_id() -  - set message_id f167e4d1-a2d7-4884-bebe-45471d5f2782
-2026-07-14 23:56:25,727 - SL - DEBUG - 133 - "/app/email_handler.py:2342" - _handle() - f167e4d1-a2d7-4884-bebe-45471d5f2782 - ====>=====>====>====>====>====>====>====>
-2026-07-14 23:56:25,727 - SL - INFO - 133 - "/app/email_handler.py:2343" - _handle() - f167e4d1-a2d7-4884-bebe-45471d5f2782 - New message, mail from someone@example.com, rctp tos ['x@sl.local']
-2026-07-14 23:56:25,728 - SL - DEBUG - 133 - "/app/email_handler.py:1963" - handle() - f167e4d1-a2d7-4884-bebe-45471d5f2782 - Cannot parse Postfix queue ID from None None
-2026-07-14 23:56:25,797 - SL - DEBUG - 133 - "/app/email_handler.py:1980" - handle() - f167e4d1-a2d7-4884-bebe-45471d5f2782 - ==>> Handle mail_from:someone@example.com, rcpt_tos:['x@sl.local'], header_from:someone@example.com, header_to:x@sl.local, cc:None, reply-to:None, message_id:None, client_ip:None, headers:[('From', 'someone@example.com'), ('To', 'x@sl.local'), ('Subject', 'test'), ('Content-Type', 'text/plain; charset="utf-8"'), ('Content-Transfer-Encoding', '7bit'), ('MIME-Version', '1.0')], mail_options:['SIZE=151'], rcpt_options:[]
-2026-07-14 23:56:25,801 - SL - DEBUG - 133 - "/app/email_handler.py:2202" - handle() - f167e4d1-a2d7-4884-bebe-45471d5f2782 - Forward phase someone@example.com(someone@example.com) -> x@sl.local
-2026-07-14 23:56:25,812 - SL - DEBUG - 133 - "/app/email_handler.py:545" - handle_forward() - f167e4d1-a2d7-4884-bebe-45471d5f2782 - alias x@sl.local not exist. Try to see if it can be created on the fly
-2026-07-14 23:56:25,869 - SL - INFO - 133 - "/app/app/alias_utils.py:104" - check_if_alias_can_be_auto_created_for_custom_domain() - f167e4d1-a2d7-4884-bebe-45471d5f2782 - Cannot auto-create custom domain alias for x@sl.local because there's no custom domain for sl.local
-2026-07-14 23:56:25,869 - SL - INFO - 133 - "/app/app/alias_utils.py:165" - check_if_alias_can_be_auto_created_for_a_directory() - f167e4d1-a2d7-4884-bebe-45471d5f2782 - Cannot auto-create x@sl.local since it has no directory separator
-2026-07-14 23:56:25,870 - SL - DEBUG - 133 - "/app/email_handler.py:551" - handle_forward() - f167e4d1-a2d7-4884-bebe-45471d5f2782 - alias x@sl.local cannot be created on-the-fly, return 550
-2026-07-14 23:56:25,871 - SL - INFO - 133 - "/app/email_handler.py:2367" - _handle() - f167e4d1-a2d7-4884-bebe-45471d5f2782 - Finish mail_from someone@example.com, rcpt_tos ['x@sl.local'], takes 0.14393949508666992 seconds with return code '550 SL E515 Email not exist'<<===
+2026-07-15 02:30:56,331 - SL - DEBUG - 339 - "/app/app/log.py:24" - set_message_id() -  - set message_id fa8b67fd-33f0-4713-a25f-4fb7aba76724
+2026-07-15 02:30:56,331 - SL - DEBUG - 339 - "/app/email_handler.py:2342" - _handle() - fa8b67fd-33f0-4713-a25f-4fb7aba76724 - ====>=====>====>====>====>====>====>====>
+2026-07-15 02:30:56,331 - SL - INFO - 339 - "/app/email_handler.py:2343" - _handle() - fa8b67fd-33f0-4713-a25f-4fb7aba76724 - New message, mail from someone@example.com, rctp tos ['x@sl.local']
+2026-07-15 02:30:56,333 - SL - DEBUG - 339 - "/app/email_handler.py:1963" - handle() - fa8b67fd-33f0-4713-a25f-4fb7aba76724 - Cannot parse Postfix queue ID from None None
+2026-07-15 02:30:56,463 - SL - DEBUG - 339 - "/app/email_handler.py:1980" - handle() - fa8b67fd-33f0-4713-a25f-4fb7aba76724 - ==>> Handle mail_from:someone@example.com, rcpt_tos:['x@sl.local'], header_from:someone@example.com, header_to:x@sl.local, cc:None, reply-to:None, message_id:None, client_ip:None, headers:[('From', 'someone@example.com'), ('To', 'x@sl.local'), ('Subject', 'test'), ('Content-Type', 'text/plain; charset="utf-8"'), ('Content-Transfer-Encoding', '7bit'), ('MIME-Version', '1.0')], mail_options:['SIZE=151'], rcpt_options:[]
+2026-07-15 02:30:56,468 - SL - DEBUG - 339 - "/app/email_handler.py:2202" - handle() - fa8b67fd-33f0-4713-a25f-4fb7aba76724 - Forward phase someone@example.com(someone@example.com) -> x@sl.local
+2026-07-15 02:30:56,478 - SL - DEBUG - 339 - "/app/email_handler.py:545" - handle_forward() - fa8b67fd-33f0-4713-a25f-4fb7aba76724 - alias x@sl.local not exist. Try to see if it can be created on the fly
+2026-07-15 02:30:56,487 - SL - INFO - 339 - "/app/app/alias_utils.py:104" - check_if_alias_can_be_auto_created_for_custom_domain() - fa8b67fd-33f0-4713-a25f-4fb7aba76724 - Cannot auto-create custom domain alias for x@sl.local because there's no custom domain for sl.local
+2026-07-15 02:30:56,488 - SL - INFO - 339 - "/app/app/alias_utils.py:165" - check_if_alias_can_be_auto_created_for_a_directory() - fa8b67fd-33f0-4713-a25f-4fb7aba76724 - Cannot auto-create x@sl.local since it has no directory separator
+2026-07-15 02:30:56,488 - SL - DEBUG - 339 - "/app/email_handler.py:551" - handle_forward() - fa8b67fd-33f0-4713-a25f-4fb7aba76724 - alias x@sl.local cannot be created on-the-fly, return 550
+2026-07-15 02:30:56,489 - SL - INFO - 339 - "/app/email_handler.py:2367" - _handle() - fa8b67fd-33f0-4713-a25f-4fb7aba76724 - Finish mail_from someone@example.com, rcpt_tos ['x@sl.local'], takes 0.15763425827026367 seconds with return code '550 SL E515 Email not exist'<<===
 ```
 
 The **two rejection log lines** (identified here in prose, outside the evidence block, so the
@@ -1594,12 +1880,14 @@ here because they would be self-referential — quoting them would change this v
 ### 5.4 Evidence-fidelity statement
 
 Every fenced `text`/`python`/`bash` block in this document is the **actual captured output or the
-actual helper source**, reproduced verbatim, with a single disclosed non-semantic transformation:
-trailing whitespace on each line was trimmed for markdown hygiene (no line content, ordering, or
-value was altered). **Nothing is redacted.** The one item that might look sensitive — the
-`Set-Cookie: slapp=...` value in §2.3(d) — is a **throwaway** session cookie signed with the
-**public** `example.env` value `FLASK_SECRET=secret` inside a disposable container, so it carries
-no secret and is shown raw to keep the capture literally complete.
+actual helper source**, reproduced verbatim, with two disclosed transformations: (1) trailing
+whitespace on each line was trimmed for markdown hygiene (no line content, ordering, or value was
+altered); and (2) **exactly one value is redacted** — the signed `slapp` session-cookie token in
+§2.3(d) is shown as `<redacted>`. Its non-sensitive attributes (`Expires`, `HttpOnly`, `Path`,
+`SameSite`) are kept, and its decoded payload (session flags plus a CSRF token, **no PII**) is
+disclosed in prose there. That cookie is a **throwaway** token signed with the **public**
+`example.env` value `FLASK_SECRET=secret` inside a disposable container, so it carries no secret;
+the raw token is redacted purely as a repo-hygiene measure.
 
 ## §6 Coverage — every named item answered
 
