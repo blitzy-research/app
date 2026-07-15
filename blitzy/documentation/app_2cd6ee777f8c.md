@@ -458,6 +458,8 @@ forgot my password
 name="password"
 ```
 
+> **Note on the login-page `Content-Length` (dynamic value).** The `349998` above is a per-render snapshot, **not** a fixed constant. The login page is a full HTML document rendered by the Flask **debug** server (`app.run(debug=True, port=7777)` at [server.py:L588]), and its serialized byte size varies from render to render and across environments — re-issuing the same `GET /auth/login` during this investigation produced bodies of, e.g., `220498` and `283794` bytes. What is **stable and the actual readiness signal** is the `200 OK` status plus the `Log in` / `name="password"` / `forgot my password` markers and the `Server: Werkzeug/1.0.1 Python/3.10.18` header. The same dynamic-render caveat applies to the other full rendered HTML pages captured in this document (the registration form in §Q2.1 and the *"Activation Email Sent"* waiting page in §Q2.2, whose `Content-Length` values are likewise per-render snapshots). By contrast, the **small fixed-payload** responses are byte-stable across renders: the `229`-byte `GET /` redirect body (§Q1.2), the `3`-byte `/git` body, and the `4`-byte `/live` body (§Q1.3).
+
 The redirect and the login render are both logged by `after_request` at [server.py:L284]:
 
 ```bash
@@ -652,7 +654,7 @@ Submitting a valid email + password returns `200 OK` rendering `register_waiting
 docker exec sl-canonical bash -c '
 JAR=/tmp/obs/probe_jar.txt
 CSRF=$(curl -sS -c "$JAR" http://localhost:7777/auth/register | grep -oE "name=\"csrf_token\"[^>]*value=\"[^\"]+\"" | grep -oE "value=\"[^\"]+\"" | sed "s/value=\"//;s/\"//")
-curl -sSi -b "$JAR" -c "$JAR" \
+curl -sS -b "$JAR" -c "$JAR" -D - -o /tmp/obs/register_body.html \
   --data-urlencode "csrf_token=$CSRF" \
   --data-urlencode "email=blitzyprobe@gmail.com" \
   --data-urlencode "password=BlitzyProbe#2026" \
@@ -848,7 +850,7 @@ http_code=400
 Activation code cannot be found
 ```
 
-- **Expired code** → *"Activation code was expired"* at [app/auth/views/activate.py:L38-L46] (the `if activation_code.is_expired():` branch — a plain `if` that functions as an effective else-if because the preceding not-found block at [app/auth/views/activate.py:L28-L36] `return`s first — where `is_expired()` compares `self.expired < arrow.now()` at [app/models.py:L1214]). To exercise this branch we inserted a temporary `ActivationCode` whose `expired` timestamp is in the past (this row is removed in §Q4):
+- **Expired code** → *"Activation code was expired"* at [app/auth/views/activate.py:L38-L46] (the `if activation_code.is_expired():` branch — a plain `if` that functions as an effective else-if because the preceding not-found block at [app/auth/views/activate.py:L28-L36] `return`s first — where `is_expired()` — defined at [app/models.py:L1214] — evaluates the comparison `self.expired < arrow.now()` at [app/models.py:L1215]). To exercise this branch we inserted a temporary `ActivationCode` whose `expired` timestamp is in the past (this row is removed in §Q4):
 
 ```bash
 docker exec sl-canonical bash -c 'cd /app && source /app/venv/bin/activate && CONFIG=/root/sl.env python3 - <<PY 2>/dev/null
@@ -1291,6 +1293,8 @@ D  blitzy/screenshots/simplelogin_login_page.png
 
 The two `D` (deleted) entries are the removal of two screenshot PNGs that a prior revision had committed; deleting them brings the net change versus the project baseline to a single added file (see §Q4.5). No application source, template, migration, config, or dependency file appears — none was touched.
 
+> **Historical snapshot.** The `git status --short` output above was captured *during* remediation — while the rewritten answer document was staged (`M`) and the two obsolete screenshot PNGs were being removed (`D`). It is retained here to explain how the tree reached its final shape. On the **current committed tree** the same command yields **no output at all** (a clean working tree), because those changes are now committed; the net change versus the project baseline `2cd6ee77` is exactly the single added answer document. The committed-state proof is in §Q4.5.
+
 ### Q4.2 — Temporary-artifact cleanup and exact baseline restoration (proof)
 
 **What was created during the investigation (all temporary):** one probe user `blitzyprobe@gmail.com` (`id=3`) with its auto-created default alias (`id=12`) and mailbox (`id=5`); one deliberately-expired `ActivationCode` (`id=2`) used to exercise the expiry branch (§Q2.6); one `onboarding-1` `Job` (`id=1`) used to exercise the worker (§Q3.2); and one `SyncEvent` used to exercise the event bus (§Q3.3, already self-deleted by the listener).
@@ -1478,7 +1482,10 @@ git diff --cached --name-status 2cd6ee77
 A	blitzy/documentation/app_2cd6ee777f8c.md
 ```
 
-This is the concrete proof of the MainRule scope: the only durable change to the repository is the addition of `blitzy/documentation/app_2cd6ee777f8c.md`. (The same single-file result holds against the new commit once created; see the repository history.)
+This is the concrete proof of the MainRule scope: the only durable change to the repository is the addition of `blitzy/documentation/app_2cd6ee777f8c.md`.
+
+> **Historical snapshot.** The three-file `git diff` and the `git rm` step above are a *pre-remediation* record showing how the two obsolete screenshot PNGs were removed. Those removals are now committed, so on the **current committed tree** the plain `git diff --name-status 2cd6ee77..HEAD` yields the single-file result **directly** — `A blitzy/documentation/app_2cd6ee777f8c.md` — with no `git rm` needed, and `git status --short` is clean (see §Q4.1). The same single-file result holds against the current commit.
+
 ---
 
 ## Coverage pass
