@@ -252,10 +252,11 @@ fuser <port>/tcp ; echo rc=$?     # rc=1 + no PIDs = released
 ### 1.8 Migrations: `flask db upgrade` vs `alembic upgrade head` (previewed; evidence in §3.2)
 
 The README/AAP document `flask db upgrade`, but in this codebase **Flask-Migrate is not
-registered** in `create_app` (no `Migrate(app, db)` call exists anywhere in the source; the
-only reference, `shell.py:20`, is dead code under `if False:` [shell.py:11-26]), so that
-command **fails** with `KeyError: 'migrate'`. The working, canonical migration path is
-`alembic upgrade head` — exactly what CI uses
+registered** in `create_app` (no `Migrate(app, db)` call exists anywhere in the source; the only
+two `flask_migrate` references are a top-level `import flask_migrate` [shell.py:1] and a dead
+`flask_migrate.upgrade()` call under `if False:` [shell.py:20, within shell.py:11-26] — **neither
+registers the extension**), so that command **fails** with `KeyError: 'migrate'`. The working,
+canonical migration path is `alembic upgrade head` — exactly what CI uses
 (`CONFIG=tests/test.env poetry run alembic upgrade head` [.github/workflows/main.yml:98]). The
 complete failure traceback and the successful Alembic run are captured in **§3.2**.
 
@@ -428,9 +429,10 @@ issues no query). The app **boot preamble** (`load config file` -> `>>> init log
 `load words file`) appears **twice** — once per process — because `app.run(debug=True)`
 [server.py:588] enables the Werkzeug reloader, which spawns a child: the first preamble is the
 reloader **parent** (PID 375), the second is the **child** (PID 399) that actually serves. The
-Werkzeug `* Serving Flask app` / `* Environment: production` / `* Debug mode: on` banner prints
-**once**; note the **absence** of any `* Running on http://127.0.0.1:7777` or `* Debugger PIN:`
-line — SimpleLogin's logging setup suppresses Werkzeug's `_internal` "Running on" emitter (§1.9):
+**Flask dev-server** `* Serving Flask app` / `* Environment: production` / `* Debug mode: on`
+banner (Flask's own, emitted via `click` — not Werkzeug) prints **once**; note the **absence** of
+any `* Running on http://127.0.0.1:7777` or `* Debugger PIN:` line — SimpleLogin's logging setup
+suppresses Werkzeug's `_internal` "Running on" emitter (§1.9):
 
 ```text
 load config file /tmp/obs.env
@@ -687,7 +689,7 @@ local-development system to function [README.md:461,477-480,495]:
 
 | # | Service | Command | Port | Readiness signal (observed) |
 |---|---------|---------|------|-----------------------------|
-| 1 | Web application | `python server.py` | TCP **7777** | Werkzeug `* Serving Flask app` banner; `:7777` LISTEN; `GET /health -> 200` |
+| 1 | Web application | `python server.py` | TCP **7777** | Flask dev-server `* Serving Flask app` banner (Flask's own, via `click`; Werkzeug's `* Running on` line is suppressed — see §1.9); `:7777` LISTEN; `GET /health -> 200` |
 | 2 | Email handler (SMTP ingress) | `python email_handler.py` | TCP **20381** | `Listen for port 20381` [email_handler.py:2403] + `Start mail controller 0.0.0.0 20381` [email_handler.py:2386]; `:20381` LISTEN; live SMTP `EHLO`/`NOOP` |
 | 3 | Job runner (background worker) | `python job_runner.py` | **none** | No port, no "ready" banner — readiness = *process alive and polling* the `Job` table every 10s [job_runner.py:329-347] |
 
@@ -1376,19 +1378,19 @@ $ PGPASSWORD=mypassword psql -h 127.0.0.1 -U myuser -d simplelogin -tAc "SELECT 
 exit=0
 ```
 
-**(b) Email handler startup** (`:20381`, PID 1295) — same readiness lines as §3.6:
+**(b) Email handler startup** (`:20381`, PID 133) — same readiness lines as §3.6:
 
 ```text
 load config file /tmp/obs.env
 >>> URL: http://localhost:7777
 MAX_NB_EMAIL_FREE_PLAN is not set, use 5 as default value
 Paddle param not set
-WARNING: Use a temp directory for GNUPGHOME /tmp/mcwnppzmxiustmjeapid
+WARNING: Use a temp directory for GNUPGHOME /tmp/srzrvzjqsplyjsoxiywp
 Upload files to local dir
 >>> init logging <<<
-2026-07-14 21:28:27,561 - SL - DEBUG - 1295 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
-2026-07-14 21:28:28,033 - SL - INFO - 1295 - "/app/email_handler.py:2403" - <module>() -  - Listen for port 20381
-2026-07-14 21:28:28,035 - SL - DEBUG - 1295 - "/app/email_handler.py:2386" - main() -  - Start mail controller 0.0.0.0 20381
+2026-07-14 23:56:17,052 - SL - DEBUG - 133 - "/app/app/utils.py:17" - <module>() -  - load words file: /app/local_data/test_words.txt
+2026-07-14 23:56:18,320 - SL - INFO - 133 - "/app/email_handler.py:2403" - <module>() -  - Listen for port 20381
+2026-07-14 23:56:18,322 - SL - DEBUG - 133 - "/app/email_handler.py:2386" - main() -  - Start mail controller 0.0.0.0 20381
 ```
 
 **(c) Complete, unedited SMTP transcript** (from `req3_send.py` with `set_debuglevel(1)`). The
@@ -1398,12 +1400,12 @@ returned **after** the message body, and smtplib raises `SMTPDataError code=550`
 ```text
 $ /app/venv/bin/python /tmp/req3_send.py
 send: 'ehlo [172.17.0.3]\r\n'
-reply: b'250-abe149475ec4\r\n'
+reply: b'250-9a85502bb1b6\r\n'
 reply: b'250-SIZE 33554432\r\n'
 reply: b'250-8BITMIME\r\n'
 reply: b'250-SMTPUTF8\r\n'
 reply: b'250 HELP\r\n'
-reply: retcode (250); Msg: b'abe149475ec4\nSIZE 33554432\n8BITMIME\nSMTPUTF8\nHELP'
+reply: retcode (250); Msg: b'9a85502bb1b6\nSIZE 33554432\n8BITMIME\nSMTPUTF8\nHELP'
 send: 'mail FROM:<someone@example.com> size=151\r\n'
 reply: b'250 OK\r\n'
 reply: retcode (250); Msg: b'OK'
@@ -1427,21 +1429,31 @@ reply: retcode (221); Msg: b'Bye'
 RESULT: SMTPDataError -> code= 550 msg= b'SL E515 Email not exist'
 ```
 
-**(d) Complete, unedited handler logs for this message** — all lines for message-id
-`2e6e5e3b-fbd8-4147-81e7-b66f7b7ca965`, exactly as written to stdout, with **no annotations
-added**. (The `==>>` and `<<===` markers are **source-emitted** — literal format text in
-`email_handler.py:1981` and `email_handler.py:2368` — not editorial marks.)
+**(d) Complete, unedited handler logs for this message** — **every** line the handler writes to
+stdout for message-id `f167e4d1-a2d7-4884-bebe-45471d5f2782`, in emission order, from the **very
+first** line emitted for it (`set_message_id`) through the closing `Finish` line, with **no
+annotations added** and nothing elided (each `_handle()` call deterministically emits exactly
+these 11 lines — reconfirmed across repeated sends). The following spans are **source-emitted**,
+not editorial marks: the opening line `set_message_id() … set message_id <id>` [app/log.py:24]
+shows an **empty** `message_id` field because `set_message_id()` logs the id *before* it assigns
+the module global `_MESSAGE_ID` (the `LOG.d(...)` at [app/log.py:24] precedes the assignment at
+[app/log.py:25]), so the id is not yet attached to that one line; the `====>=====>…` separator
+[email_handler.py:2342]; the `==>>` prefix [email_handler.py:1980, string literal `:1981`]; and
+the `<<===` suffix [email_handler.py:2367, string literal `:2368`]. Every line after the opening
+one carries the message-id.
 
 ```text
-2026-07-14 21:28:35,500 - SL - INFO - 1295 - "/app/email_handler.py:2343" - _handle() - 2e6e5e3b-fbd8-4147-81e7-b66f7b7ca965 - New message, mail from someone@example.com, rctp tos ['x@sl.local']
-2026-07-14 21:28:35,501 - SL - DEBUG - 1295 - "/app/email_handler.py:1963" - handle() - 2e6e5e3b-fbd8-4147-81e7-b66f7b7ca965 - Cannot parse Postfix queue ID from None None
-2026-07-14 21:28:35,641 - SL - DEBUG - 1295 - "/app/email_handler.py:1980" - handle() - 2e6e5e3b-fbd8-4147-81e7-b66f7b7ca965 - ==>> Handle mail_from:someone@example.com, rcpt_tos:['x@sl.local'], header_from:someone@example.com, header_to:x@sl.local, cc:None, reply-to:None, message_id:None, client_ip:None, headers:[('From', 'someone@example.com'), ('To', 'x@sl.local'), ('Subject', 'test'), ('Content-Type', 'text/plain; charset="utf-8"'), ('Content-Transfer-Encoding', '7bit'), ('MIME-Version', '1.0')], mail_options:['SIZE=151'], rcpt_options:[]
-2026-07-14 21:28:35,646 - SL - DEBUG - 1295 - "/app/email_handler.py:2202" - handle() - 2e6e5e3b-fbd8-4147-81e7-b66f7b7ca965 - Forward phase someone@example.com(someone@example.com) -> x@sl.local
-2026-07-14 21:28:35,656 - SL - DEBUG - 1295 - "/app/email_handler.py:545" - handle_forward() - 2e6e5e3b-fbd8-4147-81e7-b66f7b7ca965 - alias x@sl.local not exist. Try to see if it can be created on the fly
-2026-07-14 21:28:35,716 - SL - INFO - 1295 - "/app/app/alias_utils.py:104" - check_if_alias_can_be_auto_created_for_custom_domain() - 2e6e5e3b-fbd8-4147-81e7-b66f7b7ca965 - Cannot auto-create custom domain alias for x@sl.local because there's no custom domain for sl.local
-2026-07-14 21:28:35,716 - SL - INFO - 1295 - "/app/app/alias_utils.py:165" - check_if_alias_can_be_auto_created_for_a_directory() - 2e6e5e3b-fbd8-4147-81e7-b66f7b7ca965 - Cannot auto-create x@sl.local since it has no directory separator
-2026-07-14 21:28:35,716 - SL - DEBUG - 1295 - "/app/email_handler.py:551" - handle_forward() - 2e6e5e3b-fbd8-4147-81e7-b66f7b7ca965 - alias x@sl.local cannot be created on-the-fly, return 550
-2026-07-14 21:28:35,717 - SL - INFO - 1295 - "/app/email_handler.py:2367" - _handle() - 2e6e5e3b-fbd8-4147-81e7-b66f7b7ca965 - Finish mail_from someone@example.com, rcpt_tos ['x@sl.local'], takes 0.2176060676574707 seconds with return code '550 SL E515 Email not exist'<<===
+2026-07-14 23:56:25,727 - SL - DEBUG - 133 - "/app/app/log.py:24" - set_message_id() -  - set message_id f167e4d1-a2d7-4884-bebe-45471d5f2782
+2026-07-14 23:56:25,727 - SL - DEBUG - 133 - "/app/email_handler.py:2342" - _handle() - f167e4d1-a2d7-4884-bebe-45471d5f2782 - ====>=====>====>====>====>====>====>====>
+2026-07-14 23:56:25,727 - SL - INFO - 133 - "/app/email_handler.py:2343" - _handle() - f167e4d1-a2d7-4884-bebe-45471d5f2782 - New message, mail from someone@example.com, rctp tos ['x@sl.local']
+2026-07-14 23:56:25,728 - SL - DEBUG - 133 - "/app/email_handler.py:1963" - handle() - f167e4d1-a2d7-4884-bebe-45471d5f2782 - Cannot parse Postfix queue ID from None None
+2026-07-14 23:56:25,797 - SL - DEBUG - 133 - "/app/email_handler.py:1980" - handle() - f167e4d1-a2d7-4884-bebe-45471d5f2782 - ==>> Handle mail_from:someone@example.com, rcpt_tos:['x@sl.local'], header_from:someone@example.com, header_to:x@sl.local, cc:None, reply-to:None, message_id:None, client_ip:None, headers:[('From', 'someone@example.com'), ('To', 'x@sl.local'), ('Subject', 'test'), ('Content-Type', 'text/plain; charset="utf-8"'), ('Content-Transfer-Encoding', '7bit'), ('MIME-Version', '1.0')], mail_options:['SIZE=151'], rcpt_options:[]
+2026-07-14 23:56:25,801 - SL - DEBUG - 133 - "/app/email_handler.py:2202" - handle() - f167e4d1-a2d7-4884-bebe-45471d5f2782 - Forward phase someone@example.com(someone@example.com) -> x@sl.local
+2026-07-14 23:56:25,812 - SL - DEBUG - 133 - "/app/email_handler.py:545" - handle_forward() - f167e4d1-a2d7-4884-bebe-45471d5f2782 - alias x@sl.local not exist. Try to see if it can be created on the fly
+2026-07-14 23:56:25,869 - SL - INFO - 133 - "/app/app/alias_utils.py:104" - check_if_alias_can_be_auto_created_for_custom_domain() - f167e4d1-a2d7-4884-bebe-45471d5f2782 - Cannot auto-create custom domain alias for x@sl.local because there's no custom domain for sl.local
+2026-07-14 23:56:25,869 - SL - INFO - 133 - "/app/app/alias_utils.py:165" - check_if_alias_can_be_auto_created_for_a_directory() - f167e4d1-a2d7-4884-bebe-45471d5f2782 - Cannot auto-create x@sl.local since it has no directory separator
+2026-07-14 23:56:25,870 - SL - DEBUG - 133 - "/app/email_handler.py:551" - handle_forward() - f167e4d1-a2d7-4884-bebe-45471d5f2782 - alias x@sl.local cannot be created on-the-fly, return 550
+2026-07-14 23:56:25,871 - SL - INFO - 133 - "/app/email_handler.py:2367" - _handle() - f167e4d1-a2d7-4884-bebe-45471d5f2782 - Finish mail_from someone@example.com, rcpt_tos ['x@sl.local'], takes 0.14393949508666992 seconds with return code '550 SL E515 Email not exist'<<===
 ```
 
 The **two rejection log lines** (identified here in prose, outside the evidence block, so the
