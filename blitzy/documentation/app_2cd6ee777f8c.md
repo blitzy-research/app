@@ -360,7 +360,7 @@ docker exec sl-canonical bash -c 'sed -n "8p" /app/app/spamassassin_utils.py'   
 import re
 ```
 
-The canonical tracked source instead uses `import re2 as re` at [app/spamassassin_utils.py:L8]. Because of this patch, `email_handler.py` boots normally in this image and its startup banners were captured **live** (§Q1.5/§Q3.5); the banner text and `file:line` sites are the canonical ones — only the underlying RE2 binding differs. **Crucially, all of these differences exist only inside the container's `/app` working tree; the host branch `app_2cd6ee777f8c` where this document is authored is untouched (proven in §Q4.1).**
+The canonical tracked source instead uses `import re2 as re` at [app/spamassassin_utils.py:L8]. Because of this patch, `email_handler.py` boots normally in this image and its startup banners were captured **live** (§Q1.5/§Q3.4); the banner text and `file:line` sites are the canonical ones — only the underlying RE2 binding differs. **Crucially, all of these differences exist only inside the container's `/app` working tree; the host branch `app_2cd6ee777f8c` where this document is authored is untouched (proven in §Q4.1).**
 
 ### 0.8 Security posture of the local debug runtime (trusted-local-only)
 
